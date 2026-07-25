@@ -3134,6 +3134,31 @@ mod tests {
     }
 
     #[test]
+    fn paste_fills_an_open_text_input_modal_not_the_pane() {
+        // Regression: pasting (e.g. an nsec) into a Settings string field leaked
+        // to the focused pane instead of the field. A paste while a text-input
+        // modal is open must fill that modal.
+        let _env = crate::persist::test_env("paste-modal");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.module_setting_edit = Some(crate::app::ModuleSettingEdit {
+            module_id: "example.buzz".into(),
+            key: "nsec".into(),
+            title: "Private key".into(),
+            buffer: String::new(),
+            secret: true,
+        });
+        // A paste carrying a newline (multi-line clipboard) — the field is
+        // single-line, so control chars are dropped.
+        app.handle_event(AppEvent::Paste("nsec1abcdef\n".into()));
+        assert_eq!(
+            app.module_setting_edit.as_ref().map(|e| e.buffer.as_str()),
+            Some("nsec1abcdef"),
+            "the paste filled the setting field, newline stripped"
+        );
+    }
+
+    #[test]
     fn session_roundtrip() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();

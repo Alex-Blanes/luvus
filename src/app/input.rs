@@ -23,10 +23,15 @@ impl App {
                 true // conservative: hover/selection/clicks can change the UI
             }
             AppEvent::Paste(s) => {
-                // `send_paste` re-wraps in the bracketed-paste markers crossterm
-                // stripped, so a child that distinguishes paste from typing (an
-                // agent CLI attaching a dropped file, vim not auto-indenting)
-                // still sees a paste.
+                // A paste while a text-input modal is open (a Settings field, a
+                // rename prompt, …) fills that field, not the pane underneath.
+                if self.paste_into_modal(&s) {
+                    return true; // the modal buffer changed → redraw
+                }
+                // Otherwise it goes to the focused pane. `send_paste` re-wraps in
+                // the bracketed-paste markers crossterm stripped, so a child that
+                // distinguishes paste from typing (an agent CLI attaching a
+                // dropped file, vim not auto-indenting) still sees a paste.
                 if let Some(p) = self.focused() {
                     p.scroll_to_bottom(); // pasting is input → snap to live
                     p.send_paste(&s);
@@ -124,6 +129,34 @@ impl App {
             }
         }
         None
+    }
+
+    /// Route pasted text into an open text-input modal by replaying it as
+    /// keypresses, so a paste fills the field instead of leaking to the pane
+    /// underneath. Mirrors `handle_key`'s text-input precedence; returns whether
+    /// a modal consumed it. Control chars (newlines/tabs) are dropped — these are
+    /// all single-line fields.
+    fn paste_into_modal(&mut self, s: &str) -> bool {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let handler: fn(&mut Self, KeyEvent) = if self.module_setting_edit.is_some() {
+            Self::handle_module_setting_key
+        } else if self.worktree_prompt.is_some() {
+            Self::handle_worktree_prompt_key
+        } else if self.tab_rename.is_some() {
+            Self::handle_tab_rename_key
+        } else if self.file_prompt.is_some() {
+            Self::file_prompt_key
+        } else if self.ws_rename.is_some() {
+            Self::handle_ws_rename_key
+        } else if self.orch_form.is_some() {
+            Self::handle_orch_form_key
+        } else {
+            return false;
+        };
+        for c in s.chars().filter(|c| !c.is_control()) {
+            handler(self, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        true
     }
 
     fn handle_mouse(&mut self, m: ratatui::crossterm::event::MouseEvent) {
