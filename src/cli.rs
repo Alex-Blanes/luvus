@@ -183,7 +183,7 @@ pub fn run(args: &[String]) -> Result<i32> {
         return wait_cmd(args);
     }
     let (method, params) = parse(args)?;
-    let path = crate::persist::socket_path();
+    let path = crate::persist::cli_socket_path();
     let mut stream = crate::ipc::transport::connect(&path)
         .map_err(|_| anyhow!("no bohay server running (socket: {})", path.display()))?;
 
@@ -517,7 +517,7 @@ fn pane_status(pane: &str) -> Result<Option<String>> {
 /// status — so a transition that happens between the poll and the subscribe is
 /// never missed (it's already buffered on the stream).
 fn wait_status_stream(pane: &str, target: &str, deadline: Option<Instant>) -> Result<i32> {
-    let path = crate::persist::socket_path();
+    let path = crate::persist::cli_socket_path();
     let stream =
         crate::ipc::transport::connect(&path).map_err(|_| anyhow!("no bohay server running"))?;
     let mut writer = stream.clone();
@@ -577,7 +577,7 @@ pub fn request_attach(pane: &str) -> Result<()> {
 
 /// One request/response over the control socket.
 fn send_request(method: &str, params: Value) -> Result<Value> {
-    let path = crate::persist::socket_path();
+    let path = crate::persist::cli_socket_path();
     let mut stream =
         crate::ipc::transport::connect(&path).map_err(|_| anyhow!("no bohay server running"))?;
     let req = json!({ "id": "1", "method": method, "params": params });

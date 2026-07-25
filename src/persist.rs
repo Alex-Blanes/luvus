@@ -217,9 +217,24 @@ all = [\"do you want to proceed\"]
 not = [\"cancelled\"]
 ";
 
-/// The JSON control-API socket path for this session.
+/// The JSON control-API socket path for this session (home-derived). Used by the
+/// **server** to bind — never reads `$BOHAY_SOCKET_PATH`, or a server spawned
+/// from inside a pane would try to bind its parent's socket.
 pub fn socket_path() -> PathBuf {
     config_dir().join("bohay.sock")
+}
+
+/// The control socket a **CLI** should talk to: the one injected into this
+/// process (a pane / module command carries `$BOHAY_SOCKET_PATH` pointing at its
+/// own server), else the home-derived default. This is what makes `bohay …` run
+/// inside a pane reach *that* session's server — so a module action that shells
+/// out to `bohay`, or a `bohay module link` typed in a dev pane, targets the
+/// instance you're in rather than whatever `$BOHAY_HOME` defaults to.
+pub fn cli_socket_path() -> PathBuf {
+    match std::env::var_os("BOHAY_SOCKET_PATH") {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => socket_path(),
+    }
 }
 
 /// The binary client/render socket path for this session.
@@ -435,6 +450,30 @@ pub fn load() -> Option<SessionSnapshot> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// A CLI in a pane/module targets the injected socket (its own server), not
+    /// the home-derived default — so `bohay …` inside a dev pane reaches the dev
+    /// server, and a module action opening a pane hits the right instance.
+    #[test]
+    fn cli_socket_path_prefers_the_injected_socket() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os("BOHAY_SOCKET_PATH");
+
+        std::env::set_var("BOHAY_SOCKET_PATH", "/tmp/injected-bohay.sock");
+        assert_eq!(cli_socket_path(), PathBuf::from("/tmp/injected-bohay.sock"));
+
+        // Empty is treated as unset → falls back to the home-derived socket.
+        std::env::set_var("BOHAY_SOCKET_PATH", "");
+        assert_eq!(cli_socket_path(), socket_path());
+
+        std::env::remove_var("BOHAY_SOCKET_PATH");
+        assert_eq!(cli_socket_path(), socket_path());
+
+        match saved {
+            Some(v) => std::env::set_var("BOHAY_SOCKET_PATH", v),
+            None => std::env::remove_var("BOHAY_SOCKET_PATH"),
+        }
+    }
 
     // The control sockets grant command execution as the user, so the state
     // dir must be owner-only (0700) and each bound socket 0600 — regardless of
