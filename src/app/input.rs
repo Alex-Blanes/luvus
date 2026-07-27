@@ -851,6 +851,7 @@ impl App {
             return false;
         };
         let page = self.focused_page();
+        let newline = self.config.shift_enter_bytes();
         let mut exit = false;
         if let Some(pane) = self.panes.get(&id) {
             match key.code {
@@ -886,7 +887,7 @@ impl App {
                     // forwarded, so typing to the agent resumes with no lost key.
                     pane.scroll_to_bottom();
                     exit = true;
-                    if let Some(bytes) = encode_key(&key) {
+                    if let Some(bytes) = encode_key(&key, newline) {
                         pane.send(&bytes);
                     }
                 }
@@ -1295,7 +1296,8 @@ impl App {
                         return true;
                     }
                 }
-                if let Some(bytes) = encode_key(&key) {
+                let newline = self.config.shift_enter_bytes();
+                if let Some(bytes) = encode_key(&key, newline) {
                     if let Some(p) = self.focused() {
                         // Typing snaps the view back to the live bottom, so you
                         // always see what you type (like every terminal).
@@ -1385,7 +1387,9 @@ fn mouse_wheel_seq(up: bool, col: u16, row: u16, sgr: bool) -> Vec<u8> {
 }
 
 /// Encode a crossterm key event into the bytes a terminal program expects.
-fn encode_key(key: &KeyEvent) -> Option<Vec<u8>> {
+/// `newline` is the configured Shift/Alt+Enter sequence (`config::shift_enter`),
+/// forwarded verbatim for "new line, don't submit" so it can be tuned per setup.
+fn encode_key(key: &KeyEvent, newline: &[u8]) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -1417,10 +1421,12 @@ fn encode_key(key: &KeyEvent) -> Option<Vec<u8>> {
         }
         // Shift/Alt+Enter means "new line, don't submit" in every agent CLI.
         // A terminal sends a bare `CR` for both Enter and Shift+Enter, so this
-        // only ever fires when the host terminal disambiguates modified keys
-        // (`main::push_key_protocol`). `ESC CR` is the sequence agents already
-        // understand — it's what Claude Code's own `/terminal-setup` installs.
-        KeyCode::Enter if shift || alt => vec![0x1b, b'\r'],
+        // only ever fires when the terminal disambiguates modified keys — either
+        // via the keyboard protocol (`main::push_key_protocol`, macOS/Linux) or
+        // native console records (Windows). The bytes are configurable
+        // (`config::shift_enter`); the default `ESC CR` is what agents expect out
+        // of the box (Claude Code's `/terminal-setup`).
+        KeyCode::Enter if shift || alt => newline.to_vec(),
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Tab => vec![b'\t'],
         KeyCode::BackTab => vec![0x1b, b'[', b'Z'],
@@ -1471,7 +1477,9 @@ mod tests {
     // CLIs already understand.
     #[test]
     fn shift_enter_sends_a_newline_not_a_submit() {
-        let enter = |m: KeyModifiers| encode_key(&KeyEvent::new(KeyCode::Enter, m));
+        // The default newline sequence is `ESC CR`.
+        let nl = b"\x1b\r";
+        let enter = |m: KeyModifiers| encode_key(&KeyEvent::new(KeyCode::Enter, m), nl);
         assert_eq!(
             enter(KeyModifiers::NONE),
             Some(b"\r".to_vec()),
@@ -1488,7 +1496,25 @@ mod tests {
             "Alt/Option+Enter is the other common newline binding"
         );
         // Ctrl+Enter keeps the legacy submit byte — agents bind it to submit.
-        assert_eq!(enter(KeyModifiers::CONTROL), Some(b"\r".to_vec()));
+        assert_eq!(
+            encode_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), nl),
+            Some(b"\r".to_vec())
+        );
+    }
+
+    /// The Shift/Alt+Enter sequence is whatever `config::shift_enter` selects —
+    /// so a setup whose agent wants a bare `LF` can get one.
+    #[test]
+    fn shift_enter_sequence_is_configurable() {
+        let shift = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        assert_eq!(encode_key(&shift, b"\n"), Some(b"\n".to_vec()));
+        assert_eq!(
+            encode_key(&shift, b"\x1b[13;2u"),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+        // Plain Enter ignores the newline sequence and always submits.
+        let plain = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(encode_key(&plain, b"\n"), Some(b"\r".to_vec()));
     }
 
     #[test]

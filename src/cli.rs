@@ -368,6 +368,9 @@ fn doctor() -> i32 {
 
 enum KeyProto {
     Supported,
+    // Windows always reports Supported (native console records), so this variant
+    // is only constructed off Windows.
+    #[cfg_attr(windows, allow(dead_code))]
     Unsupported,
     /// Queried from inside a bohay pane, which answers for *bohay's* PTY rather
     /// than the real terminal — so the result would be misleading.
@@ -378,19 +381,30 @@ enum KeyProto {
 /// query needs raw mode (crossterm writes a request and reads the reply), so it
 /// is enabled just for the probe and always restored.
 fn keyboard_protocol_status() -> KeyProto {
-    use ratatui::crossterm::terminal;
     if std::env::var_os("BOHAY_ENV").is_some() {
         return KeyProto::InsidePane;
     }
-    let raw = terminal::enable_raw_mode().is_ok();
-    let supported = matches!(terminal::supports_keyboard_enhancement(), Ok(true));
-    if raw {
-        let _ = terminal::disable_raw_mode();
+    // Windows reads keys from native console records (not the keyboard protocol,
+    // which `supports_keyboard_enhancement` always reports `false` for there), and
+    // those records carry the SHIFT modifier — so Shift+Enter is distinguishable
+    // regardless. Reporting on the protocol would wrongly say it isn't.
+    #[cfg(windows)]
+    {
+        return KeyProto::Supported;
     }
-    if supported {
-        KeyProto::Supported
-    } else {
-        KeyProto::Unsupported
+    #[cfg(not(windows))]
+    {
+        use ratatui::crossterm::terminal;
+        let raw = terminal::enable_raw_mode().is_ok();
+        let supported = matches!(terminal::supports_keyboard_enhancement(), Ok(true));
+        if raw {
+            let _ = terminal::disable_raw_mode();
+        }
+        if supported {
+            KeyProto::Supported
+        } else {
+            KeyProto::Unsupported
+        }
     }
 }
 

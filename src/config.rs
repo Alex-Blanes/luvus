@@ -81,11 +81,36 @@ pub struct LayoutConfig {
     /// `0` disables compact mode entirely (the full UI always renders).
     #[serde(default = "default_compact_width")]
     pub compact_width: u16,
+    /// What bohay forwards to a pane for **Shift/Alt+Enter** ("new line, don't
+    /// submit"). A keyword from [`SHIFT_ENTER_CHOICES`]; default `esc-cr`
+    /// (`ESC CR`, the sequence Claude Code's `/terminal-setup` installs). Exposed
+    /// because agents/terminals disagree on which byte sequence they treat as a
+    /// newline — notably some Windows agents want a bare `LF` where macOS wants
+    /// `ESC CR`. Set once, applied to every pane's keystroke encoding.
+    #[serde(default = "default_shift_enter")]
+    pub shift_enter: String,
 }
 
 fn default_compact_width() -> u16 {
     crate::app::COMPACT_WIDTH
 }
+
+fn default_shift_enter() -> String {
+    SHIFT_ENTER_CHOICES[0].0.to_string()
+}
+
+/// Ordered choices for what Shift/Alt+Enter sends to a pane: `(keyword, label,
+/// bytes)`. The keyword is the stable `config.layout.shift_enter` value; the
+/// label is shown in the Settings chooser; the bytes are what `encode_key`
+/// forwards. `ESC CR` leads because it is what agent CLIs expect out of the box
+/// (Claude Code's `/terminal-setup`). The others cover agents/terminals that
+/// bind a plain `LF` or the CSI-u modified-Enter form instead.
+pub const SHIFT_ENTER_CHOICES: &[(&str, &str, &[u8])] = &[
+    ("esc-cr", "ESC CR (default)", b"\x1b\r"),
+    ("lf", "LF (newline)", b"\n"),
+    ("esc-lf", "ESC LF", b"\x1b\n"),
+    ("csi-u", "CSI-u (\\e[13;2u)", b"\x1b[13;2u"),
+];
 
 /// Left + right sidebar layout (docs/29). Serialized under `sidebars`.
 #[derive(Serialize, Deserialize, Clone)]
@@ -208,6 +233,7 @@ impl Default for LayoutConfig {
             scrollback: default_scrollback(),
             files_show_hidden: true,
             compact_width: default_compact_width(),
+            shift_enter: default_shift_enter(),
         }
     }
 }
@@ -224,6 +250,16 @@ impl Config {
     /// Lines of scrollback per pane, clamped to the supported range.
     pub fn scrollback(&self) -> usize {
         self.layout.scrollback.clamp(SCROLLBACK_MIN, SCROLLBACK_MAX)
+    }
+
+    /// Bytes forwarded to a pane for Shift/Alt+Enter (see `shift_enter`). Falls
+    /// back to the default (`ESC CR`) if the stored keyword is unrecognized.
+    pub fn shift_enter_bytes(&self) -> &'static [u8] {
+        SHIFT_ENTER_CHOICES
+            .iter()
+            .find(|(k, _, _)| *k == self.layout.shift_enter)
+            .map(|(_, _, b)| *b)
+            .unwrap_or(SHIFT_ENTER_CHOICES[0].2)
     }
 
     /// Clamp the persisted sidebar width into the supported range.

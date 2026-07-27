@@ -457,6 +457,20 @@ fn draw_content(
                         toggle(app.config.layout.files_show_hidden, t),
                         t,
                     )),
+                    GeneralRow::ShiftEnter => {
+                        let r = slider_row(
+                            f,
+                            area,
+                            y,
+                            i,
+                            cursor == i,
+                            cat.set_shift_enter,
+                            app.shift_enter_label(),
+                            t,
+                            &mut arrows,
+                        );
+                        ctls.push((i, r));
+                    }
                     GeneralRow::SoundDone => ctls.push(ctl_row(
                         f,
                         area,

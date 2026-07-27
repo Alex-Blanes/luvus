@@ -97,6 +97,7 @@ pub enum LayoutRow {
 pub enum GeneralRow {
     FileOpen,
     FilesShowHidden,
+    ShiftEnter,
     SoundDone,
     SoundBlocked,
     TestSound,
@@ -120,6 +121,7 @@ impl App {
         vec![
             GeneralRow::FileOpen,
             GeneralRow::FilesShowHidden,
+            GeneralRow::ShiftEnter,
             GeneralRow::SoundDone,
             GeneralRow::SoundBlocked,
             GeneralRow::TestSound,
@@ -127,10 +129,10 @@ impl App {
     }
 
     /// Index of the first notification row (where the `── Notifications ──`
-    /// divider goes), mirroring `dock_section_start` in the Layout tab. The two
-    /// general settings (file-open + show-hidden) sit above it.
+    /// divider goes), mirroring `dock_section_start` in the Layout tab. The three
+    /// general settings (file-open, show-hidden, Shift+Enter) sit above it.
     pub fn general_section_start(&self) -> usize {
-        2
+        3
     }
 
     /// The Layout tab's ordered selectable rows (docs/29). The first index of the
@@ -642,6 +644,28 @@ impl App {
         config::save(&self.config);
     }
 
+    /// Cycle the Shift/Alt+Enter sequence through [`config::SHIFT_ENTER_CHOICES`].
+    fn cycle_shift_enter(&mut self, delta: i32) {
+        let opts = config::SHIFT_ENTER_CHOICES;
+        let n = opts.len() as i32;
+        let cur = opts
+            .iter()
+            .position(|(k, _, _)| *k == self.config.layout.shift_enter)
+            .unwrap_or(0) as i32;
+        let next = (((cur + delta) % n + n) % n) as usize;
+        self.config.layout.shift_enter = opts[next].0.to_string();
+        config::save(&self.config);
+    }
+
+    /// The current Shift+Enter choice's display label (the raw keyword if unknown).
+    pub fn shift_enter_label(&self) -> String {
+        config::SHIFT_ENTER_CHOICES
+            .iter()
+            .find(|(k, _, _)| *k == self.config.layout.shift_enter)
+            .map(|(_, label, _)| label.to_string())
+            .unwrap_or_else(|| self.config.layout.shift_enter.clone())
+    }
+
     /// The current file-open choice as a display string: `read-only`, an editor's
     /// label, or the raw command if a configured editor is no longer installed.
     pub fn file_open_label(&self) -> String {
@@ -692,6 +716,7 @@ impl App {
             Some(GeneralRow::FileOpen) => self.cycle_file_open(delta),
             // Flips config *and* the live tree (docs/38), so it applies at once.
             Some(GeneralRow::FilesShowHidden) => self.toggle_files_hidden(),
+            Some(GeneralRow::ShiftEnter) => self.cycle_shift_enter(delta),
             Some(GeneralRow::SoundDone) => {
                 self.config.notifications.sound_on_done = !self.config.notifications.sound_on_done;
                 config::save(&self.config);
@@ -757,7 +782,7 @@ mod tests {
         if let Some(ui) = app.settings.as_mut() {
             ui.tab = SettingsTab::General;
         }
-        assert_eq!(app.settings_rows(SettingsTab::General), 5);
+        assert_eq!(app.settings_rows(SettingsTab::General), 6);
         let rows = app.general_rows();
         assert_eq!(rows[0], GeneralRow::FileOpen, "file-open leads the tab");
 
@@ -878,5 +903,34 @@ mod tests {
             app.config.layout.file_open, "nano",
             "steps backward with wrap"
         );
+    }
+
+    /// The General tab's Shift+Enter chooser cycles through the known sequences
+    /// and drives the bytes `encode_key` forwards.
+    #[test]
+    fn general_shift_enter_cycles_and_drives_the_bytes() {
+        let _env = crate::persist::test_env("shift-enter-cycle");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.open_settings();
+        if let Some(ui) = app.settings.as_mut() {
+            ui.tab = SettingsTab::General;
+        }
+        let idx = app
+            .general_rows()
+            .iter()
+            .position(|r| *r == GeneralRow::ShiftEnter)
+            .expect("the General tab has a Shift+Enter row");
+
+        assert_eq!(app.config.layout.shift_enter, "esc-cr", "starts at ESC CR");
+        assert_eq!(app.config.shift_enter_bytes(), b"\x1b\r");
+        app.settings_adjust(idx, 1);
+        assert_eq!(app.config.layout.shift_enter, "lf", "steps to LF");
+        assert_eq!(app.config.shift_enter_bytes(), b"\n");
+        // Backward from the first entry wraps to the last.
+        app.settings_adjust(idx, -1);
+        app.settings_adjust(idx, -1);
+        let last = config::SHIFT_ENTER_CHOICES.last().unwrap().0;
+        assert_eq!(app.config.layout.shift_enter, last, "wraps to the last");
     }
 }
