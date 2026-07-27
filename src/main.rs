@@ -1359,6 +1359,54 @@ mod tests {
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
     }
 
+    /// A double-width emoji must mark the cell to its right as a wide-char
+    /// continuation (empty symbol), not leave a blank space — otherwise the
+    /// client blits that space into the glyph's second column, corrupting the
+    /// emoji and shifting the rest of the row (the reported bug). Tests the real
+    /// server render path (`render_into` a Buffer, which `frame_from_buffer`
+    /// serializes), not a TestBackend flush — ratatui's flush hides the
+    /// continuation cell, but bohay's wire protocol reads it.
+    #[test]
+    fn wide_emoji_marks_its_continuation_cell() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let (tx, _rx) = mpsc::channel::<AppEvent>();
+        let mut app = App::new(80, 24, tx).expect("spawn pane");
+        let id = app.layout().focus;
+        app.panes
+            .get(&id)
+            .unwrap()
+            .engine
+            .lock()
+            .unwrap()
+            .advance("\x1b[H\x1b[2J\u{1F534}AB".as_bytes());
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        {
+            let mut target = ui::RenderTarget::new(&mut buf, area);
+            ui::render_into(&mut target, &mut app);
+        }
+        let mut at = None;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if buf[(x, y)].symbol() == "\u{1F534}" {
+                    at = Some((x, y));
+                }
+            }
+        }
+        let (x, y) = at.expect("the emoji rendered somewhere");
+        assert_eq!(
+            buf[(x + 1, y)].symbol(),
+            "",
+            "the wide-char continuation cell must be empty, not a space"
+        );
+        assert_eq!(
+            buf[(x + 2, y)].symbol(),
+            "A",
+            "the text after the emoji is not shifted"
+        );
+    }
+
     /// End-to-end: start the socket server, run a mini app loop, and drive it
     /// over the wire like an agent would.
     #[test]

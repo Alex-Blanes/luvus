@@ -256,6 +256,20 @@ fn draw_one_pane(
                     let target = &mut buf[(x, y)];
                     target.set_symbol(ch.encode_utf8(&mut tmp));
                     target.set_style(style);
+                    // A double-width glyph (emoji / CJK) spans this cell *and* the
+                    // next. The VT engine skips the spacer, so that next cell keeps
+                    // the reset blank — which the client would blit as a space over
+                    // the glyph's right half (crossterm advances its cursor +1 per
+                    // cell, but the terminal advances +2 for the glyph), corrupting
+                    // it and shifting the row. Mark it as a wide-char continuation:
+                    // an empty symbol prints nothing, realigning the accounting.
+                    if x + 1 < content.x + content.width
+                        && unicode_width::UnicodeWidthChar::width(ch) == Some(2)
+                    {
+                        let next = &mut buf[(x + 1, y)];
+                        next.set_symbol("");
+                        next.set_style(style); // carry bg so a highlight stays contiguous
+                    }
                 });
             }
             scrolled = engine.scroll_offset();
