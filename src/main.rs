@@ -822,7 +822,7 @@ mod tests {
         for _ in 0..n {
             if let Some(p) = app.panes.get(&focus) {
                 if let Ok(e) = p.engine.lock() {
-                    e.for_each_cell(&mut |_, _, _| {});
+                    e.for_each_cell(&mut |_, _, _, _| {});
                 }
             }
         }

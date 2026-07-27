@@ -7,10 +7,11 @@ pub mod alacritty;
 
 use ratatui::style::{Color, Modifier};
 
-/// One rendered cell, already mapped to ratatui colors/modifiers so the trait
-/// surface stays free of engine-specific types.
+/// A rendered cell's style, already mapped to ratatui colors/modifiers so the
+/// trait surface stays free of engine-specific types. The cell's *symbol* (its
+/// grapheme cluster) is passed alongside as a `&str`, not stored here, so the
+/// common one-char case needs no per-cell allocation.
 pub struct RenderCell {
-    pub c: char,
     pub fg: Color,
     pub bg: Color,
     pub mods: Modifier,
@@ -34,9 +35,11 @@ pub trait VtEngine: Send {
     /// Cursor position in the visible viewport.
     fn cursor(&self) -> Cursor;
 
-    /// Visit every visible cell as `(row, col, cell)`. Wide-char spacer cells
-    /// are skipped by the implementation.
-    fn for_each_cell(&self, f: &mut dyn FnMut(u16, u16, RenderCell));
+    /// Visit every visible cell as `(row, col, symbol, style)`. `symbol` is the
+    /// cell's full grapheme cluster (base char + any combining/VS16/ZWJ chars),
+    /// so emoji and accented text render whole. Wide-char spacer cells are
+    /// skipped by the implementation.
+    fn for_each_cell(&self, f: &mut dyn FnMut(u16, u16, &str, RenderCell));
 
     /// Bottom `n` rows of the visible grid, for agent detection. Independent of
     /// the user's scroll position.

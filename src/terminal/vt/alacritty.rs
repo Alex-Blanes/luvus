@@ -123,7 +123,7 @@ impl VtEngine for AlacrittyEngine {
         }
     }
 
-    fn for_each_cell(&self, f: &mut dyn FnMut(u16, u16, RenderCell)) {
+    fn for_each_cell(&self, f: &mut dyn FnMut(u16, u16, &str, RenderCell)) {
         // `display_iter` walks the *displayed* region, whose lines are *negative*
         // once scrolled into history (it starts at `Line(-display_offset)`).
         // Shift by the offset to get viewport rows `0..screen_lines`; dropping
@@ -131,6 +131,19 @@ impl VtEngine for AlacrittyEngine {
         let grid = self.term.grid();
         let offset = grid.display_offset() as i32;
         let rows = grid.screen_lines() as i32;
+        // The symbol is `cell.c` plus any combining/VS16/ZWJ chars alacritty stores
+        // as `zerowidth`. Emitting only `cell.c` dropped those, so `🖥️`/accents
+        // rendered as a bare base glyph or a tofu box.
+        //
+        // Hot path (every visible cell, every frame): the overwhelmingly common
+        // cell is a single char with no combining marks, so encode it straight into
+        // a stack buffer and touch no heap at all — the same cost as the old
+        // single-`char` path. Only a cell that actually carries `zerowidth` marks
+        // spills into `combined`, a `String` allocated lazily (at most once, then
+        // reused) and never touched otherwise. Zero allocation in the common case,
+        // correctness in the rare one.
+        let mut stack = [0u8; 4];
+        let mut combined = String::new();
         for indexed in grid.display_iter() {
             let row = indexed.point.line.0 + offset;
             if !(0..rows).contains(&row) {
@@ -140,11 +153,20 @@ impl VtEngine for AlacrittyEngine {
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                 continue;
             }
+            let sym: &str = match cell.zerowidth() {
+                None => cell.c.encode_utf8(&mut stack),
+                Some(zw) => {
+                    combined.clear();
+                    combined.push(cell.c);
+                    combined.extend(zw.iter());
+                    &combined
+                }
+            };
             f(
                 row as u16,
                 indexed.point.column.0 as u16,
+                sym,
                 RenderCell {
-                    c: cell.c,
                     fg: map_color(cell.fg),
                     bg: map_color(cell.bg),
                     mods: map_flags(cell.flags),
@@ -460,8 +482,8 @@ mod tests {
 
         let cells = |e: &AlacrittyEngine| {
             let mut n = 0usize;
-            e.for_each_cell(&mut |_r, _c, cell| {
-                if cell.c != ' ' {
+            e.for_each_cell(&mut |_r, _c, sym, _cell| {
+                if sym != " " {
                     n += 1
                 }
             });
@@ -479,6 +501,34 @@ mod tests {
         assert!(
             visible.contains("OLDEST"),
             "history text is selectable/copyable: {visible:?}"
+        );
+    }
+
+    #[test]
+    fn for_each_cell_emits_the_whole_grapheme_cluster() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(40, 3, tx, 200);
+        // 🖥️ = U+1F5A5 (desktop computer) + U+FE0F (VS16). Alacritty stores the
+        // VS16 as a `zerowidth` attachment on the base cell; emitting only the
+        // base char rendered a bare monochrome glyph or a tofu box.
+        e.advance("🖥️A".as_bytes());
+
+        let mut syms: Vec<(u16, String)> = Vec::new();
+        e.for_each_cell(&mut |_r, c, sym, _cell| {
+            if sym != " " {
+                syms.push((c, sym.to_string()));
+            }
+        });
+
+        let emoji = syms.iter().find(|(c, _)| *c == 0).map(|(_, s)| s.as_str());
+        assert_eq!(
+            emoji,
+            Some("🖥\u{fe0f}"),
+            "the base char and its VS16 must arrive together as one symbol"
+        );
+        assert!(
+            syms.iter().any(|(_, s)| s == "A"),
+            "the following glyph still renders: {syms:?}"
         );
     }
 

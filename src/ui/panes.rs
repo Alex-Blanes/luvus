@@ -220,7 +220,7 @@ fn draw_one_pane(
         Ok(engine) => {
             {
                 let buf = f.buffer_mut();
-                engine.for_each_cell(&mut |row, col, cell| {
+                engine.for_each_cell(&mut |row, col, sym, cell| {
                     if row >= content.height || col >= content.width {
                         return;
                     }
@@ -249,12 +249,18 @@ fn draw_one_pane(
                     if sel.is_some_and(|s| s.contains(x, y)) {
                         style = style.bg(t.sel_bg);
                     }
-                    // ratatui panics if a control char reaches the buffer; the
-                    // VT grid can hold stray C0/C1 bytes, so render them blank.
-                    let ch = if cell.c.is_control() { ' ' } else { cell.c };
-                    let mut tmp = [0u8; 4];
+                    // ratatui panics if a control char reaches the buffer; the VT
+                    // grid can hold stray C0/C1 bytes, so render those blank. `sym`
+                    // is the whole grapheme cluster (base + combining/VS16/ZWJ), so
+                    // emoji and accents print whole instead of losing their modifier
+                    // chars to a tofu box.
+                    let sym = if sym.starts_with(|c: char| c.is_control()) {
+                        " "
+                    } else {
+                        sym
+                    };
                     let target = &mut buf[(x, y)];
-                    target.set_symbol(ch.encode_utf8(&mut tmp));
+                    target.set_symbol(sym);
                     target.set_style(style);
                     // A double-width glyph (emoji / CJK) spans this cell *and* the
                     // next. The VT engine skips the spacer, so that next cell keeps
@@ -264,7 +270,7 @@ fn draw_one_pane(
                     // it and shifting the row. Mark it as a wide-char continuation:
                     // an empty symbol prints nothing, realigning the accounting.
                     if x + 1 < content.x + content.width
-                        && unicode_width::UnicodeWidthChar::width(ch) == Some(2)
+                        && unicode_width::UnicodeWidthStr::width(sym) == 2
                     {
                         let next = &mut buf[(x + 1, y)];
                         next.set_symbol("");

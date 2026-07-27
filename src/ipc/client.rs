@@ -207,8 +207,9 @@ fn sync_end() {
 fn make_cell(sym: &str, fg: u32, bg: u32, mods: u16, truecolor: bool) -> Cell {
     let adjust = |c| if truecolor { c } else { protocol::to_256(c) };
     // ratatui panics on control chars in a symbol; the server filters, but never
-    // trust the wire.
-    let s = if sym.is_empty() || sym.chars().any(|c| c.is_control()) {
+    // trust the wire. (Empty symbols are wide-char continuations and are already
+    // skipped by `frame_cells`/`diff_cells`, so they never reach here.)
+    let s = if sym.chars().any(|c| c.is_control()) {
         " "
     } else {
         sym
@@ -227,6 +228,13 @@ fn frame_cells(frame: &FrameData, truecolor: bool) -> Vec<(u16, u16, Cell)> {
         .cells
         .iter()
         .enumerate()
+        // An empty symbol is a wide-char continuation (the cell right of a
+        // double-width glyph — the renderer marks it so). It must NOT be drawn:
+        // the glyph already covers that column, and blitting a space there would
+        // overwrite the glyph's right half and shift the row. Skipping it also
+        // makes the next real cell non-contiguous, so crossterm re-anchors with a
+        // MoveTo — keeping the whole row aligned.
+        .filter(|(_, c)| !c.symbol.is_empty())
         .map(|(i, c)| {
             let i = i as u16;
             (
@@ -244,6 +252,9 @@ fn diff_cells(diff: &FrameDiff, truecolor: bool) -> Vec<(u16, u16, Cell)> {
     let mut cells = Vec::new();
     for run in &diff.runs {
         for (k, sym) in run.symbols.iter().enumerate() {
+            if sym.is_empty() {
+                continue; // wide-char continuation — see `frame_cells`
+            }
             let i = run.start + k as u32;
             cells.push((
                 (i % w) as u16,
@@ -298,6 +309,41 @@ mod tests {
     use std::io::{Cursor, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::thread;
+
+    /// The blit skips wide-char continuation cells (empty symbol) instead of
+    /// drawing a space into the glyph's right half — the emoji-glitch fix. The
+    /// real char after the emoji stays at its column.
+    #[test]
+    fn blit_skips_wide_char_continuation() {
+        use crate::ipc::protocol::{pack, CellData, FrameData};
+        use ratatui::style::Color;
+        let c = |symbol: &str| CellData {
+            symbol: symbol.to_string(),
+            fg: pack(Color::Reset),
+            bg: pack(Color::Reset),
+            mods: 0,
+        };
+        // Row: [🔴][continuation ""][A][B]
+        let frame = FrameData {
+            width: 4,
+            height: 1,
+            cells: vec![c("\u{1F534}"), c(""), c("A"), c("B")],
+            cursor: None,
+        };
+        let cells = super::frame_cells(&frame, true);
+        let syms: Vec<(u16, String)> = cells
+            .iter()
+            .map(|(x, _, cell)| (*x, cell.symbol().to_string()))
+            .collect();
+        // The continuation cell (x=1) is absent; the emoji, A, B keep their x.
+        assert!(
+            !syms.iter().any(|(x, _)| *x == 1),
+            "continuation cell skipped"
+        );
+        assert!(syms.contains(&(0, "\u{1F534}".to_string())), "emoji at x=0");
+        assert!(syms.contains(&(2, "A".to_string())), "A stays at x=2");
+        assert!(syms.contains(&(3, "B".to_string())), "B stays at x=3");
+    }
 
     #[test]
     fn relay_pumps_both_directions() {
