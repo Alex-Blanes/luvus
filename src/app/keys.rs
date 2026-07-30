@@ -16,6 +16,7 @@ pub enum Cmd {
     FocusDown,
     FocusUp,
     FocusRight,
+    NextAttention,
     SplitRight,
     SplitDown,
     ForkSession,
@@ -48,6 +49,7 @@ impl Cmd {
         Cmd::FocusDown,
         Cmd::FocusUp,
         Cmd::FocusRight,
+        Cmd::NextAttention,
         Cmd::SplitRight,
         Cmd::SplitDown,
         Cmd::ForkSession,
@@ -80,6 +82,7 @@ impl Cmd {
             Cmd::FocusDown => "focus_down",
             Cmd::FocusUp => "focus_up",
             Cmd::FocusRight => "focus_right",
+            Cmd::NextAttention => "next_attention",
             Cmd::SplitRight => "split_right",
             Cmd::SplitDown => "split_down",
             Cmd::ForkSession => "fork_session",
@@ -115,6 +118,7 @@ impl Cmd {
             Cmd::FocusDown => cat.cmd_focus_down,
             Cmd::FocusUp => cat.cmd_focus_up,
             Cmd::FocusRight => cat.cmd_focus_right,
+            Cmd::NextAttention => cat.cmd_next_attention,
             Cmd::SplitRight => cat.cmd_split_right,
             Cmd::SplitDown => cat.cmd_split_down,
             Cmd::ForkSession => cat.cmd_fork_session,
@@ -151,6 +155,7 @@ impl Cmd {
             | Cmd::FocusDown
             | Cmd::FocusUp
             | Cmd::FocusRight
+            | Cmd::NextAttention
             | Cmd::SplitRight
             | Cmd::SplitDown
             | Cmd::ForkSession
@@ -181,6 +186,7 @@ impl Cmd {
             Cmd::FocusDown => "↓",
             Cmd::FocusUp => "↑",
             Cmd::FocusRight => "→",
+            Cmd::NextAttention => ".",
             Cmd::SplitRight => "v",
             Cmd::SplitDown => "s",
             Cmd::ForkSession => "f",
@@ -400,6 +406,7 @@ impl App {
             Cmd::FocusDown => self.focus_dir(Dir::Down),
             Cmd::FocusUp => self.focus_dir(Dir::Up),
             Cmd::FocusRight => self.focus_dir(Dir::Right),
+            Cmd::NextAttention => self.focus_next_attention(),
             Cmd::SplitRight => self.split(Axis::Col),
             Cmd::SplitDown => self.split(Axis::Row),
             // Fork the focused agent pane's session into a new pane (no-op if it
@@ -441,6 +448,41 @@ impl App {
             Cmd::Switcher => self.toggle_switcher(),
             Cmd::Detach => self.detach_requested = true,
         }
+    }
+
+    /// Jump focus to the next agent pane that is **Blocked** — one waiting on the
+    /// user — cycling in the same node → tab → pane order the AGENTS sidebar lists
+    /// (QW-1, docs/46). Crosses nodes and tabs via [`focus_pane_global`]. With
+    /// nothing waiting it flashes a toast instead of moving focus, so the key is
+    /// always safe to mash.
+    pub fn focus_next_attention(&mut self) {
+        let mut blocked: Vec<crate::ids::PaneId> = Vec::new();
+        for ws in &self.workspaces {
+            for tab in &ws.tabs {
+                for id in tab.layout.leaves() {
+                    if let Some(s) = self.status.get(&id) {
+                        let is_agent =
+                            self.manifests.is_agent(&s.agent) || s.agent_session.is_some();
+                        if is_agent && s.state == crate::ui::theme::State::Blocked {
+                            blocked.push(id);
+                        }
+                    }
+                }
+            }
+        }
+        if blocked.is_empty() {
+            let msg = self.catalog.no_agents_waiting;
+            self.show_toast(msg);
+            return;
+        }
+        // Advance from the current focus if it's already on a waiting agent,
+        // otherwise start at the first one.
+        let focus = self.layout().focus;
+        let next = match blocked.iter().position(|&b| b == focus) {
+            Some(i) => blocked[(i + 1) % blocked.len()],
+            None => blocked[0],
+        };
+        self.focus_pane_global(next);
     }
 }
 
@@ -519,6 +561,47 @@ mod tests {
             app.layout().len(),
             panes + 1,
             "Ctrl+Space+v splits the pane"
+        );
+    }
+
+    #[test]
+    fn next_attention_cycles_blocked_agents() {
+        let _env = crate::persist::test_env("next-attention");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+
+        // Two panes in the tab, both marked as blocked agents.
+        app.run_cmd(Cmd::SplitRight);
+        let ids = app.layout().leaves();
+        assert_eq!(ids.len(), 2, "split gave two panes");
+        for &id in &ids {
+            let mut st = PaneStatus::new("claude".to_string());
+            st.state = crate::ui::theme::State::Blocked;
+            app.status.insert(id, st);
+        }
+
+        // From whichever pane is focused, cycling reaches the other, then wraps.
+        let start = app.layout().focus;
+        app.focus_next_attention();
+        let second = app.layout().focus;
+        assert_ne!(second, start, "moved to the other waiting agent");
+        app.focus_next_attention();
+        assert_eq!(app.layout().focus, start, "wrapped back to the first");
+    }
+
+    #[test]
+    fn next_attention_no_blocked_keeps_focus() {
+        let _env = crate::persist::test_env("next-attention-none");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.run_cmd(Cmd::SplitRight);
+        let before = app.layout().focus;
+        // No pane is in the Blocked state → focus must not move.
+        app.focus_next_attention();
+        assert_eq!(
+            app.layout().focus,
+            before,
+            "no waiting agents: focus unchanged"
         );
     }
 }
