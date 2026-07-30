@@ -12,7 +12,8 @@ import '@fontsource-variable/jetbrains-mono';
 import '@fontsource/ibm-plex-mono/500.css';
 import '@fontsource/ibm-plex-mono/600.css';
 import '@fontsource/ibm-plex-mono/700.css';
-import Logo from '../assets/logo.svg';
+import Logo from '../components/Logo.astro';
+import { Image } from 'astro:assets';
 // Authentic brand marks (24×24 SVGs) for the "works with" grid. The `-color`
 // ones carry their own fills; the rest are `currentColor` (recolored via CSS,
 // flagged `mono`). `hook` marks agents that get native session resume (a dot in
@@ -35,6 +36,14 @@ import IconAider from '../assets/icons/aider.svg';
 import droidMask from '../assets/icons/droid-mask.png';
 
 const GITHUB = 'https://github.com/RizRiyz/bohay';
+
+// Artwork for the closing call to action, sitting above the licence badge.
+// Resolved through a glob rather than a plain import so the page still builds
+// when the file is not in the tree — drop `bohay-cta.png` into src/assets/ and
+// it appears; take it away and the card falls back to text alone.
+const ctaArt = Object.values(
+  import.meta.glob('../assets/bohay-cta.{png,jpg,jpeg,webp}', { eager: true, import: 'default' })
+)[0];
 
 // Every agent in `detect::KNOWN_AGENTS` (14), which CLAUDE.md requires this
 // grid to stay truthful to. `aider` and `droid` have no icon in assets/icons,
@@ -480,6 +489,7 @@ const ogImage = 'https://bohay.dev/og.png';
 
     <section class="cta-repo">
       <div class="cta-card">
+        {ctaArt && <Image class="cta-art" src={ctaArt} width={200} densities={[2]} alt="" loading="lazy" />}
         <span class="cta-badge">Open source · AGPL-3.0 licensed</span>
         <h2>If bohay saves you time, give it a star</h2>
         <p>
@@ -1700,6 +1710,11 @@ const ogImage = 'https://bohay.dev/og.png';
         border: 1px solid var(--line);
         padding: 3.2rem 2rem 2.8rem;
       }
+      /* Sits directly above the licence badge, centred, as the card's opener. */
+      .cta-art {
+        display: block; margin: 0 auto 1.4rem; width: 200px; height: auto;
+        border-radius: 12px;
+      }
       .cta-badge {
         display: inline-block; font: 0.72rem 'IBM Plex Mono', monospace; color: var(--accent);
         background: rgb(from var(--accent) r g b / 0.1); border: 1px solid rgb(from var(--accent) r g b / 0.25);
@@ -1794,7 +1809,7 @@ const ogImage = 'https://bohay.dev/og.png';
       /* Grows upward from the button. No max-height and no overflow, so every
          palette is visible and no scrollbar ever appears. */
       .td-list {
-        position: absolute; bottom: calc(100% + 0.4rem); right: 0;
+        position: absolute; bottom: 100%; right: 0; margin-bottom: -1px;
         margin: 0; padding: 0.3rem; list-style: none;
         background: rgb(from var(--bg2) r g b / 0.98);
         border: 1px solid var(--line);
@@ -1843,7 +1858,12 @@ const ogImage = 'https://bohay.dev/og.png';
           opts.forEach((x) => x.setAttribute('aria-selected', String(x.dataset.theme === id)));
         };
 
+        // Set once the arrow keys take over, so pointer and keyboard previews
+        // don't fight over which one wins when the pointer leaves the list.
+        let kbdNav = false;
+
         const open = (yes) => {
+          kbdNav = false;
           list.hidden = !yes;
           btn.setAttribute('aria-expanded', String(yes));
           if (yes) (opts.find((o) => o.getAttribute('aria-selected') === 'true') || opts[0])?.focus();
@@ -1864,9 +1884,17 @@ const ogImage = 'https://bohay.dev/og.png';
             btn.focus();
           });
         });
-        // Leaving the list without choosing puts the committed palette back.
+        // Leaving the list without choosing puts the committed palette back —
+        // unless the keyboard is driving, in which case the focused row is the
+        // preview and the pointer wandering off must not cancel it. Opening the
+        // list focuses a row, so testing `activeElement` alone would treat every
+        // mouse-opened list as keyboard-driven and leave the preview stuck on
+        // whatever was hovered last.
         list.addEventListener('mouseleave', () => {
-          if (!list.hidden && !list.contains(document.activeElement)) paint(committed);
+          if (list.hidden) return;
+          const act = document.activeElement;
+          const focused = kbdNav && act instanceof HTMLElement ? act.dataset.theme : null;
+          paint(focused || committed);
         });
         document.addEventListener('click', (e) => {
           if (!dock.contains(e.target)) open(false);
@@ -1878,6 +1906,7 @@ const ogImage = 'https://bohay.dev/og.png';
           const i = opts.indexOf(document.activeElement);
           if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
             e.preventDefault();
+            kbdNav = true;
             const next = e.key === 'ArrowDown' ? i + 1 : i - 1;
             opts[(next + opts.length) % opts.length].focus();
           }

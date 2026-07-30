@@ -28,3 +28,14 @@ export const THEMES: { id: string; label: string; note: string }[] = [
 
 /** The palette the site opens with, matching bohay's own default. */
 export const DEFAULT_THEME = 'noir';
+
+/**
+ * The palettes whose surfaces are light. bohay's registry has no light/dark
+ * flag — a theme is simply a set of colours — but Starlight keys a few of its
+ * own rules (and Expressive Code's syntax theme) off `data-theme`, so the docs
+ * have to say which side of the line each palette falls on.
+ */
+export const LIGHT_THEMES = ['catppuccin-latte', 'gruvbox-light'];
+
+/** `data-theme` for a palette: what Starlight's own light/dark rules key off. */
+export const modeOf = (id: string) => (LIGHT_THEMES.includes(id) ? 'light' : 'dark');

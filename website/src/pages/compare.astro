@@ -10,7 +10,7 @@ import '@fontsource-variable/jetbrains-mono';
 import '@fontsource/ibm-plex-mono/500.css';
 import '@fontsource/ibm-plex-mono/600.css';
 import '@fontsource/ibm-plex-mono/700.css';
-import Logo from '../assets/logo.svg';
+import Logo from '../components/Logo.astro';
 
 const GITHUB = 'https://github.com/RizRiyz/bohay';
 const title = 'Compare bohay vs Herdr, tmux, and Zellij';
@@ -543,7 +543,7 @@ const LANDSCAPE = [
       /* Grows upward from the button. No max-height and no overflow, so every
          palette is visible and no scrollbar ever appears. */
       .td-list {
-        position: absolute; bottom: calc(100% + 0.4rem); right: 0;
+        position: absolute; bottom: 100%; right: 0; margin-bottom: -1px;
         margin: 0; padding: 0.3rem; list-style: none;
         background: rgb(from var(--bg2) r g b / 0.98);
         border: 1px solid var(--line);
@@ -592,7 +592,12 @@ const LANDSCAPE = [
           opts.forEach((x) => x.setAttribute('aria-selected', String(x.dataset.theme === id)));
         };
 
+        // Set once the arrow keys take over, so pointer and keyboard previews
+        // don't fight over which one wins when the pointer leaves the list.
+        let kbdNav = false;
+
         const open = (yes) => {
+          kbdNav = false;
           list.hidden = !yes;
           btn.setAttribute('aria-expanded', String(yes));
           if (yes) (opts.find((o) => o.getAttribute('aria-selected') === 'true') || opts[0])?.focus();
@@ -613,9 +618,17 @@ const LANDSCAPE = [
             btn.focus();
           });
         });
-        // Leaving the list without choosing puts the committed palette back.
+        // Leaving the list without choosing puts the committed palette back —
+        // unless the keyboard is driving, in which case the focused row is the
+        // preview and the pointer wandering off must not cancel it. Opening the
+        // list focuses a row, so testing `activeElement` alone would treat every
+        // mouse-opened list as keyboard-driven and leave the preview stuck on
+        // whatever was hovered last.
         list.addEventListener('mouseleave', () => {
-          if (!list.hidden && !list.contains(document.activeElement)) paint(committed);
+          if (list.hidden) return;
+          const act = document.activeElement;
+          const focused = kbdNav && act instanceof HTMLElement ? act.dataset.theme : null;
+          paint(focused || committed);
         });
         document.addEventListener('click', (e) => {
           if (!dock.contains(e.target)) open(false);
@@ -627,6 +640,7 @@ const LANDSCAPE = [
           const i = opts.indexOf(document.activeElement);
           if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
             e.preventDefault();
+            kbdNav = true;
             const next = e.key === 'ArrowDown' ? i + 1 : i - 1;
             opts[(next + opts.length) % opts.length].focus();
           }

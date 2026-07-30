@@ -1,0 +1,31 @@
+---
+// Overrides Starlight's ThemeProvider (astro.config.mjs · `components`).
+//
+// Starlight ships a light/dark switch backed by `localStorage['starlight-theme']`.
+// The docs instead run on bohay's own palettes — the same 15 the app ships, the
+// same ones the landing page switches between — so the palette *is* the theme:
+// picking one also decides whether the page is light or dark.
+//
+// This runs inline in <head>, before first paint, for the same reason the
+// landing page does it there: a deferred script would paint noir first and then
+// repaint, which is the palette flash on every navigation.
+import { DEFAULT_THEME, LIGHT_THEMES } from '../lib/themes';
+---
+
+<script is:inline define:vars={{ FALLBACK: DEFAULT_THEME, LIGHT: LIGHT_THEMES }}>
+  (() => {
+    var id = FALLBACK;
+    try {
+      id = localStorage.getItem('bohay-theme') || FALLBACK;
+    } catch (e) {}
+    var root = document.documentElement;
+    // `data-bh-theme` carries the palette (styles/themes.css); `data-theme` is
+    // what Starlight's own rules and Expressive Code's syntax themes key off.
+    root.setAttribute('data-bh-theme', id);
+    root.dataset.theme = LIGHT.indexOf(id) === -1 ? 'dark' : 'light';
+  })();
+  // Starlight components call this global to refresh its light/dark picker.
+  // Ours is palette-driven and keeps itself in sync, so it is a no-op shim that
+  // exists only so an un-overridden Starlight component can't throw.
+  window.StarlightThemeProvider = { updatePickers() {} };
+</script>

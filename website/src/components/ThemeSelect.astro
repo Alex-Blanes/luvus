@@ -1,0 +1,275 @@
+---
+// Overrides Starlight's light/dark select with bohay's palette picker, in the
+// place Starlight puts its own theme control: the top right of the navbar
+// (Starlight renders this component there on desktop, and again in the mobile
+// menu below 50rem).
+//
+// The palettes come from bohay's own registry, generated into styles/themes.css,
+// so what you preview is what the app ships. Applying one sets `data-bh-theme`
+// on <html> (the colours) and `data-theme` (light or dark, which Starlight's own
+// rules and the code-block themes read). The choice lives in
+// `localStorage['bohay-theme']` — the same key the landing page uses, so it
+// carries between the docs and the rest of the site.
+import { THEMES, DEFAULT_THEME } from '../lib/themes';
+
+const current = THEMES.find((t) => t.id === DEFAULT_THEME);
+---
+
+<div class="td" data-theme-picker>
+  <button
+    type="button"
+    class="td-btn"
+    aria-expanded="false"
+    aria-haspopup="listbox"
+    aria-label="Colour theme"
+  >
+    <i class="td-sw" data-theme={DEFAULT_THEME} aria-hidden="true"></i>
+    <span class="td-cur">{current?.label ?? DEFAULT_THEME}</span>
+    <span class="td-caret" aria-hidden="true">▾</span>
+  </button>
+  <ul class="td-list" role="listbox" aria-label="Colour theme" hidden>
+    {
+      /* Names only, and deliberately no `title`: a native tooltip on every row
+         pops up and flickers as the pointer crosses the list, which fights the
+         live preview that is the point of hovering in the first place. */
+      THEMES.map((t) => (
+        <li>
+          <button type="button" class="td-opt" role="option" data-theme={t.id}>
+            <i class="td-sw" data-theme={t.id} aria-hidden="true" />
+            <span class="td-name">{t.label}</span>
+          </button>
+        </li>
+      ))
+    }
+  </ul>
+</div>
+
+<script>
+  // A plain module script over a `data-theme-picker` element rather than a
+  // custom element: `customElements.define` throws on its second call, so every
+  // hot reload of this file during `astro dev` killed the module and left the
+  // control on the page but unwired — clicking it did nothing until a full
+  // refresh. Wiring is idempotent for the same reason, and runs again on
+  // `astro:page-load` in case view transitions are ever turned on.
+  import { DEFAULT_THEME, modeOf } from '../lib/themes';
+
+  const KEY = 'bohay-theme';
+  const root = document.documentElement;
+
+  const read = () => {
+    try {
+      return localStorage.getItem(KEY) || DEFAULT_THEME;
+    } catch {
+      return DEFAULT_THEME;
+    }
+  };
+
+  let committed = read();
+
+  /**
+   * Preview only: paints the page without touching the committed choice.
+   *
+   * Writing either attribute invalidates the style of the whole document — and
+   * `data-theme` additionally swaps Starlight's light/dark rules and the code
+   * blocks' syntax theme — so both are only written when they actually change.
+   * Moving down a list of dark palettes then costs one repaint per row instead
+   * of two, which is what made dragging the pointer through the list stutter.
+   */
+  const paint = (id: string) => {
+    if (root.getAttribute('data-bh-theme') !== id) root.setAttribute('data-bh-theme', id);
+    const mode = modeOf(id);
+    if (root.dataset.theme !== mode) root.dataset.theme = mode;
+  };
+
+  function wire(picker: HTMLElement) {
+    if (picker.dataset.wired) return;
+    picker.dataset.wired = 'yes';
+
+    const btn = picker.querySelector<HTMLButtonElement>('.td-btn');
+    const list = picker.querySelector<HTMLElement>('.td-list');
+    const label = picker.querySelector<HTMLElement>('.td-cur');
+    const swatch = picker.querySelector<HTMLElement>('.td-btn .td-sw');
+    const opts = [...picker.querySelectorAll<HTMLButtonElement>('.td-opt')];
+    if (!btn || !list || !label || !swatch || !opts.length) return;
+
+    /** Reflect the committed palette in the button and the selection. */
+    const sync = (id: string) => {
+      const opt = opts.find((o) => o.dataset.theme === id);
+      label.textContent = opt?.querySelector('.td-name')?.textContent ?? id;
+      swatch.dataset.theme = id;
+      opts.forEach((o) => o.setAttribute('aria-selected', String(o.dataset.theme === id)));
+    };
+
+    const open = (yes: boolean) => {
+      list.hidden = !yes;
+      btn.setAttribute('aria-expanded', String(yes));
+      if (yes) {
+        (opts.find((o) => o.getAttribute('aria-selected') === 'true') ?? opts[0])?.focus();
+      } else {
+        paint(committed); // closing always restores the committed palette
+      }
+    };
+
+    const commit = (id: string) => {
+      committed = id;
+      try {
+        localStorage.setItem(KEY, id);
+      } catch {}
+      paint(id);
+      // Every picker on the page (header + mobile menu) shows the same choice.
+      document
+        .querySelectorAll<HTMLElement>('[data-theme-picker]')
+        .forEach((p) => p.dispatchEvent(new CustomEvent('bh:theme', { detail: id })));
+    };
+
+    picker.addEventListener('bh:theme', (e) => sync((e as CustomEvent<string>).detail));
+    sync(committed);
+
+    btn.addEventListener('click', () => open(list.hidden));
+    opts.forEach((o) => {
+      const id = o.dataset.theme!;
+      // Live preview on hover and on keyboard focus.
+      o.addEventListener('mouseenter', () => paint(id));
+      o.addEventListener('focus', () => paint(id));
+      o.addEventListener('click', () => {
+        commit(id);
+        open(false);
+        btn.focus();
+      });
+    });
+
+    // Restore on leaving the *whole* control, not just the list: the button sits
+    // flush against the list, so a pointer travelling between them would other-
+    // wise snap the page back to the committed palette and then forward again.
+    picker.addEventListener('mouseleave', () => {
+      if (!list.hidden) paint(committed);
+    });
+
+    list.addEventListener('keydown', (e) => {
+      if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+      e.preventDefault();
+      const i = opts.indexOf(document.activeElement as HTMLButtonElement);
+      const next = e.key === 'ArrowDown' ? i + 1 : i - 1;
+      opts[(next + opts.length) % opts.length]?.focus();
+    });
+    document.addEventListener('click', (e) => {
+      if (!picker.contains(e.target as Node) && !list.hidden) open(false);
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !list.hidden) {
+        open(false);
+        btn.focus();
+      }
+    });
+    // A palette picked in another tab lands here too.
+    window.addEventListener('storage', (e) => {
+      if (e.key !== KEY || !e.newValue || e.newValue === committed) return;
+      committed = e.newValue;
+      paint(committed);
+      sync(committed);
+    });
+  }
+
+  const wireAll = () => document.querySelectorAll<HTMLElement>('[data-theme-picker]').forEach(wire);
+  wireAll();
+  document.addEventListener('astro:page-load', wireAll);
+</script>
+
+<style>
+  /* Square, hairline, monospace — the app's own chrome. Anchored to the navbar,
+     opening downward under the button. */
+  .td {
+    position: relative;
+    display: block;
+  }
+  .td-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.36rem 0.6rem;
+    cursor: pointer;
+    background: var(--bg2);
+    border: 1px solid var(--line);
+    color: var(--text);
+    font-family: var(--bh-display);
+    font-size: 0.78rem;
+    line-height: 1.4;
+    transition: border-color 0.15s;
+  }
+  .td-btn:hover,
+  .td-btn[aria-expanded='true'] {
+    border-color: var(--accent);
+  }
+  .td-caret {
+    color: var(--sub);
+    font-size: 0.6rem;
+    transition: transform 0.18s;
+  }
+  .td-btn[aria-expanded='true'] .td-caret {
+    transform: rotate(180deg);
+  }
+  /* The swatch colour comes from styles/themes.css, keyed off `data-theme`, so
+     the picker never has to know a single hex value. */
+  .td-sw {
+    width: 9px;
+    height: 9px;
+    flex-shrink: 0;
+    display: block;
+    border: 1px solid rgb(from var(--text) r g b / 0.25);
+  }
+  /* Flush under the button — a gap would be dead space for the pointer to
+     cross, which reads as the preview dropping out at random. */
+  .td-list {
+    position: absolute;
+    top: 100%;
+    inset-inline-end: 0;
+    z-index: calc(var(--sl-z-index-navbar, 10) + 1);
+    margin: -1px 0 0; /* borders meet, so the control reads as one piece */
+    padding: 0.3rem;
+    list-style: none;
+    background: var(--bg2);
+    border: 1px solid var(--line);
+    box-shadow: 0 14px 34px rgb(0 0 0 / 0.4);
+    max-height: min(72vh, 28rem);
+    overflow-y: auto;
+  }
+  .td-list[hidden] {
+    display: none;
+  }
+  .td-opt {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    width: 100%;
+    padding: 0.26rem 0.75rem 0.26rem 0.5rem;
+    cursor: pointer;
+    background: none;
+    border: 0;
+    text-align: left;
+    color: var(--sub);
+    font-family: var(--bh-display);
+    font-size: 0.78rem;
+    white-space: nowrap;
+  }
+  .td-opt:hover,
+  .td-opt:focus-visible {
+    background: rgb(from var(--accent) r g b / 0.14);
+    color: var(--text);
+    outline: none;
+  }
+  .td-opt[aria-selected='true'] {
+    color: var(--accent);
+  }
+  /* In the mobile menu the control sits in a row at the foot of a scrolling
+     panel, so the list grows upward from the left instead. */
+  @media (max-width: 50rem) {
+    .td-list {
+      top: auto;
+      bottom: 100%;
+      margin: 0 0 -1px;
+      inset-inline-end: auto;
+      inset-inline-start: 0;
+      max-height: min(50vh, 20rem);
+    }
+  }
+</style>

@@ -1,0 +1,18 @@
+---
+// Overrides Starlight's SiteTitle so the docs wordmark is built from the same
+// `Logo` component as the landing pages: an optimised, rounded mark at the size
+// it is actually displayed. Starlight's own version renders the configured logo
+// file untouched — for a 1286×1286 illustration that means shipping the full
+// artwork to draw a 34px mark, which is why the `logo` option is no longer set
+// in astro.config.mjs.
+//
+// Sizing and type live with the rest of the header in styles/custom.css.
+import Logo from './Logo.astro';
+
+const { siteTitle, siteTitleHref } = Astro.locals.starlightRoute;
+---
+
+<a href={siteTitleHref} class="site-title sl-flex">
+  <Logo width={34} aria-hidden="true" />
+  <span translate="no">{siteTitle}</span>
+</a>

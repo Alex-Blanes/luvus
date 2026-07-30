@@ -1,0 +1,40 @@
+---
+// The bohay mark, as a raster. Drop-in for the old `assets/logo.svg` import —
+// same `width`/`height`/`class` props — so every call site across the landing
+// pages keeps working, and the docs get the same mark through Starlight's
+// `logo` config.
+//
+// The artwork is a full-bleed square, so it is rounded like an app icon; square
+// corners read as a cropped image. Rendered at 2× for the density the marks are
+// actually displayed at (16–34px), which is small enough that the extra file
+// costs nothing.
+import { Image } from 'astro:assets';
+import logo from '../assets/logo.png';
+
+interface Props {
+  width?: number;
+  height?: number;
+  class?: string;
+  [key: string]: unknown;
+}
+
+const { width = 32, height, class: className, ...rest } = Astro.props;
+---
+
+<Image
+  src={logo}
+  width={width}
+  height={height ?? width}
+  densities={[2]}
+  alt=""
+  loading="eager"
+  class:list={['bh-mark', className]}
+  {...rest}
+/>
+
+<style>
+  .bh-mark {
+    border-radius: 22%;
+    object-fit: cover;
+  }
+</style>
