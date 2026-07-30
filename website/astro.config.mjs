@@ -15,8 +15,13 @@ export default defineConfig({
       // No `logo` option: Starlight would ship the full-resolution artwork to
       // draw a 34px mark. The SiteTitle override renders it through the same
       // `Logo` component the landing pages use, which optimises and rounds it.
-      favicon: '/favicon.svg',
+      // The brand mark, as PNGs: the artwork is a raster illustration, so there
+      // is no vector icon to serve. `favicon` covers the default <link>; the
+      // small and Apple sizes are added by hand, as the landing pages do.
+      favicon: '/favicon.png',
       head: [
+        { tag: 'link', attrs: { rel: 'icon', type: 'image/png', sizes: '32x32', href: '/favicon-32.png' } },
+        { tag: 'link', attrs: { rel: 'apple-touch-icon', href: '/apple-touch-icon.png' } },
         { tag: 'meta', attrs: { property: 'og:image', content: 'https://bohay.dev/og.png' } },
         { tag: 'meta', attrs: { property: 'og:image:width', content: '1200' } },
         { tag: 'meta', attrs: { property: 'og:image:height', content: '630' } },
