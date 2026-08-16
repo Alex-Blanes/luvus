@@ -5,8 +5,9 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::Result;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -15,6 +16,70 @@ use crate::event::AppEvent;
 use crate::ids::PaneId;
 use crate::terminal::vt::alacritty::AlacrittyEngine;
 use crate::terminal::vt::VtEngine;
+
+/// A child waiting to be reaped by the process-wide PTY reaper.
+///
+/// A blocking `Child::wait` thread per pane made every live pane own a third
+/// thread in addition to its reader and writer. `portable_pty::Child` exposes
+/// nonblocking `try_wait`, so one worker can reap all panes without delaying
+/// PTY output or pane input.
+struct ReapJob {
+    id: PaneId,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    exited: Arc<std::sync::atomic::AtomicBool>,
+    app_tx: Sender<AppEvent>,
+}
+
+static REAPER: OnceLock<Sender<ReapJob>> = OnceLock::new();
+
+fn shared_reaper() -> &'static Sender<ReapJob> {
+    REAPER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<ReapJob>();
+        thread::Builder::new()
+            .name("bohay-pty-reaper".into())
+            .spawn(move || reap_loop(rx))
+            .expect("spawn shared PTY reaper");
+        tx
+    })
+}
+
+fn reap_loop(rx: mpsc::Receiver<ReapJob>) {
+    let mut children = Vec::<ReapJob>::new();
+    loop {
+        if children.is_empty() {
+            let Ok(job) = rx.recv() else { break };
+            children.push(job);
+        }
+
+        while let Ok(job) = rx.try_recv() {
+            children.push(job);
+        }
+
+        let mut i = 0;
+        while i < children.len() {
+            // Treat a wait error like the former blocking reaper did: the pane
+            // is no longer safely waitable, so release its PID guard and let the
+            // app retire the pane instead of leaking the job forever.
+            let exited = !matches!(children[i].child.try_wait(), Ok(None));
+            if exited {
+                let job = children.swap_remove(i);
+                job.exited.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = job.app_tx.send(AppEvent::PtyExit(job.id));
+            } else {
+                i += 1;
+            }
+        }
+
+        // Exit detection is not latency-sensitive to the millisecond: PTY EOF
+        // still announces a normal exit immediately, while this bounds the
+        // shared worker's idle wakeups and avoids one blocked thread per pane.
+        match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(job) => children.push(job),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
 
 /// A pane app's mouse-tracking state (all four DECSET-derived flags in one
 /// read): whether it reports at all, whether it wants press-and-move (1002) or
@@ -264,17 +329,18 @@ impl Pane {
         let pending = data_pending.clone();
         thread::spawn(move || read_loop(id, reader, eng, tx, pending));
 
-        // Reap the child so we notice it exiting. The exit flag is set *before*
-        // the event goes out, so by the time the loop closes the pane (and drops
-        // it) `Drop` already knows not to signal a possibly-recycled pid.
+        // Hand the child to the shared reaper. The exit flag is set *before* the
+        // event goes out, so by the time the loop closes the pane (and drops it)
+        // `Drop` already knows not to signal a possibly-recycled pid.
         let child_exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let exited = child_exited.clone();
-        thread::spawn(move || {
-            let mut child = child;
-            let _ = child.wait();
-            exited.store(true, std::sync::atomic::Ordering::SeqCst);
-            let _ = app_tx.send(AppEvent::PtyExit(id));
-        });
+        shared_reaper()
+            .send(ReapJob {
+                id,
+                child,
+                exited: child_exited.clone(),
+                app_tx: app_tx.clone(),
+            })
+            .expect("shared PTY reaper stays alive for the process");
 
         Ok(Pane {
             engine,
@@ -583,6 +649,30 @@ mod reap_tests {
             "the surviving pane's child is untouched by its neighbour closing"
         );
         drop(keep);
+    }
+
+    #[test]
+    fn shared_reaper_marks_an_exited_child() {
+        let (tx, rx) = mpsc::channel();
+        let id = PaneId::alloc();
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exit 0".to_string(),
+        ];
+        let pane = Pane::spawn_command(id, 80, 24, std::env::temp_dir(), tx, &argv, &[], 500)
+            .expect("spawn short-lived child");
+
+        for _ in 0..40 {
+            if pane.child_exited.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            let _ = rx.recv_timeout(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            pane.child_exited.load(std::sync::atomic::Ordering::SeqCst),
+            "the shared reaper marks a completed child before its pane drops"
+        );
     }
 }
 

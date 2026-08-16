@@ -11,12 +11,18 @@ read its JSON output.
 
 ## Wire format
 
-One request per connection, newline-terminated, and one JSON reply:
+Requests and replies are newline-terminated JSON. A connection may carry one or
+more ordinary request/reply pairs in order:
 
 ```json
 → {"id":"1","method":"pane.split","params":{"down":true}}
 ← {"id":"1","result":{"type":"ok","pane":"7"}}
 ```
+
+For scripts that need several operations, send NDJSON through one client with
+`bohay api < requests.ndjson`; it writes one response line per request. Existing
+`bohay <verb>` commands remain one-shot. `events.subscribe` is the exception:
+after its acknowledgment, that connection becomes an event stream.
 
 Errors come back structured:
 

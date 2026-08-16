@@ -761,7 +761,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         let tx = tx.clone();
         thread::spawn(move || input_loop(tx, pending));
     }
-    ipc::api::start_server(api_listener, api_tx, events);
+    ipc::api::start_server(api_listener, api_tx, tx.clone(), events);
     drop(startup_lock);
     app.run_module_startup_hooks(); // docs/13 §3.7 — same point as the server role
     if app.config.install_agent_skill {
@@ -1824,14 +1824,14 @@ mod tests {
         use std::io::{BufRead, BufReader, Write};
 
         let (tx, _rx) = mpsc::channel();
-        let mut app = App::new(80, 24, tx).unwrap();
+        let mut app = App::new(80, 24, tx.clone()).unwrap();
         let (api_tx, api_rx) = mpsc::channel::<ipc::api::ApiRequest>();
         let path = std::env::temp_dir().join(format!("bohay-test-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let startup_lock =
             ipc::transport::acquire_server_startup_lock(path.parent().unwrap()).unwrap();
         let listener = ipc::api::bind_server(&path, &startup_lock).unwrap();
-        ipc::api::start_server(listener, api_tx, app.events.clone());
+        ipc::api::start_server(listener, api_tx, tx, app.events.clone());
         drop(startup_lock);
         thread::spawn(move || {
             while let Ok(req) = api_rx.recv() {
@@ -1853,6 +1853,25 @@ mod tests {
         assert!(list.contains("pane_list"), "got: {list}");
         let split = send(r#"{"id":"3","method":"pane.split","params":{}}"#);
         assert!(split.contains("\"pane\""), "got: {split}");
+
+        // A persistent API client can batch ordinary control requests on one
+        // socket. One-shot clients remain supported above; this path avoids a
+        // new accept/handler thread for every agent-side operation.
+        let stream = ipc::transport::connect(&path).unwrap();
+        let mut writer = stream.clone();
+        let mut reader = BufReader::new(stream);
+        writer
+            .write_all(b"{\"id\":\"4\",\"method\":\"ping\",\"params\":{}}\n")
+            .unwrap();
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
+        assert!(first.contains("pong"), "got: {first}");
+        writer
+            .write_all(b"{\"id\":\"5\",\"method\":\"pane.list\",\"params\":{}}\n")
+            .unwrap();
+        let mut second = String::new();
+        reader.read_line(&mut second).unwrap();
+        assert!(second.contains("pane_list"), "got: {second}");
         let _ = std::fs::remove_file(&path);
     }
 

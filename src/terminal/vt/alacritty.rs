@@ -314,8 +314,12 @@ impl VtEngine for AlacrittyEngine {
         // `set_options` funnels into `Grid::update_history`, which *shrinks* the
         // retained history when the limit drops — so lowering the setting frees
         // memory on existing panes instead of only applying to new ones.
+        let compact = bytes < self.history_budget_bytes;
         self.history_budget_bytes = bytes;
         self.apply_history_budget();
+        if compact {
+            self.term.compact_history();
+        }
     }
 
     fn scroll(&mut self, delta: i32) {
@@ -571,6 +575,38 @@ mod tests {
 
     fn budget_for_rows(cols: usize, rows: usize) -> usize {
         estimated_row_bytes(cols).saturating_mul(rows)
+    }
+
+    /// Manual release-only allocation probe for the Alacritty grid cache.
+    ///
+    /// Run with `cargo test --release --features dev-tools
+    /// hold_scrollback_cache_for_measurement -- --ignored --nocapture`, inspect
+    /// the printed PID with `vmmap`, then compare the upstream and patched
+    /// `alacritty_terminal` dependency under the same workload.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    #[ignore = "manual allocation measurement"]
+    fn hold_scrollback_cache_for_measurement() {
+        const PANES: usize = 13;
+        const COLS: u16 = 258;
+        const ROWS: u16 = 24;
+        const OUTPUT_LINES: usize = 300;
+
+        let (tx, _rx) = channel();
+        let budget = crate::config::SCROLLBACK_BYTES_DEFAULT;
+        let mut engines = Vec::with_capacity(PANES);
+        for _ in 0..PANES {
+            let mut engine = AlacrittyEngine::new(COLS, ROWS, tx.clone(), budget);
+            feed_lines(&mut engine, OUTPUT_LINES);
+            engines.push(engine);
+        }
+
+        eprintln!(
+            "cache-measurement ready: pid={} panes={PANES} cols={COLS} rows={ROWS} output_lines={OUTPUT_LINES} budget_bytes={budget}",
+            std::process::id(),
+        );
+        std::thread::sleep(std::time::Duration::from_secs(45));
+        assert_eq!(engines.len(), PANES);
     }
 
     // docs/07: agent detection must read the **live** screen, never the

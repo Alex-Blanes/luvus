@@ -1,7 +1,7 @@
 //! CLI client (M4): `bohay pane …` / `bohay ping` / `bohay events` connect to
 //! the session socket, send one JSON request, and print the reply. See docs/08.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -14,6 +14,7 @@ pub fn is_cli(args: &[String]) -> bool {
         args.get(1).map(String::as_str),
         Some(
             "ping"
+                | "api"
                 | "pane"
                 | "node"
                 | "workspace"
@@ -45,6 +46,7 @@ usage: bohay <command> [args]
   help                 show this help
   doctor               check optional external tools (git, gh, …)
   ping                 check the server
+  api                  forward newline-delimited JSON API requests from stdin over one connection
 
 workspaces:
   workspace list             list workspaces
@@ -192,6 +194,11 @@ pub fn run(args: &[String]) -> Result<i32> {
     if args.get(1).map(String::as_str) == Some("skill") {
         return skill_cmd(&args[2.min(args.len())..]);
     }
+    // A persistent, raw control connection for agent scripts that need several
+    // requests. Existing commands remain one-shot and backwards compatible.
+    if args.get(1).map(String::as_str) == Some("api") {
+        return api_cmd(args);
+    }
     // `doctor` is a local environment check — no server needed.
     if args.get(1).map(String::as_str) == Some("doctor") {
         return Ok(doctor());
@@ -261,6 +268,37 @@ pub fn run(args: &[String]) -> Result<i32> {
             }
         }
         Err(_) => println!("{line}"),
+    }
+    Ok(0)
+}
+
+/// Forward newline-delimited API requests over one connection.
+///
+/// This is intentionally raw: callers keep their request ids and receive one
+/// JSON response line for each request line. It avoids repeatedly launching a
+/// client and a short-lived server handler when an agent needs several control
+/// operations. `bohay events` remains the dedicated streaming command.
+fn api_cmd(args: &[String]) -> Result<i32> {
+    if args.len() != 2 {
+        return Err(anyhow!("usage: bohay api < requests.ndjson"));
+    }
+    let path = crate::persist::cli_socket_path();
+    let stream = crate::ipc::transport::connect(&path)
+        .map_err(|_| anyhow!("no bohay server running (socket: {})", path.display()))?;
+    let mut writer = stream.clone();
+    let mut reader = BufReader::new(stream);
+
+    for request in io::stdin().lock().lines() {
+        let request = request?;
+        if request.trim().is_empty() {
+            continue;
+        }
+        writeln!(writer, "{request}")?;
+        let mut response = String::new();
+        if reader.read_line(&mut response)? == 0 {
+            return Err(anyhow!("bohay server closed the API connection"));
+        }
+        print!("{response}");
     }
     Ok(0)
 }

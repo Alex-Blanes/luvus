@@ -30,6 +30,10 @@ pub enum AppEvent {
     PtyData(PaneId),
     /// The given pane's child process exited.
     PtyExit(PaneId),
+    /// A control-API request reached its queue. The owning app loop drains the
+    /// request channel immediately after this wake-up; the payload stays off
+    /// the UI event channel so request/reply ownership remains in `ipc::api`.
+    ApiRequest,
     /// A binary client attached (server mode); `messages` feeds its socket writer.
     ClientConnected {
         id: u64,

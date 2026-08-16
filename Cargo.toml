@@ -80,7 +80,10 @@ strip = true
 # `vte`'s synchronized-update buffer is allocated lazily in our pinned local
 # patch. The upstream 0.15.0 release reserves 2 MiB for every terminal parser,
 # even when the terminal never uses synchronized updates.
+# Alacritty's scrollback row cache is bounded by bytes instead of a fixed
+# 1,000 rows, so wide panes do not reserve multi-megabyte row caches.
 [patch.crates-io]
+alacritty_terminal = { path = "vendor/alacritty_terminal" }
 vte = { path = "vendor/vte" }
 
 # ── Linux packaging (docs/16) ────────────────────────────────────────────────

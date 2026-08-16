@@ -250,7 +250,8 @@ impl App {
                 true
             }
             // Handled by the server loop; never reaches here at runtime.
-            AppEvent::ClientConnected { .. }
+            AppEvent::ApiRequest
+            | AppEvent::ClientConnected { .. }
             | AppEvent::ClientDetach { .. }
             | AppEvent::ClientInput { .. } => false,
         }
