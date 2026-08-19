@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 
 use super::App;
@@ -1063,7 +1063,7 @@ impl App {
     }
 
     pub fn search_key(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let ctrl = super::keys::is_ctrl_chord(key.modifiers); // not AltGr
         match key.code {
             KeyCode::Esc => {
                 if self.search.as_ref().is_some_and(|s| !s.query.is_empty()) {
