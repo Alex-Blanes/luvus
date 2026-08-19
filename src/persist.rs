@@ -363,17 +363,47 @@ fn resolve_pane_sessions(app: &App) -> HashMap<PaneId, Option<(String, String)>>
         let Some(st) = app.status.get(id) else {
             continue;
         };
+        // The sidebar label is updated asynchronously. A restart can happen
+        // before that update, while `proc_commands` already contains the live
+        // process tree. In that short window `st.agent` is still the shell, so
+        // looking up sessions with it would write no resume information and the
+        // next server could only restore a bare shell. Use the process-derived
+        // identity for this save when it is available; it is the same
+        // authoritative source used by regular detection, but does not alter
+        // the UI state or lifecycle bookkeeping.
+        let agent = snapshot_agent(
+            &app.manifests,
+            app.proc_commands.get(id).map(Vec::as_slice),
+            &st.agent,
+        );
         let guess = app.panes.get(id).and_then(|p| {
-            crate::agent::sessions_for(&st.agent, &p.cwd)
+            crate::agent::sessions_for(&agent, &p.cwd)
                 .into_iter()
                 .find(|sid| !claimed.contains(sid))
         });
         if let Some(sid) = &guess {
             claimed.insert(sid.clone());
         }
-        out.insert(*id, guess.map(|sid| (st.agent.clone(), sid)));
+        out.insert(*id, guess.map(|sid| (agent, sid)));
     }
     out
+}
+
+/// The agent identity to use only while writing a restart snapshot.
+///
+/// `PaneStatus::agent` is intentionally asynchronous because it is a UI-facing
+/// classification. `proc_commands` arrives first from the process scan, so it
+/// is the safer identity during the small interval before the UI catches up.
+/// If process information is unavailable, preserve the existing status-based
+/// behaviour.
+fn snapshot_agent(
+    manifests: &crate::detect::Manifests,
+    commands: Option<&[String]>,
+    fallback: &str,
+) -> String {
+    commands
+        .and_then(|commands| manifests.agent_in_processes(commands))
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 pub fn snapshot(app: &App) -> SessionSnapshot {
@@ -585,6 +615,26 @@ mod tests {
             Some(v) => std::env::set_var("BOHAY_SOCKET_PATH", v),
             None => std::env::remove_var("BOHAY_SOCKET_PATH"),
         }
+    }
+
+    #[test]
+    fn snapshot_uses_the_live_process_identity_before_sidebar_detection_catches_up() {
+        let manifests = crate::detect::Manifests::builtin();
+        let commands = vec![
+            "/bin/zsh -l".to_string(),
+            "codex --sandbox workspace-write".to_string(),
+        ];
+
+        assert_eq!(
+            snapshot_agent(&manifests, Some(&commands), "zsh"),
+            "codex",
+            "a running resumable agent must not be snapshotted as its shell"
+        );
+        assert_eq!(
+            snapshot_agent(&manifests, None, "zsh"),
+            "zsh",
+            "without a process scan, retain the existing safe fallback"
+        );
     }
 
     // The control sockets grant command execution as the user, so the state
