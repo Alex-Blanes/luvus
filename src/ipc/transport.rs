@@ -108,10 +108,20 @@ impl Write for Conn {
 
 #[cfg(windows)]
 fn pipe_id(path: &Path) -> String {
+    namespaced_pipe_id(path, "luvus")
+}
+
+#[cfg(windows)]
+fn legacy_pipe_id(path: &Path) -> String {
+    namespaced_pipe_id(path, "bohay")
+}
+
+#[cfg(windows)]
+fn namespaced_pipe_id(path: &Path, namespace: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut h);
-    format!("luvus-{:016x}", h.finish())
+    format!("{namespace}-{:016x}", h.finish())
 }
 
 /// Connect to a server socket identified by a per-session filesystem path.
@@ -129,6 +139,28 @@ pub fn connect(path: &Path) -> io::Result<Conn> {
         let name = path.to_fs_name::<GenericFilePath>()?;
         Ok(Conn::new(Stream::connect(name)?))
     }
+}
+
+/// Connect using Bohay 0.10's Windows named-pipe namespace. On Unix the caller
+/// has already resolved any old long-path alias, so the transport is unchanged.
+pub(crate) fn connect_legacy(path: &Path) -> io::Result<Conn> {
+    #[cfg(windows)]
+    {
+        use interprocess::local_socket::GenericNamespaced;
+        let name = legacy_pipe_id(path).to_ns_name::<GenericNamespaced>()?;
+        Ok(Conn::new(Stream::connect(name)?))
+    }
+    #[cfg(not(windows))]
+    {
+        connect(path)
+    }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn bind_legacy_for_test(path: &Path) -> io::Result<Listener> {
+    use interprocess::local_socket::GenericNamespaced;
+    let name = legacy_pipe_id(path).to_ns_name::<GenericNamespaced>()?;
+    ListenerOptions::new().name(name).create_sync()
 }
 
 /// Bind a listener at the given per-session path.
@@ -217,7 +249,7 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-    use super::pipe_id;
+    use super::{legacy_pipe_id, pipe_id};
     use std::path::Path;
 
     #[test]
@@ -228,6 +260,19 @@ mod windows_tests {
         assert_eq!(
             alpha,
             pipe_id(Path::new(r"C:\Users\riz\.luvus\sessions\alpha\luvus.sock"))
+        );
+    }
+
+    #[test]
+    fn legacy_pipe_keeps_the_old_namespace_and_same_path_hash() {
+        let path = Path::new(r"C:\Users\riz\.bohay\bohay.sock");
+        let current = pipe_id(path);
+        let legacy = legacy_pipe_id(path);
+        assert!(current.starts_with("luvus-"));
+        assert!(legacy.starts_with("bohay-"));
+        assert_eq!(
+            current.strip_prefix("luvus-"),
+            legacy.strip_prefix("bohay-")
         );
     }
 }

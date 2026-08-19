@@ -108,13 +108,17 @@ jobs:
       - name: Build .deb
         # --no-build: package the binary cross already built. --no-strip: the
         # release profile already strips, and there is no aarch64 `strip` here.
+        env:
+          RELEASE_VERSION: ${{ steps.v.outputs.version }}
         run: |
           cargo deb --no-build --no-strip --target ${{ matrix.target }} \
-            --output "luvus_${{ steps.v.outputs.version }}_${{ matrix.arch }}.deb"
+            --output "luvus_${RELEASE_VERSION}_${{ matrix.arch }}.deb"
       - name: Build .rpm
+        env:
+          RELEASE_VERSION: ${{ steps.v.outputs.version }}
         run: |
           cargo generate-rpm --target ${{ matrix.target }} \
-            --output "luvus-${{ steps.v.outputs.version }}-${{ matrix.target }}.rpm"
+            --output "luvus-${RELEASE_VERSION}-${{ matrix.target }}.rpm"
       - name: Attach packages to the Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -153,6 +157,8 @@ jobs:
 
       - name: Build .app (universal, ad-hoc signed)
         working-directory: notch
+        env:
+          RELEASE_VERSION: ${{ steps.v.outputs.version }}
         run: |
           # No Developer ID identity available — build unsigned, then apply a
           # deep ad-hoc signature (required or arm64 macOS refuses to launch it).
@@ -160,7 +166,7 @@ jobs:
             -project luvus-notch.xcodeproj -scheme "$SCHEME" \
             -configuration Release -derivedDataPath "$RUNNER_TEMP/dd" \
             ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
-            MARKETING_VERSION="${{ steps.v.outputs.version }}" \
+            MARKETING_VERSION="$RELEASE_VERSION" \
             CODE_SIGN_IDENTITY="-" CODE_SIGN_STYLE=Manual \
             CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=YES \
             DEVELOPMENT_TEAM=""
@@ -170,9 +176,10 @@ jobs:
 
       - name: Build DMG
         id: dmg
+        env:
+          RELEASE_VERSION: ${{ steps.v.outputs.version }}
         run: |
-          VER="${{ steps.v.outputs.version }}"
-          DMG="luvus-notch-$VER.dmg"
+          DMG="luvus-notch-$RELEASE_VERSION.dmg"
           STAGE="$RUNNER_TEMP/dmg"
           mkdir -p "$STAGE"
           cp -R "$APP" "$STAGE/"
@@ -183,21 +190,23 @@ jobs:
 
       - name: Attach DMG to this luvus release
         env:
+          DMG_PATH: ${{ steps.dmg.outputs.dmg }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$GITHUB_REF_NAME" "${{ steps.dmg.outputs.dmg }}" --repo "$GITHUB_REPOSITORY" --clobber
+        run: gh release upload "$GITHUB_REF_NAME" "$DMG_PATH" --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: Bump Homebrew cask
         run: |
-          VER="${{ steps.v.outputs.version }}"
-          SHA="$(shasum -a 256 "${{ steps.dmg.outputs.dmg }}" | cut -d' ' -f1)"
+          SHA="$(shasum -a 256 "$DMG_PATH" | cut -d' ' -f1)"
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" "$RUNNER_TEMP/tap"
           CASK="$RUNNER_TEMP/tap/Casks/luvus-notch.rb"
-          sed -i '' -E "s/^  version \".*\"/  version \"$VER\"/" "$CASK"
+          sed -i '' -E "s/^  version \".*\"/  version \"$RELEASE_VERSION\"/" "$CASK"
           sed -i '' -E "s/^  sha256 \".*\"/  sha256 \"$SHA\"/" "$CASK"
           cd "$RUNNER_TEMP/tap"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -am "luvus-notch $VER"
+          git commit -am "luvus-notch $RELEASE_VERSION"
           git push
         env:
+          DMG_PATH: ${{ steps.dmg.outputs.dmg }}
+          RELEASE_VERSION: ${{ steps.v.outputs.version }}
           TAP_TOKEN: ${{ secrets.TAP_TOKEN }}

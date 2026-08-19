@@ -98,11 +98,10 @@ fn install_inner(
             .with_context(|| format!("build step {:?} failed", b.command))?;
     }
 
-    // 5. The manifest must not have changed during the build.
-    let after = fs::read(&manifest_path).context("re-read manifest after build")?;
-    if before != after {
-        bail!("manifest changed during build — refusing to install");
-    }
+    // 5. The selected manifest must not have changed during the build. Resolve
+    // it again because a build that started from the legacy filename could add
+    // a higher-priority luvus-module.toml without touching the checked bytes.
+    verify_manifest_unchanged(&module_root, &manifest_path, &before)?;
 
     // 6. Atomically move into the managed dir.
     let dest = paths::git_dir(slug, &short(&sha));
@@ -120,6 +119,15 @@ fn install_inner(
         source: format!("{spec}@{sha}"),
         id: manifest.id,
     })
+}
+
+fn verify_manifest_unchanged(root: &Path, before_path: &Path, before: &[u8]) -> Result<()> {
+    let after_path = ModuleManifest::path(root);
+    let after = fs::read(&after_path).context("re-read manifest after build")?;
+    if after_path != before_path || after != before {
+        bail!("manifest changed during build — refusing to install");
+    }
+    Ok(())
 }
 
 /// Parse `owner/repo[/sub]` → a GitHub URL, or a local path / git URL verbatim.
@@ -238,6 +246,7 @@ fn short(sha: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::module::manifest::LEGACY_MANIFEST_FILE;
 
     #[test]
     fn parse_owner_repo_and_paths() {
@@ -255,5 +264,24 @@ mod tests {
         assert!(sub.is_empty());
 
         assert!(parse_spec("nope").is_err());
+    }
+
+    #[test]
+    fn manifest_selection_cannot_change_during_build() {
+        let root =
+            std::env::temp_dir().join(format!("luvus-manifest-switch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let legacy_path = root.join(LEGACY_MANIFEST_FILE);
+        let before = b"legacy manifest";
+        fs::write(&legacy_path, before).unwrap();
+        assert_eq!(ModuleManifest::path(&root), legacy_path);
+
+        fs::write(root.join(MANIFEST_FILE), "replacement manifest").unwrap();
+        let error = verify_manifest_unchanged(&root, &legacy_path, before)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("manifest changed during build"), "{error}");
+        let _ = fs::remove_dir_all(root);
     }
 }

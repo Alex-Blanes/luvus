@@ -493,14 +493,20 @@ impl App {
         let placement = placement.unwrap_or("split");
 
         let ctx = context::build(self, source);
-        let (root, mut env) = {
+        let (root, env) = {
             let m = self.modules.find(module_id).unwrap();
-            (m.root.clone(), runtime::base_env(m, &ctx))
+            (
+                m.root.clone(),
+                runtime::env(
+                    m,
+                    &ctx,
+                    vec![(
+                        "LUVUS_MODULE_ENTRYPOINT_ID".to_string(),
+                        entrypoint.to_string(),
+                    )],
+                ),
+            )
         };
-        env.push((
-            "LUVUS_MODULE_ENTRYPOINT_ID".to_string(),
-            entrypoint.to_string(),
-        ));
 
         // The pane runs the argv in the module root (so relative paths resolve);
         // the script reads the workspace cwd from the context.
@@ -600,11 +606,10 @@ impl App {
             ));
         }
         let ctx = context::build_for(self, source, &target);
-        let (root, mut env) = {
+        let (root, env) = {
             let module = self.modules.find(module_id).unwrap();
-            (module.root.clone(), runtime::base_env(module, &ctx))
+            (module.root.clone(), runtime::env(module, &ctx, extra_env))
         };
-        env.extend(extra_env);
         let log_id = runtime::next_log_id();
         self.push_module_log(ModuleCommandLog {
             id: log_id,

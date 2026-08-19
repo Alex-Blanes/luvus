@@ -192,23 +192,36 @@ pub fn client_socket_path_for(name: Option<&str>) -> PathBuf {
 
 fn socket_path_for(name: Option<&str>, file_name: &str, role: &str) -> PathBuf {
     let logical = session_dir_for(name).join(file_name);
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
+    socket_alias_path(logical, "luvus", role)
+}
 
-        // macOS allows only 103 bytes plus the terminating NUL in `sun_path`.
-        // Keep ordinary paths readable and backward-compatible, but make long
-        // custom LUVUS_HOME values usable through a stable owner-scoped alias.
-        if logical.as_os_str().as_bytes().len() >= 100 {
-            let mut hash = 0xcbf29ce484222325u64;
-            for byte in logical.as_os_str().as_bytes() {
-                hash ^= u64::from(*byte);
-                hash = hash.wrapping_mul(0x100000001b3);
-            }
-            let uid = unsafe { libc::geteuid() };
-            return PathBuf::from(format!("/tmp/luvus-{uid}/{hash:016x}-{role}.sock"));
+/// Resolve a Bohay 0.10 logical socket path exactly as the old binary did.
+/// Migration uses this to detect a live old server before copying its state.
+pub(crate) fn legacy_socket_path(logical: PathBuf, role: &str) -> PathBuf {
+    socket_alias_path(logical, "bohay", role)
+}
+
+#[cfg(unix)]
+fn socket_alias_path(logical: PathBuf, namespace: &str, role: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+
+    // macOS allows only 103 bytes plus the terminating NUL in `sun_path`.
+    // Keep ordinary paths readable and backward-compatible, but make long
+    // application homes usable through a stable owner-scoped alias.
+    if logical.as_os_str().as_bytes().len() >= 100 {
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in logical.as_os_str().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
         }
+        let uid = unsafe { libc::geteuid() };
+        return PathBuf::from(format!("/tmp/{namespace}-{uid}/{hash:016x}-{role}.sock"));
     }
+    logical
+}
+
+#[cfg(not(unix))]
+fn socket_alias_path(logical: PathBuf, _namespace: &str, _role: &str) -> PathBuf {
     logical
 }
 

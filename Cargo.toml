@@ -58,6 +58,13 @@ unicode-width = "0.2"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Agent skills are distributed separately from the runtime. Manifests are
+# authenticated with Ed25519, artifact/package hashes use SHA-256, and semver
+# keeps independently released skills inside their declared Luvus range.
+base64 = "0.22"
+ed25519-dalek = "2"
+semver = "1"
+sha2 = "0.10"
 # Module manifests (`luvus-module.toml`).
 toml = "0.8"
 # Format-preserving TOML edits (Kimi's `~/.kimi-code/config.toml` holds the

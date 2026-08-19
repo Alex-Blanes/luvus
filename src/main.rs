@@ -75,6 +75,10 @@ fn main() -> Result<()> {
     // must never contaminate stdout/stderr used by installers and scripts.
     persist::migrate_legacy_state()?;
     integration::migrate_legacy_integrations();
+    // One-time local cleanup of the old default-on skill installation. This
+    // never downloads or installs a skill; it only removes Luvus/Bohay-managed
+    // global pointers and exact known auto-installed files.
+    let _ = skill::migrate_legacy_installation();
     match args.get(1).map(String::as_str) {
         Some("server") => return server_cmd(&args),
         Some("client") => return ipc::client::run(&persist::client_socket_path()),
@@ -809,9 +813,6 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     ipc::api::start_server(api_listener, tx.clone(), events);
     drop(startup_lock);
     app.run_module_startup_hooks(); // docs/13 §3.7 — same point as the server role
-    if app.config.install_agent_skill {
-        let _ = skill::install_default(); // keep the agent skill installed (opt out via config)
-    }
 
     // Background "update available" check (off if the user disabled it).
     if app.config.check_updates {

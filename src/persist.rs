@@ -277,16 +277,20 @@ fn legacy_state_recognized(root: &std::path::Path) -> bool {
 }
 
 fn legacy_server_running(root: &std::path::Path) -> bool {
-    let mut candidates = vec![root.join("bohay.sock"), root.join("bohay-client.sock")];
+    let mut candidates = vec![
+        (root.join("bohay.sock"), "api"),
+        (root.join("bohay-client.sock"), "client"),
+    ];
     if let Ok(entries) = fs::read_dir(root.join("sessions")) {
         for entry in entries.flatten().filter(|entry| entry.path().is_dir()) {
-            candidates.push(entry.path().join("bohay.sock"));
-            candidates.push(entry.path().join("bohay-client.sock"));
+            candidates.push((entry.path().join("bohay.sock"), "api"));
+            candidates.push((entry.path().join("bohay-client.sock"), "client"));
         }
     }
-    candidates
-        .iter()
-        .any(|path| crate::ipc::transport::connect(path).is_ok())
+    candidates.into_iter().any(|(logical, role)| {
+        let path = crate::session::legacy_socket_path(logical, role);
+        crate::ipc::transport::connect_legacy(&path).is_ok()
+    })
 }
 
 fn copy_legacy_tree(
@@ -411,11 +415,10 @@ pub fn manifests_dir() -> PathBuf {
     config_dir().join("manifests")
 }
 
-/// The luvus-managed skill cache: the OTA-updated `SKILL.md` written by
-/// `luvus skill update`, kept apart from the compiled-in default so a skill fix
-/// can reach users between releases. `~/.luvus/skill/`.
-pub fn skill_dir() -> PathBuf {
-    config_dir().join("skill")
+/// Opt-in skill state, verified package cache, and migration marker. Skill
+/// bodies live in their agent-native locations, never in the Luvus binary.
+pub fn skills_dir() -> PathBuf {
+    config_dir().join("skills")
 }
 
 /// Create the manifests dir if it doesn't exist and drop an annotated example
@@ -793,6 +796,7 @@ pub fn load() -> Option<SessionSnapshot> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
 
     #[test]
     fn legacy_state_migration_is_copy_only_and_skips_runtime_artifacts() {
@@ -856,6 +860,28 @@ mod tests {
             fs::read_to_string(current.join("config.toml")).unwrap(),
             "new"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migration_detects_a_live_legacy_long_path_alias() {
+        let root = std::env::temp_dir().join(format!(
+            "luvus-legacy-running-{}-{}",
+            std::process::id(),
+            "x".repeat(120)
+        ));
+        let logical = root.join("bohay.sock");
+        let alias = crate::session::legacy_socket_path(logical, "api");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&alias);
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&alias).unwrap();
+
+        assert!(legacy_server_running(&root));
+
+        drop(listener);
+        let _ = fs::remove_file(alias);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -940,5 +966,23 @@ mod tests {
         let _listener = crate::ipc::transport::bind(&sock).unwrap();
         let mode = fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "socket is chmod 0600, got {mode:o}");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_migration_tests {
+    use super::*;
+
+    #[test]
+    fn migration_detects_a_live_legacy_named_pipe() {
+        let root = std::env::temp_dir().join(format!("luvus-legacy-pipe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("bohay.sock");
+        let _listener = crate::ipc::transport::bind_legacy_for_test(&path).unwrap();
+
+        assert!(legacy_server_running(&root));
+
+        let _ = fs::remove_dir_all(root);
     }
 }

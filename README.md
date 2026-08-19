@@ -98,18 +98,17 @@ and start your agents — luvus recognizes them automatically.
 > Keyboard Shortcuts → Input Sources* (untick *Select the previous input source*).
 > Everything is mouse-driven too, so you're never locked out.
 
-## Codex plugin
+## Codex skill
 
-Install the `luvus` plugin from the repository marketplace so Codex can inspect
-and control your local Luvus session:
+Luvus does not install agent instructions by default. Explicitly enable the
+Codex skill when you want Codex to inspect and control your local Luvus session:
 
 ```bash
-codex plugin marketplace add RizRiyz/luvus
-codex plugin add luvus@luvus
+luvus skill enable codex
 ```
 
-Start a new Codex thread after installation. See the
-[Codex plugin guide](https://luvus.dev/docs/guides/codex-plugin/) for delegation,
+Start a new Codex thread after enabling it. See the
+[Codex skill guide](https://luvus.dev/docs/guides/codex-plugin/) for delegation,
 permissions, and production setup.
 
 ## Supported agents

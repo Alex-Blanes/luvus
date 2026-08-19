@@ -5,17 +5,51 @@
 #   sh test/run.sh /path/to/luvus
 set -eu
 BIN="${1:-luvus}"
-HOME_DIR=/tmp/luvus-esp-test
-LOG=/tmp/idf-calls.log
+case "$BIN" in
+  */*) BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")" ;;
+esac
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/luvus-esp-test.XXXXXX")
+HOME_DIR="$TEST_ROOT/home"
+LOG="$TEST_ROOT/idf-calls.log"
+PROJECT="$TEST_ROOT/project"
+STATE="$TEST_ROOT/state"
+FAIL_FLAG="$TEST_ROOT/idf-fake-fail"
+SERVER_LOG="$TEST_ROOT/server.log"
+SERVER_PID=
 FAKE="$(cd "$(dirname "$0")/fake-idf" && pwd)"
-R() { env -u LUVUS_SOCKET_PATH -u LUVUS_PANE_ID LUVUS_HOME="$HOME_DIR" IDF_FAKE_LOG="$LOG" "$@"; }
+R() {
+  env -u LUVUS_SOCKET_PATH -u BOHAY_SOCKET_PATH \
+    -u LUVUS_PANE_ID -u BOHAY_PANE_ID \
+    -u LUVUS_SESSION -u BOHAY_SESSION \
+    LUVUS_HOME="$HOME_DIR" IDF_FAKE_LOG="$LOG" IDF_FAKE_FAIL="$FAIL_FLAG" "$@"
+}
 ok() { printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 no() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAILED=1; }
 FAILED=0
 
-pkill -f "luvus server" 2>/dev/null || true; sleep 1
-rm -rf "$HOME_DIR" /tmp/luvus-esp-proj; mkdir -p /tmp/luvus-esp-proj; : > "$LOG"
-( cd /tmp/luvus-esp-proj && R "$BIN" server >/tmp/luvus-esp-srv.log 2>&1 & )
+cleanup() {
+  status=$?
+  trap - EXIT HUP INT TERM
+  if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
+  rm -rf "$TEST_ROOT"
+  exit "$status"
+}
+trap cleanup EXIT HUP INT TERM
+
+mkdir -p "$HOME_DIR" "$PROJECT" "$STATE"
+: > "$LOG"
+(
+  cd "$PROJECT"
+  exec env -u LUVUS_SOCKET_PATH -u BOHAY_SOCKET_PATH \
+    -u LUVUS_PANE_ID -u BOHAY_PANE_ID \
+    -u LUVUS_SESSION -u BOHAY_SESSION \
+    LUVUS_HOME="$HOME_DIR" IDF_FAKE_LOG="$LOG" IDF_FAKE_FAIL="$FAIL_FLAG" \
+    "$BIN" server
+) >"$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
 sleep 2
 
 R "$BIN" module link "$(cd "$(dirname "$0")/.." && pwd)" >/dev/null
@@ -45,10 +79,10 @@ R "$BIN" pane read 1 | grep -q 'boot log line' && ok "pre-flash log survives" ||
 
 # A failing flash must NOT bring the monitor back over the error.
 : > "$LOG"; R "$BIN" module run example.esp-idf monitor >/dev/null 2>&1; sleep 3
-touch /tmp/idf-fake-fail
+touch "$FAIL_FLAG"
 R "$BIN" module run example.esp-idf flash >/dev/null 2>&1 || true
 sleep 5
-rm -f /tmp/idf-fake-fail
+rm -f "$FAIL_FLAG"
 # The log was cleared after the monitor started, so a correct run records the
 # flash and no further `monitor` invocation.
 [ "$(grep -c 'IDFCALL.*monitor' "$LOG")" -eq 0 ] && ok "failed flash leaves the error visible" \
@@ -60,7 +94,7 @@ rm -f /tmp/idf-fake-fail
 # variant really reaches idf.py -- otherwise every child would run `build`.
 : > "$LOG"
 R env LUVUS_MODULE_ROW_VALUE=app LUVUS_MODULE_ACTION_ID=run \
-  LUVUS_MODULE_STATE_DIR=/tmp LUVUS_PANE_ID=1 \
+  LUVUS_MODULE_STATE_DIR="$STATE" LUVUS_PANE_ID=1 \
   LUVUS_SETTING_IDF_PATH="$FAKE" LUVUS_SETTING_PORT=/dev/ttyFAKE0 \
   LUVUS_BIN_PATH="$BIN" sh idf.sh >/dev/null 2>&1 || true
 sleep 2
@@ -74,7 +108,6 @@ grep -q "IDFCALL.* app" "$LOG" && ok "a child row's value picks the subcommand" 
 # reaches a real click through the *server*, which spawns the action with its own
 # environment -- so `env VAR=x luvus module run ...` would set the variable on
 # the CLI process and never reach the script.
-STATE=/tmp/luvus-esp-state; rm -rf "$STATE"; mkdir -p "$STATE"
 RUN() { R env LUVUS_MODULE_STATE_DIR="$STATE" LUVUS_BIN_PATH="$BIN" \
           LUVUS_SETTING_IDF_PATH="$FAKE" "$@"; }
 
@@ -103,14 +136,14 @@ fi
 # The chip row must show what the *project* is configured for, not the module
 # setting -- it used to print the setting's arbitrary `esp32s3` default even for
 # an esp32 project, which is a guess presented as fact.
-printf 'CONFIG_IDF_TARGET="esp32"\n' > /tmp/luvus-esp-proj/sdkconfig
+printf 'CONFIG_IDF_TARGET="esp32"\n' > "$PROJECT/sdkconfig"
 CHIP=$(RUN LUVUS_BIN_PATH=/bin/echo LUVUS_SETTING_TARGET=esp32s3 \
-        LUVUS_WORKSPACE_CWD=/tmp/luvus-esp-proj sh dock.sh 2>/dev/null || true)
+        LUVUS_WORKSPACE_CWD="$PROJECT" sh dock.sh 2>/dev/null || true)
 case "$CHIP" in
   *"chip · esp32 → esp32s3"*) ok "chip row reports the project's real target" ;;
   *) no "chip row did not reflect sdkconfig (got: $(printf '%s' "$CHIP" | head -c 120))" ;;
 esac
-rm -f /tmp/luvus-esp-proj/sdkconfig
+rm -f "$PROJECT/sdkconfig"
 
 # An open group emits its children. `dock.sh` pipes its rows straight into
 # `luvus ui dock push`, so point LUVUS_BIN_PATH at `echo` to read the JSON it
@@ -121,8 +154,6 @@ case "$OUT" in
   *"full clean"*) ok "an open group lists its children" ;;
   *)              no "open group did not emit children" ;;
 esac
-rm -rf "$STATE"
-
 # The partition editor must explain itself rather than dying, when the node is
 # not an ESP-IDF project (the `exec` bug that blinked a tab out of existence).
 R "$BIN" module run example.esp-idf edit-partitions >/dev/null 2>&1; sleep 3
@@ -132,5 +163,6 @@ R "$BIN" pane read "$P" 2>/dev/null | grep -q "Not an ESP-IDF project" \
   || no "partition editor pane did not report why it stopped"
 
 R "$BIN" server stop >/dev/null 2>&1 || true
-rm -rf "$HOME_DIR" /tmp/luvus-esp-proj
+wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=
 [ "$FAILED" = 0 ] && echo "  all good" || { echo "  some checks failed"; exit 1; }

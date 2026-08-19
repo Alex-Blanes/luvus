@@ -4377,8 +4377,11 @@ fn restore_module_pane(
         .find(|p| p.id == ep)
         .map(|p| p.command.clone())?;
     let ctx = serde_json::json!({ "invocation_source": "restore" });
-    let mut env = crate::module::runtime::base_env(m, &ctx);
-    env.push(("LUVUS_MODULE_ENTRYPOINT_ID".to_string(), ep.to_string()));
+    let env = crate::module::runtime::env(
+        m,
+        &ctx,
+        vec![("LUVUS_MODULE_ENTRYPOINT_ID".to_string(), ep.to_string())],
+    );
     let pane = Pane::spawn_command(
         id,
         80,

@@ -1,7 +1,7 @@
 //! CLI client (M4): `luvus pane …` / `luvus ping` / `luvus events` connect to
 //! the session socket, send one JSON request, and print the reply. See docs/08.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -61,7 +61,7 @@ Commands:
   session      List, attach, stop, and delete server sessions
   server       Inspect and manage the selected background server
   integration  Manage agent session-resume integrations
-  skill        Print, install, update, enable, or remove the Luvus skill
+  skill        Explicitly enable, inspect, update, or remove agent skills
   wait         Wait for pane output or an agent state
   search       Search across pane scrollback
   events       Stream live status changes
@@ -143,11 +143,12 @@ panes / agents:
   agent get <target>         one agent's live info (pane, name, kind, status, cwd)
   agent sessions             list resumable sessions found on disk
   agent resume <id>          reopen a resumable session into a pane
-  skill                      print the agent skill (delegation + session control)
-  skill install [--dir <p>]  install the skill where a coding agent auto-loads it
-  skill uninstall [--dir <p>]   remove the installed skill
-  skill update               fetch the latest skill from the luvus repo (no reinstall)
-  skill on | off             enable / disable auto-install (installs / removes now)
+  skill status [<agent>]      show enabled state, release, path, and integrity
+  skill enable <agent>|--all  opt an agent into the remotely distributed skill
+  skill disable <agent>|--all remove an unmodified managed skill
+  skill update [<agent>]      update enabled agents only (all enabled by default)
+  skill show <agent>          print an installed agent's SKILL.md
+                             <agent> is claude, codex, or opencode
   wait output <id> --match <text> [--timeout <s>]    block until output appears
   wait agent-status <id> --status done|blocked|working|idle [--timeout <s>]
   attach <id>                open the TUI into a single fullscreen pane
@@ -462,7 +463,7 @@ fn write_topic_help(
             detailed_section("panes / agents:\n", "\nsearch:\n"),
         ),
         "skill" => (
-            "luvus skill [install|uninstall|update|on|off] [options]",
+            "luvus skill <status|enable|disable|update|show> [agent|--all] [--url URL]",
             detailed_section("panes / agents:\n", "\nsearch:\n"),
         ),
         "wait" => (
@@ -1187,95 +1188,207 @@ fn agent_start_cmd(args: &[String]) -> Result<i32> {
     Ok(if ready { 0 } else { 2 })
 }
 
-/// `luvus skill` prints the agent skill; `luvus skill install [--dir <path>]`
-/// writes it where a coding agent auto-loads it (default: Claude Code's
-/// `~/.claude/skills/luvus/SKILL.md`). No server needed either way.
+/// Manage explicit, per-agent skill installations. No server is required and
+/// no command here changes agent configuration unless the user names an agent
+/// (or passes `--all`).
 fn skill_cmd(rest: &[String]) -> Result<i32> {
-    // With `--dir`, act on that one path (the full Claude-style skill). Without
-    // it, act on every supported agent that is set up (Claude skill + Codex /
-    // opencode pointer).
-    let explicit_dir = flag(rest, "--dir").map(std::path::PathBuf::from);
-    match rest.first().map(String::as_str) {
-        Some("install") => {
-            match explicit_dir {
-                Some(dir) => println!("installed {}", crate::skill::install_to(&dir)?.display()),
-                None => print_touched("installed", crate::skill::install_default()),
-            }
-            Ok(0)
+    use crate::skill::SkillAgent;
+
+    fn agent(value: Option<&String>) -> Result<SkillAgent> {
+        value
+            .filter(|value| !value.starts_with('-'))
+            .ok_or_else(|| anyhow!("an agent is required: claude, codex, or opencode"))?
+            .parse()
+    }
+
+    fn manifest_url(args: &[String]) -> String {
+        flag(args, "--url")
+            .or_else(|| std::env::var("LUVUS_SKILL_MANIFEST_URL").ok())
+            .or_else(|| std::env::var("LUVUS_SKILL_URL").ok())
+            .unwrap_or_else(|| crate::skill::DEFAULT_MANIFEST_URL.to_string())
+    }
+
+    fn print_status(status: crate::skill::SkillStatus) {
+        match status.installed {
+            Some(installed) => println!(
+                "{}\tenabled\t{}\t{}\t{}\t{}",
+                status.agent,
+                installed.release,
+                status
+                    .integrity
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                installed.target.display(),
+                installed.source
+            ),
+            None => println!("{}\tdisabled", status.agent),
         }
-        Some("uninstall") => {
-            match explicit_dir {
-                Some(dir) if crate::skill::uninstall_from(&dir)? => {
-                    println!("uninstalled {}", dir.join("SKILL.md").display())
+    }
+
+    fn confirm_legacy_all(command: &str) -> Result<bool> {
+        if !std::io::stdin().is_terminal() {
+            return Err(anyhow!(
+                "deprecated `skill {command} --all` requires an interactive confirmation; use the explicit per-agent commands instead"
+            ));
+        }
+        eprint!("Apply `skill {command}` to claude, codex, and opencode? [y/N] ");
+        std::io::stderr().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        Ok(matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        ))
+    }
+
+    let mut positionals = Vec::new();
+    let mut index = 1;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--all" => index += 1,
+            "--url" => {
+                if rest.get(index + 1).is_none() {
+                    return Err(anyhow!("--url requires a manifest URL"));
                 }
-                Some(dir) => println!("not installed at {}", dir.join("SKILL.md").display()),
-                None => print_touched("removed", crate::skill::uninstall_default()),
+                index += 2;
+            }
+            flag if flag.starts_with('-') => {
+                return Err(anyhow!("unknown skill option `{flag}`"));
+            }
+            _ => {
+                positionals.push(&rest[index]);
+                index += 1;
+            }
+        }
+    }
+    if positionals.len() > 1 {
+        return Err(anyhow!("skill commands accept at most one agent"));
+    }
+
+    let all = rest.iter().any(|value| value == "--all");
+    let has_url = rest.iter().any(|value| value == "--url");
+    match rest.first().map(String::as_str) {
+        None | Some("status") => {
+            if all || has_url {
+                return Err(anyhow!("`skill status` accepts only an optional agent"));
+            }
+            if let Some(value) = positionals.first() {
+                print_status(crate::skill::status(value.parse()?)?);
+            } else {
+                for status in crate::skill::statuses()? {
+                    print_status(status);
+                }
             }
             Ok(0)
         }
-        // Turn auto-install on/off (persisted), and install/remove now to match.
-        Some("on") => {
-            set_auto_install_skill(true);
-            print_touched(
-                "auto-install on; installed",
-                crate::skill::install_default(),
-            );
+        Some("enable" | "install") => {
+            if rest[0] == "install" {
+                eprintln!("warning: `skill install` is deprecated; use `skill enable`");
+            }
+            let agents = if all {
+                SkillAgent::ALL.to_vec()
+            } else {
+                vec![agent(positionals.first().copied())?]
+            };
+            for installed in crate::skill::enable(&agents, &manifest_url(rest))? {
+                println!(
+                    "enabled skill {} at {}",
+                    installed.release,
+                    installed.target.display()
+                );
+            }
             Ok(0)
         }
-        Some("off") => {
-            set_auto_install_skill(false);
-            print_touched(
-                "auto-install off; removed",
-                crate::skill::uninstall_default(),
-            );
-            println!("(restart the server to stop reinstalling)");
+        Some("disable" | "uninstall") => {
+            if has_url {
+                return Err(anyhow!("`skill disable` does not accept --url"));
+            }
+            if rest[0] == "uninstall" {
+                eprintln!("warning: `skill uninstall` is deprecated; use `skill disable`");
+            }
+            let agents = if all {
+                SkillAgent::ALL.to_vec()
+            } else {
+                vec![agent(positionals.first().copied())?]
+            };
+            for agent in agents {
+                match crate::skill::disable(agent)? {
+                    Some(path) => println!("disabled {agent} skill at {}", path.display()),
+                    None => println!("{agent} skill is already disabled"),
+                }
+            }
             Ok(0)
         }
-        // OTA: fetch the latest skill from the repo (or `$LUVUS_SKILL_URL`) and
-        // cache it so it wins over the compiled-in default, then apply it now —
-        // a skill fix without waiting for a new luvus release. No server needed.
         Some("update") => {
-            let url = flag(rest, "--url")
-                .or_else(|| std::env::var("LUVUS_SKILL_URL").ok())
-                .unwrap_or_else(|| {
-                    "https://raw.githubusercontent.com/RizRiyz/luvus/main/skills/luvus/SKILL.md"
-                        .to_string()
-                });
-            let body = crate::module::discovery::http_get(&url)
-                .map_err(|e| anyhow!("could not fetch the skill ({url}): {e}"))?;
-            if !crate::skill::skill_valid(&body) {
+            if all {
                 return Err(anyhow!(
-                    "the download from {url} is not a valid luvus skill; nothing changed"
+                    "`skill update` already updates every enabled agent; omit --all"
                 ));
             }
-            let cache = crate::skill::save_managed(&body)?;
-            println!("updated the luvus skill -> {}", cache.display());
-            print_touched("refreshed", crate::skill::install_default());
+            let selected = positionals.first().map(|value| value.parse()).transpose()?;
+            let updated = crate::skill::update(selected, &manifest_url(rest))?;
+            if updated.is_empty() {
+                println!("no agent skills are enabled; nothing to update");
+            } else {
+                for installed in updated {
+                    println!(
+                        "updated skill {} at {}",
+                        installed.release,
+                        installed.target.display()
+                    );
+                }
+            }
             Ok(0)
         }
-        _ => {
-            print!("{}", crate::skill::effective_skill());
+        Some("show") => {
+            if all || has_url {
+                return Err(anyhow!("`skill show` accepts exactly one agent"));
+            }
+            print!(
+                "{}",
+                crate::skill::show(agent(positionals.first().copied())?)?
+            );
             Ok(0)
         }
-    }
-}
-
-/// Print the files an install/uninstall touched, or a friendly no-op line.
-fn print_touched(verb: &str, files: Vec<std::path::PathBuf>) {
-    if files.is_empty() {
-        println!("{verb}: nothing (no supported agent set up, or already current)");
-    } else {
-        for f in files {
-            println!("{verb} {}", f.display());
+        Some("on" | "off") => {
+            if !all || !positionals.is_empty() || (rest[0] == "off" && has_url) {
+                return Err(anyhow!(
+                    "`skill {}` is deprecated; use `luvus skill {} <agent>`, or pass --all for interactive compatibility",
+                    rest[0],
+                    if rest[0] == "on" { "enable" } else { "disable" }
+                ));
+            }
+            eprintln!(
+                "warning: `skill {}` is deprecated; use `skill {} --all`",
+                rest[0],
+                if rest[0] == "on" { "enable" } else { "disable" }
+            );
+            if !confirm_legacy_all(&rest[0])? {
+                println!("cancelled; no agent skills changed");
+                return Ok(0);
+            }
+            if rest[0] == "on" {
+                for installed in crate::skill::enable(&SkillAgent::ALL, &manifest_url(rest))? {
+                    println!(
+                        "enabled skill {} at {}",
+                        installed.release,
+                        installed.target.display()
+                    );
+                }
+            } else {
+                for agent in SkillAgent::ALL {
+                    match crate::skill::disable(agent)? {
+                        Some(path) => println!("disabled {agent} skill at {}", path.display()),
+                        None => println!("{agent} skill is already disabled"),
+                    }
+                }
+            }
+            Ok(0)
         }
+        Some(command) => Err(anyhow!(
+            "unknown skill command `{command}`; expected status, enable, disable, update, or show"
+        )),
     }
-}
-
-/// Persist the `install_agent_skill` toggle so the change survives a restart.
-fn set_auto_install_skill(on: bool) {
-    let mut c = crate::config::load();
-    c.install_agent_skill = on;
-    crate::config::save(&c);
 }
 
 /// `luvus agent send <target> <text…> [--wait] [--until STATE] [--timeout S]` —
@@ -2618,5 +2731,23 @@ mod tests {
             "website/…/reference/cli.mdx has drifted from `luvus help all` — \
              regenerate the page's txt block from the DETAILED_USAGE text"
         );
+    }
+
+    #[test]
+    fn skill_management_is_opt_in_and_disabled_updates_are_local() {
+        let _env = crate::persist::test_env("cli-skill-opt-in");
+        assert_eq!(skill_cmd(&[]).unwrap(), 0);
+        assert_eq!(skill_cmd(&["update".into()]).unwrap(), 0);
+
+        for args in [
+            vec!["enable".into()],
+            vec!["disable".into()],
+            vec!["show".into()],
+            vec!["update".into(), "codex".into()],
+            vec!["on".into()],
+            vec!["off".into(), "--all".into()],
+        ] {
+            assert!(skill_cmd(&args).is_err(), "{args:?}");
+        }
     }
 }

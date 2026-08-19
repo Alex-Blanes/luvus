@@ -4,9 +4,9 @@ import LegalPage from '../components/LegalPage.astro';
 
 <LegalPage
   title="Privacy Policy"
-  description="How Luvus handles data in the local app, the Codex plugin, and the Luvus website."
+  description="How Luvus handles data in the local app, optional agent skills, and the Luvus website."
   path="/privacy/"
-  updated="August 15, 2026"
+  updated="August 19, 2026"
 >
   <h2>Overview</h2>
   <p>
@@ -15,7 +15,7 @@ import LegalPage from '../components/LegalPage.astro';
     repository files, or messages sent between local agents.
   </p>
 
-  <h2>Local app and Codex plugin</h2>
+  <h2>Local app and optional agent skills</h2>
   <p>
     Luvus stores the configuration and session state needed to run the app on your computer. This
     can include workspace paths, layouts, pane and agent metadata, tasks, modules, and preferences.
@@ -23,9 +23,11 @@ import LegalPage from '../components/LegalPage.astro';
     Luvus's supported environment variables.
   </p>
   <p>
-    The Codex plugin is a skills-only plugin. It starts no separate network service and stores no
-    separate account data. It calls the installed <code>luvus</code> command and communicates with
-    your configured local Luvus server through its Unix socket.
+    Agent skills are disabled by default. When you explicitly enable one, Luvus downloads it from
+    the configured HTTPS endpoint after verifying a signed manifest and file hashes, then stores it
+    in that agent's native local skill directory. The skill starts no separate network service and
+    stores no separate account data. It calls the installed <code>luvus</code> command and
+    communicates with your configured local Luvus server through its Unix socket.
   </p>
   <p>
     Commands you ask Luvus or a coding agent to run can read or change files and can contact
@@ -42,7 +44,7 @@ import LegalPage from '../components/LegalPage.astro';
 
   <h2>Data recipients</h2>
   <p>
-    The Luvus project does not receive local project data merely because you use the app or plugin.
+    The Luvus project does not receive local project data merely because you use the app or a skill.
     Cloudflare processes website request information as the hosting provider. GitHub processes
     information you choose to include in an issue or private security advisory. A command you ask
     Luvus to run may also send data to a third-party tool or service you selected, subject to that
@@ -52,8 +54,8 @@ import LegalPage from '../components/LegalPage.astro';
   <h2>Data retention</h2>
   <p>
     Local configuration and session state remain on your computer until you remove them through
-    Luvus, uninstall the related data, or delete the configured data directory. The Codex plugin
-    keeps no separate account or hosted copy of that data.
+    Luvus, uninstall the related data, or delete the configured data directory. Agent skills keep
+    no separate account or hosted copy of that data.
   </p>
   <p>
     The Luvus project does not create or retain a separate first-party database of website request
@@ -67,19 +69,19 @@ import LegalPage from '../components/LegalPage.astro';
   <p>
     Luvus can launch or control third-party tools including Codex, other coding agents, Git, GitHub,
     and your shell. Those products may process data under their own privacy policies. Installing the
-    Luvus plugin does not change the policies or permissions of those products.
+    Luvus skill does not change the policies or permissions of those products.
   </p>
 
   <h2>Sale and sharing of personal data</h2>
   <p>
     The Luvus project does not sell personal data. It does not receive local project data merely
-    because you use the Luvus app or plugin.
+    because you use the Luvus app or an optional skill.
   </p>
 
   <h2>Your choices</h2>
   <p>
     You control local Luvus data through the app, its CLI, and its configured data directory. You
-    can remove the Codex plugin without stopping Luvus or changing a Luvus session. You can avoid
+    can disable an agent skill without stopping Luvus or changing a Luvus session. You can avoid
     submitting information to GitHub, edit or delete information where GitHub permits it, and use
     the private security advisory form for a sensitive report.
   </p>

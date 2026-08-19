@@ -1,17 +1,17 @@
 ---
 title: Control Luvus from Codex
-description: Install Luvus's Codex plugin to delegate work and control agents, panes, tabs, and workspaces from a managed pane or local terminal.
+description: Opt in to Luvus's Codex skill to delegate work and control agents, panes, tabs, and workspaces from a managed pane or local terminal.
 ---
 
-The Luvus Codex plugin provides one primary `luvus` skill for agent delegation
-and full session control. It covers workspaces, tabs, panes, agents, files, Git,
-worktrees, tasks, leases, modules, and UI state.
+The optional Luvus Codex skill provides agent delegation and full session
+control. It covers workspaces, tabs, panes, agents, files, Git, worktrees,
+tasks, leases, modules, and UI state.
 
 Inside a Luvus pane, the skill uses that pane's inherited binary, socket, and
 pane identity. This lets the same skill delegate and control the current Luvus
 session without guessing which server owns the pane.
 
-Outside Luvus, the plugin resolves the installed `luvus` command and controls
+Outside Luvus, the skill resolves the installed `luvus` command and controls
 its configured production session. With the default configuration this is the
 server at `~/.luvus/luvus.sock`.
 
@@ -22,38 +22,41 @@ luvus --session api agent list
 luvus --session api pane focus 7
 ```
 
-The plugin preserves the inherited socket inside a managed pane. Outside a
+The skill preserves the inherited socket inside a managed pane. Outside a
 pane, an explicit `--session` wins over any inherited socket. It does not run
 `session list`, `help`, or `ping` before an ordinary operation, so named-session
 routing adds no discovery round trip to the fast command path.
 
-## Install from the Luvus marketplace
+## Enable the Codex skill
 
-Register the public Luvus repository as a Codex marketplace, then install the
-plugin:
+Luvus starts without installing skills or editing Codex configuration. Opt in
+when you want Codex to control Luvus:
 
 ```sh
-codex plugin marketplace add RizRiyz/luvus
-codex plugin add luvus@luvus
+luvus skill enable codex
 ```
 
-Start a new Codex thread after installation so Codex loads the
-`luvus` skill. Confirm the install at any time with:
+The command downloads a signed release, verifies its package and file hashes,
+and installs it at `~/.agents/skills/luvus/`, Codex's native user-skill path.
+It does not add an always-on pointer to `~/.codex/AGENTS.md`.
+
+Start a new Codex thread after enabling the skill. Confirm its release, path,
+and integrity at any time with:
 
 ```sh
-codex plugin list
+luvus skill status codex
 ```
 
 ## Connect to Luvus
 
-The plugin supports two modes:
+The skill supports two modes:
 
-- **Managed pane:** Codex is running inside Luvus. The plugin uses the injected
+- **Managed pane:** Codex is running inside Luvus. The skill uses the injected
   `LUVUS_BIN_PATH`, `LUVUS_SOCKET_PATH`, and `LUVUS_PANE_ID` values exactly. It
   controls only that inherited session and never substitutes another socket or
   binary.
 - **External terminal:** Codex is running in any other local terminal. The
-  plugin resolves the installed `luvus` command from `PATH` and uses its
+  skill resolves the installed `luvus` command from `PATH` and uses its
   configured production session.
 
 ### Approve local socket access in the Codex app
@@ -64,16 +67,16 @@ before `ping` or another control command. Approve the request if you want that
 thread to operate Luvus.
 
 Without this approval, the operating system returns the same connection error
-as an offline server. The plugin retries with explicit permission and reports
+as an offline server. The skill retries with explicit permission and reports
 `Luvus access was not approved` when permission is declined. It only reports
 the server offline after an approved connection attempt fails.
 
-Do not disable the Codex sandbox globally. The plugin requests only the local
+Do not disable the Codex sandbox globally. The skill requests only the local
 execution permission when it needs to connect to Luvus.
 
 ### Install and start Luvus
 
-The external plugin works with every supported Luvus installation method:
+The skill works with every supported Luvus installation method:
 
 ```sh
 curl -fsSL https://luvus.dev/install.sh | sh
@@ -89,9 +92,9 @@ luvus --version
 luvus server start
 ```
 
-The plugin supports custom production locations. If `LUVUS_HOME` or
+The skill supports custom production locations. If `LUVUS_HOME` or
 `LUVUS_SOCKET_PATH` is explicitly configured, it preserves that configuration.
-Otherwise the installed release uses `~/.luvus/luvus.sock`. The plugin never
+Otherwise the installed release uses `~/.luvus/luvus.sock`. The skill never
 runs bare `luvus` for discovery because that launches or attaches the
 interactive TUI.
 
@@ -125,7 +128,7 @@ Try requests such as:
 
 ### Fork an agent session
 
-The plugin can fork a supported live agent into a sibling pane while the
+The skill can fork a supported live agent into a sibling pane while the
 original keeps running. Resolve the source first, then optionally name the new
 fork or preserve the current focus:
 
@@ -137,12 +140,12 @@ luvus agent fork reviewer --name experiment --no-focus
 The fork inherits the source conversation and receives its own new session.
 Native forks currently support Claude, Codex, and Pi. If the target is
 unsupported, its session cannot be resolved, or its pane cannot start, the
-plugin reports Luvus's structured error instead of substituting a split, new
+skill reports Luvus's structured error instead of substituting a split, new
 agent, or resume operation that could lose or reuse the wrong context.
 
 ### Arrange panes and tabs
 
-The plugin can move a running pane to another tab without restarting its
+The skill can move a running pane to another tab without restarting its
 process, or append a new tab for it. Resolve the pane and inspect the tabs in
 its workspace before changing the layout:
 
@@ -161,10 +164,10 @@ luvus tab move 3 1
 Tab positions are 1-based. A pane move stays inside that pane's workspace,
 removes an empty source tab, keeps the process and terminal history alive, and
 follows the pane with focus. Reordering tabs keeps the same tab active even
-when its position changes. The plugin uses explicit pane IDs and confirmed tab
+when its position changes. The skill uses explicit pane IDs and confirmed tab
 positions instead of inferring either from the visible sidebar.
 
-The plugin can also organize workspaces after resolving their stable 0-based
+The skill can also organize workspaces after resolving their stable 0-based
 indices:
 
 ```sh
@@ -190,11 +193,11 @@ sender can name itself and ask the worker to report back through `agent send`.
 ### How agent readiness works
 
 Luvus reports agent identity separately from lifecycle status. Once a pane is
-recognized as Codex, the plugin considers `idle`, `done`, `working`, and
+recognized as Codex, the skill considers `idle`, `done`, `working`, and
 `blocked` ready states. An idle or completed agent is ready for a stable name
-and a new prompt, so the plugin does not wait for it to become `working` first.
+and a new prompt, so the skill does not wait for it to become `working` first.
 
-For new agents, the plugin prefers `agent start`, which launches, recognizes,
+For new agents, the skill prefers `agent start`, which launches, recognizes,
 and names the agent with one bounded command. `wait agent-status` is reserved
 for waiting on a specific lifecycle state after work has been sent.
 
@@ -208,18 +211,18 @@ the faster path.
 
 ### Fast command path
 
-The plugin does not run `help` or `ping` before every control command. A normal
+The skill does not run `help` or `ping` before every control command. A normal
 command already proves whether the production server is reachable. It also reuses
 resolved pane IDs and successful command results instead of immediately listing
 or reading the same state again.
 
 Delegation calls `agent send` directly because the server already resolves live
 names, pane IDs, and unique agent kinds. A successful response returns the pane,
-agent, name, and status, so the plugin does not prepend `agent list`. It lists
+agent, name, and status, so the skill does not prepend `agent list`. It lists
 agents once only after `not_found` or `ambiguous_target`, when live choices are
 needed to recover safely.
 
-A successful `agent start` result with `ready: true` is complete. The plugin
+A successful `agent start` result with `ready: true` is complete. The skill
 does not follow it with another status or agent lookup. It waits only when the
 next requested action depends on a state transition or when you explicitly ask
 it to wait.
@@ -230,21 +233,21 @@ when a request needs it, which keeps normal startup and control prompts lighter.
 
 ## Update or remove
 
-Reinstall the plugin to pick up a new marketplace release, then start a new
-Codex thread:
+Update the enabled Codex skill, then start a new Codex thread:
 
 ```sh
-codex plugin marketplace upgrade luvus
-codex plugin add luvus@luvus
+luvus skill update codex
 ```
 
-`luvus skill update` refreshes Luvus's auto-installed agent guidance, not the
-versioned plugin cache. Use the marketplace command above for the plugin.
+Without an agent argument, `luvus skill update` refreshes every enabled agent.
+It does nothing—and makes no network request—when no skills are enabled.
 
-Remove only the Codex plugin with:
+Remove only the managed Codex skill with:
 
 ```sh
-codex plugin remove luvus@luvus
+luvus skill disable codex
 ```
 
-Removing the plugin does not stop Luvus or change any Luvus session.
+Disabling the skill does not stop Luvus or change any Luvus session. If the
+managed files were modified, Luvus preserves them rather than deleting user
+changes.

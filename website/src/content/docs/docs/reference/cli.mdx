@@ -69,11 +69,12 @@ panes / agents:
   agent get <target>         one agent's live info (pane, name, kind, status, cwd)
   agent sessions             list resumable sessions found on disk
   agent resume <id>          reopen a resumable session into a pane
-  skill                      print the agent skill (delegation + session control)
-  skill install [--dir <p>]  install the skill where a coding agent auto-loads it
-  skill uninstall [--dir <p>]   remove the installed skill
-  skill update               fetch the latest skill from the luvus repo (no reinstall)
-  skill on | off             enable / disable auto-install (installs / removes now)
+  skill status [<agent>]      show enabled state, release, path, and integrity
+  skill enable <agent>|--all  opt an agent into the remotely distributed skill
+  skill disable <agent>|--all remove an unmodified managed skill
+  skill update [<agent>]      update enabled agents only (all enabled by default)
+  skill show <agent>          print an installed agent's SKILL.md
+                             <agent> is claude, codex, or opencode
   wait output <id> --match <text> [--timeout <s>]    block until output appears
   wait agent-status <id> --status done|blocked|working|idle [--timeout <s>]
   attach <id>                open the TUI into a single fullscreen pane

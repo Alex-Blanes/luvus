@@ -58,13 +58,6 @@ pub struct Config {
     /// (`--permission-mode bypassPermissions`), so switching it on is deliberate.
     #[serde(default)]
     pub resume_launch_flags: bool,
-    /// Auto-install the bundled agent skill on startup so agents can delegate to
-    /// each other out of the box (docs): the full skill for Claude Code, and a
-    /// short pointer in the global `AGENTS.md` for Codex and opencode. Each is
-    /// written only when that agent is set up, and only when missing or stale.
-    /// Set false to manage it yourself.
-    #[serde(default = "yes")]
-    pub install_agent_skill: bool,
     /// Custom keybindings: command id → key string (overrides the defaults).
     /// An empty value means the command is explicitly unbound.
     #[serde(default)]
@@ -284,7 +277,6 @@ impl Default for Config {
             notifications: NotifyConfig::default(),
             check_updates: true,
             resume_launch_flags: false,
-            install_agent_skill: true,
             keybindings: std::collections::HashMap::new(),
             prefix: default_prefix(),
             mission_pricing: std::collections::HashMap::new(),
