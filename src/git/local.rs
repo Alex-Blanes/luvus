@@ -250,7 +250,7 @@ pub fn commits(cwd: &Path, n: usize, all: bool) -> Result<Vec<Commit>, String> {
 }
 
 /// Arguments for the native commit-flow view. `--no-color` is mandatory: this
-/// output is rendered by Bohay, not replayed into a terminal. Git configuration
+/// output is rendered by Luvus, not replayed into a terminal. Git configuration
 /// such as `color.ui=always` must never leak ANSI control sequences into cells.
 fn commit_log_args<'a>(count: &'a str, pretty: &'a str, all: bool) -> Vec<&'a str> {
     let mut args = vec!["log", "--no-color", "--graph", count, pretty];
@@ -561,16 +561,16 @@ mod tests {
     fn github_slug_parses_ssh_and_https() {
         use super::parse_github_slug;
         assert_eq!(
-            parse_github_slug("git@github.com:RizRiyz/bohay.git").as_deref(),
-            Some("RizRiyz/bohay")
+            parse_github_slug("git@github.com:RizRiyz/luvus.git").as_deref(),
+            Some("RizRiyz/luvus")
         );
         assert_eq!(
-            parse_github_slug("https://github.com/RizRiyz/bohay.git").as_deref(),
-            Some("RizRiyz/bohay")
+            parse_github_slug("https://github.com/RizRiyz/luvus.git").as_deref(),
+            Some("RizRiyz/luvus")
         );
         assert_eq!(
-            parse_github_slug("https://github.com/RizRiyz/bohay").as_deref(),
-            Some("RizRiyz/bohay")
+            parse_github_slug("https://github.com/RizRiyz/luvus").as_deref(),
+            Some("RizRiyz/luvus")
         );
         // Non-GitHub host → None (fall back to gh's cwd resolution).
         assert_eq!(parse_github_slug("git@gitlab.com:me/proj.git"), None);
@@ -580,7 +580,7 @@ mod tests {
     #[test]
     fn tree_status_maps_changes_and_dirties_parents() {
         // A throwaway repo with a modified + an untracked file in a subdir.
-        let dir = std::env::temp_dir().join(format!("bohay-gs-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("luvus-gs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).unwrap();
         let g = |args: &[&str]| {
@@ -705,7 +705,7 @@ detached
     fn worktree_and_repo_share_common_dir() {
         // A repo and a worktree of it resolve to the same git common dir — the
         // grouping key the sidebar nests on (docs/18 WT).
-        let base = std::env::temp_dir().join(format!("bohay-wtcommon-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("luvus-wtcommon-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -749,7 +749,7 @@ detached
         // ORCH-6: a non-overlapping branch integrates cleanly; a branch that
         // clashes with already-integrated work is reported as a conflict and
         // aborted — and the user's own checkout is never touched throughout.
-        let base_dir = std::env::temp_dir().join(format!("bohay-merge-{}", std::process::id()));
+        let base_dir = std::env::temp_dir().join(format!("luvus-merge-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base_dir);
         let repo = base_dir.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -784,13 +784,13 @@ detached
 
         let integ_dir = base_dir.join("integ");
         // feat1 integrates cleanly.
-        let r1 = integrate_branch(&repo, &integ_dir, "bohay/integration", "main", "feat1").unwrap();
+        let r1 = integrate_branch(&repo, &integ_dir, "luvus/integration", "main", "feat1").unwrap();
         assert_eq!(r1, MergeOutcome::Merged);
         // The user's checkout is untouched (still main, X == base).
         assert_eq!(std::fs::read_to_string(repo.join("X")).unwrap(), "base\n");
 
         // feat2 now conflicts with the integrated feat1 change to X.
-        let r2 = integrate_branch(&repo, &integ_dir, "bohay/integration", "main", "feat2").unwrap();
+        let r2 = integrate_branch(&repo, &integ_dir, "luvus/integration", "main", "feat2").unwrap();
         match r2 {
             MergeOutcome::Conflict(files) => {
                 assert!(
@@ -1001,7 +1001,7 @@ mod change_tests {
     /// text; this proves the actual `git diff -U0` invocation agrees with it.
     #[test]
     fn file_changes_reads_a_real_working_tree_edit() {
-        let dir = std::env::temp_dir().join(format!("bohay-chg-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("luvus-chg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let g = |args: &[&str]| {
@@ -1053,7 +1053,7 @@ mod change_tests {
     /// rather than erroring — they are an enhancement, never a requirement.
     #[test]
     fn file_changes_degrades_outside_a_repo() {
-        let dir = std::env::temp_dir().join(format!("bohay-norepo-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("luvus-norepo-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("loose.txt");

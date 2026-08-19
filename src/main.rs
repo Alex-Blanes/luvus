@@ -1,4 +1,4 @@
-//! bohay — mission control for your AI coding agents.
+//! luvus — mission control for your AI coding agents.
 //! A client/server terminal workspace with live agent detection.
 //! See docs/12-execution-plan.md.
 
@@ -6,6 +6,7 @@ mod agent;
 mod app;
 mod changelog;
 mod cli;
+mod compat;
 mod config;
 mod detect;
 mod event;
@@ -52,12 +53,13 @@ fn main() -> Result<()> {
     // waits aren't quantized to Windows' ~15.6ms default (the cause of laggy
     // typing in panes there). No-op on Unix; restored when `main` returns.
     let _timer = platform::high_res_timer();
+    compat::normalize_legacy_environment();
     let raw_args: Vec<String> = std::env::args().collect();
     let args = session::configure_from_args(&raw_args).map_err(anyhow::Error::msg)?;
     match args.get(1).map(String::as_str) {
         // Standard CLI conveniences (don't start the server).
         Some("--version") | Some("-V") => {
-            println!("bohay {}", env!("CARGO_PKG_VERSION"));
+            println!("luvus {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
         Some("--help") | Some("-h") => {
@@ -65,6 +67,15 @@ fn main() -> Result<()> {
             std::process::exit(cli::run(&help)?);
         }
         Some(_) if cli::is_help_request(&args) => std::process::exit(cli::run(&args)?),
+        _ => {}
+    }
+
+    // Migration belongs to commands that use the runtime, not informational
+    // output. In particular, `luvus --version` must stay side-effect-free and
+    // must never contaminate stdout/stderr used by installers and scripts.
+    persist::migrate_legacy_state()?;
+    integration::migrate_legacy_integrations();
+    match args.get(1).map(String::as_str) {
         Some("server") => return server_cmd(&args),
         Some("client") => return ipc::client::run(&persist::client_socket_path()),
         // Remote attach (docs/18 RA): the bridge runs on the remote host (via
@@ -106,7 +117,7 @@ pub(crate) fn install_tui_panic_hook() {
 /// keyboard protocol, via crossterm's `DISAMBIGUATE_ESCAPE_CODES`).
 ///
 /// Legacy terminal encoding has no room for modifiers on `Enter`: the terminal
-/// sends a bare `CR` for Enter *and* Shift+Enter, so bohay literally cannot tell
+/// sends a bare `CR` for Enter *and* Shift+Enter, so luvus literally cannot tell
 /// them apart and an agent's "new line, don't submit" key never works. With this
 /// pushed, a capable terminal (Ghostty, Kitty, WezTerm, foot, rio, recent
 /// iTerm2) reports `Shift+Enter` as its own key, which `encode_key` forwards to
@@ -172,9 +183,9 @@ pub(crate) fn emit_sound() {
     });
 }
 
-/// Synthesize the jingle WAV to `<tmp>/bohay-done.wav` on first use; return it.
+/// Synthesize the jingle WAV to `<tmp>/luvus-done.wav` on first use; return it.
 fn ensure_done_jingle() -> Option<std::path::PathBuf> {
-    let path = std::env::temp_dir().join("bohay-done.wav");
+    let path = std::env::temp_dir().join("luvus-done.wav");
     if !path.exists() {
         std::fs::write(&path, synth_done_wav()).ok()?;
     }
@@ -319,23 +330,23 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-/// The window title we ask the host terminal to show — exactly one "bohay".
+/// The window title we ask the host terminal to show — exactly one "luvus".
 ///
 /// macOS Terminal.app composes its title bar itself as
-/// `cwd — <OSC title> — <process ▸ child> — size`, so an OSC title of "bohay"
-/// reads "… — bohay — bohay ▸ zsh — …" (and *never* setting one is worse: the
+/// `cwd — <OSC title> — <process ▸ child> — size`, so an OSC title of "luvus"
+/// reads "… — luvus — luvus ▸ zsh — …" (and *never* setting one is worse: the
 /// title component falls back to the command line, repeating the process name
 /// twice). Setting an **empty** OSC title (measured against a live
 /// Terminal.app) collapses the component entirely → one clean process mention.
 /// Every other terminal treats the OSC title as THE title, so they keep
-/// "bohay".
+/// "luvus".
 pub(crate) fn window_title() -> String {
     if let Some(name) = session::active_name() {
-        return format!("bohay · {name}");
+        return format!("luvus · {name}");
     }
     match std::env::var("TERM_PROGRAM") {
         Ok(p) if p == "Apple_Terminal" => String::new(),
-        _ => "bohay".to_string(),
+        _ => "luvus".to_string(),
     }
 }
 
@@ -369,8 +380,8 @@ fn autodetect_and_attach() -> Result<()> {
         let binary = env!("CARGO_PKG_VERSION");
         if let Some(running) = server_version().filter(|running| running != binary) {
             eprintln!(
-                "bohay v{binary} installed, but the running server is v{running} — \
-                 run `bohay server restart` to load it (your session is saved and restored)."
+                "luvus v{binary} installed, but the running server is v{running} — \
+                 run `luvus server restart` to load it (your session is saved and restored)."
             );
             thread::sleep(Duration::from_millis(2000));
         }
@@ -407,7 +418,7 @@ fn open_cwd_workspace() {
 
 /// Remote bridge role (docs/18 RA-1), run *on the remote host* by ssh. Ensure a
 /// server is up, then pump this process's stdin/stdout to/from the local socket
-/// so the `bohay --remote` client on the other end of the ssh pipe drives it.
+/// so the `luvus --remote` client on the other end of the ssh pipe drives it.
 fn remote_client_bridge() -> Result<()> {
     let sock = persist::client_socket_path();
     if !server_running(&sock) {
@@ -417,7 +428,7 @@ fn remote_client_bridge() -> Result<()> {
     ipc::client::remote_bridge(&sock)
 }
 
-/// `bohay attach <id>` (docs/18 WA-2): focus + zoom the pane (one round-trip via
+/// `luvus attach <id>` (docs/18 WA-2): focus + zoom the pane (one round-trip via
 /// `attach.pane`), then attach the client so it opens straight into that
 /// fullscreen terminal. Composes with `--remote` for a remote fullscreen attach.
 fn attach_cmd(args: &[String]) -> Result<()> {
@@ -432,7 +443,7 @@ fn attach_cmd(args: &[String]) -> Result<()> {
     ipc::client::run(&sock)
 }
 
-/// `bohay --remote <host> [ssh args]` (docs/18 RA-2): bridge a remote session's
+/// `luvus --remote <host> [ssh args]` (docs/18 RA-2): bridge a remote session's
 /// socket through plain ssh and attach to it locally. No port-forwarding, no
 /// `~/.ssh/config` edits — keepalive options are passed on argv only.
 fn remote_attach(args: &[String]) -> Result<()> {
@@ -457,7 +468,7 @@ fn remote_attach(args: &[String]) -> Result<()> {
 fn remote_ssh_command(args: &[String]) -> Result<Command> {
     let host = args
         .get(2)
-        .ok_or_else(|| anyhow!("usage: bohay --remote <host> [ssh args]"))?;
+        .ok_or_else(|| anyhow!("usage: luvus --remote <host> [ssh args]"))?;
     let mut cmd = Command::new("ssh");
     cmd.arg("-T")
         .arg("-o")
@@ -468,7 +479,7 @@ fn remote_ssh_command(args: &[String]) -> Result<Command> {
     for extra in args.iter().skip(3) {
         cmd.arg(extra);
     }
-    cmd.arg(host).arg("bohay");
+    cmd.arg(host).arg("luvus");
     if let Some(name) = session::active_name() {
         cmd.arg("--session").arg(name);
     } else if session::explicit_session_requested() {
@@ -486,8 +497,9 @@ fn spawn_server() -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
     cmd.arg("server")
-        // The selector was already resolved into BOHAY_SESSION. A parent pane's
+        // The selector was already resolved into LUVUS_SESSION. A parent pane's
         // injected API socket must not leak into a newly spawned server.
+        .env_remove("LUVUS_SOCKET_PATH")
         .env_remove("BOHAY_SOCKET_PATH")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -520,11 +532,11 @@ fn wait_for_socket(sock: &Path) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(50));
     }
-    Err(anyhow!("bohay server did not start in time"))
+    Err(anyhow!("luvus server did not start in time"))
 }
 
-/// `bohay server <start|stop|restart|status>` — manage the background server.
-/// Bare `bohay server` (no subcommand) is the internal headless role that
+/// `luvus server <start|stop|restart|status>` — manage the background server.
+/// Bare `luvus server` (no subcommand) is the internal headless role that
 /// `spawn_server` launches via setsid; users go through the subcommands.
 fn server_cmd(args: &[String]) -> Result<()> {
     match args.get(2).map(String::as_str) {
@@ -536,27 +548,27 @@ fn server_cmd(args: &[String]) -> Result<()> {
         Some("update-manifest") => update_manifest(),
         Some(other) => {
             eprintln!("unknown server command: {other}");
-            eprintln!("usage: bohay server <start|stop|restart|status|update-manifest>");
+            eprintln!("usage: luvus server <start|stop|restart|status|update-manifest>");
             std::process::exit(2);
         }
     }
 }
 
-/// The published agent-detection manifest index (`bohay.dev/manifests/index.json`).
+/// The published agent-detection manifest index (`luvus.dev/manifests/index.json`).
 #[derive(serde::Deserialize)]
 struct ManifestIndex {
     files: Vec<String>,
 }
 
-/// `bohay server update-manifest` — fetch the latest agent-detection manifests
+/// `luvus server update-manifest` — fetch the latest agent-detection manifests
 /// and merge them in, so detection keeps up with agent-CLI UI changes without a
 /// binary release. Files land in the **managed** manifest dir (never touching a
 /// user's own manifests) and apply live if a server is running, else on next
-/// start. The source is `https://bohay.dev/manifests` (override with
-/// `$BOHAY_MANIFEST_URL`, e.g. a `file://` dir for testing).
+/// start. The source is `https://luvus.dev/manifests` (override with
+/// `$LUVUS_MANIFEST_URL`, e.g. a `file://` dir for testing).
 fn update_manifest() -> Result<()> {
-    let base = std::env::var("BOHAY_MANIFEST_URL")
-        .unwrap_or_else(|_| "https://bohay.dev/manifests".to_string());
+    let base = std::env::var("LUVUS_MANIFEST_URL")
+        .unwrap_or_else(|_| "https://luvus.dev/manifests".to_string());
     let index_url = format!("{base}/index.json");
     let index_body = crate::module::discovery::http_get(&index_url)
         .map_err(|e| anyhow!("could not fetch the manifest index ({index_url}): {e}"))?;
@@ -627,14 +639,14 @@ fn server_start() -> Result<()> {
     let sock = persist::client_socket_path();
     if server_running(&sock) {
         println!(
-            "bohay server already running (session {})",
+            "luvus server already running (session {})",
             session::display_name()
         );
         return Ok(());
     }
     spawn_server()?;
     wait_for_socket(&sock)?;
-    println!("bohay server started (session {})", session::display_name());
+    println!("luvus server started (session {})", session::display_name());
     Ok(())
 }
 
@@ -645,9 +657,9 @@ fn server_stop() -> Result<()> {
         // socket — then `stop` returning means it's really down (and a following
         // `status` reports "not running", not a half-shutdown "running").
         wait_for_shutdown(&sock);
-        println!("bohay server stopped (session {})", session::display_name());
+        println!("luvus server stopped (session {})", session::display_name());
     } else {
-        println!("no bohay server running");
+        println!("no luvus server running");
     }
     Ok(())
 }
@@ -662,7 +674,7 @@ fn server_restart() -> Result<()> {
     spawn_server()?;
     wait_for_socket(&sock)?;
     println!(
-        "bohay server restarted (session {})",
+        "luvus server restarted (session {})",
         session::display_name()
     );
     Ok(())
@@ -685,7 +697,7 @@ fn server_status() -> Result<()> {
     let sock = persist::client_socket_path();
     if !server_running(&sock) {
         println!(
-            "bohay server: not running (session {})",
+            "luvus server: not running (session {})",
             session::display_name()
         );
         return Ok(());
@@ -693,18 +705,18 @@ fn server_status() -> Result<()> {
     match server_version() {
         Some(running) => {
             println!(
-                "bohay server: running (v{running}, session {})",
+                "luvus server: running (v{running}, session {})",
                 session::display_name()
             );
             let binary = env!("CARGO_PKG_VERSION");
             if running != binary {
                 println!(
-                    "  note: this binary is v{binary} — run `bohay server restart` to load it"
+                    "  note: this binary is v{binary} — run `luvus server restart` to load it"
                 );
             }
         }
         None => println!(
-            "bohay server: running (session {})",
+            "luvus server: running (session {})",
             session::display_name()
         ),
     }
@@ -751,7 +763,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     let client_sock = persist::client_socket_path();
     if ipc::transport::connect(&sock).is_ok() || ipc::transport::connect(&client_sock).is_ok() {
         return Err(anyhow!(
-            "a Bohay server is already active for {}; use `bohay` to attach to it",
+            "a Luvus server is already active for {}; use `luvus` to attach to it",
             state_dir.display()
         ));
     }
@@ -759,7 +771,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     let events = ipc::api::new_bus();
     let api_listener = ipc::api::bind_server(&sock, &startup_lock)?;
 
-    // Advertise the socket before spawning panes so they inherit BOHAY_SOCKET_PATH.
+    // Advertise the socket before spawning panes so they inherit LUVUS_SOCKET_PATH.
     ipc::api::set_socket_path(sock.clone());
     let mut app = match App::restore_or_new(cols, rows, tx.clone()) {
         Ok(app) => app,
@@ -954,14 +966,14 @@ mod tests {
     fn named_session_is_visible_in_the_terminal_title() {
         let _env = crate::persist::test_env("named-session-title");
         std::env::set_var(crate::session::SESSION_ENV_VAR, "docs");
-        assert_eq!(window_title(), "bohay · docs");
+        assert_eq!(window_title(), "luvus · docs");
     }
 
     #[test]
     fn remote_bridge_preserves_the_selected_named_session() {
         let _env = crate::persist::test_env("named-session-remote");
         let raw = [
-            "bohay",
+            "luvus",
             "--session",
             "api",
             "--remote",
@@ -987,7 +999,7 @@ mod tests {
                 "-p",
                 "2222",
                 "devbox",
-                "bohay",
+                "luvus",
                 "--session",
                 "api",
                 "remote-client-bridge",
@@ -1170,7 +1182,7 @@ mod tests {
             text.push_str(cell.symbol());
         }
 
-        assert!(text.contains("bohay"), "brand missing");
+        assert!(text.contains("luvus"), "brand missing");
         assert!(text.contains("WORKSPACES"), "workspaces header missing");
         assert!(text.contains("AGENTS"), "agents header missing");
         assert!(text.contains("tab"), "tab status missing");
@@ -1248,7 +1260,7 @@ mod tests {
         );
     }
 
-    /// Clicking the sidebar version number opens the changelog modal, which shows
+    /// Clicking the bottom-right version number opens the changelog modal, which shows
     /// the embedded release notes; esc closes it.
     #[test]
     fn clicking_version_opens_the_changelog() {
@@ -1272,9 +1284,11 @@ mod tests {
                 .collect()
         };
 
-        // The version number is a click target once the sidebar renders.
+        // The version number is a click target in the bottom status line.
         render(&mut app);
         let vr = app.version_rect.expect("version number is clickable");
+        assert_eq!(vr.y, h - 1, "version belongs to the bottom status line");
+        assert_eq!(vr.right() + 1, w, "version keeps one right padding cell");
         app.handle_event(AppEvent::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: vr.x + 1,
@@ -1310,7 +1324,7 @@ mod tests {
     fn sidebar_toggle_button_shows_and_hides() {
         use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         // Isolate config so a concurrent config-writing test can't change the
-        // sidebar layout under us via the shared `BOHAY_HOME` env var.
+        // sidebar layout under us via the shared `LUVUS_HOME` env var.
         let _env = crate::persist::test_env("toggle");
         let (tx, _rx) = mpsc::channel::<AppEvent>();
         let mut app = App::new(80, 24, tx).expect("spawn pane");
@@ -1572,7 +1586,7 @@ mod tests {
         );
     }
 
-    /// Remote from a phone SSH app (docs/18): the client renders bohay over the
+    /// Remote from a phone SSH app (docs/18): the client renders luvus over the
     /// ssh PTY at whatever the phone terminal reports. Validate the viewport range
     /// a phone presents — portrait/narrow and landscape — renders without panic or
     /// garbage, dropping the sidebar when the content would fall below its minimum.
@@ -1615,7 +1629,7 @@ mod tests {
     /// row, and the leases section into the off-screen buffer without panicking.
     #[test]
     fn renders_orch_board() {
-        // Isolate $BOHAY_HOME: orch mutations call `orch.save()`, so without this
+        // Isolate $LUVUS_HOME: orch mutations call `orch.save()`, so without this
         // parallel orch tests race on a shared `orch.json`.
         let _env = crate::persist::test_env("renders-orch-board");
         let (tx, _rx) = mpsc::channel::<AppEvent>();
@@ -1672,7 +1686,7 @@ mod tests {
             .set_status("t1", crate::orch::TaskStatus::Running)
             .unwrap();
         app.orch
-            .bind_worktree("t1", Some("/tmp/wt".into()), Some("bohay/t1".into()));
+            .bind_worktree("t1", Some("/tmp/wt".into()), Some("luvus/t1".into()));
         // The worker pane's live detection state rides on the row.
         if let Some(st) = app.status.get_mut(&pane) {
             st.agent = "claude".into();
@@ -1689,7 +1703,7 @@ mod tests {
 
         let text = render_text(&mut app);
         assert!(text.contains("running"), "started worker shows running");
-        assert!(text.contains("bohay/t1"), "worker branch shown");
+        assert!(text.contains("luvus/t1"), "worker branch shown");
         assert!(text.contains("working"), "live agent state shown");
 
         // The start-worker picker draws over the board.
@@ -1735,7 +1749,7 @@ mod tests {
     /// emoji and shifting the rest of the row (the reported bug). Tests the real
     /// server render path (`render_into` a Buffer, which `frame_from_buffer`
     /// serializes), not a TestBackend flush — ratatui's flush hides the
-    /// continuation cell, but bohay's wire protocol reads it.
+    /// continuation cell, but luvus's wire protocol reads it.
     #[test]
     fn wide_emoji_marks_its_continuation_cell() {
         use ratatui::buffer::Buffer;
@@ -1900,7 +1914,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let mut app = App::new(80, 24, tx.clone()).unwrap();
-        let path = std::env::temp_dir().join(format!("bohay-test-{}.sock", std::process::id()));
+        let path = std::env::temp_dir().join(format!("luvus-test-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let startup_lock =
             ipc::transport::acquire_server_startup_lock(path.parent().unwrap()).unwrap();
@@ -1957,7 +1971,7 @@ mod tests {
         }
 
         // The blank row immediately above and below the Codex prompt matches
-        // its live composer geometry, exercising Bohay's theme-aware composer
+        // its live composer geometry, exercising Luvus's theme-aware composer
         // surface in both generated previews.
         let codex_payload = "\x1b[2J\x1b[H\r\n\
 \x1b[1m  OpenAI Codex\x1b[0m  \x1b[38;5;245mv0.147.0\x1b[0m\r\n\
@@ -1983,7 +1997,7 @@ mod tests {
         let prompt = "\x1b[2J\x1b[H\r\n\
 \x1b[38;5;213m  ✻ Claude Code\x1b[0m  \x1b[38;5;245mopus-4.8\x1b[0m\r\n\r\n\
 \x1b[38;5;252m  Reviewing release notes.\x1b[0m\r\n\r\n\
-\x1b[38;5;114m  ●\x1b[0m \x1b[38;5;252mRead\x1b[0m  \x1b[38;5;111mv0.10.3.md\x1b[0m\r\n\
+\x1b[38;5;114m  ●\x1b[0m \x1b[38;5;252mRead\x1b[0m  \x1b[38;5;111mv0.11.0.md\x1b[0m\r\n\
 \x1b[38;5;221m  ●\x1b[0m \x1b[38;5;252mWorking\x1b[0m  \x1b[38;5;245mReady\x1b[0m\r\n\r\n\
 \x1b[38;5;245m  >\x1b[0m \x1b[7m \x1b[0m";
         if let Some(p) = app.panes.get(&right) {
@@ -2055,7 +2069,7 @@ mod tests {
         }
 
         let html = format!(
-            "<!doctype html><meta charset=utf-8><title>bohay preview</title>\
+            "<!doctype html><meta charset=utf-8><title>luvus preview</title>\
 <style>body{{background:#11111b;margin:0;padding:40px;display:flex;justify-content:center}}\
 pre{{font:14px/1.3 'SF Mono',Menlo,Consolas,monospace;background:#1e1e2e;padding:0;\
 border-radius:12px;overflow:hidden;box-shadow:0 16px 50px rgba(0,0,0,.6)}}\
@@ -2163,7 +2177,7 @@ span{{white-space:pre}}</style><pre>{body}</pre>"
     fn bench_file_viewer_render() {
         use ratatui::{backend::TestBackend, Terminal};
         use std::time::Instant;
-        let dir = std::env::temp_dir().join("bohay-perf-fv");
+        let dir = std::env::temp_dir().join("luvus-perf-fv");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src/app")).unwrap();
         std::fs::create_dir_all(dir.join("src/ui")).unwrap();
@@ -2240,7 +2254,7 @@ span{{white-space:pre}}</style><pre>{body}</pre>"
         use ratatui::Terminal;
         let _env = crate::persist::test_env("file-diff-markers");
 
-        let dir = std::env::temp_dir().join(format!("bohay-fvdiff-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("luvus-fvdiff-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let sh = |args: &[&str]| {

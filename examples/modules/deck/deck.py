@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""A self-contained Markdown slide presenter for bohay (docs/53, PRES-A).
+"""A self-contained Markdown slide presenter for luvus (docs/53, PRES-A).
 
-Runs as a module pane entrypoint: bohay spawns it in a real pane, it takes over
+Runs as a module pane entrypoint: luvus spawns it in a real pane, it takes over
 the terminal, renders one slide at a time, and pages through them with the arrow
 keys / space. Pure Python stdlib, no dependencies, so the module installs with
 nothing to build.
@@ -12,11 +12,11 @@ large block-font (figlet-style) text — the deck way of making a title "big".
 Supports: block-font H1 titles, headings, bold/italic/code, bullet & ordered
 lists, blockquotes, fenced code / ASCII art (verbatim), horizontal rules,
 Markdown tables, links, and wide glyphs (CJK/box-drawing counted at 2 cells).
-Images are out — bohay renders panes as cells, so pixel graphics don't pass
+Images are out — luvus renders panes as cells, so pixel graphics don't pass
 through (docs/42); use ASCII art instead.
 
-Deck resolution: $BOHAY_SETTING_FILE (default "slides.md", resolved against the
-node folder $BOHAY_WORKSPACE_CWD), else the bundled sample.md.
+Deck resolution: $LUVUS_SETTING_FILE (default "slides.md", resolved against the
+node folder $LUVUS_WORKSPACE_CWD), else the bundled sample.md.
 
 Keys: → / space / l / j / PageDn  next   ·   ← / h / k / PageUp  prev
       g / Home  first   ·   G / End  last   ·   r  reload   ·   q  quit
@@ -442,18 +442,18 @@ def parse_deck(text):
 
 
 def resolve_deck_path():
-    setting = os.environ.get("BOHAY_SETTING_FILE", "slides.md").strip()
+    setting = os.environ.get("LUVUS_SETTING_FILE", "slides.md").strip()
     if setting:
         p = os.path.expanduser(setting)
         if os.path.isabs(p):
             if os.path.isfile(p):
                 return p
         else:
-            for base in (os.environ.get("BOHAY_WORKSPACE_CWD"),
-                         os.environ.get("BOHAY_PANE_CWD"), os.getcwd()):
+            for base in (os.environ.get("LUVUS_WORKSPACE_CWD"),
+                         os.environ.get("LUVUS_PANE_CWD"), os.getcwd()):
                 if base and os.path.isfile(os.path.join(base, p)):
                     return os.path.join(base, p)
-    here = os.environ.get("BOHAY_MODULE_ROOT") or os.path.dirname(os.path.abspath(__file__))
+    here = os.environ.get("LUVUS_MODULE_ROOT") or os.path.dirname(os.path.abspath(__file__))
     sample = os.path.join(here, "sample.md")
     return sample if os.path.isfile(sample) else None
 
@@ -467,7 +467,7 @@ def load_deck():
             return (title or os.path.basename(path)), slides, path
         except OSError as e:
             return "deck", [f"# Cannot read deck\n\n`{path}`\n\n{e}"], path
-    want = os.environ.get("BOHAY_SETTING_FILE", "slides.md")
+    want = os.environ.get("LUVUS_SETTING_FILE", "slides.md")
     return "deck", [
         "# No deck found\n\n"
         f"Looked for `{want}` in this node's folder.\n\n"
@@ -595,8 +595,8 @@ def _flag(name, default):
 
 
 def main():
-    OPTS["big"] = _flag("BOHAY_SETTING_BIG_TITLES", True)
-    OPTS["center"] = _flag("BOHAY_SETTING_CENTER", True)
+    OPTS["big"] = _flag("LUVUS_SETTING_BIG_TITLES", True)
+    OPTS["center"] = _flag("LUVUS_SETTING_CENTER", True)
     title, slides, _ = load_deck()
     if "--print" in sys.argv or not sys.stdout.isatty():
         print_all(title, slides)

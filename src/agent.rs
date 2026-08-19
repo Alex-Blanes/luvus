@@ -1,9 +1,9 @@
 //! Agent session discovery & resume.
 //!
-//! bohay resumes an agent's *native* session after a restart by discovering its
+//! luvus resumes an agent's *native* session after a restart by discovering its
 //! session id straight from the agent's own on-disk store, keyed by the pane's
 //! working directory — so Claude Code and Copilot resume with zero setup (no
-//! hooks required). The optional `bohay integration install` hook still works
+//! hooks required). The optional `luvus integration install` hook still works
 //! and takes precedence when present (it knows the exact session of a pane).
 
 use std::path::{Path, PathBuf};
@@ -33,7 +33,7 @@ struct Discovery {
     list: Option<fn(&Path, &Path) -> Vec<String>>,
 }
 
-/// One agent bohay can resume: how to find its sessions (optional — some agents
+/// One agent luvus can resume: how to find its sessions (optional — some agents
 /// have no readable store) and how to build its resume command from a shell-quoted
 /// session id. Adding an agent (docs/23) is one entry here, not scattered edits.
 struct SessionSource {
@@ -148,7 +148,7 @@ fn source(agent: &str) -> Option<&'static SessionSource> {
     SOURCES.iter().find(|s| s.name == agent)
 }
 
-/// Agents whose native session bohay knows how to resume.
+/// Agents whose native session luvus knows how to resume.
 pub fn is_resumable(agent: &str) -> bool {
     source(agent).is_some()
 }
@@ -282,7 +282,7 @@ pub fn resume_command(agent: &str, session_id: &str) -> Option<String> {
 }
 
 /// Strip the session-selection flags from a captured launch argv (docs/62) so
-/// replaying it cannot fight the fresh `--resume <id>` bohay injects or re-fork
+/// replaying it cannot fight the fresh `--resume <id>` luvus injects or re-fork
 /// the pane. Every other flag is kept verbatim, so unknown future flags survive
 /// untouched. Value-taking selectors also swallow the following bareword value.
 fn filter_launch_flags(agent: &str, launch: &[String]) -> Vec<String> {
@@ -383,7 +383,7 @@ pub fn fork_command(agent: &str, session_id: &str) -> Option<String> {
     Some(f(&q))
 }
 
-/// Whether bohay can fork this agent's session (it has a native fork command).
+/// Whether luvus can fork this agent's session (it has a native fork command).
 pub fn can_fork(agent: &str) -> bool {
     source(agent).and_then(|s| s.fork).is_some()
 }
@@ -1190,7 +1190,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("bohay-agent-{}-{}", tag, std::process::id()));
+        let d = std::env::temp_dir().join(format!("luvus-agent-{}-{}", tag, std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -1449,7 +1449,7 @@ mod tests {
         let f = |a: &str, v: &[&str]| {
             filter_launch_flags(a, &v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
         };
-        // A stale `--resume <id>` (captured from a pane bohay itself resumed) is
+        // A stale `--resume <id>` (captured from a pane luvus itself resumed) is
         // dropped with its value; the real flags survive.
         assert_eq!(
             f("claude", &["--resume", "old-id", "--model", "opus"]),

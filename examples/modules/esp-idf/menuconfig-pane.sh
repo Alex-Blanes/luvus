@@ -13,8 +13,8 @@ set -u
 
 pause() { echo; printf 'Press enter to close this tab. '; read -r _ || true; }
 
-idf_path=$(printf '%s' "${BOHAY_SETTING_IDF_PATH:-$HOME/esp/esp-idf}" | sed "s|^~|$HOME|")
-proj="${BOHAY_WORKSPACE_CWD:-$PWD}"
+idf_path=$(printf '%s' "${LUVUS_SETTING_IDF_PATH:-$HOME/esp/esp-idf}" | sed "s|^~|$HOME|")
+proj="${LUVUS_WORKSPACE_CWD:-$PWD}"
 
 if [ ! -f "$idf_path/export.sh" ]; then
   echo "ESP-IDF not found at: $idf_path"

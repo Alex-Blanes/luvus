@@ -1,13 +1,13 @@
-//! bohay-buzz — a NIP-29 nostr chat client for Buzz relays (docs/39).
+//! luvus-buzz — a NIP-29 nostr chat client for Buzz relays (docs/39).
 //!
 //! Buzz's relay speaks standard NIP-29 (relay-based groups) + NIP-42 (auth) over
 //! a WebSocket, so this talks to it directly — no `buzz` CLI needed, no tokio.
 //!
-//!   bohay-buzz keygen
-//!   bohay-buzz channels [--relay <url>] [--nsec <nsec>]
-//!   bohay-buzz listen   [--relay <url>] [--nsec <nsec>] --channel <uuid>
-//!   bohay-buzz send      [--relay <url>] [--nsec <nsec>] --channel <uuid> --content <text>
-//!   bohay-buzz tui       [--relay <url>] [--nsec <nsec>]      # the interactive pane
+//!   luvus-buzz keygen
+//!   luvus-buzz channels [--relay <url>] [--nsec <nsec>]
+//!   luvus-buzz listen   [--relay <url>] [--nsec <nsec>] --channel <uuid>
+//!   luvus-buzz send      [--relay <url>] [--nsec <nsec>] --channel <uuid> --content <text>
+//!   luvus-buzz tui       [--relay <url>] [--nsec <nsec>]      # the interactive pane
 //!
 //! Each flag also reads an env var (the module-setting names):
 //!   --relay → BUZZ_RELAY_URL   --nsec → BUZZ_PRIVATE_KEY   --channel → BUZZ_CHANNEL
@@ -45,9 +45,9 @@ fn main() -> Result<()> {
         }
         _ => {
             eprintln!(
-                "usage:\n  bohay-buzz keygen\n  bohay-buzz channels\n  bohay-buzz listen \
-                 --channel <uuid>\n  bohay-buzz send --channel <uuid> --content <text>\n  \
-                 bohay-buzz tui"
+                "usage:\n  luvus-buzz keygen\n  luvus-buzz channels\n  luvus-buzz listen \
+                 --channel <uuid>\n  luvus-buzz send --channel <uuid> --content <text>\n  \
+                 luvus-buzz tui"
             );
             std::process::exit(2);
         }
@@ -168,13 +168,13 @@ fn share(args: &[String]) -> Result<()> {
     }
 }
 
-/// Build the chat message from the pane's context env (flat `BOHAY_PANE_*`) plus
-/// any text selection (from `BOHAY_MODULE_CONTEXT_JSON`).
+/// Build the chat message from the pane's context env (flat `LUVUS_PANE_*`) plus
+/// any text selection (from `LUVUS_MODULE_CONTEXT_JSON`).
 fn share_message() -> String {
     let env = |k: &str| std::env::var(k).unwrap_or_default();
-    let agent = env("BOHAY_PANE_AGENT");
-    let status = env("BOHAY_PANE_STATUS");
-    let dir = std::path::Path::new(&env("BOHAY_PANE_CWD"))
+    let agent = env("LUVUS_PANE_AGENT");
+    let status = env("LUVUS_PANE_STATUS");
+    let dir = std::path::Path::new(&env("LUVUS_PANE_CWD"))
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("")
@@ -199,7 +199,7 @@ fn share_message() -> String {
 /// The mouse selection over the right-clicked pane, if any (it travels in the
 /// JSON context, not a flat env var).
 fn selection_text() -> Option<String> {
-    let json = std::env::var("BOHAY_MODULE_CONTEXT_JSON").ok()?;
+    let json = std::env::var("LUVUS_MODULE_CONTEXT_JSON").ok()?;
     let v: serde_json::Value = serde_json::from_str(&json).ok()?;
     v.get("selection")
         .and_then(|s| s.as_str())
@@ -213,7 +213,7 @@ fn selection_text() -> Option<String> {
 fn relay_url(args: &[String]) -> Result<String> {
     flag(args, "--relay")
         .or_else(|| env_nonempty("BUZZ_RELAY_URL"))
-        .or_else(|| env_nonempty("BOHAY_SETTING_RELAY_URL")) // the module setting
+        .or_else(|| env_nonempty("LUVUS_SETTING_RELAY_URL")) // the module setting
         .context("set --relay, BUZZ_RELAY_URL, or the relay_url module setting")
 }
 
@@ -246,7 +246,7 @@ fn env_nonempty(name: &str) -> Option<String> {
 fn explicit_nsec(args: &[String]) -> Option<String> {
     flag(args, "--nsec")
         .or_else(|| env_nonempty("BUZZ_PRIVATE_KEY"))
-        .or_else(|| env_nonempty("BOHAY_SETTING_NSEC"))
+        .or_else(|| env_nonempty("LUVUS_SETTING_NSEC"))
 }
 fn short(npub: &str) -> String {
     if npub.len() > 16 {

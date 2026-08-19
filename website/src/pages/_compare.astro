@@ -3,7 +3,7 @@ import jetbrainsLatin from '@fontsource-variable/jetbrains-mono/files/jetbrains-
 import plexLatin600 from '@fontsource/ibm-plex-mono/files/ibm-plex-mono-latin-600-normal.woff2?url';
 import '../styles/themes.css';
 import { THEMES, DEFAULT_THEME } from '../lib/themes';
-// The /compare page: bohay vs Herdr (agent multiplexer) and tmux / Zellij
+// The /compare page: luvus vs Herdr (agent multiplexer) and tmux / Zellij
 // (traditional multiplexers). Standalone dark page matching the landing look.
 import '@fontsource-variable/inter';
 import '@fontsource-variable/jetbrains-mono';
@@ -12,11 +12,11 @@ import '@fontsource/ibm-plex-mono/600.css';
 import '@fontsource/ibm-plex-mono/700.css';
 import Logo from '../components/Logo.astro';
 
-const GITHUB = 'https://github.com/RizRiyz/bohay';
-const title = 'Compare bohay vs Herdr, tmux, and Zellij';
+const GITHUB = 'https://github.com/RizRiyz/luvus';
+const title = 'Compare luvus vs Herdr, tmux, and Zellij';
 const description =
-  'How bohay compares to Herdr, tmux, and Zellij for running AI coding agents: live agent status, token and cost tracking, reboot-proof session resume, session forking, a built-in git tab, multi-agent orchestration, and a macOS notch app.';
-const ogImage = 'https://bohay.dev/og.png';
+  'How luvus compares to Herdr, tmux, and Zellij for running AI coding agents: live agent status, token and cost tracking, reboot-proof session resume, session forking, a built-in git tab, multi-agent orchestration, and a macOS notch app.';
+const ogImage = 'https://luvus.dev/og.png';
 
 // Comparison cells. Each cell is { s: 'yes' | 'part' | 'no', t?: note }.
 const yes = { s: 'yes' };
@@ -24,7 +24,7 @@ const no = { s: 'no' };
 const part = (t) => ({ s: 'part', t });
 const ICON = { yes: '✓', part: '◐', no: '–' };
 
-// Columns, left to right: bohay, Herdr, tmux, Zellij.
+// Columns, left to right: luvus, Herdr, tmux, Zellij.
 //
 // Competitor cells are taken from each project's own documentation, checked
 // 2026-08-06: herdr.dev/docs (v0.8.0 — agents, session state, configuration,
@@ -84,14 +84,14 @@ const GROUPS = [
 ];
 
 const OVER_TMUX = [
-  { k: 'Agent-aware', h: 'They cannot see your agents', p: 'tmux and Zellij show panes. bohay shows which agent is blocked, working, done, or idle, and pings you the moment one needs you.' },
-  { k: 'Resume', h: 'They forget after a reboot', p: 'A tmux session keeps your shell alive only until the machine restarts. bohay reloads each agent’s actual conversation after a full reboot, with zero setup.' },
-  { k: 'Git + teamwork', h: 'No git, no coordination', p: 'bohay adds a git tab, worktrees as panes, and a board that runs several agents on one repo at once without letting them overwrite each other.' },
+  { k: 'Agent-aware', h: 'They cannot see your agents', p: 'tmux and Zellij show panes. luvus shows which agent is blocked, working, done, or idle, and pings you the moment one needs you.' },
+  { k: 'Resume', h: 'They forget after a reboot', p: 'A tmux session keeps your shell alive only until the machine restarts. luvus reloads each agent’s actual conversation after a full reboot, with zero setup.' },
+  { k: 'Git + teamwork', h: 'No git, no coordination', p: 'luvus adds a git tab, worktrees as panes, and a board that runs several agents on one repo at once without letting them overwrite each other.' },
   { k: 'No config', h: 'Agent-first, mouse-first', p: 'No config file to memorize. Click to split, drag to resize, and the whole interface is built around agents instead of raw shells.' },
 ];
 
 const OVER_HERDR = [
-  { k: 'Notch app', h: 'A native Mac notch app', p: 'Herdr stays in the terminal. bohay mirrors every agent into your Mac’s notch, so you can approve a prompt or jump to an agent without switching windows.' },
+  { k: 'Notch app', h: 'A native Mac notch app', p: 'Herdr stays in the terminal. luvus mirrors every agent into your Mac’s notch, so you can approve a prompt or jump to an agent without switching windows.' },
   { k: 'Real teamwork', h: 'A team, not just many panes', p: 'File locks so two agents never edit the same file, isolated worktrees, and a merge gate that waits for your tests. Point five agents at one repo and stay safe.' },
   { k: 'Resume', h: 'Reboot-proof resume', p: 'Not just panes that survive a detach. Each agent reloads its own conversation after a full restart, so you can close the laptop and pick up mid-thought tomorrow.' },
   { k: 'Git built in', h: 'Git built in, not bolted on', p: 'A full git tab with pull requests and issues, plus worktrees as first-class panes, so you rarely leave the terminal.' },
@@ -140,12 +140,12 @@ const LANDSCAPE = [
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
     <link rel="icon" type="image/png" sizes="192x192" href="/favicon.png" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-    <link rel="canonical" href="https://bohay.dev/compare/" />
+    <link rel="canonical" href="https://luvus.dev/compare/" />
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
     <meta property="og:type" content="website" />
-    <meta property="og:url" content="https://bohay.dev/compare/" />
-    <meta property="og:site_name" content="bohay" />
+    <meta property="og:url" content="https://luvus.dev/compare/" />
+    <meta property="og:site_name" content="luvus" />
     <meta property="og:image" content={ogImage} />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
@@ -161,7 +161,7 @@ const LANDSCAPE = [
          Deliberately tiny and dependency-free; it must not delay rendering. -->
     <script is:inline>
       try {
-        var t = localStorage.getItem('bohay-theme');
+        var t = localStorage.getItem('luvus-theme');
         if (t) document.documentElement.setAttribute('data-bh-theme', t);
       } catch (e) {}
     </script>
@@ -171,7 +171,7 @@ const LANDSCAPE = [
       <div class="nav-inner">
         <a class="brand" href="/">
           <Logo width={34} height={34} class="mark" aria-hidden="true" />
-          <span>bohay</span>
+          <span>luvus</span>
         </a>
         <div class="nav-links">
           <a href="/docs/">Docs</a>
@@ -179,7 +179,7 @@ const LANDSCAPE = [
           <a href="/compare/" aria-current="page">Compare</a>
           <a href="/changelog/">Changelog</a>
   
-        <a href={GITHUB} class="gh" aria-label="bohay on GitHub" title="GitHub">
+        <a href={GITHUB} class="gh" aria-label="luvus on GitHub" title="GitHub">
             <svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"
               ><path
                 fill="currentColor"
@@ -196,9 +196,9 @@ const LANDSCAPE = [
     <header class="page-hero">
       <div class="glow" aria-hidden="true"></div>
       <span class="eyebrow">Compare</span>
-      <h1>bohay vs Herdr, tmux, and Zellij</h1>
+      <h1>luvus vs Herdr, tmux, and Zellij</h1>
       <p>
-        Every multiplexer keeps your panes alive. bohay is built to run a whole team of AI coding
+        Every multiplexer keeps your panes alive. luvus is built to run a whole team of AI coding
         agents: watch them, resume them, and ship their work without leaving the terminal.
       </p>
     </header>
@@ -209,7 +209,7 @@ const LANDSCAPE = [
           <thead>
             <tr>
               <th class="feat"></th>
-              <th class="colname c-bohay"><span class="ch"><Logo width={17} height={17} class="mark" aria-hidden="true" /> bohay</span></th>
+              <th class="colname c-luvus"><span class="ch"><Logo width={17} height={17} class="mark" aria-hidden="true" /> luvus</span></th>
               <th class="colname">Herdr</th>
               <th class="colname">tmux</th>
               <th class="colname">Zellij</th>
@@ -223,7 +223,7 @@ const LANDSCAPE = [
                   <tr>
                     <th scope="row" class="feat">{row.f}</th>
                     {row.cells.map((c, i) => (
-                      <td class={`cell ${c.s}${i === 0 ? ' c-bohay' : ''}`}>
+                      <td class={`cell ${c.s}${i === 0 ? ' c-luvus' : ''}`}>
                         <span class="ic">{ICON[c.s]}</span>
                         {c.t && <span class="note">{c.t}</span>}
                       </td>
@@ -244,7 +244,7 @@ const LANDSCAPE = [
     </section>
 
     <section class="why">
-      <h2>Why bohay over tmux &amp; Zellij</h2>
+      <h2>Why luvus over tmux &amp; Zellij</h2>
       <p class="lead">Traditional multiplexers are great at panes. They were never built for agents.</p>
       <div class="wcards">
         {OVER_TMUX.map((c) => (
@@ -258,8 +258,8 @@ const LANDSCAPE = [
     </section>
 
     <section class="why alt">
-      <h2>Why bohay over Herdr</h2>
-      <p class="lead">Same foundation as other agent multiplexers. bohay stacks the coordination, git, and resume layer on top.</p>
+      <h2>Why luvus over Herdr</h2>
+      <p class="lead">Same foundation as other agent multiplexers. luvus stacks the coordination, git, and resume layer on top.</p>
       <div class="wcards">
         {OVER_HERDR.map((c) => (
           <div class="wcard">
@@ -275,7 +275,7 @@ const LANDSCAPE = [
       <h2>The wider landscape</h2>
       <p class="lead">
         A few nearby tools solve part of the same problem from a different angle. Here is where
-        bohay fits against each.
+        luvus fits against each.
       </p>
       <div class="lscards">
         {LANDSCAPE.map((c) => (
@@ -285,20 +285,20 @@ const LANDSCAPE = [
               <span class="ltools">{c.tools}</span>
             </div>
             <p>{c.what}</p>
-            <p class="lfit"><b>bohay:</b> {c.fit}</p>
+            <p class="lfit"><b>luvus:</b> {c.fit}</p>
           </div>
         ))}
       </div>
       <p class="lnote">
         Each of these is a different shape of tool (a desktop app, a process runner, a terminal).
-        bohay's bet is one terminal-native workspace that does the whole loop: run, watch, resume,
+        luvus's bet is one terminal-native workspace that does the whole loop: run, watch, resume,
         coordinate, and ship.
       </p>
     </section>
 
     <section class="cta-final">
       <h2>See it for yourself</h2>
-      <p class="cta-install">Install in one line: <code>brew install RizRiyz/bohay/bohay</code></p>
+      <p class="cta-install">Install in one line: <code>brew install RizRiyz/luvus/luvus</code></p>
       <div class="cta-row">
         <a class="btn primary" href="/docs/">Get started</a>
         <a class="btn" href={GITHUB}>Star on GitHub</a>
@@ -311,12 +311,12 @@ const LANDSCAPE = [
       <div class="foot-inner">
         <div class="foot-brand">
           <Logo width={22} height={22} class="mark" aria-hidden="true" />
-          <span>bohay</span>
+          <span>luvus</span>
           <span class="dim">by Riz</span>
         </div>
         <div class="foot-links">
           <a href={GITHUB}>GitHub</a>
-          <a href="https://crates.io/crates/bohay">crates.io</a>
+          <a href="https://crates.io/crates/luvus">crates.io</a>
         </div>
       </div>
     </footer>
@@ -328,9 +328,9 @@ const LANDSCAPE = [
          way most product sites expose their mark. Plain links + clipboard, no
          dependency. -->
     <div class="brandmenu" id="brandmenu" hidden>
-      <a class="bm-item" id="bm-png" href="/brand/bohay-logo.png" download="bohay-logo.png">Download PNG</a>
-      <a class="bm-item" id="bm-svg" href="/brand/bohay-logo.svg" download="bohay-logo.svg">Download SVG</a>
-      <button type="button" class="bm-item" id="bm-copy" data-src="/brand/bohay-logo.svg">Copy SVG</button>
+      <a class="bm-item" id="bm-png" href="/brand/luvus-logo.png" download="luvus-logo.png">Download PNG</a>
+      <a class="bm-item" id="bm-svg" href="/brand/luvus-logo.svg" download="luvus-logo.svg">Download SVG</a>
+      <button type="button" class="bm-item" id="bm-copy" data-src="/brand/luvus-logo.svg">Copy SVG</button>
     </div>
     <div class="theme-dock" id="theme-dock">
       <ul class="td-list" id="td-list" role="listbox" aria-label="Color theme" hidden>
@@ -460,10 +460,10 @@ const LANDSCAPE = [
       .cell.part .ic { color: var(--amber); }
       .cell.no .ic { color: var(--overlay0); }
       .cell .note { display: block; font-size: 0.66rem; color: var(--sub); margin-top: 3px; font-family: 'Inter Variable', sans-serif; }
-      /* bohay column highlight */
-      .c-bohay { background: rgb(from var(--accent) r g b / 0.05); }
-      thead th.c-bohay { background: rgb(from var(--accent) r g b / 0.1); border-top: 2px solid var(--accent); color: var(--accent); }
-      .cmp tbody tr:not(.grp):hover td.c-bohay { background: rgb(from var(--accent) r g b / 0.09); }
+      /* luvus column highlight */
+      .c-luvus { background: rgb(from var(--accent) r g b / 0.05); }
+      thead th.c-luvus { background: rgb(from var(--accent) r g b / 0.1); border-top: 2px solid var(--accent); color: var(--accent); }
+      .cmp tbody tr:not(.grp):hover td.c-luvus { background: rgb(from var(--accent) r g b / 0.09); }
 
       .legend { display: flex; gap: 1.3rem; justify-content: center; align-items: center; margin-top: 1.1rem; font-size: 0.82rem; color: var(--sub); flex-wrap: wrap; }
       .legend .yes { color: var(--accent); } .legend .part { color: var(--amber); } .legend .no { color: var(--overlay0); }
@@ -602,7 +602,7 @@ const LANDSCAPE = [
     </style>
 
     <script>
-      // Theme picker · palettes come from bohay's own registry, generated into
+      // Theme picker · palettes come from luvus's own registry, generated into
       // styles/themes.css, so what you preview is what the app ships. Applying a
       // theme sets `data-bh-theme` on <html>, which outranks each page's :root.
       //
@@ -610,7 +610,7 @@ const LANDSCAPE = [
       // click, so moving away or closing restores what you had.
       import { DEFAULT_THEME } from '../lib/themes';
       (() => {
-        const KEY = 'bohay-theme';
+        const KEY = 'luvus-theme';
         const dock = document.getElementById('theme-dock');
         const btn = document.getElementById('td-btn');
         const list = document.getElementById('td-list');

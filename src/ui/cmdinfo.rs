@@ -1,8 +1,8 @@
 //! The "what's actually running in this pane?" overlay — click a pane's title.
 //!
 //! Agent CLIs elide long tool commands on screen (`Bash(cargo test …)`), and the
-//! elided characters are never sent to the terminal, so bohay cannot expand what
-//! it was never given. What bohay *does* have is the pane's child pid, so this
+//! elided characters are never sent to the terminal, so luvus cannot expand what
+//! it was never given. What luvus *does* have is the pane's child pid, so this
 //! reads the process tree from the OS and shows every command in full.
 //!
 //! Drawn last over a dimmed backdrop, like the help overlay; any key or click

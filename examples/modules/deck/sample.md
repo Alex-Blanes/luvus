@@ -4,7 +4,7 @@ title: Markdown Deck
 
 # Deck
 
-Big block-font titles, right in a bohay pane.
+Big block-font titles, right in a luvus pane.
 
 **→** or **space** forward · **←** back · **r** reload · **q** quit
 
@@ -60,7 +60,7 @@ fn main() {
 }
 ```
 
-Inline: **bold**, *italic*, `code`, and [links](https://bohay.dev) keep their
+Inline: **bold**, *italic*, `code`, and [links](https://luvus.dev) keep their
 label. Blockquotes get a rule:
 
 > Present what your agents built, without leaving the terminal.

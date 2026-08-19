@@ -3,7 +3,7 @@
 # changelog.sh — release notes for a tag.
 #
 # `changelog/<tag>.md` in the repo is the **source of truth**. It is what the
-# GitHub Release publishes and what bohay.dev/changelog renders, so the notes are
+# GitHub Release publishes and what luvus.dev/changelog renders, so the notes are
 # version-controlled, reviewable in a PR, and identical everywhere.
 #
 #   scripts/changelog.sh v0.8.1            # print the notes (curated file if it
@@ -16,7 +16,7 @@
 # for it — the website reads it for the version/date.
 set -euo pipefail
 
-REPO="${GITHUB_REPOSITORY:-RizRiyz/bohay}"
+REPO="${GITHUB_REPOSITORY:-RizRiyz/luvus}"
 NEW=""
 PREV=""
 WRITE=0

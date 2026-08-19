@@ -3,14 +3,14 @@ title: Writing a Module
 description: The complete guide to the manifest reference, environment, context, callbacks, and distribution.
 ---
 
-A **module** is the way you extend bohay. It's a plain directory with one
-manifest file (`bohay-module.toml`) that declares **commands**, the argv arrays
-bohay runs as subprocesses. There's no SDK, no scripting runtime, and no
+A **module** is the way you extend luvus. It's a plain directory with one
+manifest file (`luvus-module.toml`) that declares **commands**, the argv arrays
+luvus runs as subprocesses. There's no SDK, no scripting runtime, and no
 language requirement: if it can be executed and read environment variables, it
-can be a bohay module: a Bash script, a Python file, a Lua or Rust binary, a
+can be a luvus module: a Bash script, a Python file, a Lua or Rust binary, a
 Node app, anything your machine can run. A command does its work by reading the
-injected `BOHAY_*` context and, when it needs to change the workspace, by
-calling the same `bohay` CLI you use by hand. **The bohay CLI is the module
+injected `LUVUS_*` context and, when it needs to change the workspace, by
+calling the same `luvus` CLI you use by hand. **The luvus CLI is the module
 API**.
 
 A module can reach every surface the app has:
@@ -28,8 +28,8 @@ A module can reach every surface the app has:
 ## Author with your AI agent
 
 If you build modules with a coding agent (Claude Code, or any agent that reads
-skills), bohay ships a **module-authoring skill**. It teaches the agent this whole
-guide: the manifest tables, the `BOHAY_*` environment, the callback methods, and
+skills), luvus ships a **module-authoring skill**. It teaches the agent this whole
+guide: the manifest tables, the `LUVUS_*` environment, the callback methods, and
 the common recipes. With it installed you can just say "add a sidebar dock listing
 my git branches" and the agent already knows the manifest and the socket API.
 
@@ -37,27 +37,27 @@ Install it into your agent's skills folder (the block below has a copy button),
 then start your agent inside your module's directory:
 
 ```sh
-mkdir -p ~/.claude/skills/bohay-module
-curl -fsSL https://raw.githubusercontent.com/RizRiyz/bohay/main/skills/bohay-module/SKILL.md \
-  -o ~/.claude/skills/bohay-module/SKILL.md
+mkdir -p ~/.claude/skills/luvus-module
+curl -fsSL https://raw.githubusercontent.com/RizRiyz/luvus/main/skills/luvus-module/SKILL.md \
+  -o ~/.claude/skills/luvus-module/SKILL.md
 ```
 
-Prefer to read or copy it by hand? [View the skill on GitHub](https://github.com/RizRiyz/bohay/blob/main/skills/bohay-module/SKILL.md) (use the raw view's copy button).
+Prefer to read or copy it by hand? [View the skill on GitHub](https://github.com/RizRiyz/luvus/blob/main/skills/luvus-module/SKILL.md) (use the raw view's copy button).
 
 ## A module in five minutes
 
 ```
 my-module/
-├── bohay-module.toml
+├── luvus-module.toml
 └── refresh.sh
 ```
 
 ```toml
-# bohay-module.toml
+# luvus-module.toml
 id = "you.hello"                 # required, globally unique-ish
 name = "Hello"                   # required
 version = "0.1.0"                # required
-min_bohay_version = "0.8.3"      # required
+min_luvus_version = "0.8.3"      # required
 
 [[actions]]
 id = "refresh"                   # local id (no dots)
@@ -68,16 +68,16 @@ command = ["sh", "refresh.sh"]   # argv, run without a shell
 ```sh
 #!/bin/sh
 # refresh.sh
-echo "hello from $BOHAY_MODULE_ID"
-echo "context: $BOHAY_MODULE_CONTEXT_JSON"
+echo "hello from $LUVUS_MODULE_ID"
+echo "context: $LUVUS_MODULE_CONTEXT_JSON"
 ```
 
 Register and run it:
 
 ```sh
-bohay module link ./my-module        # → { "id": "you.hello" }
-bohay module run you.hello refresh   # → { "log_id": 1 }
-bohay module log                     # status + captured output
+luvus module link ./my-module        # → { "id": "you.hello" }
+luvus module run you.hello refresh   # → { "log_id": 1 }
+luvus module log                     # status + captured output
 ```
 
 `module run` is fire-and-forget: it returns a `log_id` immediately and the
@@ -93,9 +93,14 @@ with `module log`.
 | `id` | ✓ | `[a-z0-9:._-]`, ≤120 chars. Dots allowed (e.g. `you.git-status`). |
 | `name` | ✓ | Human-readable, non-empty. |
 | `version` | ✓ | Your module's version. |
-| `min_bohay_version` | ✓ | Install is refused if newer than the host. Use `0.8.3` if you use right-click menus, settings, startup hooks, or dock row values. |
+| `min_luvus_version` | ✓ | Install is refused if newer than the host. Use `0.8.3` if you use right-click menus, settings, startup hooks, or dock row values. |
 | `description` |  | One-line summary. |
 | `platforms` |  | e.g. `["macos", "linux"]`. Omit for all. `[]` is an error. |
+
+The canonical filename is `luvus-module.toml`. During the 0.11.x migration
+window, Luvus also loads `bohay-module.toml` and accepts `min_bohay_version` as
+an alias. If both files exist, `luvus-module.toml` wins and Luvus warns when
+their contents differ. New modules should use only the Luvus names.
 
 Every entry below (`build`, `startup`, `actions`, `events`, `panes`) also
 accepts its own `platforms` list, which overrides the top-level one. That's how
@@ -113,12 +118,12 @@ platforms = ["macos", "linux"]   # optional: narrower than the top level
 command = ["bun", "run", "commit.ts"]
 ```
 
-Invoke with `bohay module run <module-id> <action-id>`. The qualified id is
+Invoke with `luvus module run <module-id> <action-id>`. The qualified id is
 `{module-id}.{action-id}`.
 
 ### `contexts`: put an action in a right-click menu
 
-An action with `contexts` is offered in bohay's own context menus, below a
+An action with `contexts` is offered in luvus's own context menus, below a
 divider under the built-in items. This is the shortest path from a shell script
 to something that feels native.
 
@@ -138,11 +143,11 @@ command = ["python3", "blame.py"]
 ```
 
 The target is **what you clicked**, not what happened to be focused: right-click
-a background node and `BOHAY_WORKSPACE_CWD` is that node's folder. Actions
+a background node and `LUVUS_WORKSPACE_CWD` is that node's folder. Actions
 without `contexts` never appear in a menu, which is right for anything meant
 only for the CLI, a dock row, or another module.
 
-`contexts` adds items to **bohay's** menus. To give **your own dock rows** a
+`contexts` adds items to **luvus's** menus. To give **your own dock rows** a
 right-click menu, see [a row's own right-click menu](#a-rows-own-right-click-menu)
 further down: those rows are your data, so you declare the menu rather than
 appending to one.
@@ -153,7 +158,7 @@ appending to one.
 
 ### `[[settings]]`: user-editable configuration
 
-Declare settings and bohay renders them in **Settings → Modules**, indented
+Declare settings and luvus renders them in **Settings → Modules**, indented
 under your module, and hands the resolved values to every command you run. You
 never write a settings UI, and you never parse a config file.
 
@@ -197,23 +202,23 @@ default = false
 Values reach your command two ways, so no language needs a JSON parser:
 
 ```sh
-echo "$BOHAY_SETTING_TOKEN"          # one flat var per key, UPPER_SNAKE
-echo "$BOHAY_SETTING_MODE"
-echo "$BOHAY_MODULE_SETTINGS_JSON"   # {"token":"...","limit":20,...}
+echo "$LUVUS_SETTING_TOKEN"          # one flat var per key, UPPER_SNAKE
+echo "$LUVUS_SETTING_MODE"
+echo "$LUVUS_MODULE_SETTINGS_JSON"   # {"token":"...","limit":20,...}
 ```
 
-bohay validates on write: a number is clamped into range, an enum choice
+luvus validates on write: a number is clamped into range, an enum choice
 outside `options` is refused, and a type that drifted between module versions
 falls back to the declared default rather than erroring. Values live in
-`$BOHAY_MODULE_CONFIG_DIR/settings.json`, so they survive a reinstall and you
+`$LUVUS_MODULE_CONFIG_DIR/settings.json`, so they survive a reinstall and you
 can read the file directly if you prefer.
 
 Read and write them from a script or the CLI too:
 
 ```sh
-bohay module settings you.ci                  # list keys, types, current values
-bohay module settings you.ci limit            # read one
-bohay module settings you.ci limit 30         # write one
+luvus module settings you.ci                  # list keys, types, current values
+luvus module settings you.ci limit            # read one
+luvus module settings you.ci limit 30         # write one
 ```
 
 :::caution
@@ -221,7 +226,7 @@ A **listing** reports a `secret` setting only as `"set": true|false`, never its
 value, because that output usually lands in a terminal and its scrollback. Ask
 for the key by name (`module settings you.ci token`) when a script genuinely
 needs the value. Your own commands always get the real value in
-`$BOHAY_SETTING_TOKEN`, so a module never needs to read its own secrets back
+`$LUVUS_SETTING_TOKEN`, so a module never needs to read its own secrets back
 over the API.
 :::
 
@@ -241,7 +246,7 @@ memory and deliberately not persisted, so the startup hook is where you repaint
 them. Keep hooks one-shot: restore your state, call what you need, exit. They
 are not supervised daemons, and a failure is logged without stopping the server.
 
-Startup commands get the normal environment plus `BOHAY_MODULE_EVENT=startup`.
+Startup commands get the normal environment plus `LUVUS_MODULE_EVENT=startup`.
 
 ### `[[events]]`: react to lifecycle events
 
@@ -251,8 +256,8 @@ on = "pane.agent_status_changed"
 command = ["sh", "notify.sh"]
 ```
 
-Your command runs with `BOHAY_MODULE_EVENT` (the name) and
-`BOHAY_MODULE_EVENT_JSON` (the payload).
+Your command runs with `LUVUS_MODULE_EVENT` (the name) and
+`LUVUS_MODULE_EVENT_JSON` (the payload).
 
 | Group | Events |
 |---|---|
@@ -284,14 +289,14 @@ placement = "split"              # overlay | split | tab
 command = ["bun", "run", "board.ts"]
 ```
 
-Open with `bohay module pane open <module-id> board`. It becomes a real bohay
+Open with `luvus module pane open <module-id> board`. It becomes a real luvus
 pane (a TUI, a log tail, anything), runs in the module root with the full
-`BOHAY_*` environment, and is auto-untracked on close. A module pane that's
+`LUVUS_*` environment, and is auto-untracked on close. A module pane that's
 open when you detach is re-opened on the next launch.
 
 ### `[[docks]]`: a panel in the sidebar
 
-A **dock** is a section that lives in one of bohay's two sidebars (left or
+A **dock** is a section that lives in one of luvus's two sidebars (left or
 right), alongside the built-in Workspaces and Agents lists. It's the way a
 plugin puts an always-visible panel (a git status, a CI feed, a notifications
 list) into the chrome.
@@ -303,7 +308,7 @@ title = "CI"                     # the dock header
 placement = "sidebar.right"      # default side: sidebar.left | sidebar.right
 ```
 
-Unlike a pane, **your module doesn't draw a dock**. Bohay owns the rendering
+Unlike a pane, **your module doesn't draw a dock**. Luvus owns the rendering
 and your module just **pushes rows**. That keeps docks fast (nothing runs per
 frame), visually consistent with the rest of the UI, and freely relocatable:
 from **Settings → Layout**, the user can move any dock between the left sidebar,
@@ -312,7 +317,7 @@ the right sidebar, or turn it **Off** with `[Left] [Right] [Off]` buttons.
 Push rows with the CLI:
 
 ```sh
-"$BOHAY_BIN_PATH" ui dock push --id you:ci --title CI --rows '[
+"$LUVUS_BIN_PATH" ui dock push --id you:ci --title CI --rows '[
   {"text": "build passing", "dot": "done",    "action": "open-ci", "value": "1421"},
   {"text": "3 checks",      "dot": "working"}
 ]'
@@ -321,7 +326,7 @@ Push rows with the CLI:
 or pipe the JSON array on stdin (handy when you build it with `jq`):
 
 ```sh
-printf '%s' "$rows_json" | "$BOHAY_BIN_PATH" ui dock push --id you:ci --title CI
+printf '%s' "$rows_json" | "$LUVUS_BIN_PATH" ui dock push --id you:ci --title CI
 ```
 
 Each **row** is an object:
@@ -344,14 +349,14 @@ readout.
 
 | Variable | Meaning |
 |---|---|
-| `BOHAY_MODULE_ROW_VALUE` | The row's `value` (falls back to `text`). |
-| `BOHAY_MODULE_ROW_TEXT` | The row's visible label. |
-| `BOHAY_MODULE_ROW_INDEX` | Its position in the dock. |
-| `BOHAY_MODULE_DOCK_ID` | Which dock it came from. |
+| `LUVUS_MODULE_ROW_VALUE` | The row's `value` (falls back to `text`). |
+| `LUVUS_MODULE_ROW_TEXT` | The row's visible label. |
+| `LUVUS_MODULE_ROW_INDEX` | Its position in the dock. |
+| `LUVUS_MODULE_DOCK_ID` | Which dock it came from. |
 
 That's the whole trick behind a clickable branch list: push one row per branch
 with `"action": "checkout"` and `"value": "<branch>"`, then have `checkout` read
-`$BOHAY_MODULE_ROW_VALUE`.
+`$LUVUS_MODULE_ROW_VALUE`.
 
 #### A row's own right-click menu
 
@@ -359,7 +364,7 @@ A row can only do one thing on a left-click. Give it a `menu` and right-clicking
 it opens a context menu of your own:
 
 ```sh
-"$BOHAY_BIN_PATH" ui dock push --id you:boards --title BOARDS --rows '[
+"$LUVUS_BIN_PATH" ui dock push --id you:boards --title BOARDS --rows '[
   {
     "text": "esp32s3", "dot": "done",
     "action": "select", "value": "/dev/cu.usbserial-110",
@@ -394,19 +399,19 @@ Without it you would need a separate action id per entry, which is the same
 row-explosion the row-level `value` exists to prevent, one level down.
 
 The menu is **per row**, which is the point: in the example above the board row
-offers three actions while the `build` row below it offers none. Bohay can't
+offers three actions while the `build` row below it offers none. Luvus can't
 guess a menu for a row it didn't create, so you declare it. A row with no `menu`
 has no context menu, exactly as before.
 
-The action receives the same `BOHAY_MODULE_ROW_*` variables a left-click passes
-(with `BOHAY_MODULE_ROW_VALUE` set to the entry's `value` when it has one), plus
-`BOHAY_MODULE_ACTION_ID` telling it which item was picked, so one script can
+The action receives the same `LUVUS_MODULE_ROW_*` variables a left-click passes
+(with `LUVUS_MODULE_ROW_VALUE` set to the entry's `value` when it has one), plus
+`LUVUS_MODULE_ACTION_ID` telling it which item was picked, so one script can
 serve the whole menu:
 
 ```sh
-case "$BOHAY_MODULE_ACTION_ID" in
-  flash)   idf.py -p "$BOHAY_MODULE_ROW_VALUE" flash ;;
-  erase)   idf.py -p "$BOHAY_MODULE_ROW_VALUE" erase-flash ;;
+case "$LUVUS_MODULE_ACTION_ID" in
+  flash)   idf.py -p "$LUVUS_MODULE_ROW_VALUE" flash ;;
+  erase)   idf.py -p "$LUVUS_MODULE_ROW_VALUE" erase-flash ;;
 esac
 ```
 
@@ -414,7 +419,7 @@ The row identity is captured **when the menu opens**, so a refresh that lands
 while the menu is up can't make a click hit the wrong row. That matters if you
 push on a timer.
 
-`destructive` is only a colour: bohay won't ask "are you sure" for you. If an
+`destructive` is only a colour: luvus won't ask "are you sure" for you. If an
 action can't be undone, open a pane that says what it's about to do and waits for
 a keypress. That's better than a generic dialog anyway, because it can name the
 port it's about to erase.
@@ -425,7 +430,7 @@ your module removes its docks.
 
 #### A dock that stays fresh
 
-Docks are **event-driven and cached**, so bohay never polls your module. Push when
+Docks are **event-driven and cached**, so luvus never polls your module. Push when
 your data changes: from an `[[events]]` hook, a timer, or a long-lived
 `[[panes]]` process. A live git panel refreshed whenever an agent's status
 changes:
@@ -444,14 +449,14 @@ command = ["sh", "push-git.sh"]
 ```sh
 #!/bin/sh
 # push-git.sh: build the rows with jq and push them
-cwd="$BOHAY_WORKSPACE_CWD"        # no JSON parsing needed for the common ids
+cwd="$LUVUS_WORKSPACE_CWD"        # no JSON parsing needed for the common ids
 branch=$(git -C "$cwd" branch --show-current)
 dirty=$(git -C "$cwd" status --porcelain | wc -l | tr -d ' ')
 rows=$(jq -n --arg b "$branch" --arg d "$dirty" '[
   {text: ("on " + $b),        dot: "idle"},
   {text: ($d + " changed"),   dot: (if $d == "0" then "done" else "working" end)}
 ]')
-printf '%s' "$rows" | "$BOHAY_BIN_PATH" ui dock push --id you:git --title Git
+printf '%s' "$rows" | "$LUVUS_BIN_PATH" ui dock push --id you:git --title Git
 ```
 
 That's a live git dock in the sidebar, kept current with zero per-frame cost.
@@ -470,13 +475,13 @@ the top-level module `id` may contain dots.
 command = ["bun", "install"]
 ```
 
-Runs at git-install time with a **scrubbed environment** (no `BOHAY_*`, no
+Runs at git-install time with a **scrubbed environment** (no `LUVUS_*`, no
 socket access). For local `link` you run your own setup.
 
 ### Validation
 
 A manifest is rejected if: any `command` is empty (or contains an empty
-string) · `min_bohay_version` is newer than the host · an id uses characters
+string) · `min_luvus_version` is newer than the host · an id uses characters
 outside its set, or a local id contains a dot · two actions/panes/docks/settings
 share an id · `platforms = []` at any level · an action names a `contexts` value
 that isn't `pane` / `workspace` / `node` / `agent` / `tab` · an `enum` setting
@@ -493,7 +498,7 @@ For pipes or `$VAR`, invoke a shell explicitly:
 
 ## How a command runs
 
-1. bohay builds the environment and a context snapshot of the focused
+1. luvus builds the environment and a context snapshot of the focused
    workspace/tab/pane.
 2. Your `command` spawns as a subprocess, **cwd = the module root**.
 3. stdout and stderr are captured (64 KiB each), the exit is recorded:
@@ -501,7 +506,7 @@ For pipes or `$VAR`, invoke a shell explicitly:
 
 Caps: at most **32** module commands in flight, and the **200** most recent log
 entries are kept. Commands are isolated processes, so a crash or hang never
-takes down bohay.
+takes down luvus.
 
 ## Environment variables
 
@@ -509,35 +514,35 @@ takes down bohay.
 
 | Variable | Meaning |
 |---|---|
-| `BOHAY_ENV` | Always `1`, meaning you're running under bohay. |
-| `BOHAY_MODULE_ID` | Your module's id. |
-| `BOHAY_MODULE_VERSION` | Your module's declared version. |
-| `BOHAY_MODULE_ROOT` | The module directory (also the cwd). Read-only by convention. |
-| `BOHAY_MODULE_CONFIG_DIR` | Durable, user-owned config/secrets dir (created for you). |
-| `BOHAY_MODULE_STATE_DIR` | Durable state/cache dir (created for you). |
-| `BOHAY_SOCKET_PATH` | The control socket (the CLI finds it automatically). |
-| `BOHAY_BIN_PATH` | Absolute path to the `bohay` binary. Use this to call back. |
+| `LUVUS_ENV` | Always `1`, meaning you're running under luvus. |
+| `LUVUS_MODULE_ID` | Your module's id. |
+| `LUVUS_MODULE_VERSION` | Your module's declared version. |
+| `LUVUS_MODULE_ROOT` | The module directory (also the cwd). Read-only by convention. |
+| `LUVUS_MODULE_CONFIG_DIR` | Durable, user-owned config/secrets dir (created for you). |
+| `LUVUS_MODULE_STATE_DIR` | Durable state/cache dir (created for you). |
+| `LUVUS_SOCKET_PATH` | The control socket (the CLI finds it automatically). |
+| `LUVUS_BIN_PATH` | Absolute path to the `luvus` binary. Use this to call back. |
 
 **Context** — the same snapshot twice: flattened for shells, whole for everyone else.
 
 | Variable | Meaning |
 |---|---|
-| `BOHAY_MODULE_CONTEXT_JSON` | The full snapshot (below). |
-| `BOHAY_WORKSPACE_ID` / `BOHAY_WORKSPACE_CWD` | The target node. |
-| `BOHAY_TAB_INDEX` | Its active tab, 1-based. |
-| `BOHAY_PANE_ID` / `BOHAY_PANE_CWD` | The target pane. |
-| `BOHAY_PANE_AGENT` / `BOHAY_PANE_STATUS` | What's running there and its state. |
+| `LUVUS_MODULE_CONTEXT_JSON` | The full snapshot (below). |
+| `LUVUS_WORKSPACE_ID` / `LUVUS_WORKSPACE_CWD` | The target node. |
+| `LUVUS_TAB_INDEX` | Its active tab, 1-based. |
+| `LUVUS_PANE_ID` / `LUVUS_PANE_CWD` | The target pane. |
+| `LUVUS_PANE_AGENT` / `LUVUS_PANE_STATUS` | What's running there and its state. |
 
 **Per-invocation**
 
 | Variable | Set for |
 |---|---|
-| `BOHAY_MODULE_ACTION_ID` | Action commands. |
-| `BOHAY_MODULE_ENTRYPOINT_ID` | Pane commands. |
-| `BOHAY_MODULE_EVENT` | Event hooks (the name) and startup hooks (`startup`). |
-| `BOHAY_MODULE_EVENT_JSON` | Event hooks (the payload). |
-| `BOHAY_MODULE_ROW_*` | Actions run from a clicked dock row. |
-| `BOHAY_SETTING_<KEY>` / `BOHAY_MODULE_SETTINGS_JSON` | Every command, when you declare `[[settings]]`. |
+| `LUVUS_MODULE_ACTION_ID` | Action commands. |
+| `LUVUS_MODULE_ENTRYPOINT_ID` | Pane commands. |
+| `LUVUS_MODULE_EVENT` | Event hooks (the name) and startup hooks (`startup`). |
+| `LUVUS_MODULE_EVENT_JSON` | Event hooks (the payload). |
+| `LUVUS_MODULE_ROW_*` | Actions run from a clicked dock row. |
+| `LUVUS_SETTING_<KEY>` / `LUVUS_MODULE_SETTINGS_JSON` | Every command, when you declare `[[settings]]`. |
 
 Persist data in the **state/config dirs**, never in the module root, because for
 git-installed modules it's a managed checkout.
@@ -564,34 +569,34 @@ what's focused.
 Most scripts want the flat vars, which need no parser at all:
 
 ```sh
-cd "$BOHAY_WORKSPACE_CWD" && git status --short
+cd "$LUVUS_WORKSPACE_CWD" && git status --short
 ```
 
 Reach for the blob when you want `selection`, `invocation_source`, or the tab
 name:
 
 ```sh
-selected=$(printf '%s' "$BOHAY_MODULE_CONTEXT_JSON" | jq -r .selection)
+selected=$(printf '%s' "$LUVUS_MODULE_CONTEXT_JSON" | jq -r .selection)
 ```
 
-## Calling back into bohay
+## Calling back into luvus
 
 ```sh
-"$BOHAY_BIN_PATH" pane run "git pull"     # run a command in the focused pane
-"$BOHAY_BIN_PATH" pane split --down       # change the layout
-"$BOHAY_BIN_PATH" workspace list          # inspect (JSON to stdout)
-"$BOHAY_BIN_PATH" tab rename review        # name the current tab
-"$BOHAY_BIN_PATH" ui toast "build passing" # flash a one-line message
-"$BOHAY_BIN_PATH" ui dock push --id you:ci --rows '[...]'   # feed your sidebar dock
+"$LUVUS_BIN_PATH" pane run "git pull"     # run a command in the focused pane
+"$LUVUS_BIN_PATH" pane split --down       # change the layout
+"$LUVUS_BIN_PATH" workspace list          # inspect (JSON to stdout)
+"$LUVUS_BIN_PATH" tab rename review        # name the current tab
+"$LUVUS_BIN_PATH" ui toast "build passing" # flash a one-line message
+"$LUVUS_BIN_PATH" ui dock push --id you:ci --rows '[...]'   # feed your sidebar dock
 ```
 
-Anything in `bohay help all` is available: panes, tabs, workspaces, worktrees, the
+Anything in `luvus help all` is available: panes, tabs, workspaces, worktrees, the
 git tab, the orchestration board, agents, and the UI chrome. Your command reads
 context from the environment and effects change through the CLI. There is no
 separate module API and no restricted command set.
 
 :::tip
-Always call through `$BOHAY_BIN_PATH` rather than a bare `bohay` on `PATH`. It
+Always call through `$LUVUS_BIN_PATH` rather than a bare `luvus` on `PATH`. It
 points at the running binary, so your module keeps working across Unix sockets
 and Windows named pipes, and against a build that isn't first on the path.
 :::
@@ -600,11 +605,11 @@ and Windows named pipes, and against a build that isn't first on the path.
 
 Three whole modules, one per language. Each is short enough to read in full and
 covers a different part of the surface. They also ship in the repo under
-[`examples/modules/`](https://github.com/RizRiyz/bohay/tree/main/examples/modules)
+[`examples/modules/`](https://github.com/RizRiyz/luvus/tree/main/examples/modules)
 if you'd rather link one directly:
 
 ```sh
-bohay module link ./examples/modules/branch-dock
+luvus module link ./examples/modules/branch-dock
 ```
 
 | Example | Language | Shows |
@@ -620,17 +625,17 @@ repaints on startup, so it survives a restart.
 
 ```
 branch-dock/
-├── bohay-module.toml
+├── luvus-module.toml
 ├── refresh.sh
 └── checkout.sh
 ```
 
 ```toml
-# bohay-module.toml
+# luvus-module.toml
 id = "example.branch-dock"
 name = "Branch Dock"
 version = "0.1.0"
-min_bohay_version = "0.8.3"
+min_luvus_version = "0.8.3"
 description = "The active node's git branches, in the sidebar."
 platforms = ["macos", "linux"]
 
@@ -677,13 +682,13 @@ default = "recent"
 #!/bin/sh
 # refresh.sh -- build the rows and push them.
 set -eu
-bohay="${BOHAY_BIN_PATH:-bohay}"
-repo="${BOHAY_WORKSPACE_CWD:-$PWD}"
-limit="${BOHAY_SETTING_LIMIT:-8}"
-sort="${BOHAY_SETTING_SORT:-recent}"
+luvus="${LUVUS_BIN_PATH:-luvus}"
+repo="${LUVUS_WORKSPACE_CWD:-$PWD}"
+limit="${LUVUS_SETTING_LIMIT:-8}"
+sort="${LUVUS_SETTING_SORT:-recent}"
 
 if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
-  "$bohay" ui dock push --id branches --title BRANCHES \
+  "$luvus" ui dock push --id branches --title BRANCHES \
     --rows '[{"text":"not a git repo"}]'
   exit 0
 fi
@@ -706,27 +711,27 @@ rows=$(git -C "$repo" for-each-ref --format='%(refname:short)' \
       "$esc" "$dot" "$esc"
   done)
 
-"$bohay" ui dock push --id branches --title BRANCHES --rows "[${rows%,}]"
+"$luvus" ui dock push --id branches --title BRANCHES --rows "[${rows%,}]"
 ```
 
 ```sh
 #!/bin/sh
-# checkout.sh -- the clicked row arrives in BOHAY_MODULE_ROW_VALUE.
+# checkout.sh -- the clicked row arrives in LUVUS_MODULE_ROW_VALUE.
 set -eu
-bohay="${BOHAY_BIN_PATH:-bohay}"
-repo="${BOHAY_WORKSPACE_CWD:-$PWD}"
-branch="${BOHAY_MODULE_ROW_VALUE:-}"
+luvus="${LUVUS_BIN_PATH:-luvus}"
+repo="${LUVUS_WORKSPACE_CWD:-$PWD}"
+branch="${LUVUS_MODULE_ROW_VALUE:-}"
 
 if [ -z "$branch" ]; then
-  "$bohay" ui toast "no branch selected"
+  "$luvus" ui toast "no branch selected"
   exit 1
 fi
 
 if git -C "$repo" checkout "$branch" >/dev/null 2>&1; then
-  "$bohay" ui toast "switched to $branch"
+  "$luvus" ui toast "switched to $branch"
   sh "$(dirname "$0")/refresh.sh"    # repaint so the current-branch dot moves
 else
-  "$bohay" ui toast "cannot switch to $branch (uncommitted changes?)"
+  "$luvus" ui toast "cannot switch to $branch (uncommitted changes?)"
   exit 1
 fi
 ```
@@ -737,11 +742,11 @@ Posts a webhook when an agent goes blocked or finishes, with the URL stored as
 a **secret** setting so it never renders in the clear.
 
 ```toml
-# bohay-module.toml
+# luvus-module.toml
 id = "example.agent-ping"
 name = "Agent Ping"
 version = "0.1.0"
-min_bohay_version = "0.8.3"
+min_luvus_version = "0.8.3"
 
 [[events]]
 on = "pane.agent_status_changed"
@@ -771,26 +776,26 @@ default = "blocked"
 #!/usr/bin/env python3
 import json, os, subprocess, sys, urllib.request
 
-BOHAY = os.environ.get("BOHAY_BIN_PATH", "bohay")
+LUVUS = os.environ.get("LUVUS_BIN_PATH", "luvus")
 
-def bohay(*args):
-    """Call back into bohay, ignoring failures: a module must never wedge the UI."""
+def luvus(*args):
+    """Call back into luvus, ignoring failures: a module must never wedge the UI."""
     try:
-        subprocess.run([BOHAY, *args], check=False, capture_output=True, timeout=10)
+        subprocess.run([LUVUS, *args], check=False, capture_output=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         pass
 
 forced = "--force" in sys.argv
-webhook = os.environ.get("BOHAY_SETTING_WEBHOOK", "").strip()
-# `notify-on` becomes BOHAY_SETTING_NOTIFY_ON: upper-cased, dashes to underscores.
-notify_on = os.environ.get("BOHAY_SETTING_NOTIFY_ON", "blocked")
+webhook = os.environ.get("LUVUS_SETTING_WEBHOOK", "").strip()
+# `notify-on` becomes LUVUS_SETTING_NOTIFY_ON: upper-cased, dashes to underscores.
+notify_on = os.environ.get("LUVUS_SETTING_NOTIFY_ON", "blocked")
 
-agent = os.environ.get("BOHAY_PANE_AGENT") or "agent"
-status = os.environ.get("BOHAY_PANE_STATUS") or "unknown"
+agent = os.environ.get("LUVUS_PANE_AGENT") or "agent"
+status = os.environ.get("LUVUS_PANE_STATUS") or "unknown"
 
 # An event hook prefers the event payload: it describes the pane that actually
 # changed, not the one in focus.
-raw = os.environ.get("BOHAY_MODULE_EVENT_JSON")
+raw = os.environ.get("LUVUS_MODULE_EVENT_JSON")
 if raw:
     event = json.loads(raw)
     agent = event.get("agent") or agent
@@ -802,9 +807,9 @@ if not forced:
     if status not in wanted:
         raise SystemExit(0)
 
-where = os.path.basename(os.environ.get("BOHAY_WORKSPACE_CWD", "")) or "bohay"
+where = os.path.basename(os.environ.get("LUVUS_WORKSPACE_CWD", "")) or "luvus"
 message = f"{agent} is {status} in {where}"
-bohay("ui", "toast", message)
+luvus("ui", "toast", message)
 
 if webhook:
     req = urllib.request.Request(
@@ -815,7 +820,7 @@ if webhook:
     try:
         urllib.request.urlopen(req, timeout=10).close()
     except OSError as err:
-        # stderr lands in `bohay module log`, which is where you debug a module.
+        # stderr lands in `luvus module log`, which is where you debug a module.
         print(f"webhook failed: {err}", file=sys.stderr)
         raise SystemExit(1)
 ```
@@ -826,11 +831,11 @@ Opens a real pane running your own program, and stashes the pane's **selected
 text** into a notes file.
 
 ```toml
-# bohay-module.toml
+# luvus-module.toml
 id = "example.scratch-pane"
 name = "Scratch Pane"
 version = "0.1.0"
-min_bohay_version = "0.8.3"
+min_luvus_version = "0.8.3"
 
 [[panes]]
 id = "notes"
@@ -860,16 +865,16 @@ default = true
 ```js
 // open.js -- open the pane entrypoint, then name the tab.
 const { spawnSync } = require("node:child_process");
-const bohay = process.env.BOHAY_BIN_PATH ?? "bohay";
-const run = (...args) => spawnSync(bohay, args, { encoding: "utf8" });
+const luvus = process.env.LUVUS_BIN_PATH ?? "luvus";
+const run = (...args) => spawnSync(luvus, args, { encoding: "utf8" });
 
-// A module pane is a normal bohay pane once it opens: focus, split, close,
+// A module pane is a normal luvus pane once it opens: focus, split, close,
 // and the layout APIs all work on it.
-run("module", "pane", "open", process.env.BOHAY_MODULE_ID, "notes",
+run("module", "pane", "open", process.env.LUVUS_MODULE_ID, "notes",
     "--placement", "split");
 
-if (process.env.BOHAY_SETTING_NAME_THE_TAB === "true") {
-  const tab = process.env.BOHAY_TAB_INDEX ?? "";
+if (process.env.LUVUS_SETTING_NAME_THE_TAB === "true") {
+  const tab = process.env.LUVUS_TAB_INDEX ?? "";
   run("tab", "rename", "notes", ...(tab ? ["--tab", tab] : []));
 }
 run("ui", "toast", "notes opened");
@@ -881,11 +886,11 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
-const bohay = process.env.BOHAY_BIN_PATH ?? "bohay";
-const toast = (t) => spawnSync(bohay, ["ui", "toast", t], { encoding: "utf8" });
+const luvus = process.env.LUVUS_BIN_PATH ?? "luvus";
+const toast = (t) => spawnSync(luvus, ["ui", "toast", t], { encoding: "utf8" });
 
 // The selection is one of the fields only the context blob carries.
-const context = JSON.parse(process.env.BOHAY_MODULE_CONTEXT_JSON ?? "{}");
+const context = JSON.parse(process.env.LUVUS_MODULE_CONTEXT_JSON ?? "{}");
 const selection = (context.selection ?? "").trim();
 if (!selection) {
   toast("select some text first");
@@ -894,7 +899,7 @@ if (!selection) {
 
 // Durable state goes in the state dir, never the module root: for a
 // git-installed module that root is a managed checkout a reinstall replaces.
-const stateDir = process.env.BOHAY_MODULE_STATE_DIR ?? process.cwd();
+const stateDir = process.env.LUVUS_MODULE_STATE_DIR ?? process.cwd();
 fs.mkdirSync(stateDir, { recursive: true });
 fs.appendFileSync(
   path.join(stateDir, "notes.md"),
@@ -904,18 +909,18 @@ toast(`saved ${selection.split("\n").length} line(s) to notes`);
 ```
 
 The `notes` pane itself is any program that reads stdin and writes stdout --
-a REPL, a log tail, a TUI. bohay closes the pane when the process exits.
+a REPL, a log tail, a TUI. luvus closes the pane when the process exits.
 
 ## Distribution & discovery
 
 Share a module as a public Git repo (one repo can hold several modules in
-subdirectories) and tag it with the **`bohay-module` GitHub topic**:
+subdirectories) and tag it with the **`luvus-module` GitHub topic**:
 
 ```sh
-bohay module search                        # most-starred modules in the topic
-bohay module install owner/repo            # whole repo is the module
-bohay module install owner/repo/path/to    # module in a subdirectory
-bohay module install owner/repo --ref v1   # pin a branch / tag / commit
+luvus module search                        # most-starred modules in the topic
+luvus module install owner/repo            # whole repo is the module
+luvus module install owner/repo/path/to    # module in a subdirectory
+luvus module install owner/repo --ref v1   # pin a branch / tag / commit
 ```
 
 Install does a shallow clone, **shows every command the module declares and
@@ -924,14 +929,14 @@ environment, verifies the manifest didn't change during the build, and pins
 the checkout to the installed commit. There's intentionally **no central
 registry**: publishing is pushing a public repo.
 
-Once the topic is on your repo, it shows up in `bohay module search` and on the
+Once the topic is on your repo, it shows up in `luvus module search` and on the
 [module index](/modules/) with no further submission. Two things make a listing
 land well, because they're what people see before they trust you:
 
 - **The repo description** is the card text on the index. One line, what it
   adds, not how it works.
 - **The README** should show the thing: a screenshot of the dock or menu entry,
-  the tools it needs (`jq`, `node`, …), and a `min_bohay_version` you've
+  the tools it needs (`jq`, `node`, …), and a `min_luvus_version` you've
   actually tested against.
 
 ## Troubleshooting
@@ -942,8 +947,8 @@ land well, because they're what people see before they trust you:
 | Listed but `runnable: false` | Disabled, platform-gated, or a manifest load warning (see `module list`). |
 | Action *is ambiguous* | Two modules expose the id, so qualify it: `module run <module-id> <action>`. |
 | No output in the log | The entry stays `running` until the command exits. Output is capped at 64 KiB. |
-| Callbacks do nothing | `$BOHAY_BIN_PATH` needs the bohay server for your session to be running. |
+| Callbacks do nothing | `$LUVUS_BIN_PATH` needs the luvus server for your session to be running. |
 | Action missing from a menu | Check its `contexts`, that the module is enabled, and that no `platforms` gate excludes this OS. |
 | Dock is empty after a restart | Push its rows from a `[[startup]]` hook. Dock contents are cached, not persisted. |
 | Settings row not showing | Settings appear only under an **enabled** module. Disabled modules collapse. |
-| `$BOHAY_SETTING_*` is empty | The key is upper-cased with `-` and `:` turned into `_`: `notify-on` → `BOHAY_SETTING_NOTIFY_ON`. |
+| `$LUVUS_SETTING_*` is empty | The key is upper-cased with `-` and `:` turned into `_`: `notify-on` → `LUVUS_SETTING_NOTIFY_ON`. |

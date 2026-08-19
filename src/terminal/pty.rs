@@ -61,7 +61,7 @@ impl Drop for Pane {
     /// Hang up the child, exactly like closing a terminal window.
     ///
     /// Without this the pane leaks everything it owns. Dropping `master` closes
-    /// only bohay's own handle: the reader thread still holds a cloned PTY fd, so
+    /// only luvus's own handle: the reader thread still holds a cloned PTY fd, so
     /// the child never sees EOF, so the reader never returns, so it keeps the
     /// engine `Arc` (and its whole scrollback grid) alive forever — and the
     /// writer thread with it, since the engine holds a clone of `input_tx`.
@@ -169,7 +169,7 @@ impl Pane {
     }
 
     /// Spawn a pane running an explicit argv with extra environment — a module
-    /// pane (docs/13 MOD-2). bohay's own identity vars always win over `env`.
+    /// pane (docs/13 MOD-2). luvus's own identity vars always win over `env`.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_command(
         id: PaneId,
@@ -635,7 +635,7 @@ impl Pane {
             .unwrap_or_default()
     }
 
-    /// Whether plain page keys should scroll Bohay's host history. Full-screen
+    /// Whether plain page keys should scroll Luvus's host history. Full-screen
     /// programs, mouse-tracking TUIs, and primary-screen pagers in application
     /// cursor mode retain their own key handling.
     pub fn host_page_keys(&self) -> bool {
@@ -652,7 +652,7 @@ impl Pane {
     /// Send pasted text to the child, wrapped in the bracketed-paste markers
     /// when the child asked for them (DECSET 2004).
     ///
-    /// The outer terminal hands bohay a paste with its markers already stripped
+    /// The outer terminal hands luvus a paste with its markers already stripped
     /// (crossterm turns `ESC[200~ … ESC[201~` into one `Event::Paste`), so
     /// forwarding the bare text would make the child see it as ordinary typing.
     /// Programs that distinguish the two then misbehave: an agent CLI shows a
@@ -736,24 +736,29 @@ fn apply_pane_env(
     extra_env: &[(String, String)],
 ) {
     cmd.cwd(cwd);
-    // Caller-supplied env first, then bohay's identity vars (so they can't
+    // Caller-supplied env first, then luvus's identity vars (so they can't
     // be overridden — no spoofing the module/pane identity).
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
     cmd.env("TERM", "xterm-256color");
+    cmd.env("LUVUS_ENV", "1");
     cmd.env("BOHAY_ENV", "1");
+    cmd.env("LUVUS_PANE_ID", id.0.to_string());
     cmd.env("BOHAY_PANE_ID", id.0.to_string());
     if let Some(sock) = crate::ipc::api::socket_path_env() {
+        cmd.env("LUVUS_SOCKET_PATH", &sock);
         cmd.env("BOHAY_SOCKET_PATH", sock);
     }
     if let Some(name) = crate::session::active_name() {
-        cmd.env(crate::session::SESSION_ENV_VAR, name);
+        cmd.env(crate::session::SESSION_ENV_VAR, &name);
+        cmd.env(crate::session::LEGACY_SESSION_ENV_VAR, name);
     }
-    // This session's exact binary, so an agent can use `$BOHAY_BIN_PATH`
-    // instead of a `bohay` on PATH that may be an older install with a
+    // This session's exact binary, so an agent can use `$LUVUS_BIN_PATH`
+    // instead of a `luvus` on PATH that may be an older install with a
     // different CLI (skill/binary skew). Matches the server it talks to.
     if let Ok(exe) = std::env::current_exe() {
+        cmd.env("LUVUS_BIN_PATH", &exe);
         cmd.env("BOHAY_BIN_PATH", exe);
     }
 }
@@ -949,7 +954,7 @@ mod tests {
     use super::wrap_paste;
 
     /// A dropped file path must reach the child as a *paste*, not as typing.
-    /// bohay receives it with the markers already stripped by crossterm, so it
+    /// luvus receives it with the markers already stripped by crossterm, so it
     /// re-adds them whenever the child enabled DECSET 2004. Without this, an
     /// agent CLI renders the path as literal text instead of attaching the file.
     #[test]

@@ -1,4 +1,4 @@
-//! User configuration at `~/.bohay/config.json` — theme, layout, notifications.
+//! User configuration at `~/.luvus/config.json` — theme, layout, notifications.
 //! Loaded on startup and saved whenever Settings changes something. Every field
 //! has a serde default, so old/new configs round-trip and a missing or corrupt
 //! file just yields defaults.
@@ -38,9 +38,9 @@ pub struct Config {
     pub layout: LayoutConfig,
     #[serde(default)]
     pub notifications: NotifyConfig,
-    /// Check `bohay.dev/latest.json` in the background for a newer release and
+    /// Check `luvus.dev/latest.json` in the background for a newer release and
     /// show an indicator by the version number. A single periodic `curl`/`wget`
-    /// GET; on by default, toggled in Settings → General. Notify-only — bohay
+    /// GET; on by default, toggled in Settings → General. Notify-only — luvus
     /// never self-updates (installed via cargo/brew/etc).
     #[serde(default = "yes")]
     pub check_updates: bool,
@@ -143,7 +143,7 @@ pub struct LayoutConfig {
     /// `0` disables compact mode entirely (the full UI always renders).
     #[serde(default = "default_compact_width")]
     pub compact_width: u16,
-    /// What bohay forwards to a pane for **Shift/Alt+Enter** ("new line, don't
+    /// What luvus forwards to a pane for **Shift/Alt+Enter** ("new line, don't
     /// submit"). A keyword from [`SHIFT_ENTER_CHOICES`]; default `esc-cr`
     /// (`ESC CR`, the sequence Claude Code's `/terminal-setup` installs). Exposed
     /// because agents/terminals disagree on which byte sequence they treat as a

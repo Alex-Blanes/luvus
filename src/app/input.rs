@@ -397,7 +397,7 @@ impl App {
         true
     }
 
-    /// Apply a mouse event and report whether it changed anything Bohay draws.
+    /// Apply a mouse event and report whether it changed anything Luvus draws.
     ///
     /// Button, drag, release, and wheel events stay conservative because they
     /// are low-frequency interactions and can change state through many modal
@@ -846,7 +846,7 @@ impl App {
                 // Code) gets the click itself — that's how clicking a collapsed
                 // tool result expands it, exactly like in a plain terminal. The
                 // click still focuses the pane first. `Shift` bypasses
-                // forwarding for bohay's own text selection (the standard
+                // forwarding for luvus's own text selection (the standard
                 // terminal convention).
                 if !m.modifiers.contains(KeyModifiers::SHIFT) && self.begin_mouse_forward(&m, 0) {
                     return;
@@ -863,7 +863,7 @@ impl App {
                     });
             }
             MouseEventKind::Down(MouseButton::Middle) => {
-                // Middle click has no bohay meaning — forward it to a
+                // Middle click has no luvus meaning — forward it to a
                 // mouse-tracking app (button 1), otherwise ignore it.
                 self.begin_mouse_forward(&m, 1);
                 return;
@@ -1073,7 +1073,7 @@ impl App {
                         }
                         scrolled_the_app = true;
                     } else if !pane.alt_screen() {
-                        // Primary screen with real history: scroll bohay's
+                        // Primary screen with real history: scroll luvus's
                         // scrollback viewport (`scroll` is -3 up / +3 down, and a
                         // positive delta scrolls up into history — so negate it).
                         pane.scroll(-scroll);
@@ -1231,11 +1231,11 @@ impl App {
                     // Tell the action *which* row was clicked, so one action can
                     // serve a whole list (docs/13 §3.10).
                     let extra = vec![
-                        ("BOHAY_MODULE_DOCK_ID".to_string(), dock_id.clone()),
-                        ("BOHAY_MODULE_ROW_INDEX".to_string(), row_i.to_string()),
-                        ("BOHAY_MODULE_ROW_TEXT".to_string(), row.text.clone()),
+                        ("LUVUS_MODULE_DOCK_ID".to_string(), dock_id.clone()),
+                        ("LUVUS_MODULE_ROW_INDEX".to_string(), row_i.to_string()),
+                        ("LUVUS_MODULE_ROW_TEXT".to_string(), row.text.clone()),
                         (
-                            "BOHAY_MODULE_ROW_VALUE".to_string(),
+                            "LUVUS_MODULE_ROW_VALUE".to_string(),
                             row.value.unwrap_or(row.text),
                         ),
                     ];
@@ -1359,7 +1359,7 @@ impl App {
 
     /// Enter keyboard scroll mode on the focused pane, scrolling up `lines` to
     /// start. Returns false (no-op) for an alt-screen pane — its history isn't in
-    /// bohay's scrollback, so the app owns scrolling there.
+    /// luvus's scrollback, so the app owns scrolling there.
     fn enter_scroll_mode(&mut self, lines: i32) -> bool {
         let id = self.layout().focus;
         match self.panes.get(&id) {
@@ -1822,7 +1822,7 @@ impl App {
     }
 
     /// Act on a resolved link (docs/58): a URL goes to the client's browser, a
-    /// file opens in bohay itself.
+    /// file opens in luvus itself.
     pub fn activate_link(&mut self, target: LinkTarget) {
         match target {
             LinkTarget::Url(url) => self.open_url(url),
@@ -1889,7 +1889,7 @@ impl App {
         }
     }
 
-    /// Returns whether this key changed the **bohay UI** (so the server should
+    /// Returns whether this key changed the **luvus UI** (so the server should
     /// render). Plain input forwarded to a pane returns `false`: the pane's echo
     /// arrives as a separate `PtyData` event and renders then, so we don't burn a
     /// full render on the keystroke itself.
@@ -2428,7 +2428,7 @@ mod tests {
     }
 
     // Agents treat Enter as "submit" and Shift+Enter as "new line". A terminal
-    // sends a bare CR for both, so bohay asks for the disambiguating keyboard
+    // sends a bare CR for both, so luvus asks for the disambiguating keyboard
     // protocol and forwards the modified form as `ESC CR` — the sequence agent
     // CLIs already understand.
     #[test]
@@ -2665,7 +2665,7 @@ mod link_click_tests {
     use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
 
-    const URL: &str = "https://bohay.dev/docs";
+    const URL: &str = "https://luvus.dev/docs";
 
     /// An app with one pane whose grid holds [`URL`], plus the screen cells that
     /// sit on it and on the prose beside it.
@@ -2877,7 +2877,7 @@ mod link_click_tests {
     }
 
     #[test]
-    fn any_motion_forwarding_does_not_mark_bohay_dirty() {
+    fn any_motion_forwarding_does_not_mark_luvus_dirty() {
         let _env = crate::persist::test_env("mouse-any-motion-dirty");
         let Fixture {
             mut app,
@@ -2970,7 +2970,7 @@ mod link_click_tests {
         (app, term, (content.x + at, content.y))
     }
 
-    /// A path an agent printed opens **in bohay**, in a new tab, not at the OS.
+    /// A path an agent printed opens **in luvus**, in a new tab, not at the OS.
     /// Tests run from the repo root, so `Cargo.toml` is a real relative path from
     /// the pane's working directory.
     #[test]
@@ -3049,7 +3049,7 @@ mod link_click_tests {
     #[test]
     fn ctrl_click_on_a_bare_domain_opens_it_over_https() {
         let _env = crate::persist::test_env("link-domain");
-        let (mut app, _t, at) = fixture_showing("visit bohay.dev/docs now", 8);
+        let (mut app, _t, at) = fixture_showing("visit luvus.dev/docs now", 8);
         app.handle_event(mouse(
             MouseEventKind::Down(MouseButton::Left),
             at,
@@ -3062,7 +3062,7 @@ mod link_click_tests {
         ));
         assert_eq!(
             app.pending_open_url.as_deref(),
-            Some("https://bohay.dev/docs")
+            Some("https://luvus.dev/docs")
         );
     }
 
@@ -3092,10 +3092,10 @@ mod link_click_tests {
         }
 
         // Same shape, no such file, and `.dev` is a domain — so it is a link.
-        let (app, _t, at) = fixture_showing("see bohay.dev here", 6);
+        let (app, _t, at) = fixture_showing("see luvus.dev here", 6);
         assert_eq!(
             app.link_at_screen(at.0, at.1).map(|h| h.target),
-            Some(LinkTarget::Url("https://bohay.dev".into()))
+            Some(LinkTarget::Url("https://luvus.dev".into()))
         );
 
         // Same shape again, no such file and no known TLD — inert either way.

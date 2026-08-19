@@ -211,7 +211,7 @@ impl Cmd {
             Cmd::NewTab => "c",
             Cmd::NextTab => "n",
             Cmd::PrevTab => "p",
-            // `,` renames the tab on both bohay and tmux (tmux's rename-window).
+            // `,` renames the tab on both luvus and tmux (tmux's rename-window).
             Cmd::RenameTab => ",",
             Cmd::NewWorkspace => "N",
             Cmd::CloseWorkspace => "D",
@@ -541,14 +541,14 @@ pub struct Preset {
     pub binds: &'static [(&'static str, &'static str)],
 }
 
-/// The built-in presets. `default` restores bohay's own keys; `tmux` matches the
+/// The built-in presets. `default` restores luvus's own keys; `tmux` matches the
 /// muscle memory of a tmux user (`Ctrl+b` prefix, `%`/`"` splits) - most other
-/// tmux keys (`c`/`n`/`p`/`x`/`z`/`d`) already agree with bohay's defaults.
+/// tmux keys (`c`/`n`/`p`/`x`/`z`/`d`) already agree with luvus's defaults.
 pub fn presets() -> &'static [Preset] {
     &[
         Preset {
             id: "default",
-            label: "bohay (default)",
+            label: "luvus (default)",
             prefix: "ctrl+space",
             binds: &[],
         },
@@ -562,7 +562,7 @@ pub fn presets() -> &'static [Preset] {
                 ("split_down", "\""),
                 // `o` cycles to the next pane (rename is `,` by default already).
                 ("next_pane", "o"),
-                // `(` / `)` step to the previous / next session (bohay workspace).
+                // `(` / `)` step to the previous / next session (luvus workspace).
                 ("prev_node", "("),
                 ("next_node", ")"),
                 // `w` opens the jump palette (tmux's choose-window / -tree); the
@@ -629,7 +629,7 @@ impl App {
 
     /// Apply a named keybinding preset (docs/64): set the prefix and replace the
     /// keybinding overrides with the preset's, then rebuild + persist. `"default"`
-    /// clears every override back to bohay's built-in keys. Returns `false` for an
+    /// clears every override back to luvus's built-in keys. Returns `false` for an
     /// unknown preset name.
     pub fn apply_preset(&mut self, name: &str) -> bool {
         let Some(preset) = presets().iter().find(|p| p.id == name) else {
@@ -829,14 +829,14 @@ mod tests {
         assert_eq!(app.prefix, PrefixSpec::parse("ctrl+b").unwrap());
         assert_eq!(app.keymap.get("%"), Some(&Cmd::SplitRight));
         assert_eq!(app.keymap.get("\""), Some(&Cmd::SplitDown));
-        // tmux pane/window/session keys map onto bohay's commands.
+        // tmux pane/window/session keys map onto luvus's commands.
         assert_eq!(app.keymap.get("o"), Some(&Cmd::NextPane));
         assert_eq!(app.keymap.get(","), Some(&Cmd::RenameTab));
         assert_eq!(app.keymap.get(")"), Some(&Cmd::NextWorkspace));
         assert_eq!(app.keymap.get("("), Some(&Cmd::PrevWorkspace));
         // The default split keys are gone under the preset.
         assert_ne!(app.keymap.get("v"), Some(&Cmd::SplitRight));
-        // `default` restores bohay's own prefix and keys.
+        // `default` restores luvus's own prefix and keys.
         assert!(app.apply_preset("default"));
         assert_eq!(app.prefix, PrefixSpec::default());
         assert_eq!(app.keymap.get("v"), Some(&Cmd::SplitRight));

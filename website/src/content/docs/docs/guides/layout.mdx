@@ -1,16 +1,16 @@
 ---
 title: Panes, Tabs & Workspaces
-description: Arrange and navigate bohay by splitting, resizing, and zooming panes, renaming and cycling tabs, managing workspaces, and customizing the sidebars.
+description: Arrange and navigate luvus by splitting, resizing, and zooming panes, renaming and cycling tabs, managing workspaces, and customizing the sidebars.
 ---
 
-bohay is **mouse-native**: everything here works by click and drag, and every
+luvus is **mouse-native**: everything here works by click and drag, and every
 action also has a key behind the [`Ctrl+Space` prefix](/docs/getting-started/concepts/#3-the-prefix-key).
 Nothing is modal, so what you type always goes to the focused pane.
 
 ## Panes
 
 A pane is a real terminal. Inside a tab you can split it as many ways as you
-like, and bohay tiles them automatically.
+like, and luvus tiles them automatically.
 
 | Do this | Mouse | Key |
 |---|---|---|
@@ -53,9 +53,9 @@ number). The `⎇ git` and `◇ orch` tabs keep their fixed labels.
 The CLI exposes the same pane move plus tab reordering for scripts and agents:
 
 ```sh
-bohay pane move 7 --tab 2       # existing tab in pane 7's workspace
-bohay pane move 7 --new-tab     # append a fresh tab for pane 7
-bohay tab move 3 1              # move current workspace tab 3 to position 1
+luvus pane move 7 --tab 2       # existing tab in pane 7's workspace
+luvus pane move 7 --new-tab     # append a fresh tab for pane 7
+luvus tab move 3 1              # move current workspace tab 3 to position 1
 ```
 
 All tab numbers are 1-based. A pane move keeps its process running and follows
@@ -70,7 +70,7 @@ live in the sidebar's top list.
 - **Open one:** the `+` button above the list, or `Ctrl+Space N`, opens a
   **folder picker**. Browse with the arrows / wheel, `⏎` to open the highlighted
   folder, `n` to create-and-open a new folder, or `w` to open a repo **as a new
-  worktree**. Running `bohay` inside a folder also adds it automatically.
+  worktree**. Running `luvus` inside a folder also adds it automatically.
 - **Switch:** click a row, or `Ctrl+Space w` / `W` to cycle.
 - **Jump to its git tab:** click the branch name next to a workspace.
 
@@ -90,10 +90,10 @@ The same organization actions are available from the CLI using stable 0-based
 workspace indices:
 
 ```sh
-bohay workspace list
-bohay workspace rename 2 "Bohay website"
-bohay workspace pin 2
-bohay workspace unpin 2
+luvus workspace list
+luvus workspace rename 2 "Luvus website"
+luvus workspace pin 2
+luvus workspace unpin 2
 ```
 
 `workspace list` reports both the stable API index and `display_position`, so a
@@ -110,7 +110,7 @@ panes the full width:
 ## Two sidebars and docks
 
 The sidebar's sections are **docks**, relocatable panels. The built-ins are
-**Workspaces** and **Agents**, and bohay has *two* sidebars (left and right), so
+**Workspaces** and **Agents**, and luvus has *two* sidebars (left and right), so
 you can split reference content from live content across both edges. Modules can
 add their own docks too (see [Writing a Module](/docs/extend/writing-modules/)).
 
@@ -128,7 +128,7 @@ and your project list on the other. If you hide the left sidebar entirely, the
 
 :::tip
 The **Agents** dock header has an **All / Active** toggle: *Active* shows only
-running agents, while *All* also lists the resumable sessions bohay found on disk (click
+running agents, while *All* also lists the resumable sessions luvus found on disk (click
 one to reopen it). See [Working with Agents](/docs/guides/agents/).
 :::
 
@@ -148,15 +148,15 @@ follows it. If you would rather not hold a modifier, **right-click** and pick
 
 | Under the cursor | What a `Ctrl`+click does |
 |---|---|
-| `https://bohay.dev/docs` | opens in your browser |
-| `bohay.dev/docs` | same, with `https://` filled in |
+| `https://luvus.dev/docs` | opens in your browser |
+| `luvus.dev/docs` | same, with `https://` filled in |
 | `localhost:3000` | opens your dev server, over `http` |
-| `src/main.rs` | opens in a bohay tab, like clicking it in FILES |
+| `src/main.rs` | opens in a luvus tab, like clicking it in FILES |
 | `src/main.rs:42` | opens in a tab, scrolled to line 42 |
 
 ### Files
 
-A file path opens **in bohay**, not in some other app. It goes through exactly the
+A file path opens **in luvus**, not in some other app. It goes through exactly the
 same path as clicking the file in the FILES tree, so it respects your
 **Settings → General → Open files with** choice: the built-in read-only viewer by
 default, or your terminal editor if you set one.
@@ -173,16 +173,16 @@ different for every editor.
 
 ### Links
 
-You do not need the `https://`. A bare `bohay.dev` or `google.com/search` works,
+You do not need the `https://`. A bare `luvus.dev` or `google.com/search` works,
 and `localhost:3000` opens your dev server over plain `http`.
 
 Bare domains are matched conservatively, so ordinary text does not turn into links:
-the name has to be lower case, end in a TLD bohay knows, and `localhost` needs a
+the name has to be lower case, end in a TLD luvus knows, and `localhost` needs a
 port on it. If a domain of yours is not recognised, writing the `https://` always
 works.
 
 One consequence worth knowing: **a filename can also be a domain.** `.rs` is
-Serbia, `.md` is Moldova. So `main.rs` is ambiguous, and bohay settles it by
+Serbia, `.md` is Moldova. So `main.rs` is ambiguous, and luvus settles it by
 looking at the disk: if the file is there, it opens the file. If not, and the name
 is a real domain, it opens the site. If neither, nothing happens.
 
@@ -203,5 +203,5 @@ a link only opens when you release without moving.
 ## Detaching
 
 Closing your terminal never loses work, because the server keeps every pane alive. Run
-`bohay` again to reattach, or `Ctrl+Space d` to detach on purpose. See
+`luvus` again to reattach, or `Ctrl+Space d` to detach on purpose. See
 [Your First Session](/docs/getting-started/first-session/#4-detach--this-is-the-magic).

@@ -1,29 +1,29 @@
 ---
 title: Core Concepts
-description: The bohay mental model in two minutes, covering server and client, workspaces, tabs, panes, and the prefix key.
+description: The luvus mental model in two minutes, covering server and client, workspaces, tabs, panes, and the prefix key.
 ---
 
-Five ideas explain everything bohay does.
+Five ideas explain everything luvus does.
 
 ## 1. A server owns your session, a client shows it
 
-When you run `bohay`, two things happen: a background **server** starts (once)
+When you run `luvus`, two things happen: a background **server** starts (once)
 and owns every pane, shell, and agent, and a thin **client** attaches to
 display it. The client is disposable. The server is durable.
 
 - Close the terminal (or `Ctrl+Space d`) → the client detaches, **the session
   lives**. Every shell and agent keeps running exactly where it was.
-- `bohay` again → a new client attaches to the same live session. Nothing
+- `luvus` again → a new client attaches to the same live session. Nothing
   restarts and no command reruns, you are just looking at it again.
 - Close every workspace → the server stays up with a fresh one. Nothing you do
   in the UI can kill the session by accident.
-- `bohay server stop` → the only way to actually end everything (the session
+- `luvus server stop` → the only way to actually end everything (the session
   snapshot is kept).
-- `bohay server status` → what's running, and whether a newer binary is
-  waiting for a `bohay server restart`.
+- `luvus server status` → what's running, and whether a newer binary is
+  waiting for a `luvus server restart`.
 
-If the server itself goes away (a reboot, an upgrade via `bohay server
-restart`, or the process being killed), bohay saves the session shape on the
+If the server itself goes away (a reboot, an upgrade via `luvus server
+restart`, or the process being killed), luvus saves the session shape on the
 way out and rebuilds it on the next start: workspaces, tabs, layout, each
 pane's folder and last screen, and any agent conversation it can
 [resume natively](/docs/guides/agents/#session-resume-the-flagship). A resumed
@@ -33,18 +33,18 @@ but you land in the same place you left.
 
 ### More than one independent session
 
-The default `bohay` command keeps the same single durable server as before. If
+The default `luvus` command keeps the same single durable server as before. If
 you need separate failure and resource boundaries, give each server a name:
 
 ```sh
-bohay session attach api
-bohay session attach website
-bohay --session api pane list
+luvus session attach api
+luvus session attach website
+luvus --session api pane list
 ```
 
 A named session owns its own server, PTYs, agents, workspaces, tabs, snapshot,
-and orchestration ledger. It is not a workspace. `bohay session stop api`
-stops only `api`, while `website` stays responsive. `bohay session list` checks
+and orchestration ledger. It is not a workspace. `luvus session stop api`
+stops only `api`, while `website` stays responsive. `luvus session list` checks
 known sessions without starting any server or background manager.
 
 ## 2. Workspace → Tab → Pane
@@ -57,7 +57,7 @@ Session
 ```
 
 - **Workspaces** are the sidebar's top list. `Ctrl+Space N` opens the folder
-  picker. Running `bohay` inside a folder adds it automatically. A workspace's
+  picker. Running `luvus` inside a folder adds it automatically. A workspace's
   cwd is fixed at creation, so `cd`-ing inside a pane never moves it.
 - **Tabs** hold split layouts. Two special tabs exist: the
   [git tab](/docs/guides/git/) and the
@@ -69,7 +69,7 @@ Session
 
 ## 3. The prefix key
 
-bohay stays out of your keystrokes: everything you type goes straight to the
+luvus stays out of your keystrokes: everything you type goes straight to the
 pane. Commands live behind one chord: press the prefix (**`Ctrl+Space`** by
 default), release, then a key. `Ctrl+Space ?` lists everything, and every
 binding is remappable in **Settings → Keys**. The prefix itself is configurable
@@ -81,7 +81,7 @@ mouse everything, and `Shift+↑` for [scroll mode](/docs/guides/scrollback/).
 
 ## 4. Agents are watched, not wrapped
 
-bohay doesn't inject itself into your agents. They run untouched in ordinary
+luvus doesn't inject itself into your agents. They run untouched in ordinary
 panes. Detection reads the screen: which agent is this, is a permission prompt
 showing (**blocked**), is output flowing (**working**), did it just go quiet
 (**done**). That's why *any* agent works with zero setup, and a
@@ -90,8 +90,8 @@ precision where you want it.
 
 ## 5. Everything is a command
 
-The UI and the CLI are the same surface: whatever you can click, `bohay <verb>`
+The UI and the CLI are the same surface: whatever you can click, `luvus <verb>`
 can do over a local socket, and agents inside panes can too (each pane gets
-`$BOHAY_PANE_ID` and the socket path injected). This is what makes
+`$LUVUS_PANE_ID` and the socket path injected). This is what makes
 [scripting](/docs/guides/scripting/) and
 [orchestration](/docs/guides/orchestration/) natural instead of bolted on.

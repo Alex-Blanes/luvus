@@ -6,11 +6,11 @@
 set -eu
 . "$(dirname "$0")/lib.sh"
 
-path="${BOHAY_MODULE_ROW_VALUE:-}"
-[ -n "$path" ] || { "$bohay" ui toast "no file selected"; exit 1; }
-[ -f "$path" ] || { "$bohay" ui toast "not a file: ${path##*/}"; exit 1; }
+path="${LUVUS_MODULE_ROW_VALUE:-}"
+[ -n "$path" ] || { "$luvus" ui toast "no file selected"; exit 1; }
+[ -f "$path" ] || { "$luvus" ui toast "not a file: ${path##*/}"; exit 1; }
 
-open_in="${BOHAY_SETTING_OPEN_IN:-pane}"
+open_in="${LUVUS_SETTING_OPEN_IN:-pane}"
 
 # The first pane id in a JSON reply. `pane split` returns exactly the new pane;
 # after `tab new` the new tab has a single (focused) shell, so its first pane is
@@ -18,13 +18,13 @@ open_in="${BOHAY_SETTING_OPEN_IN:-pane}"
 first_pane() { sed -n 's/.*"pane": *"\([0-9][0-9]*\)".*/\1/p' | head -1; }
 
 if [ "$open_in" = "tab" ]; then
-  "$bohay" tab new >/dev/null 2>&1 || true
-  pid=$("$bohay" pane list | first_pane)
+  "$luvus" tab new >/dev/null 2>&1 || true
+  pid=$("$luvus" pane list | first_pane)
 else
-  pid=$("$bohay" pane split | first_pane)
+  pid=$("$luvus" pane split | first_pane)
 fi
 
-[ -n "${pid:-}" ] || { "$bohay" ui toast "could not open a pane"; exit 1; }
+[ -n "${pid:-}" ] || { "$luvus" ui toast "could not open a pane"; exit 1; }
 
 # Single-quote the path for the shell that will run the pager, escaping any
 # embedded single quotes so a spaced or quirky filename is safe.
@@ -35,6 +35,6 @@ else
   cmd="less -N '$q'"
 fi
 
-"$bohay" pane run "$pid" "$cmd"
-"$bohay" pane focus "$pid" >/dev/null 2>&1 || true
-"$bohay" ui toast "opened ${path##*/}"
+"$luvus" pane run "$pid" "$cmd"
+"$luvus" pane focus "$pid" >/dev/null 2>&1 || true
+"$luvus" ui toast "opened ${path##*/}"

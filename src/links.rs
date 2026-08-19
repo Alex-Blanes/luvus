@@ -45,7 +45,7 @@ const KNOWN_TLDS: &[&str] = &[
     "br", "ar", "cl", "za", "ng", "ke", "eg", "ae", "sa", "eu", "us", "rs", "md", "lol",
 ];
 
-/// A bare `host[:port][/path]` worth offering as a URL, e.g. `bohay.dev/docs` or
+/// A bare `host[:port][/path]` worth offering as a URL, e.g. `luvus.dev/docs` or
 /// `localhost:3000`. Returns the text to build the URL from, or `None`.
 ///
 /// Deliberately strict, because this is the one detector with no existence check
@@ -339,11 +339,11 @@ mod tests {
 
     #[test]
     fn finds_a_plain_url_anywhere_along_it() {
-        let g = ["see https://bohay.dev/docs for more"];
+        let g = ["see https://luvus.dev/docs for more"];
         for col in 4..=25 {
             assert_eq!(
                 url_at(&g, 40, col, 0).as_deref(),
-                Some("https://bohay.dev/docs"),
+                Some("https://luvus.dev/docs"),
                 "col {col}"
             );
         }
@@ -356,7 +356,7 @@ mod tests {
     fn ignores_text_without_a_scheme() {
         // Bare hostnames and other schemes are deliberately not offered.
         for line in [
-            "visit www.bohay.dev today",
+            "visit www.luvus.dev today",
             "open file:///etc/hosts now",
             "run javascript:alert(1) no",
             "just some ordinary words",
@@ -371,10 +371,10 @@ mod tests {
     #[test]
     fn trims_trailing_punctuation_and_unbalanced_brackets() {
         let cases = [
-            ("go to https://bohay.dev.", "https://bohay.dev"),
-            ("go to https://bohay.dev,", "https://bohay.dev"),
-            ("(see https://bohay.dev)", "https://bohay.dev"),
-            ("[see https://bohay.dev]", "https://bohay.dev"),
+            ("go to https://luvus.dev.", "https://luvus.dev"),
+            ("go to https://luvus.dev,", "https://luvus.dev"),
+            ("(see https://luvus.dev)", "https://luvus.dev"),
+            ("[see https://luvus.dev]", "https://luvus.dev"),
             // A parenthesis the URL opened itself is kept.
             (
                 "see https://en.wikipedia.org/wiki/Foo_(bar)",
@@ -382,8 +382,8 @@ mod tests {
             ),
             // Query strings and fragments survive intact.
             (
-                "see https://bohay.dev/a?b=1&c=2#frag!",
-                "https://bohay.dev/a?b=1&c=2#frag",
+                "see https://luvus.dev/a?b=1&c=2#frag!",
+                "https://luvus.dev/a?b=1&c=2#frag",
             ),
         ];
         for (line, want) in cases {
@@ -401,13 +401,13 @@ mod tests {
     #[test]
     fn joins_a_url_wrapped_across_the_right_edge() {
         let g = grid(
-            &["ref https://bohay.dev/docs/gui", "des/agents and then some"],
+            &["ref https://luvus.dev/docs/gui", "des/agents and then some"],
             30,
         );
         let link = link_at(&g, 20, 0).expect("found");
         assert_eq!(
             link.hit,
-            Hit::Url("https://bohay.dev/docs/guides/agents".into())
+            Hit::Url("https://luvus.dev/docs/guides/agents".into())
         );
         assert_eq!(link.spans, vec![(0, 4, 30), (1, 0, 10)]);
         // Reachable from the continuation row too.
@@ -418,9 +418,9 @@ mod tests {
     /// short is a finished line, so the next row must not be swallowed.
     #[test]
     fn does_not_join_across_a_line_that_ended_early() {
-        let g = grid(&["ref https://bohay.dev", "docs/agents"], 30);
+        let g = grid(&["ref https://luvus.dev", "docs/agents"], 30);
         let link = link_at(&g, 8, 0).expect("found");
-        assert_eq!(link.hit, Hit::Url("https://bohay.dev".into()));
+        assert_eq!(link.hit, Hit::Url("https://luvus.dev".into()));
         assert_eq!(link.spans, vec![(0, 4, 21)]);
     }
 
@@ -474,13 +474,13 @@ mod tests {
         }
     }
 
-    /// Bare domains, so `bohay.dev` is as clickable as the written-out URL.
+    /// Bare domains, so `luvus.dev` is as clickable as the written-out URL.
     #[test]
     fn recognises_bare_domains() {
         for ok in [
-            "bohay.dev",
+            "luvus.dev",
             "google.com",
-            "bohay.dev/docs/guides",
+            "luvus.dev/docs/guides",
             "sub.domain.co.uk",
             "bun.sh",
             "example.com:8080/x",
@@ -527,7 +527,7 @@ mod tests {
     /// domain gets https.
     #[test]
     fn bare_domains_get_a_sensible_scheme() {
-        assert_eq!(domain_url("bohay.dev"), "https://bohay.dev");
+        assert_eq!(domain_url("luvus.dev"), "https://luvus.dev");
         assert_eq!(domain_url("localhost:3000"), "http://localhost:3000");
         assert_eq!(domain_url("127.0.0.1:8080/x"), "http://127.0.0.1:8080/x");
     }
@@ -541,9 +541,9 @@ mod tests {
             Hit::Path { raw, .. } => assert_eq!(raw, "localhost:3000"),
             other => panic!("expected a scheme-less hit, got {other:?}"),
         }
-        let g = grid(&["see bohay.dev/docs ok"], 40);
+        let g = grid(&["see luvus.dev/docs ok"], 40);
         match link_at(&g, 6, 0).expect("found").hit {
-            Hit::Path { raw, .. } => assert_eq!(raw, "bohay.dev/docs"),
+            Hit::Path { raw, .. } => assert_eq!(raw, "luvus.dev/docs"),
             other => panic!("expected a scheme-less hit, got {other:?}"),
         }
     }
@@ -553,18 +553,18 @@ mod tests {
     #[test]
     fn a_url_is_never_read_as_a_path() {
         assert_eq!(
-            path_at(&["see https://bohay.dev/a/b.rs ok"], 60, 10, 0),
+            path_at(&["see https://luvus.dev/a/b.rs ok"], 60, 10, 0),
             None
         );
         assert_eq!(
-            url_at(&["see https://bohay.dev/a/b.rs ok"], 60, 10, 0).as_deref(),
-            Some("https://bohay.dev/a/b.rs")
+            url_at(&["see https://luvus.dev/a/b.rs ok"], 60, 10, 0).as_deref(),
+            Some("https://luvus.dev/a/b.rs")
         );
     }
 
     #[test]
     fn covers_reports_the_cells_it_occupies() {
-        let link = link_at(&grid(&["x https://bohay.dev"], 30), 5, 0).unwrap();
+        let link = link_at(&grid(&["x https://luvus.dev"], 30), 5, 0).unwrap();
         assert!(link.covers(2, 0), "first cell of the URL");
         assert!(link.covers(18, 0), "last cell of the URL");
         assert!(!link.covers(1, 0), "the space before it");
@@ -581,16 +581,16 @@ mod tests {
     /// Never panic, whatever the grid holds.
     #[test]
     fn out_of_range_and_odd_input_are_safe() {
-        let g = grid(&["https://bohay.dev"], 20);
+        let g = grid(&["https://luvus.dev"], 20);
         assert_eq!(link_at(&g, 0, 9), None, "row past the end");
         assert_eq!(link_at(&g, 99, 0), None, "col past the end");
         assert_eq!(link_at(&[], 0, 0), None, "empty grid");
         assert_eq!(link_at(&["".to_string()], 0, 0), None, "empty row");
         // Wide glyphs and combining marks must not shift or split anything.
-        let cjk = grid(&["日本語 https://bohay.dev 語"], 40);
+        let cjk = grid(&["日本語 https://luvus.dev 語"], 40);
         assert_eq!(
             link_at(&cjk, 6, 0).map(|l| l.hit),
-            Some(Hit::Url("https://bohay.dev".into()))
+            Some(Hit::Url("https://luvus.dev".into()))
         );
     }
 }

@@ -3,7 +3,7 @@
 //!
 //! The manifest declares the *shape* (key, title, type, bounds); this file
 //! stores the *values*, as a flat JSON object in the module's own config dir
-//! (`~/.bohay/modules/config/<id>/settings.json`). That dir already belongs to
+//! (`~/.luvus/modules/config/<id>/settings.json`). That dir already belongs to
 //! the module and survives reinstalls, so a module can also read the file
 //! directly if it would rather not parse the injected env.
 //!
@@ -177,22 +177,22 @@ pub fn display(spec: &super::manifest::SettingSpec, v: &Value) -> String {
 }
 
 /// The env a module command sees for its settings: the whole set as JSON plus
-/// one `BOHAY_SETTING_<KEY>` per entry, so a shell script needs no JSON parser.
+/// one `LUVUS_SETTING_<KEY>` per entry, so a shell script needs no JSON parser.
 pub fn env(manifest: &ModuleManifest, id: &str) -> Vec<(String, String)> {
     if manifest.settings.is_empty() {
         return Vec::new();
     }
     let values = effective(manifest, id);
     let mut env = vec![(
-        "BOHAY_MODULE_SETTINGS_JSON".to_string(),
+        "LUVUS_MODULE_SETTINGS_JSON".to_string(),
         Value::Object(values.clone()).to_string(),
     )];
     for (k, v) in &values {
         let name = format!(
-            "BOHAY_SETTING_{}",
+            "LUVUS_SETTING_{}",
             k.to_uppercase().replace(['-', ':', '.'], "_")
         );
-        // Scalars go in bare (no JSON quotes) so `$BOHAY_SETTING_TOKEN` is usable.
+        // Scalars go in bare (no JSON quotes) so `$LUVUS_SETTING_TOKEN` is usable.
         let flat = match v {
             Value::String(s) => s.clone(),
             Value::Bool(b) => b.to_string(),
@@ -228,7 +228,7 @@ mod tests {
             id: "you.demo".into(),
             name: "Demo".into(),
             version: "0.1.0".into(),
-            min_bohay_version: "0.1.0".into(),
+            min_luvus_version: "0.1.0".into(),
             description: None,
             platforms: None,
             build: vec![],
@@ -244,9 +244,9 @@ mod tests {
     #[test]
     fn set_get_roundtrip_with_clamping_and_env() {
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("bohay-modset-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("luvus-modset-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::env::set_var("BOHAY_HOME", &home);
+        std::env::set_var("LUVUS_HOME", &home);
 
         let mut limit = spec("limit", SettingKind::Number);
         limit.min = Some(1);
@@ -288,17 +288,17 @@ mod tests {
                 .map(|(_, v)| v.clone())
                 .unwrap_or_default()
         };
-        assert_eq!(find("BOHAY_SETTING_LIMIT"), "10");
-        assert_eq!(find("BOHAY_SETTING_MODE"), "slow");
-        assert_eq!(find("BOHAY_SETTING_TOKEN"), "s3cret", "no JSON quoting");
-        assert_eq!(find("BOHAY_SETTING_LOUD"), "true");
-        assert!(find("BOHAY_MODULE_SETTINGS_JSON").contains("\"mode\":\"slow\""));
+        assert_eq!(find("LUVUS_SETTING_LIMIT"), "10");
+        assert_eq!(find("LUVUS_SETTING_MODE"), "slow");
+        assert_eq!(find("LUVUS_SETTING_TOKEN"), "s3cret", "no JSON quoting");
+        assert_eq!(find("LUVUS_SETTING_LOUD"), "true");
+        assert!(find("LUVUS_MODULE_SETTINGS_JSON").contains("\"mode\":\"slow\""));
 
         // Secrets are masked in the UI even though the env carries the value.
         let masked = display(m.setting("token").unwrap(), &"s3cret".into());
         assert_eq!(masked, "••••••");
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -326,9 +326,9 @@ mod tests {
     #[test]
     fn stale_values_from_an_older_manifest_are_ignored() {
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("bohay-modstale-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("luvus-modstale-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::env::set_var("BOHAY_HOME", &home);
+        std::env::set_var("LUVUS_HOME", &home);
 
         let m = manifest(vec![spec("kept", SettingKind::String)]);
         set(&m, "you.demo", "kept", "yes".into()).unwrap();
@@ -347,7 +347,7 @@ mod tests {
         // The undeclared value stays on disk (a downgrade shouldn't lose it).
         assert!(stored("you.demo").contains_key("dropped"));
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 }

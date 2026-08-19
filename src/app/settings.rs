@@ -202,7 +202,7 @@ impl App {
         self.module_setting_edit = None;
     }
 
-    /// Open the changelog modal (click the sidebar version number), scrolled to
+    /// Open the changelog modal (click the status-line version number), scrolled to
     /// the top so the newest release is shown first.
     pub fn open_changelog(&mut self) {
         self.changelog_open = true;
@@ -896,7 +896,7 @@ impl App {
     }
 
     /// Toggle an agent's integration hook: install if absent, uninstall if present.
-    /// Uninstall removes only bohay's hook — never the agent itself.
+    /// Uninstall removes only luvus's hook — never the agent itself.
     fn install_integration(&mut self, cursor: usize) {
         if let Some(agent) = crate::integration::AGENTS.get(cursor) {
             if crate::integration::is_installed(agent) {
@@ -927,7 +927,7 @@ mod tests {
     use super::*;
 
     /// The docs/62 switch: whether resume replays each agent's own CLI options,
-    /// or falls back to the plain resume command bohay used before the feature.
+    /// or falls back to the plain resume command luvus used before the feature.
     ///
     /// **Off by default** — a remembered option outlives the session it was set
     /// for, and some of them widen what the agent may do, so it is opt-in.

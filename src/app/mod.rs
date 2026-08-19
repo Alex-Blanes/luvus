@@ -137,13 +137,13 @@ pub struct DockRow {
     pub dot: Option<String>,
     /// Action id to invoke when this row is clicked.
     pub action: Option<String>,
-    /// Opaque per-row payload handed to that action as `BOHAY_MODULE_ROW_VALUE`
+    /// Opaque per-row payload handed to that action as `LUVUS_MODULE_ROW_VALUE`
     /// — what turns a list of branches into a list of *buttons* (docs/13 §3.10).
     pub value: Option<String>,
     /// Extra actions offered when this row is **right-clicked** (docs/52).
     ///
     /// Empty — the default, and what every pre-existing module pushes — means the
-    /// row has no context menu, exactly as before. bohay cannot infer a menu for
+    /// row has no context menu, exactly as before. luvus cannot infer a menu for
     /// a row it does not understand (unlike a FILES row, which is a path), so the
     /// module declares one per row: a device row can offer "flash this board"
     /// while a command row in the same dock offers nothing.
@@ -151,7 +151,7 @@ pub struct DockRow {
 }
 
 /// One entry in a dock row's right-click menu (docs/52). `destructive` only
-/// tints the label — bohay does not confirm on the module's behalf.
+/// tints the label — luvus does not confirm on the module's behalf.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DockRowMenuItem {
     pub title: String,
@@ -177,7 +177,7 @@ impl DockRowMenuItem {
 ///
 /// Everything needed to run a click is **snapshotted here when the menu opens**,
 /// never re-read from `module_docks` afterwards. Module dock rows are the most
-/// volatile thing bohay renders — any `ui.dock.push` replaces the whole list, and
+/// volatile thing luvus renders — any `ui.dock.push` replaces the whole list, and
 /// pollers do that on a timer — so indexing back into the live rows at click time
 /// could run a *different* row's action. With `erase flash` on one of them, that
 /// is a destructive mistake, not a cosmetic one.
@@ -197,7 +197,7 @@ pub struct DockMenu {
     pub rects: Vec<Rect>,
 }
 
-/// A module-contributed dock's cached content (title + rows). bohay owns the
+/// A module-contributed dock's cached content (title + rows). luvus owns the
 /// rendering; the module only pushes data via `ui.dock.push`.
 #[derive(Clone)]
 pub struct ModuleDock {
@@ -352,8 +352,8 @@ impl Tab {
 /// The "what's running here?" overlay for one pane (click its title bar).
 ///
 /// An agent's own UI elides long commands (`Bash(cargo test …)`) and those
-/// characters never reach bohay, so the *screen* can't be expanded. The OS still
-/// knows the real argv, and bohay owns the pane's child pid — so this reads the
+/// characters never reach luvus, so the *screen* can't be expanded. The OS still
+/// knows the real argv, and luvus owns the pane's child pid — so this reads the
 /// process tree instead, and shows the command in full.
 pub struct CmdInspect {
     pub pane: PaneId,
@@ -665,7 +665,7 @@ pub enum PaneMenuItem {
     /// "Open Link" — open the URL that was under the right-click (docs/58). Only
     /// offered when there actually was one, so the row is never a dead end.
     OpenLink,
-    /// "Open File" — open the file path that was under the right-click, in bohay
+    /// "Open File" — open the file path that was under the right-click, in luvus
     /// rather than the OS (docs/58). Offered only for a path that exists.
     OpenFile,
     /// "Fork to new pane" — branch this pane's agent session into a new pane to
@@ -937,7 +937,7 @@ impl PaneStatus {
 pub enum LinkTarget {
     /// Hand to the client's browser.
     Url(String),
-    /// Open in bohay's own viewer or editor, exactly like a FILES click (docs/38),
+    /// Open in luvus's own viewer or editor, exactly like a FILES click (docs/38),
     /// jumping to `line` when the reference carried one.
     File { path: PathBuf, line: Option<u32> },
 }
@@ -1071,7 +1071,7 @@ pub struct App {
     /// an agent by name instead of a pane id. Ephemeral (pane ids are reallocated
     /// each run), so it is never persisted and is pruned when a pane closes.
     pub agent_names: HashMap<String, PaneId>,
-    /// Agent-detection rule set: built-ins plus user `~/.bohay/manifests/*.toml`
+    /// Agent-detection rule set: built-ins plus user `~/.luvus/manifests/*.toml`
     /// (docs/07). Loaded once at startup.
     pub manifests: crate::detect::Manifests,
     /// Terminal editors found on `PATH` (+ `$EDITOR`), for "open file with"
@@ -1097,7 +1097,7 @@ pub struct App {
     pub picker_rects: Vec<(usize, Rect)>,
     /// Whether the keyboard-shortcut cheat-sheet overlay is open (`Ctrl+Space ?`).
     pub help_open: bool,
-    /// Whether the changelog modal is open (click the sidebar version number).
+    /// Whether the changelog modal is open (click the status-line version number).
     /// Shows every shipped release's notes; captures input while open.
     pub changelog_open: bool,
     /// Scroll offset (in lines) into the changelog modal body.
@@ -1219,7 +1219,7 @@ pub struct App {
     /// continues) and from `should_quit` (the server itself exits).
     pub end_session: bool,
     /// Force the next frame to be a **full** repaint (not a diff), so a terminal
-    /// whose screen was damaged outside bohay's knowledge — a window move/resize,
+    /// whose screen was damaged outside luvus's knowledge — a window move/resize,
     /// regaining focus, another program's output — repaints cleanly. The render
     /// loop consumes and clears it. Set on any resize and on focus-regained.
     pub force_redraw: bool,
@@ -1315,7 +1315,7 @@ pub struct App {
     git_status_inflight: bool,
     last_git_status_at: Instant,
     /// When the FILES tree last re-read its on-screen directories, to catch files
-    /// created or deleted outside bohay (docs/38). Gated so a huge repo isn't
+    /// created or deleted outside luvus (docs/38). Gated so a huge repo isn't
     /// re-scanned every tick.
     last_file_scan_at: Instant,
     /// FILES-dock right-click menu + its modals (docs/38 FILE-6).
@@ -1427,7 +1427,7 @@ pub struct App {
     pub sidebar_toggle_rect: Option<Rect>,
     /// The right sidebar's collapse/reopen toggle button (docs/29).
     pub right_sidebar_toggle_rect: Option<Rect>,
-    /// The sidebar version number, clickable to open the changelog modal.
+    /// The bottom-right status-line version, clickable to open the changelog modal.
     pub version_rect: Option<Rect>,
     /// Bounds of the changelog popup. Used to distinguish harmless clicks in
     /// its content from clicks on the dimmed backdrop that dismiss it.
@@ -1438,7 +1438,7 @@ pub struct App {
     /// shut, and also when the title row is too narrow to hold it.
     pub changelog_check_rect: Option<Rect>,
     /// Clickable links on the changelog modal's **visible** rows: commit and PR
-    /// refs from the notes, plus the "read it all on bohay.dev" row at the end.
+    /// refs from the notes, plus the "read it all on luvus.dev" row at the end.
     /// Rebuilt each frame from the rows actually on screen, so scrolling a link
     /// out of view takes its click target with it.
     pub changelog_link_rects: Vec<(Rect, String)>,
@@ -2734,7 +2734,7 @@ impl App {
     /// spawn there (a folder that vanished, no permission, a bad `config.shell`).
     /// That used to be swallowed: the caller carried on, `active_ws` still
     /// pointed at whatever was focused before, and the user saw the *previous*
-    /// folder with no error anywhere — indistinguishable from bohay ignoring
+    /// folder with no error anywhere — indistinguishable from luvus ignoring
     /// them. A toast is raised here so every caller reports it the same way.
     pub fn create_workspace_at(&mut self, cwd: PathBuf) -> bool {
         let name = ws_name(&cwd);
@@ -2822,7 +2822,7 @@ impl App {
 
     /// Create a git worktree for `branch` off `repo` and open it as a workspace
     /// (docs/18 WT). Laid out **nested by repo** —
-    /// `~/.bohay/worktrees/<repo>/<branch>` — so checkouts don't clutter the repo
+    /// `~/.luvus/worktrees/<repo>/<branch>` — so checkouts don't clutter the repo
     /// and stay readable, with a numeric suffix if that path is taken (two repos
     /// of the same name, or `feat/x` vs `feat-x` both slugging to `feat-x`).
     /// Returns the new worktree path.
@@ -4227,7 +4227,7 @@ impl App {
     /// Now the *window* ends and the *server* survives, which is what
     /// `server_mode` was for: clients detach, no node is recreated, and the empty
     /// snapshot clears `session.json`. `server stop` still ends the server, and a
-    /// later `bohay` attaches and opens its launch folder fresh. `--local` has no
+    /// later `luvus` attaches and opens its launch folder fresh. `--local` has no
     /// server to outlive, so it quits like a normal terminal app.
     fn all_workspaces_closed(&mut self) {
         self.session_dirty = true;
@@ -4330,7 +4330,7 @@ fn group_worktrees(nodes: &[(Option<&std::path::Path>, bool)]) -> Vec<(usize, bo
     out
 }
 
-/// `~/.bohay/worktrees/<repo>/` — the folder that holds all of `repo`'s bohay
+/// `~/.luvus/worktrees/<repo>/` — the folder that holds all of `repo`'s luvus
 /// worktrees. Nested under the **main** worktree's name so every checkout of one
 /// repo groups under a single folder (same rule `create_worktree` uses).
 fn worktrees_dir_for(repo: &std::path::Path) -> PathBuf {
@@ -4378,7 +4378,7 @@ fn restore_module_pane(
         .map(|p| p.command.clone())?;
     let ctx = serde_json::json!({ "invocation_source": "restore" });
     let mut env = crate::module::runtime::base_env(m, &ctx);
-    env.push(("BOHAY_MODULE_ENTRYPOINT_ID".to_string(), ep.to_string()));
+    env.push(("LUVUS_MODULE_ENTRYPOINT_ID".to_string(), ep.to_string()));
     let pane = Pane::spawn_command(
         id,
         80,
@@ -4553,7 +4553,7 @@ mod tests {
 
     #[test]
     fn plain_keystroke_does_not_mark_the_ui_dirty() {
-        // Typing into a pane must NOT trigger a bohay redraw — the character goes to
+        // Typing into a pane must NOT trigger a luvus redraw — the character goes to
         // the shell, whose echo arrives as a separate PtyData event that repaints.
         // Rendering on the keystroke too would double the frame rate while typing.
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -4609,7 +4609,7 @@ mod tests {
         app.handle_event(key(' ', KeyModifiers::CONTROL));
         app.handle_event(key('v', KeyModifiers::NONE));
         assert_eq!(app.layout().len(), 2);
-        app.rename_workspace(0, "Bohay website").unwrap();
+        app.rename_workspace(0, "Luvus website").unwrap();
         app.set_workspace_pinned(0, true).unwrap();
 
         let json = serde_json::to_string(&persist::snapshot(&app)).unwrap();
@@ -4619,7 +4619,7 @@ mod tests {
         let restored = App::from_snapshot(snap, tx2).expect("restore");
         assert_eq!(restored.workspaces.len(), 1);
         assert_eq!(restored.layout().len(), 2);
-        assert_eq!(restored.workspaces[0].name, "Bohay website");
+        assert_eq!(restored.workspaces[0].name, "Luvus website");
         assert!(restored.workspaces[0].pinned);
     }
 
@@ -4681,8 +4681,8 @@ mod tests {
     fn border_only_when_split() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
-        // Isolate `$BOHAY_HOME` so this renders the *default* layout. Without it
-        // the test read the developer's real `~/.bohay` config, so a user who had
+        // Isolate `$LUVUS_HOME` so this renders the *default* layout. Without it
+        // the test read the developer's real `~/.luvus` config, so a user who had
         // (say) a right sidebar mounted saw its chrome counted as pane borders —
         // failing alone but passing in a full run, purely because some earlier
         // test's `test_env` had already redirected the global env var.
@@ -4881,7 +4881,7 @@ mod tests {
 
         // A second node, so this mirrors the report (close one, then the other)
         // rather than the single-node case.
-        let dir = std::env::temp_dir().join("bohay-lastnode-4b1c9f");
+        let dir = std::env::temp_dir().join("luvus-lastnode-4b1c9f");
         std::fs::create_dir_all(&dir).expect("temp dir");
         assert!(app.create_workspace_at(dir.clone()));
         assert_eq!(app.workspaces.len(), 2);
@@ -4969,7 +4969,7 @@ mod tests {
             "listing nodes with none open is not an error: {res}"
         );
 
-        let dir = std::env::temp_dir().join("bohay-recover-4b1c9f");
+        let dir = std::env::temp_dir().join("luvus-recover-4b1c9f");
         std::fs::create_dir_all(&dir).expect("temp dir");
         let res = call(
             &mut app,
@@ -4985,7 +4985,7 @@ mod tests {
     }
 
     /// The same empty session must render. A client can still be attached for the
-    /// frame or two before it detaches, and `bohay attach` / `--remote` can attach
+    /// frame or two before it detaches, and `luvus attach` / `--remote` can attach
     /// before any folder is opened — every draw fn below `render` assumes a node.
     #[test]
     fn an_empty_session_still_renders() {
@@ -5246,10 +5246,10 @@ mod tests {
         // A linked worktree remains nested under its parent. Pinning the child
         // floats that complete group instead of recording a no-op pin.
         let pane = app.layout().focus;
-        let common_dir = PathBuf::from("/tmp/bohay-group/.git");
+        let common_dir = PathBuf::from("/tmp/luvus-group/.git");
         app.workspaces.push(Workspace {
             name: "parent".into(),
-            cwd: PathBuf::from("/tmp/bohay-group"),
+            cwd: PathBuf::from("/tmp/luvus-group"),
             branch: None,
             git_ahead_behind: None,
             worktree: Some(crate::git::WorktreeMembership {
@@ -5262,7 +5262,7 @@ mod tests {
         });
         app.workspaces.push(Workspace {
             name: "child".into(),
-            cwd: PathBuf::from("/tmp/bohay-group-child"),
+            cwd: PathBuf::from("/tmp/luvus-group-child"),
             branch: None,
             git_ahead_behind: None,
             worktree: Some(crate::git::WorktreeMembership {
@@ -5514,7 +5514,7 @@ mod tests {
         assert_eq!(app.panes.get(&ids[1]).unwrap().cwd, cwd, "same folder");
 
         // A Claude store holding exactly one session for that folder.
-        let store = std::env::temp_dir().join(format!("bohay-dupsess-{}", std::process::id()));
+        let store = std::env::temp_dir().join(format!("luvus-dupsess-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
         let enc: String = cwd
             .to_string_lossy()
@@ -5569,7 +5569,7 @@ mod tests {
         let (older, newer) = (ids[0], ids[1]);
 
         let cwd = app.panes.get(&older).unwrap().cwd.clone();
-        let store = std::env::temp_dir().join(format!("bohay-hooksess-{}", std::process::id()));
+        let store = std::env::temp_dir().join(format!("luvus-hooksess-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
         let enc: String = cwd
             .to_string_lossy()
@@ -5636,7 +5636,7 @@ mod tests {
         let cwd = app.panes.get(&parent).unwrap().cwd.clone();
 
         // A Claude store holding the parent's session.
-        let store = std::env::temp_dir().join(format!("bohay-forksess-{}", std::process::id()));
+        let store = std::env::temp_dir().join(format!("luvus-forksess-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
         let enc: String = cwd
             .to_string_lossy()
@@ -5716,7 +5716,7 @@ mod tests {
         let parent = app.layout().focus;
         let cwd = app.panes.get(&parent).unwrap().cwd.clone();
 
-        let store = std::env::temp_dir().join(format!("bohay-forknewer-{}", std::process::id()));
+        let store = std::env::temp_dir().join(format!("luvus-forknewer-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
         let enc: String = cwd
             .to_string_lossy()
@@ -5782,7 +5782,7 @@ mod tests {
         let older = app.layout().focus;
         let cwd = app.panes.get(&older).unwrap().cwd.clone();
 
-        let store = std::env::temp_dir().join(format!("bohay-pairing-{}", std::process::id()));
+        let store = std::env::temp_dir().join(format!("luvus-pairing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
         let enc: String = cwd
             .to_string_lossy()
@@ -6243,7 +6243,7 @@ mod tests {
     fn clicks_forward_to_a_mouse_tracking_app_instead_of_selecting() {
         // A pane app that requested mouse tracking (a TUI agent) receives
         // clicks — e.g. clicking a collapsed tool result expands it — instead
-        // of bohay starting a text selection. Shift restores selection.
+        // of luvus starting a text selection. Shift restores selection.
         let _env = crate::persist::test_env("mouse-forward");
         use crate::event::AppEvent;
         use ratatui::backend::TestBackend;
@@ -6306,7 +6306,7 @@ mod tests {
         )));
         assert!(app.mouse_grab.is_none(), "release ends the grab");
 
-        // Shift+click bypasses forwarding: bohay's own selection begins.
+        // Shift+click bypasses forwarding: luvus's own selection begins.
         app.handle_event(AppEvent::Mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             content.x + 4,
@@ -6595,7 +6595,7 @@ mod tests {
     /// An unresolvable shell is the failure that actually reaches this branch,
     /// and it is the plausible Windows one: `resolve_shell` tries `pwsh.exe`,
     /// then `powershell.exe`, then `%COMSPEC%`, and a bad `config.shell` or
-    /// `BOHAY_SHELL` defeats all three. (A *missing directory*, by contrast,
+    /// `LUVUS_SHELL` defeats all three. (A *missing directory*, by contrast,
     /// still spawns — the child only fails once it execs — so it is deliberately
     /// not what this asserts on.)
     #[test]
@@ -6606,7 +6606,7 @@ mod tests {
         let before = app.workspaces.len();
         let active_before = app.active_ws;
 
-        app.config.shell = "bohay-not-a-real-shell-4b1c9f".to_string();
+        app.config.shell = "luvus-not-a-real-shell-4b1c9f".to_string();
         assert!(
             !app.create_workspace_at(std::env::temp_dir()),
             "opening a node whose shell cannot start must report failure"
@@ -6614,7 +6614,7 @@ mod tests {
         assert_eq!(app.workspaces.len(), before, "no half-built node is added");
         assert_eq!(app.active_ws, active_before, "focus must not move");
         // The socket API must not answer with the *previously* active node, which
-        // read as success to `bohay` itself and to any scripting agent.
+        // read as success to `luvus` itself and to any scripting agent.
         let (reply, _r) = std::sync::mpsc::channel();
         let resp = app.handle_api(&crate::ipc::api::ApiRequest {
             id: "1".into(),
@@ -6652,7 +6652,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).expect("spawn pane");
 
-        let dir = std::env::temp_dir().join("bohay-dedupe-4b1c9f");
+        let dir = std::env::temp_dir().join("luvus-dedupe-4b1c9f");
         std::fs::create_dir_all(&dir).expect("temp dir");
         assert!(app.create_workspace_at(dir.clone()), "first open succeeds");
         let count = app.workspaces.len();
@@ -6883,7 +6883,7 @@ mod tests {
         );
 
         // Rows in one dock differ: a device offers actions, a command offers
-        // none. bohay cannot invent items for a row it does not understand, so
+        // none. luvus cannot invent items for a row it does not understand, so
         // an undeclared menu opens nothing rather than an empty popup.
         app.open_dock_menu("devices", 1, 6, 6);
         assert!(app.dock_menu.is_none(), "row without a menu opens nothing");
@@ -7287,7 +7287,7 @@ mod tests {
     fn orchestration_flow_over_the_api() {
         // End-to-end wiring of ORCH-1/2 through the JSON control API (docs/22 M0):
         // add → dep-gated claim → path leases (overlap denied) → done releases the
-        // lease + unlocks the dependent. `test_env` gives a fresh empty BOHAY_HOME so
+        // lease + unlocks the dependent. `test_env` gives a fresh empty LUVUS_HOME so
         // orch.json writes to a temp dir and App::new loads a clean ledger.
         let _env = crate::persist::test_env("orch");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -7371,7 +7371,7 @@ mod tests {
 
     #[test]
     fn workspace_open_focuses_existing_or_creates_new() {
-        // `bohay` attaching from a new folder → `workspace.open` adds it; from a
+        // `luvus` attaching from a new folder → `workspace.open` adds it; from a
         // folder that's already a workspace → it just focuses it (no duplicate).
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
@@ -7448,7 +7448,7 @@ mod tests {
         app.resumable = vec![crate::agent::SessionInfo {
             agent: "claude".into(),
             session_id: "abc".into(),
-            cwd: std::env::temp_dir().join("bohay-resume-test"),
+            cwd: std::env::temp_dir().join("luvus-resume-test"),
             updated: std::time::SystemTime::now(),
         }];
         app.resume_session(0);
@@ -7679,9 +7679,9 @@ mod tests {
 
         // Isolate config I/O to a temp dir so this is deterministic.
         let _env = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = std::env::temp_dir().join(format!("bohay-settings-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("luvus-settings-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::set_var("BOHAY_HOME", &tmp);
+        std::env::set_var("LUVUS_HOME", &tmp);
 
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
@@ -7772,7 +7772,7 @@ mod tests {
         )));
         assert!(app.settings.is_none());
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -7887,9 +7887,9 @@ mod tests {
         use ratatui::Terminal;
 
         let _env = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = std::env::temp_dir().join(format!("bohay-lang-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("luvus-lang-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::set_var("BOHAY_HOME", &tmp);
+        std::env::set_var("LUVUS_HOME", &tmp);
 
         let (tx, _rx) = std::sync::mpsc::channel();
         // Wide enough that all 8 tabs render (Language is the last one).
@@ -7935,7 +7935,7 @@ mod tests {
             "persisted to config.json"
         );
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -7996,9 +7996,9 @@ mod tests {
         use ratatui::Terminal;
 
         let _env = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = std::env::temp_dir().join(format!("bohay-slider-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("luvus-slider-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::set_var("BOHAY_HOME", &tmp);
+        std::env::set_var("LUVUS_HOME", &tmp);
 
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
@@ -8046,7 +8046,7 @@ mod tests {
         click(&mut app, right);
         assert!(app.sidebars.left.width > low, "right arrow increases width");
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -8054,7 +8054,7 @@ mod tests {
     // list dot slot (not the static `●`), advancing with `App.spinner`.
     // Clicking a pane's title opens the running-command overlay. The point is
     // that the command comes from the OS, not the screen: an agent's own UI
-    // elides long commands and those characters never reach bohay at all.
+    // elides long commands and those characters never reach luvus at all.
     #[test]
     fn clicking_a_pane_title_shows_the_real_command() {
         use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
@@ -8100,7 +8100,7 @@ mod tests {
     #[test]
     fn working_agent_shows_spinner() {
         use ratatui::{backend::TestBackend, Terminal};
-        // Isolate `$BOHAY_HOME`: with the developer's real config a different
+        // Isolate `$LUVUS_HOME`: with the developer's real config a different
         // dock layout can push the AGENTS rows out of view, so the spinner is
         // never drawn and this fails depending on test order.
         let _env = crate::persist::test_env("spinner");
@@ -8802,9 +8802,9 @@ mod tests {
         use ratatui::Terminal;
 
         let _env = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = std::env::temp_dir().join(format!("bohay-shell-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("luvus-shell-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::set_var("BOHAY_HOME", &tmp);
+        std::env::set_var("LUVUS_HOME", &tmp);
 
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
@@ -8837,7 +8837,7 @@ mod tests {
         // …and the choice is persisted.
         assert_eq!(crate::config::load().shell, app.config.shell);
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

@@ -1,4 +1,4 @@
-//! The `BOHAY_MODULE_CONTEXT_JSON` blob: a snapshot of the workspace / tab /
+//! The `LUVUS_MODULE_CONTEXT_JSON` blob: a snapshot of the workspace / tab /
 //! pane a module command was invoked against (docs/13 §3.4).
 //!
 //! Most invocations (CLI, socket, event hooks) target whatever is focused. A
@@ -96,9 +96,9 @@ pub fn build_for(app: &App, source: &str, target: &Target) -> Value {
     })
 }
 
-/// The flat `BOHAY_*` vars mirroring the ids in `ctx`, so a shell script can use
-/// them without parsing JSON. `BOHAY_PANE_ID` is only advisory here — for a
-/// module *pane* bohay's own identity var always wins (see `Pane::build`).
+/// The flat `LUVUS_*` vars mirroring the ids in `ctx`, so a shell script can use
+/// them without parsing JSON. `LUVUS_PANE_ID` is only advisory here — for a
+/// module *pane* luvus's own identity var always wins (see `Pane::build`).
 pub fn env_from(ctx: &Value) -> Vec<(String, String)> {
     let s = |a: &str, b: &str| -> String {
         ctx.get(a)
@@ -108,13 +108,13 @@ pub fn env_from(ctx: &Value) -> Vec<(String, String)> {
             .to_string()
     };
     vec![
-        ("BOHAY_WORKSPACE_ID".to_string(), s("workspace", "id")),
-        ("BOHAY_WORKSPACE_CWD".to_string(), s("workspace", "cwd")),
-        ("BOHAY_TAB_INDEX".to_string(), s("tab", "index")),
-        ("BOHAY_PANE_ID".to_string(), s("pane", "id")),
-        ("BOHAY_PANE_CWD".to_string(), s("pane", "cwd")),
-        ("BOHAY_PANE_AGENT".to_string(), s("pane", "agent")),
-        ("BOHAY_PANE_STATUS".to_string(), s("pane", "status")),
+        ("LUVUS_WORKSPACE_ID".to_string(), s("workspace", "id")),
+        ("LUVUS_WORKSPACE_CWD".to_string(), s("workspace", "cwd")),
+        ("LUVUS_TAB_INDEX".to_string(), s("tab", "index")),
+        ("LUVUS_PANE_ID".to_string(), s("pane", "id")),
+        ("LUVUS_PANE_CWD".to_string(), s("pane", "cwd")),
+        ("LUVUS_PANE_AGENT".to_string(), s("pane", "agent")),
+        ("LUVUS_PANE_STATUS".to_string(), s("pane", "status")),
     ]
 }
 

@@ -1,4 +1,4 @@
-//! JSON control API (M4): a Unix-socket server agents/CLI use to drive bohay.
+//! JSON control API (M4): a Unix-socket server agents/CLI use to drive luvus.
 //! Newline-delimited `{id, method, params}` → `{id, result|error}`. Mutating
 //! requests are marshalled onto the single-threaded app loop; `events.subscribe`
 //! streams from a simple broadcast bus. See docs/08.

@@ -1,6 +1,6 @@
 # ESP-IDF
 
-Build, flash and monitor ESP32 boards from bohay. No core changes: this is a
+Build, flash and monitor ESP32 boards from luvus. No core changes: this is a
 plain module — a manifest plus a few `sh` scripts that shell out to `idf.py`.
 
 ## Why this instead of `idf.py` in a pane
@@ -22,12 +22,12 @@ and normally it is destroyed on every flash.
 Everything else — build, menuconfig, size, erase — simply runs in a real pane.
 `menuconfig` is already a terminal UI and `monitor` is a serial console, so
 there is nothing to reimplement; an editor plugin has to rebuild both as GUIs,
-and bohay does not.
+and luvus does not.
 
 ## Install
 
 ```sh
-bohay module link examples/modules/esp-idf
+luvus module link examples/modules/esp-idf
 ```
 
 Then open **Settings → Modules → ESP-IDF** and set **IDF_PATH** to the folder
@@ -101,7 +101,7 @@ should not sit one stray click away in a collapsed sidebar.
 Commands are typed into a real pane on purpose: a build you cannot `Ctrl+C` is
 worse than no build button at all.
 
-This module deliberately adds **nothing** to bohay's own pane or node right-click
+This module deliberately adds **nothing** to luvus's own pane or node right-click
 menus, and uses no right-click menus of its own. It is a global module, so
 menu entries would appear on every project whether or not it is firmware — and
 expanding a group is discoverable in a way a hidden menu is not. Its dock is its
@@ -126,17 +126,17 @@ Every action is reachable over the socket, so an agent can close the loop on
 real hardware:
 
 ```sh
-bohay module run example.esp-idf build
-bohay pane read            # did it compile?
-bohay module run example.esp-idf flash
-bohay pane read            # what did the board actually print?
+luvus module run example.esp-idf build
+luvus pane read            # did it compile?
+luvus module run example.esp-idf flash
+luvus pane read            # what did the board actually print?
 ```
 
 ## Testing it without a board
 
 ```sh
-sh test/run.sh              # uses `bohay` from PATH
-sh test/run.sh ./target/debug/bohay   # or point it at a specific build
+sh test/run.sh              # uses `luvus` from PATH
+sh test/run.sh ./target/debug/luvus   # or point it at a specific build
 ```
 
 Spins up a throwaway server against a fake `idf.py` and checks the whole flow:

@@ -3,7 +3,7 @@
 #
 # `idf.py monitor` holds the serial port, so flashing means: stop the monitor,
 # flash, start it again — and every ESP-IDF user loses their scrollback doing
-# it, dozens of times a day. Because bohay owns real panes, the module can send
+# it, dozens of times a day. Because luvus owns real panes, the module can send
 # the monitor a Ctrl+C, flash, and bring the monitor back **in the same pane**,
 # so what the board printed before the flash stays on screen above what it
 # prints after. That side-by-side is the actual work of embedded debugging.
@@ -16,8 +16,8 @@ mon=""
 
 # 1. Release the port. 0x03 is Ctrl+C; idf.py monitor exits on it. If the pane
 #    is gone (user closed it) this is a harmless no-op and we just flash.
-if [ -n "$mon" ] && "$bohay" pane status "$mon" >/dev/null 2>&1; then
-  "$bohay" pane send "$mon" "$(printf '\003')" >/dev/null 2>&1 || true
+if [ -n "$mon" ] && "$luvus" pane status "$mon" >/dev/null 2>&1; then
+  "$luvus" pane send "$mon" "$(printf '\003')" >/dev/null 2>&1 || true
   # idf.py needs a moment to close the port; flashing into a held port fails
   # with a confusing "could not open" rather than anything actionable.
   sleep 1
@@ -44,5 +44,5 @@ if [ "$auto_monitor" = "true" ]; then
   printf '%s' "$pane" > "$state/monitor-pane"
   cmd="$cmd && $(idf_cmd monitor)"
 fi
-"$bohay" pane run "$pane" "$cmd"
-"$bohay" pane focus "$pane" >/dev/null 2>&1 || true
+"$luvus" pane run "$pane" "$cmd"
+"$luvus" pane focus "$pane" >/dev/null 2>&1 || true

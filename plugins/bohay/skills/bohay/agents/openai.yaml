@@ -1,4 +1,0 @@
-interface:
-  display_name: "Bohay"
-  short_description: "Delegate agents and organize Bohay workspaces"
-  default_prompt: "Use $bohay to rename and pin a workspace without changing its folder."

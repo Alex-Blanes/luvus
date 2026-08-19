@@ -1,4 +1,4 @@
-//! The terminal-emulator abstraction. The rest of bohay only ever talks to
+//! The terminal-emulator abstraction. The rest of luvus only ever talks to
 //! `VtEngine`; the concrete implementation (`alacritty_terminal`) lives behind
 //! it so it can be swapped (e.g. to `termwiz` for inline images) without
 //! touching the app. See docs/05-pty-and-terminal.md.
@@ -25,7 +25,7 @@ pub struct Cursor {
 }
 
 /// Visible rows occupied by Codex's composer, including its blank padding rows.
-/// Bohay uses this geometry only for the optional theme-aware composer frame;
+/// Luvus uses this geometry only for the optional theme-aware composer frame;
 /// the terminal engine remains responsible for recognizing the live grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CodexComposerRegion {
@@ -141,7 +141,7 @@ pub trait VtEngine: Send {
     /// Whether the child requested **mouse reporting** (any tracking mode). When
     /// true the app owns the mouse — including the wheel — so callers forward
     /// wheel/click events to it as escape sequences (e.g. a TUI agent scrolling
-    /// its own transcript) rather than scrolling bohay's scrollback.
+    /// its own transcript) rather than scrolling luvus's scrollback.
     fn mouse_report(&self) -> bool;
 
     /// Whether the pane asked for alternate scrolling on the alternate screen.

@@ -4,15 +4,15 @@ description: Work on several branches of one repo at once, where each worktree i
 ---
 
 Git worktrees let one repository have several branches checked out in separate
-folders. bohay makes them **first-class workspaces**.
+folders. luvus makes them **first-class workspaces**.
 
 ## Create one
 
-- **`Ctrl+Space G`**: type a branch name, and bohay runs `git worktree add`
-  under `~/.bohay/worktrees/<repo>/<branch>` and opens it as a workspace.
+- **`Ctrl+Space G`**: type a branch name, and luvus runs `git worktree add`
+  under `~/.luvus/worktrees/<repo>/<branch>` and opens it as a workspace.
 - **The folder picker** (`Ctrl+Space N`): when browsing a git repo, an *Open
   with new worktree* row (or the `w` key) does the same for that repo.
-- **CLI**: `bohay worktree create <branch>` · `open <path>` · `list` ·
+- **CLI**: `luvus worktree create <branch>` · `open <path>` · `list` ·
   `remove <path>` (the branch is kept).
 
 ## Why it's great with agents

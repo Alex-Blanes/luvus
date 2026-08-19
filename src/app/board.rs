@@ -3,7 +3,7 @@
 //! pattern (`Tab::is_git`) — a placeholder-leaf tab with no real panes — so every
 //! `layout()` path is untouched. **Interactive**: a task cursor (`j/k`, click) with
 //! action keys — `s` start · `d` done · `m` merge · `⏎` jump · `x` release — so the
-//! whole flow is drivable from the UI, not only the `bohay task …` CLI.
+//! whole flow is drivable from the UI, not only the `luvus task …` CLI.
 
 use super::*;
 
@@ -63,12 +63,12 @@ impl App {
             ));
         }
         // The branch this worker runs on: an explicit `--branch`, else the one
-        // recorded on the task, else `bohay/<id>`.
+        // recorded on the task, else `luvus/<id>`.
         let branch = branch
             .map(|b| b.trim().to_string())
             .filter(|b| !b.is_empty())
             .or_else(|| task.branch.clone())
-            .unwrap_or_else(|| format!("bohay/{id}"));
+            .unwrap_or_else(|| format!("luvus/{id}"));
         // Reuse an existing worktree instead of creating a second one: the one
         // recorded on the task (a restart, a closed pane), or — when the ledger
         // was reset but a leftover worktree still has this branch checked out
@@ -246,7 +246,7 @@ impl App {
         }
     }
 
-    /// ORCH-6: integrate a finished task's branch into `bohay/integration`, in an
+    /// ORCH-6: integrate a finished task's branch into `luvus/integration`, in an
     /// **isolated integration worktree** (never the user's checkout). A clean merge
     /// lands on the integration branch; a conflict aborts, blocks the task, and
     /// reports the clashing files so its agent can resolve them in its own worktree.
@@ -295,7 +295,7 @@ impl App {
             .join("worktrees")
             .join(&repo_name)
             .join("__integration");
-        let integ_branch = "bohay/integration";
+        let integ_branch = "luvus/integration";
 
         let outcome =
             crate::git::local::integrate_branch(&repo, &integ_dir, integ_branch, &base, &branch)
@@ -749,7 +749,7 @@ pub fn agent_choices() -> &'static [(&'static str, Option<&'static str>)] {
 fn task_briefing(task: &crate::orch::Task) -> String {
     let id = &task.id;
     let mut b = format!(
-        "You are the worker for bohay task {id}: {}. This directory is your isolated git worktree.",
+        "You are the worker for luvus task {id}: {}. This directory is your isolated git worktree.",
         task.title
     );
     if !task.paths.is_empty() {
@@ -765,21 +765,21 @@ fn task_briefing(task: &crate::orch::Task) -> String {
         b.push_str(&format!(" Note from earlier work: {note}."));
     }
     b.push_str(&format!(
-        " When finished: commit all changes here, then run `bohay task done {id}`. \
-         Report progress with `bohay task update {id} --note <text>` and context usage \
-         with `bohay task heartbeat {id} --context <0..1>`."
+        " When finished: commit all changes here, then run `luvus task done {id}`. \
+         Report progress with `luvus task update {id} --note <text>` and context usage \
+         with `luvus task heartbeat {id} --context <0..1>`."
     ));
     b
 }
 
 /// The full line typed into a fresh worker shell to launch `agent` with the
-/// task briefing (and, on Unix, `BOHAY_TASK_ID` in the agent's environment).
+/// task briefing (and, on Unix, `LUVUS_TASK_ID` in the agent's environment).
 fn agent_launch_line(agent: &str, task: &crate::orch::Task) -> String {
     let brief = shell_quote(&task_briefing(task));
     if cfg!(windows) {
         format!("{agent} {brief}")
     } else {
-        format!("BOHAY_TASK_ID={} {agent} {brief}", task.id)
+        format!("LUVUS_TASK_ID={} {agent} {brief}", task.id)
     }
 }
 
@@ -894,9 +894,9 @@ mod tests {
         // ORCH-3: `task start` creates a worktree + pane, claims the task for it,
         // binds the branch, and leases the task's paths. Needs a real repo (with a
         // commit, since `git worktree add` requires one). `test_env` isolates
-        // BOHAY_HOME so the worktree lands in a temp dir.
+        // LUVUS_HOME so the worktree lands in a temp dir.
         let _env = crate::persist::test_env("orch3");
-        let base = std::env::temp_dir().join(format!("bohay-orch3-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("luvus-orch3-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -936,7 +936,7 @@ mod tests {
         let t = app.orch.task("t1").unwrap();
         assert_eq!(t.status, crate::orch::TaskStatus::Running);
         assert_eq!(t.assignee, Some(pane.0));
-        assert_eq!(t.branch.as_deref(), Some("bohay/t1"));
+        assert_eq!(t.branch.as_deref(), Some("luvus/t1"));
         assert!(t.worktree.is_some());
         // Its declared paths were auto-leased for the worker.
         assert!(app
@@ -994,7 +994,7 @@ mod tests {
         // Full flow on a real repo: `s` → pick "shell" → ⏎ spawns the worker,
         // marks the task Running, and keeps the board focused.
         let _env = crate::persist::test_env("orchstay");
-        let base = std::env::temp_dir().join(format!("bohay-orchstay-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("luvus-orchstay-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -1045,11 +1045,11 @@ mod tests {
     #[test]
     fn task_start_adopts_a_leftover_worktree_for_its_branch() {
         // The reported failure mode: the ledger was reset (fresh t1) but a
-        // worktree from an earlier run still has `bohay/t1` checked out — git
+        // worktree from an earlier run still has `luvus/t1` checked out — git
         // refuses a second worktree for the branch, so starting kept failing
         // and the task sat at queued. Now the leftover worktree is adopted.
         let _env = crate::persist::test_env("orchadopt");
-        let base = std::env::temp_dir().join(format!("bohay-orchadopt-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("luvus-orchadopt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -1072,14 +1072,14 @@ mod tests {
             "-m",
             "init",
         ]);
-        // The leftover: a worktree with bohay/t1 checked out, unknown to the ledger.
+        // The leftover: a worktree with luvus/t1 checked out, unknown to the ledger.
         let leftover = base.join("leftover-wt");
         git(&[
             "worktree",
             "add",
             "-q",
             "-b",
-            "bohay/t1",
+            "luvus/t1",
             leftover.to_str().unwrap(),
         ]);
 
@@ -1098,7 +1098,7 @@ mod tests {
         );
         let t = app.orch.task("t1").unwrap();
         assert_eq!(t.status, crate::orch::TaskStatus::Running);
-        assert_eq!(t.branch.as_deref(), Some("bohay/t1"));
+        assert_eq!(t.branch.as_deref(), Some("luvus/t1"));
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1119,7 +1119,7 @@ mod tests {
             .set_status("t1", crate::orch::TaskStatus::Running)
             .unwrap();
         app.orch
-            .bind_worktree("t1", Some(live_cwd), Some("bohay/t1".into()));
+            .bind_worktree("t1", Some(live_cwd), Some("luvus/t1".into()));
         // t2: worktree-backed but its folder has no pane → detached, stays Running.
         app.orch.add_task("b".into(), vec![], vec![], None).unwrap();
         app.orch.claim("t2", 9998).unwrap();
@@ -1129,7 +1129,7 @@ mod tests {
         app.orch.bind_worktree(
             "t2",
             Some("/nonexistent/worktree".into()),
-            Some("bohay/t2".into()),
+            Some("luvus/t2".into()),
         );
         // t3: a pure claim (no worktree) by a dead pane → back to the queue.
         app.orch.add_task("c".into(), vec![], vec![], None).unwrap();
@@ -1162,7 +1162,7 @@ mod tests {
             .set_status("t1", crate::orch::TaskStatus::Running)
             .unwrap();
         app.orch
-            .bind_worktree("t1", Some("/tmp/wt".into()), Some("bohay/t1".into()));
+            .bind_worktree("t1", Some("/tmp/wt".into()), Some("luvus/t1".into()));
         // A pure claim by the same pane: closing requeues it.
         app.orch.add_task("b".into(), vec![], vec![], None).unwrap();
         app.orch.claim("t2", pane.0).unwrap();
@@ -1224,10 +1224,10 @@ mod tests {
         let line = agent_launch_line("claude", &t);
         assert!(!line.contains('\n'), "typed into a shell — one line");
         assert!(line.contains("claude"));
-        assert!(line.contains("bohay task done t1"));
+        assert!(line.contains("luvus task done t1"));
         assert!(line.contains("cargo test auth"));
         if !cfg!(windows) {
-            assert!(line.starts_with("BOHAY_TASK_ID=t1 "));
+            assert!(line.starts_with("LUVUS_TASK_ID=t1 "));
             // The apostrophe in the title survives POSIX single-quoting.
             assert!(line.contains(r"auth'\''s"));
         }

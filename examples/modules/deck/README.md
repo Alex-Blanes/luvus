@@ -1,6 +1,6 @@
 # Markdown Deck — a slide presenter module
 
-Present a Markdown file as a slide deck in a bohay pane (docs/53). Pure Python
+Present a Markdown file as a slide deck in a luvus pane (docs/53). Pure Python
 stdlib, so there is nothing to build and no external presenter to install.
 
 Slides split on a line that is exactly `---`. Common Markdown renders inline:
@@ -24,15 +24,15 @@ title: My talk
 ## Install
 
 ```sh
-bohay module link examples/modules/deck
+luvus module link examples/modules/deck
 ```
 
-(or `bohay module install <owner>/<repo>/examples/modules/deck` from GitHub).
+(or `luvus module install <owner>/<repo>/examples/modules/deck` from GitHub).
 
 ## Present
 
 - **Right-click a node** in the WORKSPACES sidebar → **Present as slides**, or
-- `bohay module pane open example.deck present`
+- `luvus module pane open example.deck present`
 
 It opens a **tab** with the deck. Navigate:
 
@@ -68,7 +68,7 @@ while it works becomes a running report-out you page through.
 
 ## Notes / limits
 
-- Text only. Images (PDF/PowerPoint, kitty-graphics) are out — bohay renders
+- Text only. Images (PDF/PowerPoint, kitty-graphics) are out — luvus renders
   panes as cells, so pixel graphics do not pass through (docs/42, docs/47). Use
   ASCII art instead.
 - macOS and Linux (raw-terminal input via `termios`).

@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 #
-# release.sh — cut a new bohay version to crates.io, GitHub (binaries), and Homebrew.
+# release.sh — cut a new luvus version to crates.io, GitHub (binaries), and Homebrew.
 #
 #   scripts/release.sh 0.1.1             # full release (prompts before publishing)
 #   scripts/release.sh 0.1.1 --dry-run   # bump + verify only, then revert — no release
 #   scripts/release.sh 0.1.1 --yes       # skip the confirmation prompt
 #
 # Prereqs:  `cargo login` done · `gh auth login` · push access to the repo.
-# Tap:      the Homebrew formula in ./homebrew-bohay (or $BOHAY_TAP_DIR) — the real
-#           `brew install RizRiyz/bohay/bohay` source — is bumped & pushed too.
+# Tap:      the Homebrew formula in ./homebrew-luvus (or $LUVUS_TAP_DIR) — the real
+#           `brew install RizRiyz/luvus/luvus` source — is bumped & pushed too.
 set -euo pipefail
 
-REPO="RizRiyz/bohay"
+REPO="RizRiyz/luvus"
 
 die()  { printf '\033[31merror:\033[0m %s\n' "$1" >&2; exit 1; }
 step() { printf '\n\033[36m▸ %s\033[0m\n' "$1"; }
@@ -34,7 +34,7 @@ wait_for_assets() {
     local missing=0
     for t in $FORMULA_TARGETS; do
       gh release view "$TAG" --repo "$REPO" --json assets \
-        --jq ".assets[].name" 2>/dev/null | grep -qx "bohay-$TAG-$t.sha256" || missing=1
+        --jq ".assets[].name" 2>/dev/null | grep -qx "luvus-$TAG-$t.sha256" || missing=1
     done
     [ "$missing" = 0 ] && return 0
     printf '  waiting for release binaries… (%ss)\r' "$waited"
@@ -46,7 +46,7 @@ wait_for_assets() {
 
 # The published checksum for one target.
 asset_sha() {
-  gh release download "$TAG" --repo "$REPO" --pattern "bohay-$TAG-$1.sha256" -O - 2>/dev/null \
+  gh release download "$TAG" --repo "$REPO" --pattern "luvus-$TAG-$1.sha256" -O - 2>/dev/null \
     | awk '{print $1}'
 }
 
@@ -59,8 +59,8 @@ bump_formula() {
   for t in $FORMULA_TARGETS; do
     sha="$(asset_sha "$t")"
     [ -n "$sha" ] || die "no published checksum for $t — cannot bump the formula"
-    perl -0pi -e "s{releases/download/v[0-9.]+/bohay-v[0-9.]+-$t\.tar\.gz}{releases/download/$TAG/bohay-$TAG-$t.tar.gz}g" "$f"
-    perl -0pi -e "s{(bohay-$TAG-$t\.tar\.gz\"\n\s*sha256 \")[0-9a-f]{64}}{\${1}$sha}s" "$f"
+    perl -0pi -e "s{releases/download/v[0-9.]+/luvus-v[0-9.]+-$t\.tar\.gz}{releases/download/$TAG/luvus-$TAG-$t.tar.gz}g" "$f"
+    perl -0pi -e "s{(luvus-$TAG-$t\.tar\.gz\"\n\s*sha256 \")[0-9a-f]{64}}{\${1}$sha}s" "$f"
   done
   # The source fallback's checksum is the last one still on the old value.
   perl -0pi -e "s{(archive/refs/tags/$TAG\.tar\.gz\"\n\s*sha256 \")[0-9a-f]{64}}{\${1}$SHA}s" "$f"
@@ -92,7 +92,7 @@ git fetch --tags --quiet
 git rev-parse "$TAG" >/dev/null 2>&1 && die "$TAG already exists"
 CURRENT=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
 echo "  $CURRENT  →  $VERSION"
-# `changelog/<tag>.md` is the single source the GitHub Release *and* bohay.dev
+# `changelog/<tag>.md` is the single source the GitHub Release *and* luvus.dev
 # both render, so it has to exist and be committed before we tag. Generate the
 # skeleton and stop, rather than shipping a release with auto-listed commits.
 CHANGELOG="changelog/$TAG.md"
@@ -105,8 +105,8 @@ if grep -q 'Then delete this note' "$CHANGELOG"; then
 fi
 echo "  notes: $CHANGELOG"
 # The Homebrew tap (its own git repo): the in-repo clone by default.
-TAP="${BOHAY_TAP_DIR:-homebrew-bohay}"
-if [ -f "$TAP/Formula/bohay.rb" ]; then
+TAP="${LUVUS_TAP_DIR:-homebrew-luvus}"
+if [ -f "$TAP/Formula/luvus.rb" ]; then
   [ -z "$(git -C "$TAP" status --porcelain)" ] || die "tap '$TAP' has uncommitted changes"
   echo "  tap: $TAP  (will bump + push)"
 else
@@ -116,7 +116,7 @@ fi
 step "Bump Cargo.toml + Cargo.lock"
 # Only the [package] version is at the start of a line; deps use `name = "..."`.
 perl -0pi -e "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/version = \"$VERSION\"/m" Cargo.toml
-cargo check --quiet                       # syncs Cargo.lock's bohay version
+cargo check --quiet                       # syncs Cargo.lock's luvus version
 grep -q "^version = \"$VERSION\"" Cargo.toml || die "Cargo.toml bump failed"
 
 # Keep the nixpkgs package definition in step with the release: bump its version,
@@ -154,7 +154,7 @@ fi
 
 step "Commit + tag"
 # The changelog note ships in the same release commit as the version bump, so a
-# tag always has its notes (the GitHub Release + bohay.dev render from it).
+# tag always has its notes (the GitHub Release + luvus.dev render from it).
 git add Cargo.toml Cargo.lock "$CHANGELOG"
 [ -f nix/package.nix ] && git add nix/package.nix
 git commit -m "release: $TAG"
@@ -176,25 +176,25 @@ echo "  sha256: $SHA"
 
 # The tap (its own repo) is the single source of truth — `brew install` pulls it.
 
-if [ -f "$TAP/Formula/bohay.rb" ]; then
+if [ -f "$TAP/Formula/luvus.rb" ]; then
   step "Update tap ($TAP)"
   wait_for_assets
-  bump_formula "$TAP/Formula/bohay.rb"
-  git -C "$TAP" add Formula/bohay.rb
-  git -C "$TAP" commit -m "bohay $TAG"
+  bump_formula "$TAP/Formula/luvus.rb"
+  git -C "$TAP" add Formula/luvus.rb
+  git -C "$TAP" commit -m "luvus $TAG"
   # The notch workflow pushes its cask to this same repo during the release, so
   # land on top of whatever it did instead of being rejected.
   git -C "$TAP" pull --rebase --quiet
   git -C "$TAP" push
-  echo "  ✓ tap pushed — brew install $REPO/bohay now serves $TAG"
+  echo "  ✓ tap pushed — brew install $REPO/luvus now serves $TAG"
 else
   step "Tap '$TAP' not found — finish Homebrew by hand:"
-  echo "    git clone git@github.com:${REPO%%/*}/homebrew-bohay.git"
+  echo "    git clone git@github.com:${REPO%%/*}/homebrew-luvus.git"
   echo "    # in it: set url → .../$TAG.tar.gz and sha256 → $SHA, then commit & push"
 fi
 
 step "Done — $TAG released 🎉"
-echo "  cargo:    cargo install bohay"
+echo "  cargo:    cargo install luvus"
 echo "  binaries: https://github.com/$REPO/releases/tag/$TAG  (workflow building now)"
-echo "  brew:     brew install $REPO/bohay"
-echo "  nixpkgs:  scripts/nixpkgs-update.sh $VERSION --pr   (once bohay is in nixpkgs)"
+echo "  brew:     brew install $REPO/luvus"
+echo "  nixpkgs:  scripts/nixpkgs-update.sh $VERSION --pr   (once luvus is in nixpkgs)"

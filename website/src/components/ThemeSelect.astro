@@ -1,14 +1,14 @@
 ---
-// Overrides Starlight's light/dark select with bohay's palette picker, in the
+// Overrides Starlight's light/dark select with luvus's palette picker, in the
 // place Starlight puts its own theme control: the top right of the navbar
 // (Starlight renders this component there on desktop, and again in the mobile
 // menu below 50rem).
 //
-// The palettes come from bohay's own registry, generated into styles/themes.css,
+// The palettes come from luvus's own registry, generated into styles/themes.css,
 // so what you preview is what the app ships. Applying one sets `data-bh-theme`
 // on <html> (the colours) and `data-theme` (light or dark, which Starlight's own
 // rules and the code-block themes read). The choice lives in
-// `localStorage['bohay-theme']` — the same key the landing page uses, so it
+// `localStorage['luvus-theme']` — the same key the landing page uses, so it
 // carries between the docs and the rest of the site.
 import { THEMES, DEFAULT_THEME } from '../lib/themes';
 
@@ -53,7 +53,7 @@ const current = THEMES.find((t) => t.id === DEFAULT_THEME);
   // `astro:page-load` in case view transitions are ever turned on.
   import { DEFAULT_THEME, modeOf } from '../lib/themes';
 
-  const KEY = 'bohay-theme';
+  const KEY = 'luvus-theme';
   const root = document.documentElement;
 
   const read = () => {

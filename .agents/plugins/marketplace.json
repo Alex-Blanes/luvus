@@ -1,14 +1,14 @@
 {
-  "name": "bohay",
+  "name": "luvus",
   "interface": {
-    "displayName": "Bohay"
+    "displayName": "Luvus"
   },
   "plugins": [
     {
-      "name": "bohay",
+      "name": "luvus",
       "source": {
         "source": "local",
-        "path": "./plugins/bohay"
+        "path": "./plugins/luvus"
       },
       "policy": {
         "installation": "AVAILABLE",

@@ -1,5 +1,5 @@
 <!--
-Thanks for contributing to Bohay.
+Thanks for contributing to Luvus.
 
 Keep the PR focused on one problem. Write for someone who has not followed the
 implementation, and remove any optional section that does not apply.

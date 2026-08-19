@@ -3,7 +3,7 @@
 #   - logs every call to $IDF_FAKE_LOG (default /tmp/idf-calls.log)
 #   - `monitor` blocks and streams, like the real one holding the port
 #   - create /tmp/idf-fake-fail to make `flash` exit non-zero. A file, not an
-#     env var: the fake runs inside a bohay-spawned pane, which does not inherit
+#     env var: the fake runs inside a luvus-spawned pane, which does not inherit
 #     the test shell's environment.
 log="${IDF_FAKE_LOG:-/tmp/idf-calls.log}"
 for a in "$@"; do sub="$a"; done          # subcommand is the LAST arg, after -p/-b

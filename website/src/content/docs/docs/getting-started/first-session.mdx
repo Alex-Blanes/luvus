@@ -3,7 +3,7 @@ title: Your First Session
 description: A five-minute tour where you split panes, run an agent, detach, and come back to everything still running.
 ---
 
-This is the whole bohay experience in five minutes. You'll open a project,
+This is the whole luvus experience in five minutes. You'll open a project,
 run an agent next to a shell, watch its status live, detach, and come back to
 find everything (including the agent's conversation) exactly where you left it.
 
@@ -11,15 +11,15 @@ find everything (including the agent's conversation) exactly where you left it.
 
 ```sh
 cd ~/code/my-project
-bohay
+luvus
 ```
 
 The window has three areas: the **sidebar** (your workspaces and a live AGENTS
 list), the **tab bar**, and the **pane area** with a shell already running in
 your project folder.
 
-Running `bohay` in a different folder later adds that folder as another
-workspace in the same session: one bohay, all your projects.
+Running `luvus` in a different folder later adds that folder as another
+workspace in the same session: one luvus, all your projects.
 
 ## 2. Split and run an agent
 
@@ -61,13 +61,13 @@ panes, shells, and agents keep running in the background server. Close the
 terminal app entirely. Go make coffee.
 
 ```sh
-bohay    # …and everything is exactly where you left it
+luvus    # …and everything is exactly where you left it
 ```
 
 ## 5. Survive a real restart
 
-Even if the server itself stops (a reboot, `bohay server stop`), your session
-snapshot is saved continuously. The next `bohay` restores your workspaces,
+Even if the server itself stops (a reboot, `luvus server stop`), your session
+snapshot is saved continuously. The next `luvus` restores your workspaces,
 tabs, and layouts. It also **resumes each agent's own conversation** via its
 native session store. A Claude Code pane comes back *as the same Claude Code
 conversation*, no `--resume` flags to remember.

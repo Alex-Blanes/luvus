@@ -1,5 +1,5 @@
 // Emitted at build time as `/latest.json` — the small version manifest the
-// bohay app's background update check reads to learn the newest release. It is
+// luvus app's background update check reads to learn the newest release. It is
 // derived from the same `changelog/*.md` files the changelog page uses, so it
 // can never drift from what is actually published. Notify-only on the app side:
 // the app shows a dot by its version and points at the upgrade command; it does

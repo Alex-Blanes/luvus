@@ -1,18 +1,18 @@
 [package]
-name = "bohay-buzz"
+name = "luvus-buzz"
 version = "0.1.0"
 edition = "2021"
-description = "A NIP-29 nostr chat client for Buzz relays, as a bohay module (docs/39)"
+description = "A NIP-29 nostr chat client for Buzz relays, as a luvus module (docs/39)"
 license = "AGPL-3.0-or-later"
 
 [[bin]]
-name = "bohay-buzz"
+name = "luvus-buzz"
 path = "src/main.rs"
 
 [dependencies]
 # Nostr crypto + event/message (de)serialization. Core crate only — NOT the SDK,
 # so no tokio: BUZZ-1's relay flow (connect → NIP-42 auth → one REQ) is simple
-# enough to drive by hand over a blocking socket, matching bohay's no-async ethos.
+# enough to drive by hand over a blocking socket, matching luvus's no-async ethos.
 nostr = "0.44"
 # Blocking WebSocket with rustls TLS (wss://) and the system root store, so there
 # is no OpenSSL to link.
@@ -20,9 +20,9 @@ tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 # rustls 0.23 makes the crypto provider explicit; `ring` cross-compiles cleanly
 # to musl (the module's target). We install it as the process default in main().
 rustls = { version = "0.23", features = ["ring"] }
-# TUI for the chat pane (BUZZ-2). Same stack bohay itself renders with.
+# TUI for the chat pane (BUZZ-2). Same stack luvus itself renders with.
 ratatui = "0.30"
-# Only to read the selection out of BOHAY_MODULE_CONTEXT_JSON (BUZZ-5).
+# Only to read the selection out of LUVUS_MODULE_CONTEXT_JSON (BUZZ-5).
 serde_json = "1"
 anyhow = "1"
 

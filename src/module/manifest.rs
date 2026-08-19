@@ -1,4 +1,4 @@
-//! `bohay-module.toml` — the module manifest: identity + declared argv commands
+//! `luvus-module.toml` — the module manifest: identity + declared argv commands
 //! (actions, event hooks, panes, docks, settings, startup + build steps). Parsed
 //! with serde; validated to mirror the spec in docs/13 §3.1.
 
@@ -8,7 +8,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const MANIFEST_FILE: &str = "bohay-module.toml";
+pub const MANIFEST_FILE: &str = "luvus-module.toml";
+pub const LEGACY_MANIFEST_FILE: &str = "bohay-module.toml";
 const HOST_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -16,7 +17,8 @@ pub struct ModuleManifest {
     pub id: String,
     pub name: String,
     pub version: String,
-    pub min_bohay_version: String,
+    #[serde(alias = "min_bohay_version")]
+    pub min_luvus_version: String,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -35,7 +37,7 @@ pub struct ModuleManifest {
     #[serde(default)]
     pub panes: Vec<PaneEntry>,
     /// Sidebar docks this module contributes (docs/29). The module pushes their
-    /// content over the socket (`ui.dock.push`); bohay owns rendering.
+    /// content over the socket (`ui.dock.push`); luvus owns rendering.
     #[serde(default)]
     pub docks: Vec<DockEntry>,
     /// User-editable settings rendered in Settings → Modules (docs/13 §3.6).
@@ -125,7 +127,7 @@ pub enum SettingKind {
 
 /// One user-editable setting a module declares. Values live in the module's
 /// config dir (`settings.json`) and reach every command as
-/// `BOHAY_MODULE_SETTINGS_JSON` plus `BOHAY_SETTING_<KEY>`.
+/// `LUVUS_MODULE_SETTINGS_JSON` plus `LUVUS_SETTING_<KEY>`.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SettingSpec {
     pub key: String,
@@ -168,13 +170,29 @@ impl SettingSpec {
 pub const KNOWN_CONTEXTS: &[&str] = &["pane", "workspace", "node", "agent", "tab"];
 
 impl ModuleManifest {
-    /// Read + validate the manifest at `<root>/bohay-module.toml`.
+    pub fn path(root: &Path) -> std::path::PathBuf {
+        let current = root.join(MANIFEST_FILE);
+        if current.is_file() {
+            let legacy = root.join(LEGACY_MANIFEST_FILE);
+            if legacy.is_file() && std::fs::read(&current).ok() != std::fs::read(&legacy).ok() {
+                eprintln!(
+                    "warning: both {MANIFEST_FILE} and {LEGACY_MANIFEST_FILE} exist in {}; using {MANIFEST_FILE}",
+                    root.display()
+                );
+            }
+            current
+        } else {
+            root.join(LEGACY_MANIFEST_FILE)
+        }
+    }
+
+    /// Read + validate the manifest at `<root>/luvus-module.toml`.
     pub fn load(root: &Path) -> Result<ModuleManifest, String> {
-        let path = root.join(MANIFEST_FILE);
+        let path = Self::path(root);
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let m: ModuleManifest =
-            toml::from_str(&text).map_err(|e| format!("invalid {MANIFEST_FILE}: {e}"))?;
+            toml::from_str(&text).map_err(|e| format!("invalid {}: {e}", path.display()))?;
         m.validate()?;
         Ok(m)
     }
@@ -193,13 +211,13 @@ impl ModuleManifest {
         if self.version.trim().is_empty() {
             return Err("version is required".to_string());
         }
-        if self.min_bohay_version.trim().is_empty() {
-            return Err("min_bohay_version is required".to_string());
+        if self.min_luvus_version.trim().is_empty() {
+            return Err("min_luvus_version is required".to_string());
         }
-        if version_gt(&self.min_bohay_version, HOST_VERSION) {
+        if version_gt(&self.min_luvus_version, HOST_VERSION) {
             return Err(format!(
-                "module needs bohay ≥ {}, this is {HOST_VERSION}",
-                self.min_bohay_version
+                "module needs luvus ≥ {}, this is {HOST_VERSION}",
+                self.min_luvus_version
             ));
         }
         if self.platforms.as_ref().is_some_and(|p| p.is_empty()) {
@@ -323,7 +341,7 @@ impl ModuleManifest {
         self.settings.iter().find(|s| s.key == key)
     }
 
-    /// Event `on` names that aren't known bohay events (non-fatal warnings).
+    /// Event `on` names that aren't known luvus events (non-fatal warnings).
     /// Used when wiring event hooks (MOD-3).
     #[allow(dead_code)]
     pub fn unknown_events(&self) -> Vec<String> {
@@ -457,12 +475,33 @@ fn version_gt(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn loads_a_legacy_manifest_and_version_field() {
+        let root =
+            std::env::temp_dir().join(format!("luvus-legacy-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(LEGACY_MANIFEST_FILE),
+            r#"id = "you.legacy"
+name = "Legacy"
+version = "1.0.0"
+min_bohay_version = "0.8.3"
+"#,
+        )
+        .unwrap();
+        let manifest = ModuleManifest::load(&root).unwrap();
+        assert_eq!(manifest.min_luvus_version, "0.8.3");
+        assert_eq!(ModuleManifest::path(&root), root.join(LEGACY_MANIFEST_FILE));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn base() -> ModuleManifest {
         ModuleManifest {
             id: "you.git-status".into(),
             name: "Git Status".into(),
             version: "0.1.0".into(),
-            min_bohay_version: "0.1.0".into(),
+            min_luvus_version: "0.1.0".into(),
             description: None,
             platforms: None,
             build: vec![],
@@ -606,7 +645,7 @@ mod tests {
 id = "you.demo"
 name = "Demo"
 version = "0.1.0"
-min_bohay_version = "0.1.0"
+min_luvus_version = "0.1.0"
 
 [[startup]]
 command = ["./restore.sh"]
@@ -648,7 +687,7 @@ step = 1
         assert!(!version_gt("0.1.0", "0.1.0"));
         assert!(!version_gt("0.1.0", "0.2.0"));
         let mut m = base();
-        m.min_bohay_version = "99.0.0".into();
+        m.min_luvus_version = "99.0.0".into();
         assert!(m.validate().is_err(), "future requirement is refused");
     }
 

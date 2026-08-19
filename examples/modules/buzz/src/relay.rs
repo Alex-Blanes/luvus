@@ -93,23 +93,23 @@ pub fn identity(explicit_nsec: Option<&str>) -> Result<(Keys, String, bool)> {
     Ok((keys, npub, true))
 }
 
-/// Where the generated key lives. Prefers the module's own config dir (bohay
-/// sets `BOHAY_MODULE_CONFIG_DIR`), so each user's key stays out of bohay's
-/// shared state; falls back to `~/.config/bohay-buzz/` when run standalone.
+/// Where the generated key lives. Prefers the module's own config dir (luvus
+/// sets `LUVUS_MODULE_CONFIG_DIR`), so each user's key stays out of luvus's
+/// shared state; falls back to `~/.config/luvus-buzz/` when run standalone.
 fn identity_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("BOHAY_MODULE_CONFIG_DIR") {
+    if let Ok(dir) = std::env::var("LUVUS_MODULE_CONFIG_DIR") {
         return PathBuf::from(dir).join("identity.nsec");
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".config/bohay-buzz/identity.nsec")
+    PathBuf::from(home).join(".config/luvus-buzz/identity.nsec")
 }
 
-/// The module's state dir (bohay sets `BOHAY_MODULE_STATE_DIR`), else a temp
+/// The module's state dir (luvus sets `LUVUS_MODULE_STATE_DIR`), else a temp
 /// dir when run standalone. Shared between the pane and the share-pane action.
 fn state_dir() -> PathBuf {
-    std::env::var_os("BOHAY_MODULE_STATE_DIR")
+    std::env::var_os("LUVUS_MODULE_STATE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("bohay-buzz"))
+        .unwrap_or_else(|| std::env::temp_dir().join("luvus-buzz"))
 }
 
 /// The pane records the channel it is viewing here, so the `share` action (a

@@ -1,4 +1,4 @@
-//! CLI client (M4): `bohay pane …` / `bohay ping` / `bohay events` connect to
+//! CLI client (M4): `luvus pane …` / `luvus ping` / `luvus events` connect to
 //! the session socket, send one JSON request, and print the reply. See docs/08.
 
 use std::io::{BufRead, BufReader, Write};
@@ -38,13 +38,13 @@ pub fn is_cli(args: &[String]) -> bool {
 }
 
 const USAGE: &str = "\
-bohay: Mission control for your AI coding agents
+luvus: Mission control for your AI coding agents
 
 Usage:
-  bohay [--session <name>]               Launch or attach to the TUI
-  bohay [--session <name>] <command>     Control a local session
-  bohay --remote <host> [ssh args]       Attach to a remote session
-  bohay help all                         Show every command and option
+  luvus [--session <name>]               Launch or attach to the TUI
+  luvus [--session <name>] <command>     Control a local session
+  luvus --remote <host> [ssh args]       Attach to a remote session
+  luvus help all                         Show every command and option
 
 Commands:
   workspace    Open, organize, and switch projects
@@ -61,7 +61,7 @@ Commands:
   session      List, attach, stop, and delete server sessions
   server       Inspect and manage the selected background server
   integration  Manage agent session-resume integrations
-  skill        Print, install, update, enable, or remove the Bohay skill
+  skill        Print, install, update, enable, or remove the Luvus skill
   wait         Wait for pane output or an agent state
   search       Search across pane scrollback
   events       Stream live status changes
@@ -70,11 +70,11 @@ Commands:
   ping         Check whether the selected server responds
 
 Examples:
-  bohay agent list                       See every active coding agent
-  bohay pane split --down                Add a pane below the focused pane
-  bohay workspace open .                 Open the current project
-  bohay session attach docs              Start or open a named session
-  bohay --session docs agent list        Control a session from another terminal
+  luvus agent list                       See every active coding agent
+  luvus pane split --down                Add a pane below the focused pane
+  luvus workspace open .                 Open the current project
+  luvus session attach docs              Start or open a named session
+  luvus --session docs agent list        Control a session from another terminal
 
 Options:
   --session <name>                       Target a named server session
@@ -83,15 +83,15 @@ Options:
   --help, -h                             Show this help
 
 Help:
-  bohay help all                         Complete CLI reference
-  bohay help <topic> [command]           Focus on one area or command
-  https://bohay.dev/docs/reference/cli/  Online reference
+  luvus help all                         Complete CLI reference
+  luvus help <topic> [command]           Focus on one area or command
+  https://luvus.dev/docs/reference/cli/  Online reference
 ";
 
 const DETAILED_USAGE: &str = "\
-bohay: Mission control for your AI coding agents
+luvus: Mission control for your AI coding agents
 
-usage: bohay <command> [args]
+usage: luvus <command> [args]
 
   (no args)            launch / attach the TUI
   --session <name>     target one named server session
@@ -146,7 +146,7 @@ panes / agents:
   skill                      print the agent skill (delegation + session control)
   skill install [--dir <p>]  install the skill where a coding agent auto-loads it
   skill uninstall [--dir <p>]   remove the installed skill
-  skill update               fetch the latest skill from the bohay repo (no reinstall)
+  skill update               fetch the latest skill from the luvus repo (no reinstall)
   skill on | off             enable / disable auto-install (installs / removes now)
   wait output <id> --match <text> [--timeout <s>]    block until output appears
   wait agent-status <id> --status done|blocked|working|idle [--timeout <s>]
@@ -167,7 +167,7 @@ appearance:
   ui toast <text>            flash a one-line message in the UI
 
 modules (extensions):
-  module search [<query>]    find modules published to the `bohay-module` GitHub topic
+  module search [<query>]    find modules published to the `luvus-module` GitHub topic
   module list                list installed modules
   module info <id>           show a module's actions / panes / events / source
   module link <path>         register a local module dir (--disabled to skip enabling)
@@ -213,7 +213,7 @@ orchestration (multiple agents on one project, docs/22):
   task heartbeat <id> --context <0..1>   report context usage (blocks done at >85%)
   task update <id> [--status <s>] [--output <o>] [--note <n>]
   task done <id>             mark done + release its leases
-  task merge <id>            integrate the task's branch into bohay/integration
+  task merge <id>            integrate the task's branch into luvus/integration
                              (isolated worktree, conflicts block the task)
   task release <id>          return a claimed task to the queue
   task delete <id>           remove a task (release/finish an active one first)
@@ -231,18 +231,18 @@ sessions:
   session delete <name> [--json]  delete a stopped named session
 
 remote:
-  --remote <host> [ssh args] attach to a bohay session on <host> over plain ssh
+  --remote <host> [ssh args] attach to a luvus session on <host> over plain ssh
 
 server:
   server status              is the server running, and what version
   server start               start the background server if it isn't up
   server stop                stop the server (and all panes)
   server restart             stop + start (load a newly-installed binary)
-  server update-manifest     fetch the latest agent-detection rules from bohay.dev
+  server update-manifest     fetch the latest agent-detection rules from luvus.dev
                              (applies live if the server is up; else on next start)
   integration install|uninstall <claude|copilot|codex|opencode|kimi|grok>
-                             add/remove bohay's session-resume hook (uninstall
-                             removes only bohay's hook, never the agent)
+                             add/remove luvus's session-resume hook (uninstall
+                             removes only luvus's hook, never the agent)
 ";
 
 pub fn run(args: &[String]) -> Result<i32> {
@@ -261,12 +261,12 @@ pub fn run(args: &[String]) -> Result<i32> {
                 if write_topic_help(std::io::stdout().lock(), topic, command)? {
                     Ok(0)
                 } else {
-                    eprintln!("unknown help topic `{topic}`. Run `bohay --help` for the list.");
+                    eprintln!("unknown help topic `{topic}`. Run `luvus --help` for the list.");
                     Ok(2)
                 }
             }
             _ => {
-                eprintln!("usage: bohay help [all|<topic> [command]]");
+                eprintln!("usage: luvus help [all|<topic> [command]]");
                 Ok(2)
             }
         };
@@ -318,7 +318,7 @@ pub fn run(args: &[String]) -> Result<i32> {
     let (method, params) = parse(args)?;
     let path = crate::persist::cli_socket_path();
     let mut stream = crate::ipc::transport::connect(&path)
-        .map_err(|_| anyhow!("no bohay server running (socket: {})", path.display()))?;
+        .map_err(|_| anyhow!("no luvus server running (socket: {})", path.display()))?;
 
     let req = json!({ "id": "1", "method": method, "params": params });
     writeln!(stream, "{req}")?;
@@ -434,7 +434,7 @@ fn write_topic_help(
     };
     if topic == "session" {
         if let Some(command) = command {
-            writeln!(output, "Usage: bohay session <command>\n")?;
+            writeln!(output, "Usage: luvus session <command>\n")?;
             if !write_command_rows(&mut output, SESSION_USAGE, topic, command)? {
                 output.write_all(SESSION_USAGE.as_bytes())?;
             }
@@ -446,97 +446,97 @@ fn write_topic_help(
 
     let (usage, section) = match topic {
         "workspace" => (
-            "bohay workspace <command> [args]",
+            "luvus workspace <command> [args]",
             detailed_section("workspaces:\n", "\ntabs:\n"),
         ),
         "tab" => (
-            "bohay tab <command> [args]",
+            "luvus tab <command> [args]",
             detailed_section("tabs:\n", "\npanes / agents:\n"),
         ),
         "pane" => (
-            "bohay pane <command> [args]",
+            "luvus pane <command> [args]",
             detailed_section("panes / agents:\n", "\nsearch:\n"),
         ),
         "agent" => (
-            "bohay agent <command> [args]",
+            "luvus agent <command> [args]",
             detailed_section("panes / agents:\n", "\nsearch:\n"),
         ),
         "skill" => (
-            "bohay skill [install|uninstall|update|on|off] [options]",
+            "luvus skill [install|uninstall|update|on|off] [options]",
             detailed_section("panes / agents:\n", "\nsearch:\n"),
         ),
         "wait" => (
-            "bohay wait <output|agent-status> [args]",
+            "luvus wait <output|agent-status> [args]",
             detailed_section("panes / agents:\n", "\nsearch:\n"),
         ),
         "attach" => (
-            "bohay attach <pane-id>",
+            "luvus attach <pane-id>",
             detailed_section("panes / agents:\n", "\nsearch:\n"),
         ),
         "search" => (
-            "bohay search <text...> [--case]",
+            "luvus search <text...> [--case]",
             detailed_section("search:\n", "\nappearance:\n"),
         ),
         "ui" => (
-            "bohay ui <sidebar|dock|toast> [args]",
+            "luvus ui <sidebar|dock|toast> [args]",
             detailed_section("appearance:\n", "\nmodules (extensions):\n"),
         ),
         "module" => (
-            "bohay module <command> [args]",
+            "luvus module <command> [args]",
             detailed_section("modules (extensions):\n", "\ngit:\n"),
         ),
         "git" => (
-            "bohay git <status|branches|log|open> [args]",
+            "luvus git <status|branches|log|open> [args]",
             detailed_section("git:\n", "\nworktrees:\n"),
         ),
         "files" => (
-            "bohay files <tree|open|reveal|refresh> [args]",
+            "luvus files <tree|open|reveal|refresh> [args]",
             detailed_section("git:\n", "\nworktrees:\n"),
         ),
         "worktree" => (
-            "bohay worktree <command> [args]",
+            "luvus worktree <command> [args]",
             detailed_section(
                 "worktrees:\n",
                 "\norchestration (multiple agents on one project, docs/22):\n",
             ),
         ),
         "task" => (
-            "bohay task <command> [args]",
+            "luvus task <command> [args]",
             detailed_section(
                 "orchestration (multiple agents on one project, docs/22):\n",
                 "\nevents:\n",
             ),
         ),
         "lease" => (
-            "bohay lease <acquire|release|list> [args]",
+            "luvus lease <acquire|release|list> [args]",
             detailed_section(
                 "orchestration (multiple agents on one project, docs/22):\n",
                 "\nevents:\n",
             ),
         ),
         "events" => (
-            "bohay events",
+            "luvus events",
             detailed_section("events:\n", "\nsessions:\n"),
         ),
         "remote" => (
-            "bohay [--session <name>] --remote <host> [ssh args]",
+            "luvus [--session <name>] --remote <host> [ssh args]",
             detailed_section("remote:\n", "\nserver:\n"),
         ),
         "server" => (
-            "bohay [--session <name>] server <command>",
+            "luvus [--session <name>] server <command>",
             detailed_section_to_end("server:\n"),
         ),
         "integration" => (
-            "bohay integration <install|uninstall> <agent>",
+            "luvus integration <install|uninstall> <agent>",
             detailed_section_to_end("server:\n"),
         ),
         "ping" => (
-            "bohay [--session <name>] ping",
+            "luvus [--session <name>] ping",
             "Check whether the selected server responds.\n",
         ),
         "doctor" => (
-            "bohay doctor",
-            "Check optional external tools used by Bohay.\n",
+            "luvus doctor",
+            "Check optional external tools used by Luvus.\n",
         ),
         _ => unreachable!("normalized help topic"),
     };
@@ -627,7 +627,7 @@ fn session_cmd(args: &[String]) -> Result<i32> {
             Ok(0)
         }
         Some("attach") => {
-            eprintln!("usage: bohay session attach <name>");
+            eprintln!("usage: luvus session attach <name>");
             Ok(2)
         }
         Some("help" | "--help" | "-h") => {
@@ -642,7 +642,7 @@ fn session_cmd(args: &[String]) -> Result<i32> {
 }
 
 const SESSION_USAGE: &str = "\
-Usage: bohay session <command>
+Usage: luvus session <command>
 
 Commands:
   list [--json]         List default and named sessions
@@ -659,7 +659,7 @@ fn session_list(args: &[String]) -> Result<i32> {
     let json = match args {
         [] => false,
         [flag] if flag == "--json" => true,
-        _ => return Err(anyhow!("usage: bohay session list [--json]")),
+        _ => return Err(anyhow!("usage: luvus session list [--json]")),
     };
     let sessions = crate::session::list_sessions()?;
     if json {
@@ -695,7 +695,7 @@ fn parse_session_name_and_json<'a>(args: &'a [String], usage: &str) -> Result<(&
 
 fn session_stop(args: &[String]) -> Result<i32> {
     let (name, json_output) =
-        parse_session_name_and_json(args, "usage: bohay session stop <name> [--json]")?;
+        parse_session_name_and_json(args, "usage: luvus session stop <name> [--json]")?;
     let target = match crate::session::parse_target_name(name) {
         Ok(target) => target,
         Err(message) => return session_error("invalid_session_name", &message, json_output),
@@ -718,7 +718,7 @@ fn session_stop(args: &[String]) -> Result<i32> {
 
 fn session_delete(args: &[String]) -> Result<i32> {
     let (name, json_output) =
-        parse_session_name_and_json(args, "usage: bohay session delete <name> [--json]")?;
+        parse_session_name_and_json(args, "usage: luvus session delete <name> [--json]")?;
     match crate::session::delete_session(name) {
         Ok(session) => {
             if json_output {
@@ -745,14 +745,14 @@ fn session_error(code: &str, message: &str, json_output: bool) -> Result<i32> {
     Ok(1)
 }
 
-/// `bohay module install owner/repo[/sub] [--ref REF] [--yes]` — clone + build
+/// `luvus module install owner/repo[/sub] [--ref REF] [--yes]` — clone + build
 /// locally, then register over the socket (or directly if the server is down).
 fn module_install(args: &[String]) -> Result<i32> {
     let spec = args
         .get(3)
         .filter(|s| !s.starts_with("--"))
         .ok_or_else(|| {
-            anyhow!("usage: bohay module install owner/repo[/sub] [--ref REF] [--yes]")
+            anyhow!("usage: luvus module install owner/repo[/sub] [--ref REF] [--yes]")
         })?;
     let git_ref = flag(args, "--ref");
     let yes = args.iter().any(|a| a == "--yes" || a == "-y");
@@ -776,7 +776,7 @@ fn module_install(args: &[String]) -> Result<i32> {
             // Server down: write the registry directly; it loads on next start.
             register_directly(&installed)?;
             println!(
-                "installed {} ({}) — start bohay to use it",
+                "installed {} ({}) — start luvus to use it",
                 installed.id, installed.source
             );
             Ok(0)
@@ -784,7 +784,7 @@ fn module_install(args: &[String]) -> Result<i32> {
     }
 }
 
-/// `bohay doctor` — report which optional external tools are present. The core
+/// `luvus doctor` — report which optional external tools are present. The core
 /// multiplexer needs none of them; this just tells a fresh install (esp. via
 /// `cargo install`, which can't pull in system tools) what each missing tool
 /// would unlock and how to get it. Always exits 0 — nothing here is fatal.
@@ -805,7 +805,7 @@ fn doctor() -> i32 {
             .filter(|l| !l.is_empty())
     };
 
-    println!("bohay {}\n", env!("CARGO_PKG_VERSION"));
+    println!("luvus {}\n", env!("CARGO_PKG_VERSION"));
     println!("  ✓ core    the multiplexer (panes · tabs · agents) needs no external tools\n");
 
     // (name, cmd, version-arg, what it unlocks, required?, install hint)
@@ -830,7 +830,7 @@ fn doctor() -> i32 {
             "ssh",
             "ssh",
             "-V",
-            "bohay --remote",
+            "luvus --remote",
             false,
             "preinstalled on macOS/Linux",
         ),
@@ -838,7 +838,7 @@ fn doctor() -> i32 {
             "curl",
             "curl",
             "--version",
-            "bohay module search",
+            "luvus module search",
             false,
             "preinstalled on macOS/Linux",
         ),
@@ -869,7 +869,7 @@ fn doctor() -> i32 {
     println!();
     match keyboard_protocol_status() {
         KeyProto::InsidePane => {
-            println!("  · keys    run `bohay doctor` outside a bohay pane to test your terminal");
+            println!("  · keys    run `luvus doctor` outside a luvus pane to test your terminal");
         }
         KeyProto::Supported => {
             println!("  ✓ keys    Shift+Enter works (terminal reports modified keys)");
@@ -896,7 +896,7 @@ enum KeyProto {
     // is only constructed off Windows.
     #[cfg_attr(windows, allow(dead_code))]
     Unsupported,
-    /// Queried from inside a bohay pane, which answers for *bohay's* PTY rather
+    /// Queried from inside a luvus pane, which answers for *luvus's* PTY rather
     /// than the real terminal — so the result would be misleading.
     InsidePane,
 }
@@ -905,7 +905,7 @@ enum KeyProto {
 /// query needs raw mode (crossterm writes a request and reads the reply), so it
 /// is enabled just for the probe and always restored.
 fn keyboard_protocol_status() -> KeyProto {
-    if std::env::var_os("BOHAY_ENV").is_some() {
+    if std::env::var_os("LUVUS_ENV").is_some() {
         return KeyProto::InsidePane;
     }
     // Windows reads keys from native console records (not the keyboard protocol,
@@ -932,8 +932,8 @@ fn keyboard_protocol_status() -> KeyProto {
     }
 }
 
-/// `bohay module search [<query>]` — list modules published to the
-/// `bohay-module` GitHub topic. Read-only; doesn't need a running server.
+/// `luvus module search [<query>]` — list modules published to the
+/// `luvus-module` GitHub topic. Read-only; doesn't need a running server.
 fn module_search(args: &[String]) -> Result<i32> {
     let terms: Vec<&str> = args
         .get(3..)
@@ -946,8 +946,8 @@ fn module_search(args: &[String]) -> Result<i32> {
 
     let hits = crate::module::discovery::search(query.as_deref())?;
     if hits.is_empty() {
-        println!("No modules found in the `bohay-module` topic yet.");
-        println!("Publish one by tagging a public repo with the `bohay-module` topic.");
+        println!("No modules found in the `luvus-module` topic yet.");
+        println!("Publish one by tagging a public repo with the `luvus-module` topic.");
         return Ok(0);
     }
     for h in &hits {
@@ -960,13 +960,13 @@ fn module_search(args: &[String]) -> Result<i32> {
         }
     }
     println!(
-        "\n{} result(s). Install with:  bohay module install <owner>/<repo>",
+        "\n{} result(s). Install with:  luvus module install <owner>/<repo>",
         hits.len()
     );
     Ok(0)
 }
 
-/// What a `bohay wait …` invocation is waiting for (parsed from argv).
+/// What a `luvus wait …` invocation is waiting for (parsed from argv).
 #[derive(Debug, PartialEq)]
 enum WaitFor {
     /// `wait output <id> --match <text>`: the pane's recent output contains `text`.
@@ -982,30 +982,30 @@ struct WaitSpec {
     timeout: Option<f64>,
 }
 
-/// Parse `bohay wait output|agent-status <id> …` into a [`WaitSpec`] (pure, so
+/// Parse `luvus wait output|agent-status <id> …` into a [`WaitSpec`] (pure, so
 /// it's unit-tested). The pane id is the first numeric positional, else
-/// `$BOHAY_PANE_ID`.
+/// `$LUVUS_PANE_ID`.
 fn parse_wait(args: &[String]) -> Result<WaitSpec> {
     let kind = args.get(2).map(String::as_str).unwrap_or("");
     let pane = args
         .get(3)
         .filter(|s| s.parse::<u32>().is_ok())
         .cloned()
-        .or_else(|| std::env::var("BOHAY_PANE_ID").ok())
-        .ok_or_else(|| anyhow!("wait needs a pane id (or $BOHAY_PANE_ID)"))?;
+        .or_else(|| std::env::var("LUVUS_PANE_ID").ok())
+        .ok_or_else(|| anyhow!("wait needs a pane id (or $LUVUS_PANE_ID)"))?;
     let timeout = flag(args, "--timeout").and_then(|s| s.parse::<f64>().ok());
     let condition = match kind {
         "output" => WaitFor::Output {
             needle: flag(args, "--match").ok_or_else(|| {
-                anyhow!("usage: bohay wait output <id> --match <text> [--timeout <s>]")
+                anyhow!("usage: luvus wait output <id> --match <text> [--timeout <s>]")
             })?,
         },
         "agent-status" => WaitFor::AgentStatus {
             status: flag(args, "--status").ok_or_else(|| {
-                anyhow!("usage: bohay wait agent-status <id> --status done|blocked|working|idle [--timeout <s>]")
+                anyhow!("usage: luvus wait agent-status <id> --status done|blocked|working|idle [--timeout <s>]")
             })?,
         },
-        _ => return Err(anyhow!("usage: bohay wait output|agent-status <id> …")),
+        _ => return Err(anyhow!("usage: luvus wait output|agent-status <id> …")),
     };
     Ok(WaitSpec {
         pane,
@@ -1014,7 +1014,7 @@ fn parse_wait(args: &[String]) -> Result<WaitSpec> {
     })
 }
 
-/// `bohay wait …` — block until the condition holds (exit 0) or the timeout
+/// `luvus wait …` — block until the condition holds (exit 0) or the timeout
 /// elapses (exit 2). `wait output` is answered server-side: the connection
 /// stays open and the server replies the moment the pane's output matches,
 /// so the CLI never polls (docs/81). Older servers answer `unknown_method`
@@ -1105,13 +1105,13 @@ fn parse_agent_start_target(args: &[String], caller: Option<String>) -> Result<A
     })
 }
 
-/// `bohay agent start <name> --kind <kind> [--pane <id> | --anchor <id>] [--down] [--timeout S] [-- <extra…>]` —
+/// `luvus agent start <name> --kind <kind> [--pane <id> | --anchor <id>] [--down] [--timeout S] [-- <extra…>]` —
 /// spawn a coding agent in a sibling pane (or a given one), wait until detection
 /// recognizes it, and give it a name, all in one command. Exit 0 when it becomes
 /// ready, 2 if it did not within the timeout (the pane and name still exist).
 fn agent_start_cmd(args: &[String]) -> Result<i32> {
     let name = args.get(3).cloned().ok_or_else(|| {
-        anyhow!("usage: bohay agent start <name> --kind <kind> [--pane <id> | --anchor <id>] [--down] [--timeout S] [-- <extra>]")
+        anyhow!("usage: luvus agent start <name> --kind <kind> [--pane <id> | --anchor <id>] [--down] [--timeout S] [-- <extra>]")
     })?;
     let kind = flag(args, "--kind").ok_or_else(|| anyhow!("agent start requires --kind <kind>"))?;
     // Native agent args after `--` are appended to the launch command.
@@ -1128,7 +1128,7 @@ fn agent_start_cmd(args: &[String]) -> Result<i32> {
 
     // `--pane` reuses an existing pane. `--anchor` creates a background sibling
     // beside an explicit pane. Without either, a managed caller pane is the anchor.
-    let target = parse_agent_start_target(args, std::env::var("BOHAY_PANE_ID").ok())?;
+    let target = parse_agent_start_target(args, std::env::var("LUVUS_PANE_ID").ok())?;
     let pane = match target {
         AgentStartTarget::Existing(pane) => pane,
         AgentStartTarget::Split { anchor, down } => {
@@ -1187,9 +1187,9 @@ fn agent_start_cmd(args: &[String]) -> Result<i32> {
     Ok(if ready { 0 } else { 2 })
 }
 
-/// `bohay skill` prints the agent skill; `bohay skill install [--dir <path>]`
+/// `luvus skill` prints the agent skill; `luvus skill install [--dir <path>]`
 /// writes it where a coding agent auto-loads it (default: Claude Code's
-/// `~/.claude/skills/bohay/SKILL.md`). No server needed either way.
+/// `~/.claude/skills/luvus/SKILL.md`). No server needed either way.
 fn skill_cmd(rest: &[String]) -> Result<i32> {
     // With `--dir`, act on that one path (the full Claude-style skill). Without
     // it, act on every supported agent that is set up (Claude skill + Codex /
@@ -1231,25 +1231,25 @@ fn skill_cmd(rest: &[String]) -> Result<i32> {
             println!("(restart the server to stop reinstalling)");
             Ok(0)
         }
-        // OTA: fetch the latest skill from the repo (or `$BOHAY_SKILL_URL`) and
+        // OTA: fetch the latest skill from the repo (or `$LUVUS_SKILL_URL`) and
         // cache it so it wins over the compiled-in default, then apply it now —
-        // a skill fix without waiting for a new bohay release. No server needed.
+        // a skill fix without waiting for a new luvus release. No server needed.
         Some("update") => {
             let url = flag(rest, "--url")
-                .or_else(|| std::env::var("BOHAY_SKILL_URL").ok())
+                .or_else(|| std::env::var("LUVUS_SKILL_URL").ok())
                 .unwrap_or_else(|| {
-                    "https://raw.githubusercontent.com/RizRiyz/bohay/main/skills/bohay/SKILL.md"
+                    "https://raw.githubusercontent.com/RizRiyz/luvus/main/skills/luvus/SKILL.md"
                         .to_string()
                 });
             let body = crate::module::discovery::http_get(&url)
                 .map_err(|e| anyhow!("could not fetch the skill ({url}): {e}"))?;
             if !crate::skill::skill_valid(&body) {
                 return Err(anyhow!(
-                    "the download from {url} is not a valid bohay skill; nothing changed"
+                    "the download from {url} is not a valid luvus skill; nothing changed"
                 ));
             }
             let cache = crate::skill::save_managed(&body)?;
-            println!("updated the bohay skill -> {}", cache.display());
+            println!("updated the luvus skill -> {}", cache.display());
             print_touched("refreshed", crate::skill::install_default());
             Ok(0)
         }
@@ -1278,12 +1278,12 @@ fn set_auto_install_skill(on: bool) {
     crate::config::save(&c);
 }
 
-/// `bohay agent send <target> <text…> [--wait] [--until STATE] [--timeout S]` —
+/// `luvus agent send <target> <text…> [--wait] [--until STATE] [--timeout S]` —
 /// submit a prompt to a target agent, then optionally block until it reaches a
 /// state (default `idle`). Exit 0 on the state, 2 on timeout, like `wait`.
 fn agent_send_cmd(args: &[String]) -> Result<i32> {
     let target = args.get(3).cloned().ok_or_else(|| {
-        anyhow!("usage: bohay agent send <target> <text> [--wait] [--until STATE] [--timeout S]")
+        anyhow!("usage: luvus agent send <target> <text> [--wait] [--until STATE] [--timeout S]")
     })?;
     // Text is every positional before the first flag, so `--wait` and friends can
     // follow an unquoted multi-word prompt.
@@ -1374,7 +1374,7 @@ fn pane_status(pane: &str) -> Result<Option<String>> {
 fn wait_status_stream(pane: &str, target: &str, deadline: Option<Instant>) -> Result<i32> {
     let path = crate::persist::cli_socket_path();
     let stream =
-        crate::ipc::transport::connect(&path).map_err(|_| anyhow!("no bohay server running"))?;
+        crate::ipc::transport::connect(&path).map_err(|_| anyhow!("no luvus server running"))?;
     let mut writer = stream.clone();
     writeln!(
         writer,
@@ -1425,7 +1425,7 @@ fn wait_status_stream(pane: &str, target: &str, deadline: Option<Instant>) -> Re
     }
 }
 
-/// Focus + zoom a pane via `attach.pane` (docs/18 WA-2). Used by `bohay attach`.
+/// Focus + zoom a pane via `attach.pane` (docs/18 WA-2). Used by `luvus attach`.
 pub fn request_attach(pane: &str) -> Result<()> {
     send_request("attach.pane", json!({ "pane": pane })).map(|_| ())
 }
@@ -1434,7 +1434,7 @@ pub fn request_attach(pane: &str) -> Result<()> {
 pub(crate) fn send_request(method: &str, params: Value) -> Result<Value> {
     let path = crate::persist::cli_socket_path();
     let mut stream =
-        crate::ipc::transport::connect(&path).map_err(|_| anyhow!("no bohay server running"))?;
+        crate::ipc::transport::connect(&path).map_err(|_| anyhow!("no luvus server running"))?;
     let req = json!({ "id": "1", "method": method, "params": params });
     writeln!(stream, "{req}")?;
     let mut reader = BufReader::new(stream);
@@ -1468,14 +1468,14 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
     let verb = args.get(2).map(String::as_str).unwrap_or("");
     let rest = &args[3.min(args.len())..];
 
-    // The pane id is the first numeric positional, else $BOHAY_PANE_ID.
+    // The pane id is the first numeric positional, else $LUVUS_PANE_ID.
     let pane = || -> Value {
         if let Some(first) = rest.first() {
             if first.parse::<u32>().is_ok() {
                 return json!(first);
             }
         }
-        match std::env::var("BOHAY_PANE_ID") {
+        match std::env::var("LUVUS_PANE_ID") {
             Ok(v) => json!(v),
             Err(_) => Value::Null,
         }
@@ -1500,7 +1500,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
     // First positional arg after the verb (for workspace/tab indices).
     let arg0 = || rest.first().cloned();
     // Everything after the verb, joined, minus flags and their values — for free
-    // text like a tab name, where `bohay tab rename my tab --tab 2` must not
+    // text like a tab name, where `luvus tab rename my tab --tab 2` must not
     // fold the flag into the name.
     let rest_text = || {
         let mut out: Vec<&str> = Vec::new();
@@ -1529,7 +1529,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
     Ok(match (noun, verb) {
         ("ping", _) => ("ping".into(), json!({})),
         ("events", _) => ("events.subscribe".into(), json!({})),
-        // `bohay search <text...> [--case]` — scan every pane's scrollback
+        // `luvus search <text...> [--case]` — scan every pane's scrollback
         // (docs/63). Everything after `search`, minus flags, is the query.
         ("search", _) => {
             let case = args
@@ -1548,7 +1548,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
         ("agent", "sessions") => ("agent.sessions".into(), json!({})),
         ("agent", "resume") => ("agent.resume".into(), one("session_id", arg0())),
         ("agent", "fork") => {
-            let usage = "usage: bohay agent fork <target> [--name <alias>] [--no-focus]";
+            let usage = "usage: luvus agent fork <target> [--name <alias>] [--no-focus]";
             let target = rest
                 .first()
                 .filter(|v| !v.starts_with("--"))
@@ -1599,7 +1599,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             // `agent name <name>` names the current pane; `--pane <id>` overrides;
             // `--clear` drops the pane's alias. The name never doubles as a pane id.
             let mut obj = serde_json::Map::new();
-            if let Some(pid) = flag(args, "--pane").or_else(|| std::env::var("BOHAY_PANE_ID").ok())
+            if let Some(pid) = flag(args, "--pane").or_else(|| std::env::var("LUVUS_PANE_ID").ok())
             {
                 obj.insert("pane".to_string(), json!(pid));
             }
@@ -1665,7 +1665,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
                 "push" => {
                     let mut obj = serde_json::Map::new();
                     let id = flag(args, "--id")
-                        .ok_or_else(|| anyhow!("usage: bohay ui dock push --id <id> [--title <t>] [--side left|right] [--rows <json>]"))?;
+                        .ok_or_else(|| anyhow!("usage: luvus ui dock push --id <id> [--title <t>] [--side left|right] [--rows <json>]"))?;
                     obj.insert("id".to_string(), json!(id));
                     if let Some(tt) = flag(args, "--title") {
                         obj.insert("title".to_string(), json!(tt));
@@ -1709,7 +1709,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
         ("workspace" | "node", "open") => ("workspace.open".into(), one("path", arg0())),
         ("workspace" | "node", "focus") => ("workspace.focus".into(), one("workspace", arg0())),
         ("workspace" | "node", "rename") => {
-            let usage = "usage: bohay workspace rename <i> <name>";
+            let usage = "usage: luvus workspace rename <i> <name>";
             if rest.len() < 2 {
                 return Err(anyhow!(usage));
             }
@@ -1733,7 +1733,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             )
         }
         ("workspace" | "node", action @ ("pin" | "unpin")) => {
-            let usage = format!("usage: bohay workspace {action} <i>");
+            let usage = format!("usage: luvus workspace {action} <i>");
             if rest.len() != 1 {
                 return Err(anyhow!(usage));
             }
@@ -1749,7 +1749,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
         ("workspace" | "node", "" | "list") => ("workspace.list".into(), json!({})),
         ("workspace" | "node", other) => {
             return Err(anyhow!(
-                "unknown workspace command `{other}`. Try `bohay help workspace`."
+                "unknown workspace command `{other}`. Try `luvus help workspace`."
             ))
         }
 
@@ -1757,7 +1757,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
         ("tab", "focus") => ("tab.focus".into(), one("tab", arg0())),
         ("tab", "move") => {
             if rest.len() != 2 {
-                return Err(anyhow!("usage: bohay tab move <from> <to>"));
+                return Err(anyhow!("usage: luvus tab move <from> <to>"));
             }
             let parse_position = |raw: &str| -> Result<String> {
                 raw.parse::<usize>()
@@ -1783,7 +1783,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
         ("tab", "" | "list") => ("tab.list".into(), json!({})),
         ("tab", other) => {
             return Err(anyhow!(
-                "unknown tab command `{other}`. Try `bohay help tab`."
+                "unknown tab command `{other}`. Try `luvus help tab`."
             ))
         }
 
@@ -1799,7 +1799,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
         }
         ("pane", "focus") => ("pane.focus".into(), with_pane(serde_json::Map::new())),
         ("pane", "move") => {
-            let usage = "usage: bohay pane move [<id>] (--tab <n> | --new-tab)";
+            let usage = "usage: luvus pane move [<id>] (--tab <n> | --new-tab)";
             let mut pane_id: Option<String> = None;
             let mut tab: Option<String> = None;
             let mut new_tab = false;
@@ -1853,7 +1853,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
                     .ok_or_else(|| anyhow!("--tab must be a positive 1-based number"))?;
                 obj.insert("tab".to_string(), json!(n.to_string()));
             }
-            if let Some(pane) = pane_id.or_else(|| std::env::var("BOHAY_PANE_ID").ok()) {
+            if let Some(pane) = pane_id.or_else(|| std::env::var("LUVUS_PANE_ID").ok()) {
                 obj.insert("pane".to_string(), json!(pane));
             }
             ("pane.move".into(), Value::Object(obj))
@@ -1877,7 +1877,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
         // you can mention it by name. The name never doubles as a pane id.
         ("pane", "name") => {
             let mut obj = serde_json::Map::new();
-            if let Some(pid) = flag(args, "--pane").or_else(|| std::env::var("BOHAY_PANE_ID").ok())
+            if let Some(pid) = flag(args, "--pane").or_else(|| std::env::var("LUVUS_PANE_ID").ok())
             {
                 obj.insert("pane".to_string(), json!(pid));
             }
@@ -1922,7 +1922,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
         ("pane", "" | "list") => ("pane.list".into(), json!({})),
         ("pane", other) => {
             return Err(anyhow!(
-                "unknown pane command `{other}`. Try `bohay help pane`."
+                "unknown pane command `{other}`. Try `luvus help pane`."
             ))
         }
 
@@ -1950,7 +1950,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
                 (Some(a), None) => {
                     obj.insert("id".to_string(), json!(a));
                 }
-                _ => return Err(anyhow!("usage: bohay module run <module> <action>")),
+                _ => return Err(anyhow!("usage: luvus module run <module> <action>")),
             }
             ("module.action.invoke".into(), Value::Object(obj))
         }
@@ -1972,7 +1972,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             let mut obj = serde_json::Map::new();
             let Some(id) = rest.first() else {
                 return Err(anyhow!(
-                    "usage: bohay module settings <id> [<key> [<value>]]"
+                    "usage: luvus module settings <id> [<key> [<value>]]"
                 ));
             };
             obj.insert("id".to_string(), json!(id));
@@ -2015,7 +2015,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
                     "module.pane.close".into(),
                     one("pane", rest.get(1).cloned()),
                 ),
-                _ => return Err(anyhow!("usage: bohay module pane open|focus|close …")),
+                _ => return Err(anyhow!("usage: luvus module pane open|focus|close …")),
             }
         }
         ("module", _) => ("module.list".into(), json!({})),
@@ -2152,7 +2152,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
         ("lease", "release") => ("lease.release".into(), one("id", arg0())),
         ("lease", _) => ("lease.list".into(), json!({})),
 
-        _ => return Err(anyhow!("unknown command. Try `bohay --help`.")),
+        _ => return Err(anyhow!("unknown command. Try `luvus --help`.")),
     })
 }
 
@@ -2209,16 +2209,16 @@ mod tests {
     #[test]
     fn pass_through_commands_preserve_trailing_help_payloads() {
         for raw in [
-            "bohay pane run 9 cargo --help",
-            "bohay pane run 9 cargo -h",
-            "bohay pane send 9 --help",
-            "bohay pane send 9 -h",
-            "bohay agent send reviewer --help",
-            "bohay agent send reviewer -h",
-            "bohay agent keys reviewer --help",
-            "bohay agent keys reviewer -h",
-            "bohay --remote devbox --help",
-            "bohay --remote devbox -h",
+            "luvus pane run 9 cargo --help",
+            "luvus pane run 9 cargo -h",
+            "luvus pane send 9 --help",
+            "luvus pane send 9 -h",
+            "luvus agent send reviewer --help",
+            "luvus agent send reviewer -h",
+            "luvus agent keys reviewer --help",
+            "luvus agent keys reviewer -h",
+            "luvus --remote devbox --help",
+            "luvus --remote devbox -h",
         ] {
             let args = argv(raw);
             assert_eq!(command_help_request(&args), None, "{raw}");
@@ -2228,10 +2228,10 @@ mod tests {
     #[test]
     fn normal_and_group_help_detection_remains_intact() {
         for (raw, expected) in [
-            ("bohay pane --help", Some(("pane", None))),
-            ("bohay --remote --help", Some(("--remote", None))),
-            ("bohay pane split --help", Some(("pane", Some("split")))),
-            ("bohay module install -h", Some(("module", Some("install")))),
+            ("luvus pane --help", Some(("pane", None))),
+            ("luvus --remote --help", Some(("--remote", None))),
+            ("luvus pane split --help", Some(("pane", Some("split")))),
+            ("luvus module install -h", Some(("module", Some("install")))),
         ] {
             let args = argv(raw);
             assert_eq!(command_help_request(&args), expected, "{raw}");
@@ -2240,61 +2240,61 @@ mod tests {
 
     #[test]
     fn maps_commands() {
-        std::env::remove_var("BOHAY_PANE_ID");
-        let (m, _) = parse(&argv("bohay ping")).unwrap();
+        std::env::remove_var("LUVUS_PANE_ID");
+        let (m, _) = parse(&argv("luvus ping")).unwrap();
         assert_eq!(m, "ping");
 
-        let (m, _) = parse(&argv("bohay pane list")).unwrap();
+        let (m, _) = parse(&argv("luvus pane list")).unwrap();
         assert_eq!(m, "pane.list");
 
-        let (m, p) = parse(&argv("bohay pane split --down")).unwrap();
+        let (m, p) = parse(&argv("luvus pane split --down")).unwrap();
         assert_eq!(m, "pane.split");
         assert_eq!(p.get("direction").and_then(|v| v.as_str()), Some("down"));
 
-        let (m, p) = parse(&argv("bohay pane run 3 echo hi")).unwrap();
+        let (m, p) = parse(&argv("luvus pane run 3 echo hi")).unwrap();
         assert_eq!(m, "pane.run");
         assert_eq!(p.get("pane").and_then(|v| v.as_str()), Some("3"));
         assert_eq!(p.get("command").and_then(|v| v.as_str()), Some("echo hi"));
 
-        let (m, _) = parse(&argv("bohay node list")).unwrap();
+        let (m, _) = parse(&argv("luvus node list")).unwrap();
         assert_eq!(m, "workspace.list");
-        let (m, p) = parse(&argv("bohay node focus 2")).unwrap();
+        let (m, p) = parse(&argv("luvus node focus 2")).unwrap();
         assert_eq!(m, "workspace.focus");
         assert_eq!(p.get("workspace").and_then(|v| v.as_str()), Some("2"));
-        let (m, _) = parse(&argv("bohay tab new")).unwrap();
+        let (m, _) = parse(&argv("luvus tab new")).unwrap();
         assert_eq!(m, "tab.new");
-        let (m, _) = parse(&argv("bohay agent list")).unwrap();
+        let (m, _) = parse(&argv("luvus agent list")).unwrap();
         assert_eq!(m, "agent.list");
     }
 
     #[test]
     fn maps_workspace_organization_and_rejects_bad_syntax() {
-        let (method, params) = parse(&argv("bohay workspace rename 2 Bohay website")).unwrap();
+        let (method, params) = parse(&argv("luvus workspace rename 2 Luvus website")).unwrap();
         assert_eq!(method, "workspace.rename");
-        assert_eq!(params, json!({"workspace": "2", "name": "Bohay website"}));
+        assert_eq!(params, json!({"workspace": "2", "name": "Luvus website"}));
 
-        let (method, params) = parse(&argv("bohay workspace pin 0")).unwrap();
+        let (method, params) = parse(&argv("luvus workspace pin 0")).unwrap();
         assert_eq!(method, "workspace.pin");
         assert_eq!(params, json!({"workspace": "0", "pinned": true}));
 
-        let (method, params) = parse(&argv("bohay node unpin 3")).unwrap();
+        let (method, params) = parse(&argv("luvus node unpin 3")).unwrap();
         assert_eq!(method, "workspace.pin");
         assert_eq!(params, json!({"workspace": "3", "pinned": false}));
 
         for bad in [
-            "bohay workspace rename",
-            "bohay workspace rename 2",
-            "bohay workspace rename two name",
-            "bohay workspace pin",
-            "bohay workspace pin -1",
-            "bohay workspace pin 1 extra",
-            "bohay workspace unpin two",
-            "bohay workspace organize 1",
+            "luvus workspace rename",
+            "luvus workspace rename 2",
+            "luvus workspace rename two name",
+            "luvus workspace pin",
+            "luvus workspace pin -1",
+            "luvus workspace pin 1 extra",
+            "luvus workspace unpin two",
+            "luvus workspace organize 1",
         ] {
             assert!(parse(&argv(bad)).is_err(), "{bad} must be rejected");
         }
 
-        let long = format!("bohay workspace rename 1 {}", "x".repeat(41));
+        let long = format!("luvus workspace rename 1 {}", "x".repeat(41));
         assert!(
             parse(&argv(&long)).is_err(),
             "41-character name is rejected"
@@ -2303,35 +2303,35 @@ mod tests {
 
     #[test]
     fn maps_pane_and_tab_moves_and_rejects_bad_syntax() {
-        let (m, p) = parse(&argv("bohay pane move 7 --tab 3")).unwrap();
+        let (m, p) = parse(&argv("luvus pane move 7 --tab 3")).unwrap();
         assert_eq!(m, "pane.move");
         assert_eq!(p["pane"], "7");
         assert_eq!(p["tab"], "3");
         assert!(p.get("new_tab").is_none());
 
-        let (m, p) = parse(&argv("bohay pane move 7 --new-tab")).unwrap();
+        let (m, p) = parse(&argv("luvus pane move 7 --new-tab")).unwrap();
         assert_eq!(m, "pane.move");
         assert_eq!(p["pane"], "7");
         assert_eq!(p["new_tab"], true);
         assert!(p.get("tab").is_none());
 
-        let (m, p) = parse(&argv("bohay tab move 3 1")).unwrap();
+        let (m, p) = parse(&argv("luvus tab move 3 1")).unwrap();
         assert_eq!(m, "tab.move");
         assert_eq!(p, json!({"tab": "3", "to": "1"}));
 
         for bad in [
-            "bohay pane move 7",
-            "bohay pane move 7 --tab 0",
-            "bohay pane move 7 --tab 2 --new-tab",
-            "bohay pane move worker --tab 2",
-            "bohay pane move 7 8 --tab 2",
-            "bohay pane move 7 --new-tab extra",
-            "bohay pane move 7 --where 2",
-            "bohay tab move 1",
-            "bohay tab move 0 1",
-            "bohay tab move 1 two",
-            "bohay pane teleport 7",
-            "bohay tab reorder 2 1",
+            "luvus pane move 7",
+            "luvus pane move 7 --tab 0",
+            "luvus pane move 7 --tab 2 --new-tab",
+            "luvus pane move worker --tab 2",
+            "luvus pane move 7 8 --tab 2",
+            "luvus pane move 7 --new-tab extra",
+            "luvus pane move 7 --where 2",
+            "luvus tab move 1",
+            "luvus tab move 0 1",
+            "luvus tab move 1 two",
+            "luvus pane teleport 7",
+            "luvus tab reorder 2 1",
         ] {
             assert!(parse(&argv(bad)).is_err(), "{bad} must be rejected");
         }
@@ -2340,7 +2340,7 @@ mod tests {
     #[test]
     fn maps_agent_fork_and_rejects_ambiguous_syntax() {
         let (method, params) = parse(&argv(
-            "bohay agent fork reviewer --name experiment --no-focus",
+            "luvus agent fork reviewer --name experiment --no-focus",
         ))
         .unwrap();
         assert_eq!(method, "agent.fork");
@@ -2349,18 +2349,18 @@ mod tests {
             json!({"target": "reviewer", "name": "experiment", "focus": false})
         );
 
-        let (method, params) = parse(&argv("bohay agent fork 7")).unwrap();
+        let (method, params) = parse(&argv("luvus agent fork 7")).unwrap();
         assert_eq!(method, "agent.fork");
         assert_eq!(params, json!({"target": "7"}));
 
         for bad in [
-            "bohay agent fork",
-            "bohay agent fork --no-focus",
-            "bohay agent fork 7 extra",
-            "bohay agent fork 7 --name",
-            "bohay agent fork 7 --name one --name two",
-            "bohay agent fork 7 --no-focus --no-focus",
-            "bohay agent fork 7 --down",
+            "luvus agent fork",
+            "luvus agent fork --no-focus",
+            "luvus agent fork 7 extra",
+            "luvus agent fork 7 --name",
+            "luvus agent fork 7 --name one --name two",
+            "luvus agent fork 7 --no-focus --no-focus",
+            "luvus agent fork 7 --down",
         ] {
             assert!(parse(&argv(bad)).is_err(), "{bad} must be rejected");
         }
@@ -2368,11 +2368,11 @@ mod tests {
 
     #[test]
     fn maps_sidebar_dock_commands() {
-        std::env::remove_var("BOHAY_PANE_ID");
+        std::env::remove_var("LUVUS_PANE_ID");
 
         // A dock push with inline rows (docs/29) — the plugin API.
         let av: Vec<String> = vec![
-            "bohay".into(),
+            "luvus".into(),
             "ui".into(),
             "dock".into(),
             "push".into(),
@@ -2398,27 +2398,27 @@ mod tests {
         );
 
         // Missing --id is a clear error.
-        assert!(parse(&argv("bohay ui dock push")).is_err());
+        assert!(parse(&argv("luvus ui dock push")).is_err());
 
-        let (m, p) = parse(&argv("bohay ui dock move --id you.ci --side left")).unwrap();
+        let (m, p) = parse(&argv("luvus ui dock move --id you.ci --side left")).unwrap();
         assert_eq!(m, "ui.dock.move");
         assert_eq!(p.get("side").and_then(|v| v.as_str()), Some("left"));
 
-        let (m, _) = parse(&argv("bohay ui dock list")).unwrap();
+        let (m, _) = parse(&argv("luvus ui dock list")).unwrap();
         assert_eq!(m, "ui.dock.list");
 
         // `ui sidebar` now takes an optional side.
-        let (m, p) = parse(&argv("bohay ui sidebar --side right --width 30")).unwrap();
+        let (m, p) = parse(&argv("luvus ui sidebar --side right --width 30")).unwrap();
         assert_eq!(m, "ui.sidebar");
         assert_eq!(p.get("side").and_then(|v| v.as_str()), Some("right"));
     }
 
     #[test]
     fn maps_orchestration_commands() {
-        std::env::remove_var("BOHAY_PANE_ID");
+        std::env::remove_var("LUVUS_PANE_ID");
 
         let (m, p) = parse(&argv(
-            "bohay task add title --paths src/auth src/api --dep t1 --gate cargo",
+            "luvus task add title --paths src/auth src/api --dep t1 --gate cargo",
         ))
         .unwrap();
         assert_eq!(m, "task.add");
@@ -2433,15 +2433,15 @@ mod tests {
         );
         assert_eq!(p.get("gate").and_then(|v| v.as_str()), Some("cargo"));
 
-        let (m, _) = parse(&argv("bohay task list")).unwrap();
+        let (m, _) = parse(&argv("luvus task list")).unwrap();
         assert_eq!(m, "task.list");
-        let (m, p) = parse(&argv("bohay task claim t3")).unwrap();
+        let (m, p) = parse(&argv("luvus task claim t3")).unwrap();
         assert_eq!(m, "task.claim");
         assert_eq!(p.get("id").and_then(|v| v.as_str()), Some("t3"));
-        let (m, _) = parse(&argv("bohay task done t3")).unwrap();
+        let (m, _) = parse(&argv("luvus task done t3")).unwrap();
         assert_eq!(m, "task.done");
 
-        let (m, p) = parse(&argv("bohay lease acquire src/auth/** --task t1")).unwrap();
+        let (m, p) = parse(&argv("luvus lease acquire src/auth/** --task t1")).unwrap();
         assert_eq!(m, "lease.acquire");
         assert_eq!(
             p.get("paths").and_then(|v| v.as_array()).map(|a| a.len()),
@@ -2450,53 +2450,53 @@ mod tests {
         assert_eq!(p.get("task").and_then(|v| v.as_str()), Some("t1"));
 
         // ORCH-3/4/5/6 verbs.
-        let (m, p) = parse(&argv("bohay task start t1 --branch feat --agent claude")).unwrap();
+        let (m, p) = parse(&argv("luvus task start t1 --branch feat --agent claude")).unwrap();
         assert_eq!(m, "task.start");
         assert_eq!(p.get("branch").and_then(|v| v.as_str()), Some("feat"));
         assert_eq!(p.get("agent").and_then(|v| v.as_str()), Some("claude"));
 
-        let (m, p) = parse(&argv("bohay task next --start --agent claude")).unwrap();
+        let (m, p) = parse(&argv("luvus task next --start --agent claude")).unwrap();
         assert_eq!(m, "task.next");
         assert_eq!(p.get("start").and_then(|v| v.as_bool()), Some(true));
 
-        let (m, p) = parse(&argv("bohay task heartbeat t1 --context 0.7")).unwrap();
+        let (m, p) = parse(&argv("luvus task heartbeat t1 --context 0.7")).unwrap();
         assert_eq!(m, "task.heartbeat");
         assert_eq!(p.get("context").and_then(|v| v.as_f64()), Some(0.7));
 
-        let (m, p) = parse(&argv("bohay task merge t1")).unwrap();
+        let (m, p) = parse(&argv("luvus task merge t1")).unwrap();
         assert_eq!(m, "task.merge");
         assert_eq!(p.get("id").and_then(|v| v.as_str()), Some("t1"));
     }
 
     #[test]
     fn maps_module_commands() {
-        let (m, _) = parse(&argv("bohay module list")).unwrap();
+        let (m, _) = parse(&argv("luvus module list")).unwrap();
         assert_eq!(m, "module.list");
 
-        let (m, p) = parse(&argv("bohay module link ./mod --disabled")).unwrap();
+        let (m, p) = parse(&argv("luvus module link ./mod --disabled")).unwrap();
         assert_eq!(m, "module.link");
         assert_eq!(p.get("path").and_then(|v| v.as_str()), Some("./mod"));
         assert_eq!(p.get("disabled").and_then(|v| v.as_bool()), Some(true));
 
-        let (m, p) = parse(&argv("bohay module run my-mod refresh")).unwrap();
+        let (m, p) = parse(&argv("luvus module run my-mod refresh")).unwrap();
         assert_eq!(m, "module.action.invoke");
         assert_eq!(p.get("module").and_then(|v| v.as_str()), Some("my-mod"));
         assert_eq!(p.get("id").and_then(|v| v.as_str()), Some("refresh"));
 
-        let (m, p) = parse(&argv("bohay module run refresh")).unwrap();
+        let (m, p) = parse(&argv("luvus module run refresh")).unwrap();
         assert_eq!(m, "module.action.invoke");
         assert_eq!(p.get("id").and_then(|v| v.as_str()), Some("refresh"));
         assert!(p.get("module").is_none());
 
-        let (m, p) = parse(&argv("bohay module enable my-mod")).unwrap();
+        let (m, p) = parse(&argv("luvus module enable my-mod")).unwrap();
         assert_eq!(m, "module.enable");
         assert_eq!(p.get("id").and_then(|v| v.as_str()), Some("my-mod"));
     }
 
     #[test]
     fn parses_wait() {
-        std::env::remove_var("BOHAY_PANE_ID");
-        let s = parse_wait(&argv("bohay wait output 3 --match done --timeout 5")).unwrap();
+        std::env::remove_var("LUVUS_PANE_ID");
+        let s = parse_wait(&argv("luvus wait output 3 --match done --timeout 5")).unwrap();
         assert_eq!(s.pane, "3");
         assert_eq!(s.timeout, Some(5.0));
         assert_eq!(
@@ -2506,7 +2506,7 @@ mod tests {
             }
         );
 
-        let s = parse_wait(&argv("bohay wait agent-status 7 --status blocked")).unwrap();
+        let s = parse_wait(&argv("luvus wait agent-status 7 --status blocked")).unwrap();
         assert_eq!(s.pane, "7");
         assert_eq!(s.timeout, None);
         assert_eq!(
@@ -2517,19 +2517,19 @@ mod tests {
         );
 
         // missing --match is an error
-        assert!(parse_wait(&argv("bohay wait output 3")).is_err());
-        // pane id falls back to $BOHAY_PANE_ID
-        std::env::set_var("BOHAY_PANE_ID", "9");
-        let s = parse_wait(&argv("bohay wait output --match hi")).unwrap();
+        assert!(parse_wait(&argv("luvus wait output 3")).is_err());
+        // pane id falls back to $LUVUS_PANE_ID
+        std::env::set_var("LUVUS_PANE_ID", "9");
+        let s = parse_wait(&argv("luvus wait output --match hi")).unwrap();
         assert_eq!(s.pane, "9");
-        std::env::remove_var("BOHAY_PANE_ID");
+        std::env::remove_var("LUVUS_PANE_ID");
     }
 
     #[test]
     fn parses_agent_start_target() {
         assert_eq!(
             parse_agent_start_target(
-                &argv("bohay agent start worker --kind codex --pane 9"),
+                &argv("luvus agent start worker --kind codex --pane 9"),
                 Some("2".into())
             )
             .unwrap(),
@@ -2537,7 +2537,7 @@ mod tests {
         );
         assert_eq!(
             parse_agent_start_target(
-                &argv("bohay agent start worker --kind codex --anchor 4 --down"),
+                &argv("luvus agent start worker --kind codex --anchor 4 --down"),
                 None
             )
             .unwrap(),
@@ -2548,7 +2548,7 @@ mod tests {
         );
         assert_eq!(
             parse_agent_start_target(
-                &argv("bohay agent start worker --kind codex"),
+                &argv("luvus agent start worker --kind codex"),
                 Some("7".into())
             )
             .unwrap(),
@@ -2558,7 +2558,7 @@ mod tests {
             }
         );
         assert!(parse_agent_start_target(
-            &argv("bohay agent start worker --kind codex --pane 9 --anchor 4"),
+            &argv("luvus agent start worker --kind codex --pane 9 --anchor 4"),
             None
         )
         .is_err());
@@ -2566,39 +2566,39 @@ mod tests {
 
     #[test]
     fn maps_git_commands() {
-        let (m, _) = parse(&argv("bohay git status")).unwrap();
+        let (m, _) = parse(&argv("luvus git status")).unwrap();
         assert_eq!(m, "git.status");
-        let (m, _) = parse(&argv("bohay git")).unwrap();
+        let (m, _) = parse(&argv("luvus git")).unwrap();
         assert_eq!(m, "git.status");
-        let (m, _) = parse(&argv("bohay git branches")).unwrap();
+        let (m, _) = parse(&argv("luvus git branches")).unwrap();
         assert_eq!(m, "git.branches");
-        let (m, p) = parse(&argv("bohay git log --limit 5")).unwrap();
+        let (m, p) = parse(&argv("luvus git log --limit 5")).unwrap();
         assert_eq!(m, "git.log");
         assert_eq!(p.get("n").and_then(|v| v.as_u64()), Some(5));
-        let (m, p) = parse(&argv("bohay git open 2")).unwrap();
+        let (m, p) = parse(&argv("luvus git open 2")).unwrap();
         assert_eq!(m, "git.open");
         assert_eq!(p.get("workspace").and_then(|v| v.as_str()), Some("2"));
     }
 
     #[test]
     fn maps_worktree_commands() {
-        let (m, _) = parse(&argv("bohay worktree list")).unwrap();
+        let (m, _) = parse(&argv("luvus worktree list")).unwrap();
         assert_eq!(m, "worktree.list");
-        let (m, p) = parse(&argv("bohay worktree create feature/x")).unwrap();
+        let (m, p) = parse(&argv("luvus worktree create feature/x")).unwrap();
         assert_eq!(m, "worktree.create");
         assert_eq!(p.get("branch").and_then(|v| v.as_str()), Some("feature/x"));
-        let (m, p) = parse(&argv("bohay worktree open /tmp/wt")).unwrap();
+        let (m, p) = parse(&argv("luvus worktree open /tmp/wt")).unwrap();
         assert_eq!(m, "worktree.open");
         assert_eq!(p.get("path").and_then(|v| v.as_str()), Some("/tmp/wt"));
-        let (m, p) = parse(&argv("bohay worktree remove /tmp/wt")).unwrap();
+        let (m, p) = parse(&argv("luvus worktree remove /tmp/wt")).unwrap();
         assert_eq!(m, "worktree.remove");
         assert_eq!(p.get("path").and_then(|v| v.as_str()), Some("/tmp/wt"));
     }
 
     // The docs site's CLI reference (website/…/reference/cli.mdx) carries the
-    // `bohay help all` text VERBATIM — this guard fails CI if a command changes
+    // `luvus help all` text VERBATIM — this guard fails CI if a command changes
     // without the docs page being regenerated, so the two can never drift.
-    // Regenerate with:  bohay help all  →  the page's ```txt block.
+    // Regenerate with:  luvus help all  →  the page's ```txt block.
     #[test]
     fn docs_cli_reference_matches_help() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2615,7 +2615,7 @@ mod tests {
         assert_eq!(
             block.trim_end(),
             DETAILED_USAGE.trim_end(),
-            "website/…/reference/cli.mdx has drifted from `bohay help all` — \
+            "website/…/reference/cli.mdx has drifted from `luvus help all` — \
              regenerate the page's txt block from the DETAILED_USAGE text"
         );
     }

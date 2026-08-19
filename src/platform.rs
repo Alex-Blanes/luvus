@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 /// Do two paths name the same folder? (docs/43 WIN-6.)
 ///
 /// Node lookup used to compare `PathBuf`s with `==`, so any difference in
-/// *spelling* read as "not open" and bohay added a duplicate node instead of
+/// *spelling* read as "not open" and luvus added a duplicate node instead of
 /// focusing the existing one. Windows has many spellings for one path — case
 /// (`C:\Proj` vs `c:\proj`, which the filesystem treats as equal), the `\\?\`
 /// verbatim prefix that `canonicalize` returns, `/` accepted in place of `\`,
@@ -49,7 +49,7 @@ pub fn home_dir() -> Option<PathBuf> {
 
 /// Resolve a configured shell `choice` to a concrete command to spawn.
 ///
-/// `BOHAY_SHELL` always wins (the explicit escape hatch — set it in your shell
+/// `LUVUS_SHELL` always wins (the explicit escape hatch — set it in your shell
 /// profile). Otherwise the choice (from Settings → Pane Layout → Shell):
 /// `""`/`"default"` picks the platform default; `"powershell"` and `"cmd"` are
 /// Windows shells; anything else is treated as a literal command. The platform
@@ -57,7 +57,7 @@ pub fn home_dir() -> Option<PathBuf> {
 /// (`pwsh.exe`, then `powershell.exe`), since `COMSPEC` is always `cmd.exe`
 /// regardless of the shell you launched from and so can't reveal PowerShell.
 pub fn resolve_shell(choice: &str) -> String {
-    if let Some(s) = std::env::var_os("BOHAY_SHELL") {
+    if let Some(s) = crate::compat::inherited("LUVUS_SHELL", "BOHAY_SHELL") {
         if !s.is_empty() {
             return s.to_string_lossy().into_owned();
         }
@@ -131,7 +131,7 @@ fn editor_on_path(exe: &str) -> bool {
     find_on_path(exe).is_some() || (cfg!(windows) && find_on_path(&format!("{exe}.exe")).is_some())
 }
 
-/// Terminal editors bohay can offer to open a file with (docs/38): the ones
+/// Terminal editors luvus can offer to open a file with (docs/38): the ones
 /// actually installed on `PATH`, in preference order, plus `$EDITOR` when set
 /// and not already covered. Each entry is `(run command, display label)` — the
 /// command is spawned as a real pane, the label is what Settings/the menu shows.
@@ -416,8 +416,8 @@ pub fn descendant_commands(_roots: &[u32]) -> Option<std::collections::HashMap<u
 /// Every process running under `root` (inclusive), depth-first, newest branch
 /// last. This is the honest answer to "what command is this agent running?":
 /// an agent's own UI usually *elides* long commands (`Bash(cargo test …)`), and
-/// those characters never reach bohay, so the screen simply cannot be expanded.
-/// The OS still knows the real argv, and bohay owns the pane's child pid.
+/// those characters never reach luvus, so the screen simply cannot be expanded.
+/// The OS still knows the real argv, and luvus owns the pane's child pid.
 ///
 /// **Call on demand only** (opening the overlay), never per frame: it shells out
 /// to `ps` once and walks the result. Empty on unsupported platforms, and on any
@@ -605,11 +605,11 @@ mod tests {
     #[test]
     fn shell_override_is_honored() {
         // Use a real shell so any concurrent pane spawn still succeeds.
-        std::env::set_var("BOHAY_SHELL", "/bin/sh");
+        std::env::set_var("LUVUS_SHELL", "/bin/sh");
         // The override wins over any choice (even an explicit one).
         assert_eq!(super::resolve_shell("default"), "/bin/sh");
         assert_eq!(super::resolve_shell("zsh"), "/bin/sh");
-        std::env::remove_var("BOHAY_SHELL");
+        std::env::remove_var("LUVUS_SHELL");
     }
 
     #[test]
@@ -675,7 +675,7 @@ mod tests {
     #[test]
     fn only_http_and_https_urls_are_openable() {
         for ok in [
-            "https://bohay.dev",
+            "https://luvus.dev",
             "http://localhost:3000/x?y=1#z",
             "https://user:pw@example.com/a(b)",
         ] {
@@ -690,13 +690,13 @@ mod tests {
             "smb://host/share",
             "ssh://host",
             // Not a URL at all.
-            "bohay.dev",
+            "luvus.dev",
             "https://",
             "https:///no-host",
             "",
             // Case tricks: the check is on the exact scheme, not a prefix match.
-            "HTTPS://bohay.dev",
-            "xhttps://bohay.dev",
+            "HTTPS://luvus.dev",
+            "xhttps://luvus.dev",
             // Whitespace and control characters have no business in one argv entry.
             "https://a b.dev",
             "https://a\nb.dev",

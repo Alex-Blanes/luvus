@@ -1,17 +1,17 @@
 ---
 title: Installation
-description: Install bohay on macOS, Linux, or Windows, and keep it up to date.
+description: Install luvus on macOS, Linux, or Windows, and keep it up to date.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-bohay ships as a **single static binary** (~3 MB) with no runtime dependencies.
+luvus ships as a **single static binary** (~3 MB) with no runtime dependencies.
 Pick whichever channel you prefer:
 
 <Tabs syncKey="install">
   <TabItem label="macOS / Linux">
     ```sh
-    curl -fsSL https://bohay.dev/install.sh | sh
+    curl -fsSL https://luvus.dev/install.sh | sh
     ```
     Downloads the right prebuilt binary for your OS/arch from GitHub releases and
     puts it on your `PATH` (`/usr/local/bin` or `~/.local/bin`). macOS builds ship
@@ -19,87 +19,87 @@ Pick whichever channel you prefer:
   </TabItem>
   <TabItem label="Homebrew">
     ```sh
-    brew install RizRiyz/bohay/bohay
+    brew install RizRiyz/luvus/luvus
     ```
     Installs the same prebuilt binary, so there is no Rust toolchain and no
-    compile step. Upgrading later: `brew upgrade bohay`.
+    compile step. Upgrading later: `brew upgrade luvus`.
   </TabItem>
   <TabItem label="Debian / Fedora">
     Every release attaches a `.deb` and a `.rpm` for **x86_64 and arm64** on the
-    [releases page](https://github.com/RizRiyz/bohay/releases). Download the one
+    [releases page](https://github.com/RizRiyz/luvus/releases). Download the one
     for your arch and install it:
     ```sh
     # Debian / Ubuntu
-    sudo apt install ./bohay_0.9.2_amd64.deb
+    sudo apt install ./luvus_0.9.2_amd64.deb
 
     # Fedora / RHEL
-    sudo dnf install ./bohay-0.9.2-x86_64-unknown-linux-musl.rpm
+    sudo dnf install ./luvus-0.9.2-x86_64-unknown-linux-musl.rpm
     ```
-    bohay is a single static binary, so the package has **no hard dependencies**
-    and drops it straight into `/usr/bin`. The tools bohay optionally calls
+    luvus is a single static binary, so the package has **no hard dependencies**
+    and drops it straight into `/usr/bin`. The tools luvus optionally calls
     (`git`, `openssh-client`, `xclip`) are **Recommends**, so a desktop gets them
     by default while a minimal server can skip them without breaking the install.
     Good for provisioning a Linux server.
   </TabItem>
   <TabItem label="Cargo">
     ```sh
-    cargo install bohay
+    cargo install luvus
     ```
     Works on any platform with **Rust ≥ 1.88** (ratatui 0.30 uses Rust edition 2024): pure Rust, no C toolchain needed. On an older toolchain run `rustup update` first, or use a prebuilt binary above (no Rust required).
   </TabItem>
   <TabItem label="Nix">
-    bohay ships a **flake**, so it works on NixOS and any machine with Nix. Every
+    luvus ships a **flake**, so it works on NixOS and any machine with Nix. Every
     command below needs flakes enabled (add `experimental-features = nix-command
     flakes` to `nix.conf`, or pass `--extra-experimental-features "nix-command
     flakes"`).
 
     **Run it once**, without installing anything:
     ```sh
-    nix run github:RizRiyz/bohay
+    nix run github:RizRiyz/luvus
     ```
 
-    **Install into your user profile** (puts `bohay` on your `PATH`):
+    **Install into your user profile** (puts `luvus` on your `PATH`):
     ```sh
-    nix profile install github:RizRiyz/bohay
-    nix profile upgrade bohay          # update to the latest later
-    nix profile remove bohay           # uninstall
+    nix profile install github:RizRiyz/luvus
+    nix profile upgrade luvus          # update to the latest later
+    nix profile remove luvus           # uninstall
     ```
 
     **NixOS** (declarative): add the flake as an input and pull it into your
     system packages, then `sudo nixos-rebuild switch`:
     ```nix
     {
-      inputs.bohay.url = "github:RizRiyz/bohay";
+      inputs.luvus.url = "github:RizRiyz/luvus";
 
-      outputs = { self, nixpkgs, bohay, ... }: {
+      outputs = { self, nixpkgs, luvus, ... }: {
         nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";          # or aarch64-linux
           modules = [{
-            environment.systemPackages = [ bohay.packages.x86_64-linux.default ];
+            environment.systemPackages = [ luvus.packages.x86_64-linux.default ];
           }];
         };
       };
     }
     ```
 
-    **Home Manager** (declarative), with `bohay` added as a flake input:
+    **Home Manager** (declarative), with `luvus` added as a flake input:
     ```nix
-    home.packages = [ inputs.bohay.packages.${pkgs.system}.default ];
+    home.packages = [ inputs.luvus.packages.${pkgs.system}.default ];
     ```
 
-    **Build a local binary** without installing (result at `./result/bin/bohay`):
+    **Build a local binary** without installing (result at `./result/bin/luvus`):
     ```sh
-    nix build github:RizRiyz/bohay
+    nix build github:RizRiyz/luvus
     ```
 
-    **Dev shell**: the Rust toolchain plus everything bohay needs, for hacking:
+    **Dev shell**: the Rust toolchain plus everything luvus needs, for hacking:
     ```sh
-    nix develop github:RizRiyz/bohay
+    nix develop github:RizRiyz/luvus
     # then, inside it:
     cargo run -- --local
     ```
 
-    The package **bakes the tools bohay calls at runtime into its `PATH`**
+    The package **bakes the tools luvus calls at runtime into its `PATH`**
     (`git`, `gh`, `ps`, `ssh`), so the git tab and agent detection work on NixOS
     out of the box, where nothing is on a global `PATH`. It builds reproducibly
     from the committed `Cargo.lock`, with no C toolchain needed.
@@ -109,18 +109,18 @@ Pick whichever channel you prefer:
     Nix, and wires up none of those runtime tools, so the git tab and agent
     detection would silently not work.
 
-    bohay is not in nixpkgs yet, so the flake above is the Nix path for now. Want
+    luvus is not in nixpkgs yet, so the flake above is the Nix path for now. Want
     to help get it there? The repo's
-    [`nix/` folder](https://github.com/RizRiyz/bohay/blob/main/nix/README.md) has
+    [`nix/` folder](https://github.com/RizRiyz/luvus/blob/main/nix/README.md) has
     a ready package definition and a submission guide.
   </TabItem>
   <TabItem label="Windows">
     ```powershell
-    irm https://bohay.dev/install.ps1 | iex
+    irm https://luvus.dev/install.ps1 | iex
     ```
     Or download the `…-x86_64-pc-windows-msvc.zip` from the
-    [releases page](https://github.com/RizRiyz/bohay/releases) and put
-    `bohay.exe` on your `PATH`. Run bohay inside **Windows Terminal**. Live
+    [releases page](https://github.com/RizRiyz/luvus/releases) and put
+    `luvus.exe` on your `PATH`. Run luvus inside **Windows Terminal**. Live
     cwd tracking and the shell integration hook aren't available on Windows,
     but agent session resume still works.
   </TabItem>
@@ -129,17 +129,17 @@ Pick whichever channel you prefer:
 ## Check your setup
 
 ```sh
-bohay doctor
+luvus doctor
 ```
 
-`doctor` probes the optional tools bohay integrates with and tells you what each
+`doctor` probes the optional tools luvus integrates with and tells you what each
 unlocks:
 
 | Tool | Unlocks |
 |---|---|
 | `git` | the git tab · worktrees · orchestration workers |
 | `gh` (authenticated) | PRs, issues, and PR detail in the git tab |
-| `ssh` | remote sessions (`bohay --remote host`) |
+| `ssh` | remote sessions (`luvus --remote host`) |
 
 None are required for the core multiplexer: panes, tabs, agents, and resume all
 work without them.
@@ -151,11 +151,11 @@ session ids and lifecycle events (used by sound alerts and the macOS notch
 companion), install the integration hook for your agent:
 
 ```sh
-bohay integration install claude     # or: copilot · codex · opencode
+luvus integration install claude     # or: copilot · codex · opencode
 ```
 
-Also available from **Settings → Integrations** inside bohay.
-`bohay integration uninstall <agent>` removes only bohay's hook and never
+Also available from **Settings → Integrations** inside luvus.
+`luvus integration uninstall <agent>` removes only luvus's hook and never
 touches the agent itself.
 
 ## Upgrading
@@ -164,22 +164,47 @@ Install the new version through the same channel, then reload the running
 server:
 
 ```sh
-bohay server restart   # your session is saved and restored
+luvus server restart   # your session is saved and restored
 ```
 
-bohay warns you on attach if the running server is older than the binary you
+luvus warns you on attach if the running server is older than the binary you
 just installed, so an upgrade never silently half-applies.
 
-## Where bohay keeps its state
+### Moving from Bohay 0.10.2 to Luvus 0.11.0
 
-Everything lives in **`~/.bohay/`** (override with `$BOHAY_HOME`): your
+Luvus is the new name and binary for Bohay. Stop the Bohay server before the
+first Luvus launch so its final session snapshot is complete and no legacy
+socket is active:
+
+```sh
+bohay server stop
+curl -fsSL https://luvus.dev/install.sh | sh
+luvus
+```
+
+The first default-home launch copies durable state from `~/.bohay/` to
+`~/.luvus/` (`.bohay-dev` to `.luvus-dev` for debug builds). It carries over
+settings, session snapshots, named sessions, manifests, module configuration,
+and orchestration data. It deliberately skips sockets, locks, the old managed
+skill cache, and `worktrees/`. Existing worktree paths still work because the
+Bohay directory is never moved or deleted.
+
+Migration is copy-only and does not run when `LUVUS_HOME` or `BOHAY_HOME` is
+explicitly set. If a Bohay server is still reachable, migration is deferred;
+stop it and launch Luvus again. Keep `~/.bohay/` until you have verified your
+workspaces and agents, then archive or remove it yourself.
+
+During the 0.11.x transition, Luvus accepts the old `BOHAY_*` input variables
+when the matching `LUVUS_*` variable is absent. Panes and modules receive both
+variable families so existing automation continues working while it migrates.
+
+## Where luvus keeps its state
+
+Everything lives in **`~/.luvus/`** (override with `$LUVUS_HOME`): your
 [configuration](/docs/reference/configuration/), the auto-saved session
 snapshot, and the orchestration ledger. The directory is created owner-only
 (`0700`).
 
-The existing default session keeps its files directly in this directory, so
-upgrading requires no migration. Named server sessions store their runtime
-files under `~/.bohay/sessions/<name>/`. Preferences, manifests, skills, and
-module installations remain shared. Rollback is therefore simple: older Bohay
-versions continue to see the unchanged default session and ignore the named
-subdirectories.
+The default session keeps its files directly in this directory. Named server sessions store their runtime
+files under `~/.luvus/sessions/<name>/`. Preferences, manifests, skills, and
+module installations remain shared.

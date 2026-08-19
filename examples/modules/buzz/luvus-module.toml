@@ -1,0 +1,67 @@
+id = "example.buzz"
+name = "Buzz"
+version = "0.1.0"
+min_luvus_version = "0.9.2"
+description = "Chat on a Buzz relay (NIP-29 nostr) from a luvus pane."
+platforms = ["macos", "linux"]
+
+# The relay to connect to (one relay URL == one Buzz community). Point it at your
+# community's relay; change it any time in Settings -> Modules.
+[[settings]]
+key = "relay_url"
+title = "Relay URL"
+type = "string"
+default = "wss://luvus.communities.buzz.xyz"
+
+# Your identity. Leave blank and the module generates one on first open, stores
+# it 0600 in the module's config dir, and shows the npub so you can have it added
+# to a membership-gated relay. Paste an existing nsec to reuse an identity.
+[[settings]]
+key = "nsec"
+title = "Private key (nsec) — blank to auto-generate"
+type = "string"
+secret = true
+
+# Compile the native client. Run once on install (and on demand).
+#
+# The manifest is shipped as `Cargo.toml.example`, not `Cargo.toml`, and copied
+# into place here first. Reason: `cargo install --git <luvus>` scans the whole
+# repo for any file named `Cargo.toml` and refuses when two packages have
+# binaries (luvus + luvus-buzz). Keeping the example's manifest under a different
+# name leaves the top-level install unambiguous; the generated `Cargo.toml` is
+# gitignored so building in place never reintroduces the clash.
+[[build]]
+command = ["cp", "Cargo.toml.example", "Cargo.toml"]
+
+[[build]]
+command = ["cargo", "build", "--release"]
+
+# The chat pane. luvus spawns this argv as a real PTY pane; the module settings
+# arrive as LUVUS_SETTING_RELAY_URL / LUVUS_SETTING_NSEC.
+[[panes]]
+id = "chat"
+title = "Buzz"
+placement = "split"
+command = ["./target/release/luvus-buzz", "tui"]
+
+# The button: right-click a pane or a WORKSPACES row and pick "Open Buzz chat".
+# It shells out to open the pane entrypoint above. It uses `$LUVUS_BIN_PATH` (the
+# running server's own binary, which the runtime injects) rather than a bare
+# `luvus`, so it targets *this* instance's server — a plain `luvus` on PATH would
+# resolve a different home/socket (e.g. production while you test on the dev
+# build) and report "no module". The value needs shell double-quotes to expand,
+# so the arg is a TOML literal string.
+[[actions]]
+id = "open-chat"
+title = "Open Buzz chat"
+contexts = ["pane", "workspace"]
+command = ["sh", "-c", '"$LUVUS_BIN_PATH" module pane open example.buzz chat --placement tab']
+
+# BUZZ-5: right-click a pane (optionally with text selected) -> post a reference
+# to it into the channel the chat pane is currently viewing. The module binary
+# runs directly, so it inherits the pane context (LUVUS_PANE_* + selection).
+[[actions]]
+id = "share-pane"
+title = "Send pane to Buzz chat"
+contexts = ["pane"]
+command = ["./target/release/luvus-buzz", "share"]

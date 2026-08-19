@@ -148,26 +148,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bohay"
-version = "0.10.2"
-dependencies = [
- "alacritty_terminal",
- "anyhow",
- "bincode",
- "crossterm",
- "fs2",
- "interprocess",
- "libc",
- "portable-pty",
- "ratatui",
- "serde",
- "serde_json",
- "toml",
- "toml_edit",
- "unicode-width",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -783,6 +763,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a860605968fce16869fd239cf4237a82f3ac470723415db603b0e8b6c8d4fb9"
 dependencies = [
  "hashbrown 0.17.1",
+]
+
+[[package]]
+name = "luvus"
+version = "0.11.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "bincode",
+ "crossterm",
+ "fs2",
+ "interprocess",
+ "libc",
+ "portable-pty",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "toml",
+ "toml_edit",
+ "unicode-width",
 ]
 
 [[package]]

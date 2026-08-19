@@ -1,5 +1,5 @@
 //! Session persistence (M5): snapshot the workspace/tab/pane tree to
-//! `~/.config/bohay/session.json` and restore it on launch. Captures structure
+//! `~/.config/luvus/session.json` and restore it on launch. Captures structure
 //! + cwds only — restore re-spawns shells. See docs/09.
 
 use std::collections::{HashMap, HashSet};
@@ -7,6 +7,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::app::App;
@@ -14,6 +15,7 @@ use crate::ids::PaneId;
 use crate::layout::LayoutTree;
 
 const SNAPSHOT_VERSION: u32 = 1;
+const LEGACY_MIGRATION_MARKER: &str = ".migrated-from-bohay-0.10";
 
 #[derive(Serialize, Deserialize)]
 pub struct SessionSnapshot {
@@ -83,17 +85,17 @@ pub struct PaneSnap {
     pub file: Option<PathBuf>,
 }
 
-/// Serializes tests that mutate the global `$BOHAY_HOME` env + config files, so
+/// Serializes tests that mutate the global `$LUVUS_HOME` env + config files, so
 /// they don't race on each other's config / registry I/O. Lock it for the whole
 /// test body. Shared across modules (`app`, `module`, …).
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// RAII test isolation: locks [`TEST_ENV_LOCK`] **and** points `$BOHAY_HOME` at a
+/// RAII test isolation: locks [`TEST_ENV_LOCK`] **and** points `$LUVUS_HOME` at a
 /// fresh empty dir, so the test reads/writes only default, isolated config — never
-/// racing another test's keybinding/theme overrides (`$BOHAY_HOME` is process-global,
+/// racing another test's keybinding/theme overrides (`$LUVUS_HOME` is process-global,
 /// so the lock alone isn't enough; a parallel `App::new` would still read whatever
-/// dir a mutating test had set). Restores `$BOHAY_HOME` + removes the dir on drop.
+/// dir a mutating test had set). Restores `$LUVUS_HOME` + removes the dir on drop.
 /// Bind it for the whole test body: `let _env = test_env("name");`.
 #[cfg(test)]
 pub(crate) struct TestEnv {
@@ -101,6 +103,9 @@ pub(crate) struct TestEnv {
     prev: Option<std::ffi::OsString>,
     prev_session: Option<std::ffi::OsString>,
     prev_socket: Option<std::ffi::OsString>,
+    prev_legacy_home: Option<std::ffi::OsString>,
+    prev_legacy_session: Option<std::ffi::OsString>,
+    prev_legacy_socket: Option<std::ffi::OsString>,
     dir: PathBuf,
 }
 
@@ -108,17 +113,23 @@ pub(crate) struct TestEnv {
 impl Drop for TestEnv {
     fn drop(&mut self) {
         match &self.prev {
-            Some(p) => std::env::set_var("BOHAY_HOME", p),
-            None => std::env::remove_var("BOHAY_HOME"),
+            Some(p) => std::env::set_var("LUVUS_HOME", p),
+            None => std::env::remove_var("LUVUS_HOME"),
         }
         match &self.prev_session {
             Some(value) => std::env::set_var(crate::session::SESSION_ENV_VAR, value),
             None => std::env::remove_var(crate::session::SESSION_ENV_VAR),
         }
         match &self.prev_socket {
-            Some(value) => std::env::set_var("BOHAY_SOCKET_PATH", value),
-            None => std::env::remove_var("BOHAY_SOCKET_PATH"),
+            Some(value) => std::env::set_var("LUVUS_SOCKET_PATH", value),
+            None => std::env::remove_var("LUVUS_SOCKET_PATH"),
         }
+        restore_env("BOHAY_HOME", &self.prev_legacy_home);
+        restore_env(
+            crate::session::LEGACY_SESSION_ENV_VAR,
+            &self.prev_legacy_session,
+        );
+        restore_env("BOHAY_SOCKET_PATH", &self.prev_legacy_socket);
         crate::session::clear_explicit_for_test();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -127,13 +138,19 @@ impl Drop for TestEnv {
 #[cfg(test)]
 pub(crate) fn test_env(tag: &str) -> TestEnv {
     let guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var_os("BOHAY_HOME");
+    let prev = std::env::var_os("LUVUS_HOME");
     let prev_session = std::env::var_os(crate::session::SESSION_ENV_VAR);
-    let prev_socket = std::env::var_os("BOHAY_SOCKET_PATH");
-    let dir = std::env::temp_dir().join(format!("bohay-test-{}-{}", tag, std::process::id()));
+    let prev_socket = std::env::var_os("LUVUS_SOCKET_PATH");
+    let prev_legacy_home = std::env::var_os("BOHAY_HOME");
+    let prev_legacy_session = std::env::var_os(crate::session::LEGACY_SESSION_ENV_VAR);
+    let prev_legacy_socket = std::env::var_os("BOHAY_SOCKET_PATH");
+    let dir = std::env::temp_dir().join(format!("luvus-test-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::env::set_var("BOHAY_HOME", &dir);
+    std::env::set_var("LUVUS_HOME", &dir);
     std::env::remove_var(crate::session::SESSION_ENV_VAR);
+    std::env::remove_var("LUVUS_SOCKET_PATH");
+    std::env::remove_var("BOHAY_HOME");
+    std::env::remove_var(crate::session::LEGACY_SESSION_ENV_VAR);
     std::env::remove_var("BOHAY_SOCKET_PATH");
     crate::session::clear_explicit_for_test();
     TestEnv {
@@ -141,29 +158,213 @@ pub(crate) fn test_env(tag: &str) -> TestEnv {
         prev,
         prev_session,
         prev_socket,
+        prev_legacy_home,
+        prev_legacy_session,
+        prev_legacy_socket,
         dir,
     }
 }
 
-/// `~/.bohay/` (or `~/.bohay-dev/` in debug builds). Override with `$BOHAY_HOME`.
+#[cfg(test)]
+fn restore_env(key: &str, value: &Option<std::ffi::OsString>) {
+    match value {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+}
+
+/// `~/.luvus/` (or `~/.luvus-dev/` in debug builds). Override with `$LUVUS_HOME`.
 pub fn config_dir() -> PathBuf {
-    if let Some(p) = std::env::var_os("BOHAY_HOME") {
+    if let Some(p) = std::env::var_os("LUVUS_HOME") {
         return PathBuf::from(p);
     }
     let home = crate::platform::home_dir().unwrap_or_default();
     let name = if cfg!(debug_assertions) {
-        ".bohay-dev"
+        ".luvus-dev"
     } else {
-        ".bohay"
+        ".luvus"
     };
     home.join(name)
+}
+
+/// Copy durable 0.10 state into the 0.11 Luvus home on first launch.
+///
+/// Migration is deliberately conservative: explicit/custom homes opt out,
+/// an existing Luvus home is never merged or overwritten, and a reachable
+/// legacy server defers the copy. Runtime sockets, locks, cached skills, and
+/// worktrees are not copied. The Bohay home remains intact for rollback.
+pub fn migrate_legacy_state() -> std::io::Result<()> {
+    if std::env::var_os("LUVUS_HOME").is_some() || std::env::var_os("BOHAY_HOME").is_some() {
+        return Ok(());
+    }
+    let Some(home) = crate::platform::home_dir() else {
+        return Ok(());
+    };
+    let (legacy_name, current_name) = if cfg!(debug_assertions) {
+        (".bohay-dev", ".luvus-dev")
+    } else {
+        (".bohay", ".luvus")
+    };
+    migrate_legacy_state_between(&home.join(legacy_name), &home.join(current_name))
+}
+
+fn migrate_legacy_state_between(
+    legacy: &std::path::Path,
+    current: &std::path::Path,
+) -> std::io::Result<()> {
+    if !legacy_state_recognized(legacy) || current.exists() {
+        return Ok(());
+    }
+    if legacy_server_running(legacy) {
+        eprintln!(
+            "Luvus migration deferred: stop the running Bohay server with `bohay server stop`, then run Luvus again."
+        );
+        return Ok(());
+    }
+
+    let lock_path = current.with_file_name(".luvus-migration.lock");
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    lock.lock_exclusive()?;
+    // Another process may have completed while this one waited.
+    if current.exists() {
+        return Ok(());
+    }
+
+    let stage = current.with_file_name(format!(
+        ".{}.migrating-{}",
+        current
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("luvus"),
+        std::process::id()
+    ));
+    if stage.exists() {
+        fs::remove_dir_all(&stage)?;
+    }
+    ensure_private_dir(&stage);
+    if let Err(error) = copy_legacy_tree(legacy, &stage, true) {
+        let _ = fs::remove_dir_all(&stage);
+        return Err(error);
+    }
+    rewrite_managed_module_roots(&stage.join("modules.json"), legacy, current)?;
+    fs::write(
+        stage.join(LEGACY_MIGRATION_MARKER),
+        format!("source={}\nversion=0.11.0\n", legacy.display()),
+    )?;
+    fs::rename(&stage, current)?;
+    Ok(())
+}
+
+fn legacy_state_recognized(root: &std::path::Path) -> bool {
+    root.is_dir()
+        && [
+            "config.json",
+            "session.json",
+            "sessions",
+            "orch.json",
+            "modules.json",
+            "modules",
+            "manifests",
+            "worktrees",
+        ]
+        .iter()
+        .any(|name| root.join(name).exists())
+}
+
+fn legacy_server_running(root: &std::path::Path) -> bool {
+    let mut candidates = vec![root.join("bohay.sock"), root.join("bohay-client.sock")];
+    if let Ok(entries) = fs::read_dir(root.join("sessions")) {
+        for entry in entries.flatten().filter(|entry| entry.path().is_dir()) {
+            candidates.push(entry.path().join("bohay.sock"));
+            candidates.push(entry.path().join("bohay-client.sock"));
+        }
+    }
+    candidates
+        .iter()
+        .any(|path| crate::ipc::transport::connect(path).is_ok())
+}
+
+fn copy_legacy_tree(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    root: bool,
+) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_text = name.to_string_lossy();
+        if (root && matches!(name_text.as_ref(), "worktrees" | "skill"))
+            || matches!(
+                name_text.as_ref(),
+                "bohay.sock" | "bohay-client.sock" | "server.lock"
+            )
+            || name_text.ends_with(".sock")
+            || name_text.ends_with(".lock")
+        {
+            continue;
+        }
+        let source = entry.path();
+        let target = dst.join(&name);
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            copy_legacy_tree(&source, &target, false)?;
+        } else if kind.is_file() {
+            fs::copy(source, target)?;
+        }
+        // Symlinks are intentionally skipped. Following a user-controlled link
+        // could copy data from outside the state directory.
+    }
+    Ok(())
+}
+
+fn rewrite_managed_module_roots(
+    registry: &std::path::Path,
+    legacy: &std::path::Path,
+    current: &std::path::Path,
+) -> std::io::Result<()> {
+    let Ok(text) = fs::read_to_string(registry) else {
+        return Ok(());
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(());
+    };
+    let old_modules = legacy.join("modules").to_string_lossy().to_string();
+    let new_modules = current.join("modules").to_string_lossy().to_string();
+    rewrite_json_prefix(&mut value, &old_modules, &new_modules);
+    let encoded = serde_json::to_vec_pretty(&value).map_err(std::io::Error::other)?;
+    fs::write(registry, encoded)
+}
+
+fn rewrite_json_prefix(value: &mut serde_json::Value, old: &str, new: &str) {
+    match value {
+        serde_json::Value::String(text) if text.starts_with(old) => {
+            *text = format!("{new}{}", &text[old.len()..]);
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                rewrite_json_prefix(value, old, new);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                rewrite_json_prefix(value, old, new);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Create the state dir if needed and, on Unix, keep it owner-only (`0700`).
 /// The control sockets inside grant full command execution as the user, and
 /// some BSDs ignore permissions on a socket *file* — the directory mode is the
 /// reliable barrier, so don't leave it to the umask. Guarded against a
-/// pathological `$BOHAY_HOME=$HOME` (never chmod the home dir itself).
+/// pathological `$LUVUS_HOME=$HOME` (never chmod the home dir itself).
 pub fn ensure_config_dir() -> PathBuf {
     let dir = config_dir();
     ensure_private_dir(&dir);
@@ -205,14 +406,14 @@ fn session_path() -> PathBuf {
     session_dir().join("session.json")
 }
 
-/// User-editable agent-detection manifests (docs/07). `~/.bohay/manifests/`.
+/// User-editable agent-detection manifests (docs/07). `~/.luvus/manifests/`.
 pub fn manifests_dir() -> PathBuf {
     config_dir().join("manifests")
 }
 
-/// The bohay-managed skill cache: the OTA-updated `SKILL.md` written by
-/// `bohay skill update`, kept apart from the compiled-in default so a skill fix
-/// can reach users between releases. `~/.bohay/skill/`.
+/// The luvus-managed skill cache: the OTA-updated `SKILL.md` written by
+/// `luvus skill update`, kept apart from the compiled-in default so a skill fix
+/// can reach users between releases. `~/.luvus/skill/`.
 pub fn skill_dir() -> PathBuf {
     config_dir().join("skill")
 }
@@ -228,17 +429,17 @@ pub fn ensure_manifests_dir() -> PathBuf {
     dir
 }
 
-/// Sample manifest shipped into `~/.bohay/manifests/` on first run. The `.txt`
+/// Sample manifest shipped into `~/.luvus/manifests/` on first run. The `.txt`
 /// suffix keeps it from being loaded; copy it to `<agent>.toml` and edit.
 const MANIFEST_EXAMPLE: &str = "\
-# bohay agent-detection manifest (docs/07). Copy to `<agent>.toml` and edit --
+# luvus agent-detection manifest (docs/07). Copy to `<agent>.toml` and edit --
 # one file per agent keeps things findable. Every *.toml here merges into
-# bohay's built-in detection; rules are merged by priority (highest wins), so a
+# luvus's built-in detection; rules are merged by priority (highest wins), so a
 # higher-priority rule overrides a built-in one for the same agent.
 #
 # A manifest controls two separate things:
-#   [identity]  -- how bohay decides *which agent* a pane is running
-#   [[rule]]    -- how bohay decides *what state* that agent is in
+#   [identity]  -- how luvus decides *which agent* a pane is running
+#   [[rule]]    -- how luvus decides *what state* that agent is in
 
 # Which agent this file applies to. `generic` (default) means all agents, and
 # is only valid for [[rule]] -- identity needs a specific agent.
@@ -253,8 +454,8 @@ agent = \"claude\"
 #   ambiguous  -- also an ordinary English word, so believed ONLY in the command
 #                 that spawned the pane or the agent's own terminal title
 #
-# Use `replace = true` to drop bohay's built-in patterns instead of adding to
-# them (the way to *remove* a default). Naming an agent bohay does not ship
+# Use `replace = true` to drop luvus's built-in patterns instead of adding to
+# them (the way to *remove* a default). Naming an agent luvus does not ship
 # teaches it a new one, no rebuild needed.
 #
 # [identity]
@@ -283,23 +484,23 @@ not = [\"cancelled\"]
 ";
 
 /// The JSON control-API socket path for this session (home-derived). Used by the
-/// **server** to bind — never reads `$BOHAY_SOCKET_PATH`, or a server spawned
+/// **server** to bind — never reads `$LUVUS_SOCKET_PATH`, or a server spawned
 /// from inside a pane would try to bind its parent's socket.
 pub fn socket_path() -> PathBuf {
     crate::session::api_socket_path_for(crate::session::active_name().as_deref())
 }
 
 /// The control socket a **CLI** should talk to: the one injected into this
-/// process (a pane / module command carries `$BOHAY_SOCKET_PATH` pointing at its
-/// own server), else the home-derived default. This is what makes `bohay …` run
+/// process (a pane / module command carries `$LUVUS_SOCKET_PATH` pointing at its
+/// own server), else the home-derived default. This is what makes `luvus …` run
 /// inside a pane reach *that* session's server — so a module action that shells
-/// out to `bohay`, or a `bohay module link` typed in a dev pane, targets the
-/// instance you're in rather than whatever `$BOHAY_HOME` defaults to.
+/// out to `luvus`, or a `luvus module link` typed in a dev pane, targets the
+/// instance you're in rather than whatever `$LUVUS_HOME` defaults to.
 pub fn cli_socket_path() -> PathBuf {
     if crate::session::explicit_session_requested() {
         return socket_path();
     }
-    match std::env::var_os("BOHAY_SOCKET_PATH") {
+    match crate::compat::inherited("LUVUS_SOCKET_PATH", "BOHAY_SOCKET_PATH") {
         Some(p) if !p.is_empty() => PathBuf::from(p),
         _ => socket_path(),
     }
@@ -593,28 +794,96 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    #[test]
+    fn legacy_state_migration_is_copy_only_and_skips_runtime_artifacts() {
+        let root = std::env::temp_dir().join(format!("luvus-migration-{}", std::process::id()));
+        let legacy = root.join(".bohay");
+        let current = root.join(".luvus");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(legacy.join("sessions/docs")).unwrap();
+        fs::create_dir_all(legacy.join("worktrees/repo/branch")).unwrap();
+        fs::create_dir_all(legacy.join("modules/git/demo")).unwrap();
+        fs::write(legacy.join("config.toml"), "theme = \"gold\"").unwrap();
+        fs::write(legacy.join("sessions/docs/session.json"), "{}").unwrap();
+        fs::write(legacy.join("bohay.sock"), "stale").unwrap();
+        fs::write(legacy.join("server.lock"), "stale").unwrap();
+        fs::write(legacy.join("worktrees/repo/branch/file"), "user checkout").unwrap();
+        fs::write(legacy.join("modules/git/demo/file"), "module").unwrap();
+        fs::write(
+            legacy.join("modules.json"),
+            format!(
+                r#"{{"modules":[{{"root":"{}/modules/git/demo"}}]}}"#,
+                legacy.display()
+            ),
+        )
+        .unwrap();
+
+        migrate_legacy_state_between(&legacy, &current).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(current.join("config.toml")).unwrap(),
+            "theme = \"gold\""
+        );
+        assert!(current.join("sessions/docs/session.json").is_file());
+        assert!(current.join("modules/git/demo/file").is_file());
+        assert!(!current.join("bohay.sock").exists());
+        assert!(!current.join("server.lock").exists());
+        assert!(!current.join("worktrees").exists());
+        assert!(current.join(LEGACY_MIGRATION_MARKER).is_file());
+        let registry = fs::read_to_string(current.join("modules.json")).unwrap();
+        assert!(registry.contains(&current.join("modules").display().to_string()));
+        assert!(!registry.contains(&legacy.join("modules").display().to_string()));
+        assert!(
+            legacy.join("config.toml").is_file(),
+            "rollback state remains intact"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_state_never_overwrites_an_existing_luvus_home() {
+        let root =
+            std::env::temp_dir().join(format!("luvus-migration-existing-{}", std::process::id()));
+        let legacy = root.join(".bohay");
+        let current = root.join(".luvus");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&legacy).unwrap();
+        fs::create_dir_all(&current).unwrap();
+        fs::write(legacy.join("config.toml"), "old").unwrap();
+        fs::write(current.join("config.toml"), "new").unwrap();
+        migrate_legacy_state_between(&legacy, &current).unwrap();
+        assert_eq!(
+            fs::read_to_string(current.join("config.toml")).unwrap(),
+            "new"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     /// A CLI in a pane/module targets the injected socket (its own server), not
-    /// the home-derived default — so `bohay …` inside a dev pane reaches the dev
+    /// the home-derived default — so `luvus …` inside a dev pane reaches the dev
     /// server, and a module action opening a pane hits the right instance.
     #[test]
     fn cli_socket_path_prefers_the_injected_socket() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let saved = std::env::var_os("BOHAY_SOCKET_PATH");
+        let saved = std::env::var_os("LUVUS_SOCKET_PATH");
+        let saved_legacy = std::env::var_os("BOHAY_SOCKET_PATH");
+        std::env::remove_var("BOHAY_SOCKET_PATH");
 
-        std::env::set_var("BOHAY_SOCKET_PATH", "/tmp/injected-bohay.sock");
-        assert_eq!(cli_socket_path(), PathBuf::from("/tmp/injected-bohay.sock"));
+        std::env::set_var("LUVUS_SOCKET_PATH", "/tmp/injected-luvus.sock");
+        assert_eq!(cli_socket_path(), PathBuf::from("/tmp/injected-luvus.sock"));
 
         // Empty is treated as unset → falls back to the home-derived socket.
-        std::env::set_var("BOHAY_SOCKET_PATH", "");
+        std::env::set_var("LUVUS_SOCKET_PATH", "");
         assert_eq!(cli_socket_path(), socket_path());
 
-        std::env::remove_var("BOHAY_SOCKET_PATH");
+        std::env::remove_var("LUVUS_SOCKET_PATH");
         assert_eq!(cli_socket_path(), socket_path());
 
         match saved {
-            Some(v) => std::env::set_var("BOHAY_SOCKET_PATH", v),
-            None => std::env::remove_var("BOHAY_SOCKET_PATH"),
+            Some(v) => std::env::set_var("LUVUS_SOCKET_PATH", v),
+            None => std::env::remove_var("LUVUS_SOCKET_PATH"),
         }
+        restore_env("BOHAY_SOCKET_PATH", &saved_legacy);
     }
 
     #[test]

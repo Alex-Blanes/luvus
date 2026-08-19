@@ -6,8 +6,8 @@ import { THEMES, DEFAULT_THEME } from '../lib/themes';
 // The /modules page: the community module index.
 //
 // There is deliberately **no registry and no backend**. A module is just a
-// public GitHub repo carrying the `bohay-module` topic, exactly what
-// `bohay module search` queries from the terminal. This page runs the same
+// public GitHub repo carrying the `luvus-module` topic, exactly what
+// `luvus module search` queries from the terminal. This page runs the same
 // search so the site and the CLI can never disagree about what exists.
 //
 // The list is fetched at build time (so it renders with JS off and is
@@ -22,17 +22,17 @@ import '@fontsource/ibm-plex-mono/600.css';
 import '@fontsource/ibm-plex-mono/700.css';
 import '@fontsource/orbit/400.css'; // the wordmark face
 import Logo from '../components/Logo.astro';
-import { NAV_MARK } from '../lib/mark'; // TRIAL: the luvus nav mark
+import { NAV_MARK } from '../lib/mark';
 
-const GITHUB = 'https://github.com/RizRiyz/bohay';
-const TOPIC = 'bohay-module';
+const GITHUB = 'https://github.com/RizRiyz/luvus';
+const TOPIC = 'luvus-module';
 const TOPIC_URL = `https://github.com/topics/${TOPIC}`;
 const SEARCH_API = `https://api.github.com/search/repositories?q=topic:${TOPIC}&sort=stars&order=desc&per_page=60`;
 
-const title = 'Modules — bohay';
+const title = 'Modules — luvus';
 const description =
-  'Community modules for bohay: sidebar docks, panes, right-click actions and automations, published as ordinary GitHub repos.';
-const ogImage = 'https://bohay.dev/og.png';
+  'Community modules for luvus: sidebar docks, panes, right-click actions and automations, published as ordinary GitHub repos.';
+const ogImage = 'https://luvus.dev/og.png';
 
 // Build-time fetch. Never throw: a rate-limited or offline build must still
 // produce a page.
@@ -40,7 +40,7 @@ let repos = [];
 let fetchFailed = false;
 try {
   const res = await fetch(SEARCH_API, {
-    headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'bohay.dev' },
+    headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'luvus.dev' },
   });
   if (!res.ok) throw new Error(`GitHub returned ${res.status}`);
   const data = await res.json();
@@ -115,52 +115,52 @@ for (const [path, text] of Object.entries(exampleFiles)) {
 const examples = [
   {
     name: 'branch-dock',
-    owner: 'bohay/examples',
+    owner: 'luvus/examples',
     lang: 'Shell',
     description:
       "A sidebar dock listing the active node's git branches. Click one to check it out.",
     topics: ['dock', 'startup', 'settings'],
-    install: 'bohay module link ./examples/modules/branch-dock',
+    install: 'luvus module link ./examples/modules/branch-dock',
     path: 'examples/modules/branch-dock',
   },
   {
     name: 'agent-ping',
-    owner: 'bohay/examples',
+    owner: 'luvus/examples',
     lang: 'Python',
     description:
       'Posts a webhook when an agent goes blocked, so you know without watching it.',
     topics: ['events', 'secrets', 'right-click'],
-    install: 'bohay module link ./examples/modules/agent-ping',
+    install: 'luvus module link ./examples/modules/agent-ping',
     path: 'examples/modules/agent-ping',
   },
   {
     name: 'scratch-pane',
-    owner: 'bohay/examples',
+    owner: 'luvus/examples',
     lang: 'JavaScript',
     description:
       'Right-click a pane to open a scratch notepad beside it, and stash the selected text into it.',
     topics: ['panes', 'selection', 'tabs'],
-    install: 'bohay module link ./examples/modules/scratch-pane',
+    install: 'luvus module link ./examples/modules/scratch-pane',
     path: 'examples/modules/scratch-pane',
   },
   {
     name: 'esp-idf',
-    owner: 'bohay/examples',
+    owner: 'luvus/examples',
     lang: 'Shell',
     description:
       'Build, flash and monitor ESP32 boards. Flashing stops the serial monitor and brings it back in the same pane, so the log from before the flash is still there.',
     topics: ['dock', 'panes', 'settings'],
-    install: 'bohay module link ./examples/modules/esp-idf',
+    install: 'luvus module link ./examples/modules/esp-idf',
     path: 'examples/modules/esp-idf',
   },
   {
     name: 'deck',
-    owner: 'bohay/examples',
+    owner: 'luvus/examples',
     lang: 'Python',
     description:
       'Present a Markdown file as slides in a pane. Split on a rule, arrow keys to move, r to reload.',
     topics: ['panes', 'settings'],
-    install: 'bohay module link ./examples/modules/deck',
+    install: 'luvus module link ./examples/modules/deck',
     path: 'examples/modules/deck',
   },
 ];
@@ -185,12 +185,12 @@ const examples = [
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
     <link rel="icon" type="image/png" sizes="192x192" href="/favicon.png" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-    <link rel="canonical" href="https://bohay.dev/modules/" />
+    <link rel="canonical" href="https://luvus.dev/modules/" />
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
     <meta property="og:type" content="website" />
-    <meta property="og:url" content="https://bohay.dev/modules/" />
-    <meta property="og:site_name" content="bohay" />
+    <meta property="og:url" content="https://luvus.dev/modules/" />
+    <meta property="og:site_name" content="luvus" />
     <meta property="og:image" content={ogImage} />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
@@ -206,7 +206,7 @@ const examples = [
          Deliberately tiny and dependency-free; it must not delay rendering. -->
     <script is:inline>
       try {
-        var t = localStorage.getItem('bohay-theme');
+        var t = localStorage.getItem('luvus-theme');
         if (t) document.documentElement.setAttribute('data-bh-theme', t);
       } catch (e) {}
     </script>
@@ -216,14 +216,14 @@ const examples = [
       <div class="nav-inner">
         <a class="brand" href="/">
           <span class="mark mark-luvus" aria-hidden="true" set:html={NAV_MARK}></span>
-          <span>Bohay</span>
+          <span>Luvus</span>
         </a>
         <div class="nav-links">
           <a href="/docs/">Docs</a>
           <a href="/modules/" aria-current="page">Modules</a>
           <a href="/changelog/">Changelog</a>
   
-        <a href={GITHUB} class="gh" aria-label="bohay on GitHub" title="GitHub">
+        <a href={GITHUB} class="gh" aria-label="luvus on GitHub" title="GitHub">
             <svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"
               ><path
                 fill="currentColor"
@@ -240,7 +240,7 @@ const examples = [
     <header class="page-hero">
       <div class="glow" aria-hidden="true"></div>
       <span class="eyebrow">Modules</span>
-      <h1>Extend bohay in any language</h1>
+      <h1>Extend luvus in any language</h1>
       <p>
         A module is a plain GitHub repo with a manifest and some commands. Bash, Python, Lua,
         Rust, Node, anything your machine can run. No SDK, no plugin runtime, no registry to
@@ -262,7 +262,7 @@ const examples = [
             Browse below, or search from the terminal. Both read the same
             <a href={TOPIC_URL}><code>{TOPIC}</code></a> GitHub topic.
           </p>
-          <pre class="cmd"><code>bohay module search</code></pre>
+          <pre class="cmd"><code>luvus module search</code></pre>
         </li>
         <li>
           <span class="num">2</span>
@@ -271,7 +271,7 @@ const examples = [
             Install prints <strong>every command the module declares</strong> and waits for your
             confirmation before anything runs.
           </p>
-          <pre class="cmd"><code>bohay module install owner/repo</code></pre>
+          <pre class="cmd"><code>luvus module install owner/repo</code></pre>
         </li>
         <li>
           <span class="num">3</span>
@@ -280,7 +280,7 @@ const examples = [
             It shows up in <strong>Settings → Modules</strong> with its own settings, and wherever
             it declared itself: a dock, a pane, a right-click.
           </p>
-          <pre class="cmd"><code>bohay module list</code></pre>
+          <pre class="cmd"><code>luvus module list</code></pre>
         </li>
       </ol>
     </section>
@@ -334,7 +334,7 @@ const examples = [
                   ))}
                 </div>
               )}
-              <code class="install">bohay module install {r.full_name}</code>
+              <code class="install">luvus module install {r.full_name}</code>
             </a>
           ))
         }
@@ -407,17 +407,17 @@ const examples = [
           <h2>Getting listed takes one click</h2>
           <p>
             There is no submission, no review queue, and no account. Push a public repo with a
-            <code>bohay-module.toml</code> at its root, then add the
+            <code>luvus-module.toml</code> at its root, then add the
             <strong>{TOPIC}</strong> topic to it on GitHub. This page and
-            <code>bohay module search</code> both pick it up on their next run.
+            <code>luvus module search</code> both pick it up on their next run.
           </p>
           <ol class="pub-steps">
-            <li>Put <code>bohay-module.toml</code> in the repo root (or a subdirectory).</li>
+            <li>Put <code>luvus-module.toml</code> in the repo root (or a subdirectory).</li>
             <li>
               On GitHub: <strong>About → ⚙︎ → Topics</strong>, add <code>{TOPIC}</code>.
             </li>
             <li>
-              Tell people to run <code>bohay module install you/your-module</code>.
+              Tell people to run <code>luvus module install you/your-module</code>.
             </li>
           </ol>
         </div>
@@ -428,7 +428,7 @@ const examples = [
               <li>A one-line repo description: it is the card text here.</li>
               <li>A README showing what it adds, with a screenshot.</li>
               <li>Any tools it needs (<code>jq</code>, <code>node</code>, …) stated up front.</li>
-              <li>A <code>min_bohay_version</code> you have actually tested.</li>
+              <li>A <code>min_luvus_version</code> you have actually tested.</li>
             </ul>
           </div>
         </div>
@@ -439,12 +439,12 @@ const examples = [
       <h2>A note on trust</h2>
       <p>
         A module is ordinary code that runs on your machine as you, with your environment and
-        your full bohay CLI. That openness is the point, and a little judgment keeps it safe.
+        your full luvus CLI. That openness is the point, and a little judgment keeps it safe.
         Install from people you trust, and skim the manifest first:
-        <code>bohay module install</code> shows you every command a module declares and asks
+        <code>luvus module install</code> shows you every command a module declares and asks
         before running anything. Builds run with a scrubbed environment, and a manifest cannot
-        change between the preview and the install. bohay validates and isolates, but it does not
-        sandbox: third-party modules come from their authors, not from bohay.
+        change between the preview and the install. luvus validates and isolates, but it does not
+        sandbox: third-party modules come from their authors, not from luvus.
       </p>
       <a class="btn" href="/docs/extend/using-modules/">Read the full trust model →</a>
     </section>
@@ -455,12 +455,12 @@ const examples = [
       <div class="foot-inner">
         <div class="foot-brand">
           <Logo width={22} height={22} class="mark" aria-hidden="true" />
-          <span>Bohay</span>
+          <span>Luvus</span>
           <span class="dim">by Riz</span>
         </div>
         <div class="foot-links">
           <a href={GITHUB}>GitHub</a>
-          <a href="https://crates.io/crates/bohay">crates.io</a>
+          <a href="https://crates.io/crates/luvus">crates.io</a>
         </div>
       </div>
     </footer>
@@ -505,7 +505,7 @@ const examples = [
           <p class="mdesc">${esc(r.description || 'No description provided.')}</p>
           <div class="meta">${lang}${forks}${upd}</div>
           ${topics ? `<div class="mfoot">${topics}</div>` : ''}
-          <code class="install">bohay module install ${esc(r.full_name)}</code>
+          <code class="install">luvus module install ${esc(r.full_name)}</code>
         </a>`;
       };
 
@@ -950,9 +950,9 @@ const examples = [
          way most product sites expose their mark. Plain links + clipboard, no
          dependency. -->
     <div class="brandmenu" id="brandmenu" hidden>
-      <a class="bm-item" id="bm-png" href="/brand/bohay-logo.png" download="bohay-logo.png">Download PNG</a>
-      <a class="bm-item" id="bm-svg" href="/brand/bohay-logo.svg" download="bohay-logo.svg">Download SVG</a>
-      <button type="button" class="bm-item" id="bm-copy" data-src="/brand/bohay-logo.svg">Copy SVG</button>
+      <a class="bm-item" id="bm-png" href="/brand/luvus-logo.png" download="luvus-logo.png">Download PNG</a>
+      <a class="bm-item" id="bm-svg" href="/brand/luvus-logo.svg" download="luvus-logo.svg">Download SVG</a>
+      <button type="button" class="bm-item" id="bm-copy" data-src="/brand/luvus-logo.svg">Copy SVG</button>
     </div>
     <div class="theme-dock" id="theme-dock">
       <ul class="td-list" id="td-list" role="listbox" aria-label="Color theme" hidden>
@@ -972,7 +972,7 @@ const examples = [
       </button>
     </div>
     <script>
-      // Theme picker · palettes come from bohay's own registry, generated into
+      // Theme picker · palettes come from luvus's own registry, generated into
       // styles/themes.css, so what you preview is what the app ships. Applying a
       // theme sets `data-bh-theme` on <html>, which outranks each page's :root.
       //
@@ -980,7 +980,7 @@ const examples = [
       // click, so moving away or closing restores what you had.
       import { DEFAULT_THEME } from '../lib/themes';
       (() => {
-        const KEY = 'bohay-theme';
+        const KEY = 'luvus-theme';
         const dock = document.getElementById('theme-dock');
         const btn = document.getElementById('td-btn');
         const list = document.getElementById('td-list');

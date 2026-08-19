@@ -1,16 +1,16 @@
 #!/bin/sh
-# bohay installer — downloads the right prebuilt binary for your OS/arch from the
+# luvus installer — downloads the right prebuilt binary for your OS/arch from the
 # GitHub releases and drops it on your PATH.
 #
-#   curl -fsSL https://raw.githubusercontent.com/RizRiyz/bohay/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/RizRiyz/luvus/main/install.sh | sh
 #
 # Overrides:
-#   BOHAY_VERSION=v0.1.0   install a specific tag (default: latest release)
-#   BOHAY_INSTALL_DIR=...  where to put the binary (default: /usr/local/bin or ~/.local/bin)
+#   LUVUS_VERSION=v0.1.0   install a specific tag (default: latest release)
+#   LUVUS_INSTALL_DIR=...  where to put the binary (default: /usr/local/bin or ~/.local/bin)
 set -eu
 
-REPO="RizRiyz/bohay"
-BIN="bohay"
+REPO="RizRiyz/luvus"
+BIN="luvus"
 
 err() { printf 'error: %s\n' "$1" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -40,12 +40,15 @@ case "$os" in
 esac
 
 # ── resolve version ──
-if [ -n "${BOHAY_VERSION:-}" ]; then
-  tag="$BOHAY_VERSION"
+if [ -z "${LUVUS_VERSION:-}" ] && [ -n "${BOHAY_VERSION:-}" ]; then
+  LUVUS_VERSION=$BOHAY_VERSION
+fi
+if [ -n "${LUVUS_VERSION:-}" ]; then
+  tag="$LUVUS_VERSION"
 else
   tag=$($DL "https://api.github.com/repos/$REPO/releases/latest" \
         | grep '"tag_name"' | head -1 | cut -d'"' -f4)
-  [ -n "$tag" ] || err "could not find the latest release (set BOHAY_VERSION=vX.Y.Z)"
+  [ -n "$tag" ] || err "could not find the latest release (set LUVUS_VERSION=vX.Y.Z)"
 fi
 
 asset="$BIN-$tag-$target.tar.gz"
@@ -61,8 +64,11 @@ tar -xzf "$tmp/$asset" -C "$tmp" || err "extract failed"
 chmod +x "$tmp/$BIN"
 
 # ── choose an install dir on PATH ──
-if [ -n "${BOHAY_INSTALL_DIR:-}" ]; then
-  dir="$BOHAY_INSTALL_DIR"
+if [ -z "${LUVUS_INSTALL_DIR:-}" ] && [ -n "${BOHAY_INSTALL_DIR:-}" ]; then
+  LUVUS_INSTALL_DIR=$BOHAY_INSTALL_DIR
+fi
+if [ -n "${LUVUS_INSTALL_DIR:-}" ]; then
+  dir="$LUVUS_INSTALL_DIR"
 elif [ -w /usr/local/bin ]; then
   dir="/usr/local/bin"
 else
@@ -75,7 +81,7 @@ elif have sudo; then
   printf 'Writing to %s (needs sudo)…\n' "$dir"
   sudo mv "$tmp/$BIN" "$dir/$BIN"
 else
-  err "cannot write to $dir (set BOHAY_INSTALL_DIR to a writable dir)"
+  err "cannot write to $dir (set LUVUS_INSTALL_DIR to a writable dir)"
 fi
 
 printf '\n✓ installed to %s/%s\n' "$dir" "$BIN"

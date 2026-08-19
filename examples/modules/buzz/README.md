@@ -1,16 +1,16 @@
-# buzz — chat on a Buzz relay, inside bohay
+# buzz — chat on a Buzz relay, inside luvus
 
-A native-Rust bohay module that talks to a [Buzz](https://github.com/block/buzz)
+A native-Rust luvus module that talks to a [Buzz](https://github.com/block/buzz)
 relay directly over its standard **NIP-29 (groups) + NIP-42 (auth)** WebSocket.
 No `buzz` CLI needed, no tokio. See `docs/39-buzz-module.md` for the design.
 
-Opens as a **chat pane** in bohay: a channel sidebar, live messages, and a
+Opens as a **chat pane** in luvus: a channel sidebar, live messages, and a
 compose line. Discovers channels, self-joins open ones, and streams messages.
 
-## Use it in bohay
+## Use it in luvus
 
 ```sh
-bohay module link ./examples/modules/buzz     # builds the binary, registers it
+luvus module link ./examples/modules/buzz     # builds the binary, registers it
 ```
 
 Then set the relay in **Settings → Modules → Buzz → Relay URL** (defaults to the
@@ -28,19 +28,19 @@ channels, `PgUp`/`PgDn` to scroll, `Esc` to close.
 | `relay_url` | the community's relay (`wss://…`); one relay URL == one community |
 | `nsec` | your key; **blank auto-generates and stores one**, or paste an existing nsec |
 
-They reach the client as `BOHAY_SETTING_RELAY_URL` / `BOHAY_SETTING_NSEC`.
+They reach the client as `LUVUS_SETTING_RELAY_URL` / `LUVUS_SETTING_NSEC`.
 
 ## CLI (the tested foundation the pane calls into)
 
 ```sh
 cp Cargo.toml.example Cargo.toml   # the manifest ships as .example (see note below)
-cargo build --release              # → target/release/bohay-buzz
+cargo build --release              # → target/release/luvus-buzz
 
-bohay-buzz keygen                                   # make an identity
-bohay-buzz channels --relay wss://… --nsec nsec1…   # list channels
-bohay-buzz listen   --relay wss://… --nsec nsec1… --channel <uuid>
-bohay-buzz send     --relay wss://… --nsec nsec1… --channel <uuid> --content "hi"
-bohay-buzz tui      --relay wss://… [--nsec nsec1…] # the pane, standalone
+luvus-buzz keygen                                   # make an identity
+luvus-buzz channels --relay wss://… --nsec nsec1…   # list channels
+luvus-buzz listen   --relay wss://… --nsec nsec1… --channel <uuid>
+luvus-buzz send     --relay wss://… --nsec nsec1… --channel <uuid> --content "hi"
+luvus-buzz tui      --relay wss://… [--nsec nsec1…] # the pane, standalone
 ```
 
 Every flag also reads an env var: `BUZZ_RELAY_URL`, `BUZZ_PRIVATE_KEY`,
@@ -64,9 +64,9 @@ Built on the `nostr` core crate (crypto + event/message codec) and blocking
 
 ## Why the manifest ships as `Cargo.toml.example`
 
-`cargo install --git <bohay>` searches the whole repository for any file named
+`cargo install --git <luvus>` searches the whole repository for any file named
 `Cargo.toml` and refuses to install when two packages have binaries (it would
-find both `bohay` and `bohay-buzz`). Shipping this example's manifest as
+find both `luvus` and `luvus-buzz`). Shipping this example's manifest as
 `Cargo.toml.example` keeps the top-level install unambiguous. The module's build
 step (and the snippet above) copy it to `Cargo.toml` before compiling; that
 generated file is gitignored so building in place never reintroduces the clash.

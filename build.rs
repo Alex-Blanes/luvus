@@ -1,7 +1,7 @@
 //! Embeds the newest [`KEEP`] `changelog/*.md` release notes into the binary at
 //! compile time, so the in-app changelog modal (click the sidebar version number)
-//! works no matter where bohay is installed — the raw files are not shipped to a
-//! running host. Older releases live on bohay.dev, which the modal links to.
+//! works no matter where luvus is installed — the raw files are not shipped to a
+//! running host. Older releases live on luvus.dev, which the modal links to.
 //! Emits `$OUT_DIR/changelog_gen.rs` with a `CHANGELOG` slice of
 //! `(version, date, body)`, newest release first. Front matter (`version` /
 //! `date`) is parsed out; the body is the prose below it.
@@ -37,7 +37,7 @@ fn main() {
     // Newest release first.
     entries.sort_by_key(|e| std::cmp::Reverse(e.0));
     // Then keep only the newest few. The modal renders `ui::changelog::RECENT`
-    // (3) and links to bohay.dev for the rest, so embedding the full history was
+    // (3) and links to luvus.dev for the rest, so embedding the full history was
     // dead weight that grew by roughly 3 KB with every release, forever. Must
     // stay **greater than** RECENT: the modal names the first release past the
     // cutoff in its "older releases" hint, and a test asserts that release is
@@ -82,7 +82,7 @@ fn parse(text: &str, stem: &str) -> (String, String, String) {
 
 /// Trim the note body for the in-app modal (docs). Contributors remain visible
 /// in every output; only the trailing `Full changelog` section is removed because
-/// the modal already appends its own link to bohay.dev.
+/// the modal already appends its own link to luvus.dev.
 fn clean_body(body: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
     let mut skipping = false;

@@ -1,4 +1,4 @@
-// Generates public/og.png (1200×630), the social card for bohay.dev.
+// Generates public/og.png (1200×630), the social card for luvus.dev.
 //
 // Static asset, rendered here so it stays in step with the brand: the logo
 // (public/logo.png, the white tile, rounded like an app icon and sized
@@ -80,9 +80,9 @@ const svg = `
 
   <!-- wordmark (logo composited by sharp at 76×76 at x=64,y=60 → centre y=98) -->
   <text x="160" y="98" font-family="${FONT}" font-size="38" font-weight="700"
-        fill="${C.text}" dominant-baseline="central">Bohay</text>
+        fill="${C.text}" dominant-baseline="central">Luvus</text>
   <text x="${W - 64}" y="98" font-family="${FONT}" font-size="28" font-weight="600"
-        fill="${C.accent}" text-anchor="end" dominant-baseline="central">bohay.dev</text>
+        fill="${C.accent}" text-anchor="end" dominant-baseline="central">luvus.dev</text>
 
   <!-- headline -->
   <text x="80" y="256" font-family="${FONT}" font-size="68" font-weight="800" fill="${C.text}">Mission control for</text>
@@ -95,7 +95,7 @@ const svg = `
   ${c1.svg}${c2.svg}${c3.svg}
 
   <!-- install hint -->
-  <text x="82" y="590" font-family="${FONT}" font-size="21" font-weight="400" fill="${C.install}">$ brew install RizRiyz/bohay/bohay</text>
+  <text x="82" y="590" font-family="${FONT}" font-size="21" font-weight="400" fill="${C.install}">$ brew install RizRiyz/luvus/luvus</text>
 </svg>`;
 
 // The mark: full-bleed square art, rounded like an app icon (22% radius), sized

@@ -1,23 +1,23 @@
 ---
 title: CLI Commands
-description: Every bohay command, generated from `bohay help all` and drift-checked in CI.
+description: Every luvus command, generated from `luvus help all` and drift-checked in CI.
 ---
 
 :::note[Source of truth]
-The binary is authoritative: **`bohay help all`** always matches your installed
-version. This page carries the same text **verbatim**. A test in bohay's CI
+The binary is authoritative: **`luvus help all`** always matches your installed
+version. This page carries the same text **verbatim**. A test in luvus's CI
 fails if they ever drift apart.
 :::
 
-Use `bohay help <topic> [command]` for focused help. Most commands also accept
+Use `luvus help <topic> [command]` for focused help. Most commands also accept
 a trailing `--help`. Pass-through commands preserve that flag as payload, so
-use the explicit `bohay help` form for them. Help writes to stdout, while
+use the explicit `luvus help` form for them. Help writes to stdout, while
 invalid usage writes to stderr.
 
 ```txt
-bohay: Mission control for your AI coding agents
+luvus: Mission control for your AI coding agents
 
-usage: bohay <command> [args]
+usage: luvus <command> [args]
 
   (no args)            launch / attach the TUI
   --session <name>     target one named server session
@@ -72,7 +72,7 @@ panes / agents:
   skill                      print the agent skill (delegation + session control)
   skill install [--dir <p>]  install the skill where a coding agent auto-loads it
   skill uninstall [--dir <p>]   remove the installed skill
-  skill update               fetch the latest skill from the bohay repo (no reinstall)
+  skill update               fetch the latest skill from the luvus repo (no reinstall)
   skill on | off             enable / disable auto-install (installs / removes now)
   wait output <id> --match <text> [--timeout <s>]    block until output appears
   wait agent-status <id> --status done|blocked|working|idle [--timeout <s>]
@@ -93,7 +93,7 @@ appearance:
   ui toast <text>            flash a one-line message in the UI
 
 modules (extensions):
-  module search [<query>]    find modules published to the `bohay-module` GitHub topic
+  module search [<query>]    find modules published to the `luvus-module` GitHub topic
   module list                list installed modules
   module info <id>           show a module's actions / panes / events / source
   module link <path>         register a local module dir (--disabled to skip enabling)
@@ -139,7 +139,7 @@ orchestration (multiple agents on one project, docs/22):
   task heartbeat <id> --context <0..1>   report context usage (blocks done at >85%)
   task update <id> [--status <s>] [--output <o>] [--note <n>]
   task done <id>             mark done + release its leases
-  task merge <id>            integrate the task's branch into bohay/integration
+  task merge <id>            integrate the task's branch into luvus/integration
                              (isolated worktree, conflicts block the task)
   task release <id>          return a claimed task to the queue
   task delete <id>           remove a task (release/finish an active one first)
@@ -157,16 +157,16 @@ sessions:
   session delete <name> [--json]  delete a stopped named session
 
 remote:
-  --remote <host> [ssh args] attach to a bohay session on <host> over plain ssh
+  --remote <host> [ssh args] attach to a luvus session on <host> over plain ssh
 
 server:
   server status              is the server running, and what version
   server start               start the background server if it isn't up
   server stop                stop the server (and all panes)
   server restart             stop + start (load a newly-installed binary)
-  server update-manifest     fetch the latest agent-detection rules from bohay.dev
+  server update-manifest     fetch the latest agent-detection rules from luvus.dev
                              (applies live if the server is up; else on next start)
   integration install|uninstall <claude|copilot|codex|opencode|kimi|grok>
-                             add/remove bohay's session-resume hook (uninstall
-                             removes only bohay's hook, never the agent)
+                             add/remove luvus's session-resume hook (uninstall
+                             removes only luvus's hook, never the agent)
 ```

@@ -1,4 +1,4 @@
-//! The JSON control-API dispatch agents drive bohay through, plus the
+//! The JSON control-API dispatch agents drive luvus through, plus the
 //! per-pane agent-detection tick. Methods on [`App`](super::App).
 
 use super::*;
@@ -473,7 +473,7 @@ impl App {
                 "protocol":1,
                 "session": crate::session::display_name()
             })),
-            // Re-read `~/.bohay/manifests/` (built-in + managed OTA + user) into
+            // Re-read `~/.luvus/manifests/` (built-in + managed OTA + user) into
             // the live engine, so `server update-manifest` applies without a
             // restart. Detection uses the new rules on the next tick.
             "manifest.reload" => {
@@ -651,7 +651,7 @@ impl App {
                 Ok(json!({"type":"ok"}))
             }
             // A **global** single-pane status lookup (any workspace) — `pane.list` is
-            // scoped to the active workspace, so `bohay wait agent-status` polls this.
+            // scoped to the active workspace, so `luvus wait agent-status` polls this.
             "pane.status" => {
                 let id = self.resolve_pane(p).ok_or_else(not_found)?;
                 let (agent, status) = self
@@ -744,16 +744,16 @@ impl App {
             }
             "workspace.open" | "node.open" => {
                 // Open `path` as a workspace, or focus it if it's already one. Used
-                // when `bohay` attaches to a running server from a new folder, so the
+                // when `luvus` attaches to a running server from a new folder, so the
                 // launch directory shows up as a workspace.
                 //
                 // `focus` (default true) governs the *already-open* case. The
                 // automatic attach-open (`open_cwd_workspace`) passes `false`: it
                 // ensures the launch folder is a workspace but must NOT steal focus
                 // from the workspace a restored session left you on — otherwise
-                // reopening `bohay` always snaps back to the launch folder (usually
+                // reopening `luvus` always snaps back to the launch folder (usually
                 // the first workspace), never the one you were last using. An
-                // explicit `bohay workspace open <path>` omits it and still focuses.
+                // explicit `luvus workspace open <path>` omits it and still focuses.
                 let path = PathBuf::from(req_str(p, "path")?);
                 let focus = p.get("focus").and_then(|v| v.as_bool()).unwrap_or(true);
                 match self
@@ -959,9 +959,9 @@ impl App {
                                 .get(&id)
                                 .map(|p| p.cwd.to_string_lossy().to_string())
                                 .unwrap_or_default();
-                            // The agent's own session id, when bohay knows it
+                            // The agent's own session id, when luvus knows it
                             // exactly: reported by the integration hook, or set
-                            // because bohay launched it (resume/fork). `null`
+                            // because luvus launched it (resume/fork). `null`
                             // means unbound — nothing is guessed here, so this
                             // doubles as "is this pane's session actually known?"
                             let session = s.agent_session.as_ref().map(|a| a.session_id.clone());
@@ -1820,12 +1820,12 @@ impl App {
     }
 
     /// The pane a task/lease call acts for: the passed `pane`, else the caller's
-    /// `$BOHAY_PANE_ID`. Orchestration is pane-keyed, so this is required.
+    /// `$LUVUS_PANE_ID`. Orchestration is pane-keyed, so this is required.
     fn orch_pane(&self, p: &Value) -> Result<u32, (String, String)> {
         self.resolve_pane(p).map(|id| id.0).ok_or_else(|| {
             (
                 "no_pane".to_string(),
-                "no pane id — run inside a bohay pane or pass a pane id".to_string(),
+                "no pane id — run inside a luvus pane or pass a pane id".to_string(),
             )
         })
     }
@@ -2444,7 +2444,7 @@ mod tests {
         // unbound rather than guessed — `agent.list` never invents one.
         assert!(row["session"].is_null(), "unbound session is null");
 
-        // Once the integration hook reports one (or bohay launches it), the exact
+        // Once the integration hook reports one (or luvus launches it), the exact
         // id shows up here, which is how a script tells *which* conversation a
         // pane is running.
         app.status.get_mut(&pane).unwrap().agent_session = Some(crate::app::AgentSession {
@@ -2737,7 +2737,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
         let root = std::env::temp_dir().join(format!(
-            "bohay-workspace-organization-{}",
+            "luvus-workspace-organization-{}",
             std::process::id()
         ));
         let a = root.join("a");
@@ -2746,7 +2746,7 @@ mod tests {
         std::fs::create_dir_all(&b).unwrap();
         assert!(app.create_workspace_at(a.clone()));
         assert!(app.create_workspace_at(b.clone()));
-        // The test may run with TMPDIR inside the Bohay checkout. Keep this
+        // The test may run with TMPDIR inside the Luvus checkout. Keep this
         // fixture independent from its parent repository so pin ordering is
         // tested without the separate worktree-grouping behavior.
         for workspace in &mut app.workspaces {
@@ -2761,12 +2761,12 @@ mod tests {
         let renamed = app
             .dispatch(
                 "workspace.rename",
-                &json!({"workspace": "1", "name": "  Bohay website  "}),
+                &json!({"workspace": "1", "name": "  Luvus website  "}),
             )
             .expect("valid workspace rename");
         assert_eq!(renamed["type"], "workspace_rename");
         assert_eq!(renamed["workspace"], "1");
-        assert_eq!(renamed["name"], "Bohay website");
+        assert_eq!(renamed["name"], "Luvus website");
         assert_eq!(renamed["cwd"], a.display().to_string());
         assert_eq!(renamed["pinned"], false);
         assert_eq!(renamed["display_position"], "1");
@@ -2788,7 +2788,7 @@ mod tests {
             .expect("workspace list");
         let rows = listed["workspaces"].as_array().unwrap();
         assert_eq!(rows[0]["workspace"], "0", "API order stays stable");
-        assert_eq!(rows[1]["name"], "Bohay website");
+        assert_eq!(rows[1]["name"], "Luvus website");
         assert_eq!(rows[1]["cwd"], a.display().to_string());
         assert_eq!(rows[1]["pinned"], false);
         assert_eq!(rows[1]["display_position"], "2");

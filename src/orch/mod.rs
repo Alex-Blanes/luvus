@@ -2,7 +2,7 @@
 //! multi-agent orchestration (docs/22, milestone M0).
 //!
 //! **Pure state.** The only IO is its own JSON persistence in a *separate* file
-//! (`~/.bohay/orch.json` for the default server, or the selected named-session
+//! (`~/.luvus/orch.json` for the default server, or the selected named-session
 //! directory), so the ledger survives restart and never touches
 //! `session.json`/`SessionSnapshot` — session restore is completely unaffected.
 //! All mutation happens on the single-writer app loop (via `app/dispatch.rs`), so

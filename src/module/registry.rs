@@ -1,4 +1,4 @@
-//! `~/.bohay/modules.json` — the installed-module registry. Atomic save,
+//! `~/.luvus/modules.json` — the installed-module registry. Atomic save,
 //! fault-tolerant load, and startup re-validation against the on-disk manifests
 //! (a missing/broken manifest keeps the entry visible but not runnable).
 
@@ -20,7 +20,7 @@ pub struct ModuleRegistry {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct InstalledModule {
     pub id: String,
-    /// Directory containing `bohay-module.toml`.
+    /// Directory containing `luvus-module.toml`.
     pub root: PathBuf,
     pub enabled: bool,
     /// `owner/repo@<sha>` for git installs; `None` for a local `link`.

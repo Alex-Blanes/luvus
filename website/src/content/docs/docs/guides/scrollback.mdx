@@ -7,10 +7,10 @@ description: Scroll any pane's history with the wheel, trackpad, or keyboard scr
 
 **Mouse/trackpad:** just scroll over a pane. Apps that enable terminal mouse
 reporting receive their wheel input; full-screen apps that request alternate
-scrolling do too. Regular transcripts scroll Bohay's retained history.
+scrolling do too. Regular transcripts scroll Luvus's retained history.
 
 Each pane has a **10 MiB** retained-history budget by default. Change it in
-**Settings → Layout → Scrollback memory**. Bohay's Alacritty adapter converts this
+**Settings → Layout → Scrollback memory**. Luvus's Alacritty adapter converts this
 budget to a conservative row limit at the current pane width, so it protects
 memory predictably but reports retained bytes as an estimate rather than an
 exact allocator measurement. Reducing the setting trims existing history
@@ -34,17 +34,17 @@ what you're typing.
 
 Unmodified `PageUp` and `PageDown` scroll normal transcript history. When a
 terminal app has claimed paging input (for example a full-screen TUI or an
-application-cursor pager), Bohay forwards those keys unchanged. `Shift+↑`,
-`Shift+PageUp`, and prefix scroll shortcuts remain explicit Bohay controls.
+application-cursor pager), Luvus forwards those keys unchanged. `Shift+↑`,
+`Shift+PageUp`, and prefix scroll shortcuts remain explicit Luvus controls.
 
 ## Copying
 
 Drag across a pane to select. Release **auto-copies** and flashes a *Copied*
-toast. bohay writes both your native OS clipboard (`pbcopy` / `wl-copy` /
+toast. luvus writes both your native OS clipboard (`pbcopy` / `wl-copy` /
 `xclip` / `clip`) and OSC 52, so it works locally *and* over SSH.
 
 For keyboard selection, press **`Shift+V`**. This enters copy mode and keeps
-all navigation inside Bohay: use arrows or `h`/`j`/`k`/`l` for character and
+all navigation inside Luvus: use arrows or `h`/`j`/`k`/`l` for character and
 line movement, `w` / `B` for words, `Space` / `b` for pages, and `g` / `G` for
 the oldest / newest retained row. Press `v` to reset the selection anchor at
 the cursor. Press **`y`** or Enter to copy and return to live output. Press

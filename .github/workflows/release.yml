@@ -59,18 +59,18 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       # Builds (cross-compiling musl/aarch64 via `cross` automatically), packages
-      # `bohay-<tag>-<target>.{tar.gz,zip}` + a .sha256, and uploads them to the
+      # `luvus-<tag>-<target>.{tar.gz,zip}` + a .sha256, and uploads them to the
       # Release created above.
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: bohay
+          bin: luvus
           target: ${{ matrix.target }}
-          archive: bohay-$tag-$target
+          archive: luvus-$tag-$target
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # Build native Linux packages (.deb + .rpm) for both arches and attach them to
-  # the Release. bohay is a static musl binary, so each package just drops the
+  # the Release. luvus is a static musl binary, so each package just drops the
   # binary in /usr/bin and declares no hard dependencies (see the Recommends in
   # Cargo.toml [package.metadata.deb]/[.generate-rpm]). `cross` cross-compiles
   # aarch64 on the x86_64 runner; cargo-deb/cargo-generate-rpm read the built
@@ -110,44 +110,44 @@ jobs:
         # release profile already strips, and there is no aarch64 `strip` here.
         run: |
           cargo deb --no-build --no-strip --target ${{ matrix.target }} \
-            --output "bohay_${{ steps.v.outputs.version }}_${{ matrix.arch }}.deb"
+            --output "luvus_${{ steps.v.outputs.version }}_${{ matrix.arch }}.deb"
       - name: Build .rpm
         run: |
           cargo generate-rpm --target ${{ matrix.target }} \
-            --output "bohay-${{ steps.v.outputs.version }}-${{ matrix.target }}.rpm"
+            --output "luvus-${{ steps.v.outputs.version }}-${{ matrix.target }}.rpm"
       - name: Attach packages to the Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$GITHUB_REF_NAME" bohay_*.deb bohay-*.rpm --repo "$GITHUB_REPOSITORY" --clobber
+        run: gh release upload "$GITHUB_REF_NAME" luvus_*.deb luvus-*.rpm --repo "$GITHUB_REPOSITORY" --clobber
 
-  # Build the macOS notch companion app (separate repo RizRiyz/bohay-notch),
+  # Build the macOS notch companion app (separate repo RizRiyz/luvus-notch),
   # ad-hoc sign it (no paid Apple Developer account, so no Developer ID cert and
-  # no notarization), attach the DMG to THIS bohay release, and bump the
-  # Homebrew cask in RizRiyz/homebrew-bohay.
+  # no notarization), attach the DMG to THIS luvus release, and bump the
+  # Homebrew cask in RizRiyz/homebrew-luvus.
   #
   # Because the app is unsigned/unnotarized, Gatekeeper will block it on first
   # launch — the cask carries a caveat telling users how to get past that.
   #
   # Extra repo secrets required (in addition to GITHUB_TOKEN):
-  #   NOTCH_TOKEN  PAT (repo:read) to check out RizRiyz/bohay-notch
-  #   TAP_TOKEN    PAT (repo) to push to RizRiyz/homebrew-bohay
+  #   NOTCH_TOKEN  PAT (repo:read) to check out RizRiyz/luvus-notch
+  #   TAP_TOKEN    PAT (repo) to push to RizRiyz/homebrew-luvus
   notch:
-    name: bohay-notch.dmg
+    name: luvus-notch.dmg
     needs: create-release
     runs-on: macos-15
     env:
-      SCHEME: bohay-notch
-      APP_NAME: bohay-notch
-      TAP_REPO: RizRiyz/homebrew-bohay
+      SCHEME: luvus-notch
+      APP_NAME: luvus-notch
+      TAP_REPO: RizRiyz/homebrew-luvus
     steps:
       - name: Derive version from tag
         id: v
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Check out bohay-notch source
+      - name: Check out luvus-notch source
         uses: actions/checkout@v5
         with:
-          repository: RizRiyz/bohay-notch
+          repository: RizRiyz/luvus-notch
           path: notch
           token: ${{ secrets.NOTCH_TOKEN }}
 
@@ -157,7 +157,7 @@ jobs:
           # No Developer ID identity available — build unsigned, then apply a
           # deep ad-hoc signature (required or arm64 macOS refuses to launch it).
           xcodebuild build \
-            -project bohay-notch.xcodeproj -scheme "$SCHEME" \
+            -project luvus-notch.xcodeproj -scheme "$SCHEME" \
             -configuration Release -derivedDataPath "$RUNNER_TEMP/dd" \
             ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
             MARKETING_VERSION="${{ steps.v.outputs.version }}" \
@@ -172,16 +172,16 @@ jobs:
         id: dmg
         run: |
           VER="${{ steps.v.outputs.version }}"
-          DMG="bohay-notch-$VER.dmg"
+          DMG="luvus-notch-$VER.dmg"
           STAGE="$RUNNER_TEMP/dmg"
           mkdir -p "$STAGE"
           cp -R "$APP" "$STAGE/"
           ln -s /Applications "$STAGE/Applications"
-          hdiutil create -volname "bohay-notch" -srcfolder "$STAGE" \
+          hdiutil create -volname "luvus-notch" -srcfolder "$STAGE" \
             -fs HFS+ -format UDZO -ov "$DMG"
           echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
 
-      - name: Attach DMG to this bohay release
+      - name: Attach DMG to this luvus release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "$GITHUB_REF_NAME" "${{ steps.dmg.outputs.dmg }}" --repo "$GITHUB_REPOSITORY" --clobber
@@ -191,13 +191,13 @@ jobs:
           VER="${{ steps.v.outputs.version }}"
           SHA="$(shasum -a 256 "${{ steps.dmg.outputs.dmg }}" | cut -d' ' -f1)"
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" "$RUNNER_TEMP/tap"
-          CASK="$RUNNER_TEMP/tap/Casks/bohay-notch.rb"
+          CASK="$RUNNER_TEMP/tap/Casks/luvus-notch.rb"
           sed -i '' -E "s/^  version \".*\"/  version \"$VER\"/" "$CASK"
           sed -i '' -E "s/^  sha256 \".*\"/  sha256 \"$SHA\"/" "$CASK"
           cd "$RUNNER_TEMP/tap"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -am "bohay-notch $VER"
+          git commit -am "luvus-notch $VER"
           git push
         env:
           TAP_TOKEN: ${{ secrets.TAP_TOKEN }}

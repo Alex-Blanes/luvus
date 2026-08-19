@@ -1,25 +1,25 @@
 ---
-title: Control Bohay from Codex
-description: Install Bohay's Codex plugin to delegate work and control agents, panes, tabs, and workspaces from a managed pane or local terminal.
+title: Control Luvus from Codex
+description: Install Luvus's Codex plugin to delegate work and control agents, panes, tabs, and workspaces from a managed pane or local terminal.
 ---
 
-The Bohay Codex plugin provides one primary `bohay` skill for agent delegation
+The Luvus Codex plugin provides one primary `luvus` skill for agent delegation
 and full session control. It covers workspaces, tabs, panes, agents, files, Git,
 worktrees, tasks, leases, modules, and UI state.
 
-Inside a Bohay pane, the skill uses that pane's inherited binary, socket, and
-pane identity. This lets the same skill delegate and control the current Bohay
+Inside a Luvus pane, the skill uses that pane's inherited binary, socket, and
+pane identity. This lets the same skill delegate and control the current Luvus
 session without guessing which server owns the pane.
 
-Outside Bohay, the plugin resolves the installed `bohay` command and controls
+Outside Luvus, the plugin resolves the installed `luvus` command and controls
 its configured production session. With the default configuration this is the
-server at `~/.bohay/bohay.sock`.
+server at `~/.luvus/luvus.sock`.
 
 For a named server, include the selector in the request or command:
 
 ```sh
-bohay --session api agent list
-bohay --session api pane focus 7
+luvus --session api agent list
+luvus --session api pane focus 7
 ```
 
 The plugin preserves the inherited socket inside a managed pane. Outside a
@@ -27,81 +27,81 @@ pane, an explicit `--session` wins over any inherited socket. It does not run
 `session list`, `help`, or `ping` before an ordinary operation, so named-session
 routing adds no discovery round trip to the fast command path.
 
-## Install from the Bohay marketplace
+## Install from the Luvus marketplace
 
-Register the public Bohay repository as a Codex marketplace, then install the
+Register the public Luvus repository as a Codex marketplace, then install the
 plugin:
 
 ```sh
-codex plugin marketplace add RizRiyz/bohay
-codex plugin add bohay@bohay
+codex plugin marketplace add RizRiyz/luvus
+codex plugin add luvus@luvus
 ```
 
 Start a new Codex thread after installation so Codex loads the
-`bohay` skill. Confirm the install at any time with:
+`luvus` skill. Confirm the install at any time with:
 
 ```sh
 codex plugin list
 ```
 
-## Connect to Bohay
+## Connect to Luvus
 
 The plugin supports two modes:
 
-- **Managed pane:** Codex is running inside Bohay. The plugin uses the injected
-  `BOHAY_BIN_PATH`, `BOHAY_SOCKET_PATH`, and `BOHAY_PANE_ID` values exactly. It
+- **Managed pane:** Codex is running inside Luvus. The plugin uses the injected
+  `LUVUS_BIN_PATH`, `LUVUS_SOCKET_PATH`, and `LUVUS_PANE_ID` values exactly. It
   controls only that inherited session and never substitutes another socket or
   binary.
 - **External terminal:** Codex is running in any other local terminal. The
-  plugin resolves the installed `bohay` command from `PATH` and uses its
+  plugin resolves the installed `luvus` command from `PATH` and uses its
   configured production session.
 
 ### Approve local socket access in the Codex app
 
-The Codex app normally runs shell commands in a workspace sandbox. Bohay uses a
+The Codex app normally runs shell commands in a workspace sandbox. Luvus uses a
 local Unix socket outside that workspace, so the app will ask for permission
 before `ping` or another control command. Approve the request if you want that
-thread to operate Bohay.
+thread to operate Luvus.
 
 Without this approval, the operating system returns the same connection error
 as an offline server. The plugin retries with explicit permission and reports
-`Bohay access was not approved` when permission is declined. It only reports
+`Luvus access was not approved` when permission is declined. It only reports
 the server offline after an approved connection attempt fails.
 
 Do not disable the Codex sandbox globally. The plugin requests only the local
-execution permission when it needs to connect to Bohay.
+execution permission when it needs to connect to Luvus.
 
-### Install and start Bohay
+### Install and start Luvus
 
-The external plugin works with every supported Bohay installation method:
+The external plugin works with every supported Luvus installation method:
 
 ```sh
-curl -fsSL https://bohay.dev/install.sh | sh
-brew install RizRiyz/bohay/bohay
-cargo install bohay
+curl -fsSL https://luvus.dev/install.sh | sh
+brew install RizRiyz/luvus/luvus
+cargo install luvus
 ```
 
 Only one installation method is needed. Confirm the command is available, then
 start the production server when it is not already running:
 
 ```sh
-bohay --version
-bohay server start
+luvus --version
+luvus server start
 ```
 
-The plugin supports custom production locations. If `BOHAY_HOME` or
-`BOHAY_SOCKET_PATH` is explicitly configured, it preserves that configuration.
-Otherwise the installed release uses `~/.bohay/bohay.sock`. The plugin never
-runs bare `bohay` for discovery because that launches or attaches the
+The plugin supports custom production locations. If `LUVUS_HOME` or
+`LUVUS_SOCKET_PATH` is explicitly configured, it preserves that configuration.
+Otherwise the installed release uses `~/.luvus/luvus.sock`. The plugin never
+runs bare `luvus` for discovery because that launches or attaches the
 interactive TUI.
 
 ## Ask Codex to control the session
 
-Use `$bohay` when you want to invoke the skill explicitly:
+Use `$luvus` when you want to invoke the skill explicitly:
 
-> Use `$bohay` to show the active workspaces, tabs, panes, and agents.
+> Use `$luvus` to show the active workspaces, tabs, panes, and agents.
 
-Inside Bohay, start a line with `=target` to delegate the rest of that line:
+Inside Luvus, start a line with `=target` to delegate the rest of that line:
 
 ```text
 =reviewer inspect the current diff
@@ -115,7 +115,7 @@ for Codex skill invocation.
 
 Try requests such as:
 
-> Show me every coding agent running in Bohay.
+> Show me every coding agent running in Luvus.
 
 > Split a pane on the right, run the tests there, and show me the result.
 
@@ -130,14 +130,14 @@ original keeps running. Resolve the source first, then optionally name the new
 fork or preserve the current focus:
 
 ```sh
-bohay agent get reviewer
-bohay agent fork reviewer --name experiment --no-focus
+luvus agent get reviewer
+luvus agent fork reviewer --name experiment --no-focus
 ```
 
 The fork inherits the source conversation and receives its own new session.
 Native forks currently support Claude, Codex, and Pi. If the target is
 unsupported, its session cannot be resolved, or its pane cannot start, the
-plugin reports Bohay's structured error instead of substituting a split, new
+plugin reports Luvus's structured error instead of substituting a split, new
 agent, or resume operation that could lose or reuse the wrong context.
 
 ### Arrange panes and tabs
@@ -147,15 +147,15 @@ process, or append a new tab for it. Resolve the pane and inspect the tabs in
 its workspace before changing the layout:
 
 ```sh
-bohay pane move 7 --tab 2
-bohay pane move 7 --new-tab
+luvus pane move 7 --tab 2
+luvus pane move 7 --new-tab
 ```
 
 It can also reorder tabs in the active workspace:
 
 ```sh
-bohay tab list
-bohay tab move 3 1
+luvus tab list
+luvus tab move 3 1
 ```
 
 Tab positions are 1-based. A pane move stays inside that pane's workspace,
@@ -168,10 +168,10 @@ The plugin can also organize workspaces after resolving their stable 0-based
 indices:
 
 ```sh
-bohay workspace list
-bohay workspace rename 2 "Bohay website"
-bohay workspace pin 2
-bohay workspace unpin 2
+luvus workspace list
+luvus workspace rename 2 "Luvus website"
+luvus workspace pin 2
+luvus workspace unpin 2
 ```
 
 Renaming changes only the label. Pinning changes `display_position`, not the
@@ -189,7 +189,7 @@ sender can name itself and ask the worker to report back through `agent send`.
 
 ### How agent readiness works
 
-Bohay reports agent identity separately from lifecycle status. Once a pane is
+Luvus reports agent identity separately from lifecycle status. Once a pane is
 recognized as Codex, the plugin considers `idle`, `done`, `working`, and
 `blocked` ready states. An idle or completed agent is ready for a stable name
 and a new prompt, so the plugin does not wait for it to become `working` first.
@@ -234,17 +234,17 @@ Reinstall the plugin to pick up a new marketplace release, then start a new
 Codex thread:
 
 ```sh
-codex plugin marketplace upgrade bohay
-codex plugin add bohay@bohay
+codex plugin marketplace upgrade luvus
+codex plugin add luvus@luvus
 ```
 
-`bohay skill update` refreshes Bohay's auto-installed agent guidance, not the
+`luvus skill update` refreshes Luvus's auto-installed agent guidance, not the
 versioned plugin cache. Use the marketplace command above for the plugin.
 
 Remove only the Codex plugin with:
 
 ```sh
-codex plugin remove bohay@bohay
+codex plugin remove luvus@luvus
 ```
 
-Removing the plugin does not stop Bohay or change any Bohay session.
+Removing the plugin does not stop Luvus or change any Luvus session.

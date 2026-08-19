@@ -44,7 +44,7 @@ impl App {
     }
 
     /// Re-read the directories currently on screen so files created or removed
-    /// outside bohay (by an agent, a terminal command, another process) appear.
+    /// outside luvus (by an agent, a terminal command, another process) appear.
     /// Gated to ~1.5s and never descends into collapsed folders, so it stays
     /// cheap even on a big repo; `apply_dir` drops an unchanged listing, so a
     /// quiet tree costs one `read_dir` per open folder and no re-render.
@@ -708,7 +708,7 @@ mod tests {
     #[test]
     fn opening_with_editor_spawns_a_pty_pane_in_a_new_tab() {
         let _env = crate::persist::test_env("file-editor-open");
-        let dir = std::env::temp_dir().join(format!("bohay-ed-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("luvus-ed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("edit.rs");
@@ -799,7 +799,7 @@ mod tests {
     fn files_dock_renders_and_a_click_expands() {
         let _env = crate::persist::test_env("files-dock-render");
         // A tiny real tree on disk.
-        let root = std::env::temp_dir().join(format!("bohay-ft-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("luvus-ft-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/mod.rs"), b"// hi").unwrap();
@@ -854,7 +854,7 @@ mod tests {
     #[test]
     fn files_get_a_dot_marker_aligned_with_folder_chevrons() {
         let _env = crate::persist::test_env("files-dot-marker");
-        let root = std::env::temp_dir().join(format!("bohay-fdm-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("luvus-fdm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("README.md"), b"# hi").unwrap();
@@ -902,7 +902,7 @@ mod tests {
     #[test]
     fn files_show_hidden_defaults_on_and_the_setting_persists() {
         let _env = crate::persist::test_env("files-hidden-toggle");
-        let root = std::env::temp_dir().join(format!("bohay-fth-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("luvus-fth-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(root.join(".env"), b"X=1").unwrap();
@@ -967,7 +967,7 @@ mod tests {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let _env = crate::persist::test_env("file-view-pane");
 
-        let dir = std::env::temp_dir().join(format!("bohay-fvp-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("luvus-fvp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("code.rs");
@@ -1015,7 +1015,7 @@ mod tests {
     #[test]
     fn open_view_live_refreshes_on_disk_change() {
         let _env = crate::persist::test_env("file-live-refresh");
-        let dir = std::env::temp_dir().join(format!("bohay-lr-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("luvus-lr-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("live.txt");
@@ -1123,7 +1123,7 @@ mod tests {
     #[test]
     fn reopening_focuses_existing_and_copy_yanks_content() {
         let _env = crate::persist::test_env("file-dedup-copy");
-        let dir = std::env::temp_dir().join(format!("bohay-dc-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("luvus-dc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("a.txt");
@@ -1169,7 +1169,7 @@ mod tests {
         use crate::event::AppEvent;
         use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         let _env = crate::persist::test_env("file-drag-copy");
-        let dir = std::env::temp_dir().join(format!("bohay-md-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("luvus-md-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("s.txt");
@@ -1233,7 +1233,7 @@ mod tests {
     #[test]
     fn file_tab_survives_restore() {
         let _env = crate::persist::test_env("file-tab-restore");
-        let dir = std::env::temp_dir().join(format!("bohay-fvr-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("luvus-fvr-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("keep.txt");
@@ -1259,7 +1259,7 @@ mod tests {
     #[test]
     fn file_view_frees_content_on_close() {
         let _env = crate::persist::test_env("file-mem-free");
-        let dir = std::env::temp_dir().join(format!("bohay-mem-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("luvus-mem-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("big.txt");
@@ -1285,7 +1285,7 @@ mod tests {
     fn set_line_dock_no_stale_tail_when_row_shortens() {
         use ratatui::{backend::TestBackend, Terminal};
         let _env = crate::persist::test_env("stale-tail");
-        let root = std::env::temp_dir().join(format!("bohay-st-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("luvus-st-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("VERYLONGFILENAME_abcdefghij.rs"), b"x").unwrap();
@@ -1333,7 +1333,7 @@ mod tests {
     #[test]
     fn expanding_a_folder_loads_it_immediately() {
         let _env = crate::persist::test_env("file-expand-now");
-        let root = std::env::temp_dir().join(format!("bohay-ex-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("luvus-ex-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("sub")).unwrap();
         std::fs::write(root.join("sub/inner.rs"), b"x").unwrap();
@@ -1373,7 +1373,7 @@ mod tests {
     #[test]
     fn closing_a_file_tab_lets_it_reopen() {
         let _env = crate::persist::test_env("file-reopen");
-        let dir = std::env::temp_dir().join(format!("bohay-reopen-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("luvus-reopen-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("r.txt");
@@ -1413,7 +1413,7 @@ mod tests {
         use crate::event::AppEvent;
         use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         let _env = crate::persist::test_env("file-click-reopen");
-        let root = std::env::temp_dir().join(format!("bohay-cr-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("luvus-cr-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("hello.txt"), b"hi\n").unwrap();
@@ -1472,7 +1472,7 @@ mod tests {
     #[test]
     fn long_line_wraps_and_shows_its_tail() {
         let _env = crate::persist::test_env("file-wrap");
-        let dir = std::env::temp_dir().join(format!("bohay-wrap-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("luvus-wrap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("long.md");
@@ -1504,12 +1504,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A file created outside bohay (agent, terminal, another process) appears in
+    /// A file created outside luvus (agent, terminal, another process) appears in
     /// the tree on the next rescan, and an unchanged rescan does not churn it.
     #[test]
     fn external_new_file_is_picked_up_by_rescan() {
         let _env = crate::persist::test_env("file-external-add");
-        let root = std::env::temp_dir().join(format!("bohay-ext-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("luvus-ext-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("existing.rs"), b"x").unwrap();
@@ -1539,7 +1539,7 @@ mod tests {
             app.handle_event(ev);
         }
 
-        // A new file appears WITHOUT going through bohay's own CRUD.
+        // A new file appears WITHOUT going through luvus's own CRUD.
         std::fs::write(root.join("dropped.rs"), b"y").unwrap();
         // Force the rescan gate open and tick again.
         app.last_file_scan_at = std::time::Instant::now()
@@ -1565,7 +1565,7 @@ mod tests {
     fn file_menu_crud_creates_renames_deletes() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let _env = crate::persist::test_env("file-crud");
-        let root = std::env::temp_dir().join(format!("bohay-crud-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("luvus-crud-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/old.rs"), b"x").unwrap();
@@ -1658,7 +1658,7 @@ mod tests {
     fn delete_needs_confirmation() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let _env = crate::persist::test_env("file-del-guard");
-        let root = std::env::temp_dir().join(format!("bohay-dg-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("luvus-dg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let file = root.join("keep.rs");

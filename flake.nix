@@ -1,5 +1,5 @@
 {
-  description = "bohay — mission control for your AI coding agents";
+  description = "luvus — mission control for your AI coding agents";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -14,7 +14,7 @@
         pkgs = import nixpkgs { inherit system; };
         cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
 
-        # Tools bohay shells out to at runtime (see `Command::new(...)` in src):
+        # Tools luvus shells out to at runtime (see `Command::new(...)` in src):
         #   git  — the git tab + worktrees
         #   gh   — GitHub PR/issue views (degrades cleanly when absent)
         #   ps   — agent *identity* detection reads pane processes; without it
@@ -36,8 +36,8 @@
           ]
           ++ pkgs.lib.optionals stdenv.hostPlatform.isLinux [ procps ];
 
-        bohay = pkgs.rustPlatform.buildRustPackage {
-          pname = "bohay";
+        luvus = pkgs.rustPlatform.buildRustPackage {
+          pname = "luvus";
           version = cargoToml.package.version;
 
           # Only what cargo needs. Dropping `target/` (dirty build artifacts that
@@ -69,27 +69,27 @@
           doCheck = false;
 
           postFixup = ''
-            wrapProgram $out/bin/bohay \
+            wrapProgram $out/bin/luvus \
               --prefix PATH : ${pkgs.lib.makeBinPath runtimeTools}
           '';
 
           meta = with pkgs.lib; {
             description = "Mission control for your AI coding agents";
-            homepage = "https://bohay.dev";
+            homepage = "https://luvus.dev";
             license = licenses.agpl3Plus;
-            mainProgram = "bohay";
+            mainProgram = "luvus";
             platforms = platforms.unix;
           };
         };
       in
       {
-        packages.default = bohay;
+        packages.default = luvus;
 
-        # `nix run github:RizRiyz/bohay`
-        apps.default = flake-utils.lib.mkApp { drv = bohay; };
+        # `nix run github:RizRiyz/luvus`
+        apps.default = flake-utils.lib.mkApp { drv = luvus; };
 
         # `nix develop` — a shell with the Rust toolchain and the runtime tools,
-        # so `cargo run -- --local` behaves the same as an installed bohay.
+        # so `cargo run -- --local` behaves the same as an installed luvus.
         devShells.default = pkgs.mkShell {
           packages =
             with pkgs;

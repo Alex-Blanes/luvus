@@ -9,5 +9,5 @@ require_idf
 pane=$(target_pane)
 [ -n "$pane" ] || { toast "no pane to run in"; exit 1; }
 toast "set-target $target (this clears the build dir)"
-"$bohay" pane run "$pane" "$(idf_cmd "set-target $target")"
-"$bohay" pane focus "$pane" >/dev/null 2>&1 || true
+"$luvus" pane run "$pane" "$(idf_cmd "set-target $target")"
+"$luvus" pane focus "$pane" >/dev/null 2>&1 || true

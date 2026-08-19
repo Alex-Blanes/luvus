@@ -2,26 +2,26 @@
 # Shared helpers. Sourced by every script in this module; never run directly.
 #
 # Everything arrives in the environment, so nothing here parses JSON:
-#   BOHAY_BIN_PATH         the running server's own binary. Use this, never a
-#                          bare `bohay` on PATH, or a second install would talk
+#   LUVUS_BIN_PATH         the running server's own binary. Use this, never a
+#                          bare `luvus` on PATH, or a second install would talk
 #                          to a different socket and report "no module".
-#   BOHAY_MODULE_STATE_DIR a writable dir for this module's own bookkeeping
-#   BOHAY_PANE_ID          the pane the action was invoked from (if any)
-#   BOHAY_WORKSPACE_CWD    the folder of the node it was invoked against
-#   BOHAY_SETTING_*        the declared settings
+#   LUVUS_MODULE_STATE_DIR a writable dir for this module's own bookkeeping
+#   LUVUS_PANE_ID          the pane the action was invoked from (if any)
+#   LUVUS_WORKSPACE_CWD    the folder of the node it was invoked against
+#   LUVUS_SETTING_*        the declared settings
 
-bohay="${BOHAY_BIN_PATH:-bohay}"
-proj="${BOHAY_WORKSPACE_CWD:-$PWD}"
-state="${BOHAY_MODULE_STATE_DIR:-/tmp}"
+luvus="${LUVUS_BIN_PATH:-luvus}"
+proj="${LUVUS_WORKSPACE_CWD:-$PWD}"
+state="${LUVUS_MODULE_STATE_DIR:-/tmp}"
 
-idf_path=$(printf '%s' "${BOHAY_SETTING_IDF_PATH:-$HOME/esp/esp-idf}" | sed "s|^~|$HOME|")
-target="${BOHAY_SETTING_TARGET:-esp32s3}"
-port="${BOHAY_SETTING_PORT:-}"
-baud="${BOHAY_SETTING_BAUD:-460800}"
-flash_method="${BOHAY_SETTING_FLASH_METHOD:-uart}"
-auto_monitor="${BOHAY_SETTING_AUTO_MONITOR:-true}"
+idf_path=$(printf '%s' "${LUVUS_SETTING_IDF_PATH:-$HOME/esp/esp-idf}" | sed "s|^~|$HOME|")
+target="${LUVUS_SETTING_TARGET:-esp32s3}"
+port="${LUVUS_SETTING_PORT:-}"
+baud="${LUVUS_SETTING_BAUD:-460800}"
+flash_method="${LUVUS_SETTING_FLASH_METHOD:-uart}"
+auto_monitor="${LUVUS_SETTING_AUTO_MONITOR:-true}"
 
-toast() { "$bohay" ui toast "$1"; }
+toast() { "$luvus" ui toast "$1"; }
 
 # The chip this project is *actually* configured for, read from the sdkconfig
 # `idf.py` generates. Empty when the project has never been configured.
@@ -58,9 +58,9 @@ quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 # Where should a command run? The pane the user right-clicked, if there is one;
 # otherwise split a fresh pane so a build never takes over an agent's pane.
 target_pane() {
-  if [ -n "${BOHAY_PANE_ID:-}" ]; then
-    printf '%s' "$BOHAY_PANE_ID"
+  if [ -n "${LUVUS_PANE_ID:-}" ]; then
+    printf '%s' "$LUVUS_PANE_ID"
   else
-    "$bohay" pane split 2>/dev/null | sed -n 's/.*"pane": *"\([0-9]*\)".*/\1/p' | head -1
+    "$luvus" pane split 2>/dev/null | sed -n 's/.*"pane": *"\([0-9]*\)".*/\1/p' | head -1
   fi
 }

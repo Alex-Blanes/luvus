@@ -4,7 +4,7 @@
 //! work happens on `relay::run` in a background thread, so a slow relay can never
 //! stall input.
 //!
-//! Mouse works because bohay forwards clicks/wheel into a pane once the app asks
+//! Mouse works because luvus forwards clicks/wheel into a pane once the app asks
 //! for mouse tracking (`EnableMouseCapture`).
 
 use std::io::Stdout;
@@ -441,7 +441,7 @@ fn setup() -> Result<Term> {
     execute!(out, terminal::EnterAlternateScreen)?;
     // Enable ONLY button + SGR mouse tracking (1000 + 1006): clicks and the
     // wheel, never motion. crossterm's EnableMouseCapture also turns on
-    // any-motion (1003), which would make bohay forward every mouse *move* into
+    // any-motion (1003), which would make luvus forward every mouse *move* into
     // the pane and redraw on each — a needless perf drain. Writing the modes
     // directly keeps events firing only on click/scroll.
     write!(out, "\x1b[?1000h\x1b[?1006h")?;

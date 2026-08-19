@@ -3,9 +3,9 @@ title: Browsing & Opening Files
 description: A file tree in the sidebar, a fast read-only viewer, and opening any file straight into vim, nano, or your own $EDITOR.
 ---
 
-An agent edits files and you want to *see* them, without leaving bohay and
+An agent edits files and you want to *see* them, without leaving luvus and
 without losing the result to scrollback. The **FILES** dock puts your project's
-tree in a sidebar, and any file opens either in bohay's own read-only viewer or
+tree in a sidebar, and any file opens either in luvus's own read-only viewer or
 in a real editor.
 
 ## The FILES dock
@@ -17,7 +17,7 @@ switching projects re-roots the tree.
 Folders expand and collapse in place. Names are tinted by git status as you
 work: amber for modified, green for added or untracked, coral for deleted or
 conflicted, mint for renamed, with a letter badge and a mark on any folder that
-contains changes. Files created outside bohay, by an agent or a command in a
+contains changes. Files created outside luvus, by an agent or a command in a
 pane, show up on their own within a couple of seconds.
 
 **Right-click a row** for New File, New Folder, Rename, Copy Path, and Delete
@@ -58,7 +58,7 @@ Dragging across the text selects and copies it, the same as in any pane.
 
 ## Opening in vim, nano, or your editor
 
-bohay looks for **vim, nvim, nano, vi, helix, micro, and emacs** on your `PATH`,
+luvus looks for **vim, nvim, nano, vi, helix, micro, and emacs** on your `PATH`,
 and also honours **`$EDITOR`**. Only editors you actually have are offered, so
 there are no dead options in the menu.
 
@@ -71,7 +71,7 @@ and step through the choices with `‹ ›`: **read-only** (the default) or any
 detected editor. To override it for one file, right-click that file and pick
 from the menu.
 
-If you set an editor and later uninstall it, bohay falls back to the read-only
+If you set an editor and later uninstall it, luvus falls back to the read-only
 viewer rather than doing nothing.
 
 ## What this is not

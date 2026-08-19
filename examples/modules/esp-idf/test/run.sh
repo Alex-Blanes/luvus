@@ -1,21 +1,21 @@
 #!/bin/sh
-# Exercise the module against a throwaway bohay server and a fake idf.py, so the
+# Exercise the module against a throwaway luvus server and a fake idf.py, so the
 # whole flow is testable with no ESP32 attached.
 #
-#   sh test/run.sh /path/to/bohay
+#   sh test/run.sh /path/to/luvus
 set -eu
-BIN="${1:-bohay}"
-HOME_DIR=/tmp/bohay-esp-test
+BIN="${1:-luvus}"
+HOME_DIR=/tmp/luvus-esp-test
 LOG=/tmp/idf-calls.log
 FAKE="$(cd "$(dirname "$0")/fake-idf" && pwd)"
-R() { env -u BOHAY_SOCKET_PATH -u BOHAY_PANE_ID BOHAY_HOME="$HOME_DIR" IDF_FAKE_LOG="$LOG" "$@"; }
+R() { env -u LUVUS_SOCKET_PATH -u LUVUS_PANE_ID LUVUS_HOME="$HOME_DIR" IDF_FAKE_LOG="$LOG" "$@"; }
 ok() { printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 no() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAILED=1; }
 FAILED=0
 
-pkill -f "bohay server" 2>/dev/null || true; sleep 1
-rm -rf "$HOME_DIR" /tmp/bohay-esp-proj; mkdir -p /tmp/bohay-esp-proj; : > "$LOG"
-( cd /tmp/bohay-esp-proj && R "$BIN" server >/tmp/bohay-esp-srv.log 2>&1 & )
+pkill -f "luvus server" 2>/dev/null || true; sleep 1
+rm -rf "$HOME_DIR" /tmp/luvus-esp-proj; mkdir -p /tmp/luvus-esp-proj; : > "$LOG"
+( cd /tmp/luvus-esp-proj && R "$BIN" server >/tmp/luvus-esp-srv.log 2>&1 & )
 sleep 2
 
 R "$BIN" module link "$(cd "$(dirname "$0")/.." && pwd)" >/dev/null
@@ -59,10 +59,10 @@ rm -f /tmp/idf-fake-fail
 # every entry in a group. Simulate the env a child click sets and check the
 # variant really reaches idf.py -- otherwise every child would run `build`.
 : > "$LOG"
-R env BOHAY_MODULE_ROW_VALUE=app BOHAY_MODULE_ACTION_ID=run \
-  BOHAY_MODULE_STATE_DIR=/tmp BOHAY_PANE_ID=1 \
-  BOHAY_SETTING_IDF_PATH="$FAKE" BOHAY_SETTING_PORT=/dev/ttyFAKE0 \
-  BOHAY_BIN_PATH="$BIN" sh idf.sh >/dev/null 2>&1 || true
+R env LUVUS_MODULE_ROW_VALUE=app LUVUS_MODULE_ACTION_ID=run \
+  LUVUS_MODULE_STATE_DIR=/tmp LUVUS_PANE_ID=1 \
+  LUVUS_SETTING_IDF_PATH="$FAKE" LUVUS_SETTING_PORT=/dev/ttyFAKE0 \
+  LUVUS_BIN_PATH="$BIN" sh idf.sh >/dev/null 2>&1 || true
 sleep 2
 grep -q "IDFCALL.* app" "$LOG" && ok "a child row's value picks the subcommand" \
   || no "child row value did not reach idf.py (got: $(tail -1 "$LOG"))"
@@ -72,13 +72,13 @@ grep -q "IDFCALL.* app" "$LOG" && ok "a child row's value picks the subcommand" 
 #
 # These invoke the scripts directly rather than via `module run`: the row value
 # reaches a real click through the *server*, which spawns the action with its own
-# environment -- so `env VAR=x bohay module run ...` would set the variable on
+# environment -- so `env VAR=x luvus module run ...` would set the variable on
 # the CLI process and never reach the script.
-STATE=/tmp/bohay-esp-state; rm -rf "$STATE"; mkdir -p "$STATE"
-RUN() { R env BOHAY_MODULE_STATE_DIR="$STATE" BOHAY_BIN_PATH="$BIN" \
-          BOHAY_SETTING_IDF_PATH="$FAKE" "$@"; }
+STATE=/tmp/luvus-esp-state; rm -rf "$STATE"; mkdir -p "$STATE"
+RUN() { R env LUVUS_MODULE_STATE_DIR="$STATE" LUVUS_BIN_PATH="$BIN" \
+          LUVUS_SETTING_IDF_PATH="$FAKE" "$@"; }
 
-RUN BOHAY_MODULE_ROW_VALUE=/dev/ttyOTHER sh select-device.sh >/dev/null 2>&1 || true
+RUN LUVUS_MODULE_ROW_VALUE=/dev/ttyOTHER sh select-device.sh >/dev/null 2>&1 || true
 sleep 1
 R "$BIN" module settings example.esp-idf port 2>/dev/null | grep -q ttyOTHER \
   && ok "clicking a board selects its port" \
@@ -86,14 +86,14 @@ R "$BIN" module settings example.esp-idf port 2>/dev/null | grep -q ttyOTHER \
 R "$BIN" module settings example.esp-idf port /dev/ttyFAKE0 >/dev/null 2>&1 || true
 
 # Expanding a group is a toggle: the same row opens and closes it.
-RUN BOHAY_MODULE_ROW_VALUE=flash sh toggle.sh >/dev/null 2>&1 || true
+RUN LUVUS_MODULE_ROW_VALUE=flash sh toggle.sh >/dev/null 2>&1 || true
 [ "$(cat "$STATE/expanded" 2>/dev/null)" = flash ] \
   && ok "clicking a group expands it" || no "group did not expand"
 
 # The collapse check is only meaningful once the expand above really wrote the
 # file -- assert it existed first, so a broken expand can't make this pass.
 if [ -f "$STATE/expanded" ]; then
-  RUN BOHAY_MODULE_ROW_VALUE=flash sh toggle.sh >/dev/null 2>&1 || true
+  RUN LUVUS_MODULE_ROW_VALUE=flash sh toggle.sh >/dev/null 2>&1 || true
   [ ! -f "$STATE/expanded" ] \
     && ok "clicking it again collapses it" || no "group did not collapse"
 else
@@ -103,20 +103,20 @@ fi
 # The chip row must show what the *project* is configured for, not the module
 # setting -- it used to print the setting's arbitrary `esp32s3` default even for
 # an esp32 project, which is a guess presented as fact.
-printf 'CONFIG_IDF_TARGET="esp32"\n' > /tmp/bohay-esp-proj/sdkconfig
-CHIP=$(RUN BOHAY_BIN_PATH=/bin/echo BOHAY_SETTING_TARGET=esp32s3 \
-        BOHAY_WORKSPACE_CWD=/tmp/bohay-esp-proj sh dock.sh 2>/dev/null || true)
+printf 'CONFIG_IDF_TARGET="esp32"\n' > /tmp/luvus-esp-proj/sdkconfig
+CHIP=$(RUN LUVUS_BIN_PATH=/bin/echo LUVUS_SETTING_TARGET=esp32s3 \
+        LUVUS_WORKSPACE_CWD=/tmp/luvus-esp-proj sh dock.sh 2>/dev/null || true)
 case "$CHIP" in
   *"chip · esp32 → esp32s3"*) ok "chip row reports the project's real target" ;;
   *) no "chip row did not reflect sdkconfig (got: $(printf '%s' "$CHIP" | head -c 120))" ;;
 esac
-rm -f /tmp/bohay-esp-proj/sdkconfig
+rm -f /tmp/luvus-esp-proj/sdkconfig
 
 # An open group emits its children. `dock.sh` pipes its rows straight into
-# `bohay ui dock push`, so point BOHAY_BIN_PATH at `echo` to read the JSON it
+# `luvus ui dock push`, so point LUVUS_BIN_PATH at `echo` to read the JSON it
 # would have pushed (the later assignment wins over RUN's).
-RUN BOHAY_MODULE_ROW_VALUE=build sh toggle.sh >/dev/null 2>&1 || true
-OUT=$(RUN BOHAY_BIN_PATH=/bin/echo sh dock.sh 2>/dev/null || true)
+RUN LUVUS_MODULE_ROW_VALUE=build sh toggle.sh >/dev/null 2>&1 || true
+OUT=$(RUN LUVUS_BIN_PATH=/bin/echo sh dock.sh 2>/dev/null || true)
 case "$OUT" in
   *"full clean"*) ok "an open group lists its children" ;;
   *)              no "open group did not emit children" ;;
@@ -132,5 +132,5 @@ R "$BIN" pane read "$P" 2>/dev/null | grep -q "Not an ESP-IDF project" \
   || no "partition editor pane did not report why it stopped"
 
 R "$BIN" server stop >/dev/null 2>&1 || true
-rm -rf "$HOME_DIR" /tmp/bohay-esp-proj
+rm -rf "$HOME_DIR" /tmp/luvus-esp-proj
 [ "$FAILED" = 0 ] && echo "  all good" || { echo "  some checks failed"; exit 1; }

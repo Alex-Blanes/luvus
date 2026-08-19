@@ -1,7 +1,7 @@
-# nixpkgs package definition for bohay.
+# nixpkgs package definition for luvus.
 #
 # This is written to drop straight into nixpkgs at
-# `pkgs/by-name/bo/bohay/package.nix`. It differs from the repo's `flake.nix`
+# `pkgs/by-name/lu/luvus/package.nix`. It differs from the repo's `flake.nix`
 # in the two ways nixpkgs requires: it fetches a *released tag* with a fixed
 # hash (rather than the local tree), and it vendors dependencies via `cargoHash`
 # (rather than a local `cargoLock.lockFile`). See `nix/README.md` for how to fill
@@ -21,15 +21,15 @@
 }:
 
 rustPlatform.buildRustPackage (finalAttrs: {
-  pname = "bohay";
-  version = "0.10.2";
+  pname = "luvus";
+  version = "0.11.0";
 
   # Required for new by-name packages (nixpkgs-vet NPV-166).
   __structuredAttrs = true;
 
   src = fetchFromGitHub {
     owner = "RizRiyz";
-    repo = "bohay";
+    repo = "luvus";
     tag = "v${finalAttrs.version}";
     hash = lib.fakeHash;
   };
@@ -43,12 +43,12 @@ rustPlatform.buildRustPackage (finalAttrs: {
   # push, so the package build just compiles the release binary.
   doCheck = false;
 
-  # bohay shells out to these at runtime; bake them into PATH because NixOS has
+  # luvus shells out to these at runtime; bake them into PATH because NixOS has
   # no implicit global one. The user's own PATH is still appended, so a newer
   # git/gh they installed wins. `ps` is Linux-only here (procps); on Darwin the
   # system `ps` is used.
   postFixup = ''
-    wrapProgram $out/bin/bohay \
+    wrapProgram $out/bin/luvus \
       --prefix PATH : ${
         lib.makeBinPath (
           [
@@ -65,10 +65,10 @@ rustPlatform.buildRustPackage (finalAttrs: {
 
   meta = {
     description = "Mission control for your AI coding agents";
-    homepage = "https://bohay.dev";
-    changelog = "https://github.com/RizRiyz/bohay/releases/tag/v${finalAttrs.version}";
+    homepage = "https://luvus.dev";
+    changelog = "https://github.com/RizRiyz/luvus/releases/tag/v${finalAttrs.version}";
     license = lib.licenses.agpl3Plus;
-    mainProgram = "bohay";
+    mainProgram = "luvus";
     maintainers = with lib.maintainers; [ rizriyz ];
     platforms = lib.platforms.unix;
   };

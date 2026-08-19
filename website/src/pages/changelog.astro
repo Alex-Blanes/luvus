@@ -19,14 +19,14 @@ import '@fontsource/ibm-plex-mono/700.css';
 import '@fontsource/orbit/400.css'; // the wordmark face
 import { createMarkdownProcessor } from '@astrojs/markdown-remark';
 import Logo from '../components/Logo.astro';
-import { NAV_MARK } from '../lib/mark'; // TRIAL: the luvus nav mark
+import { NAV_MARK } from '../lib/mark';
 
-const GITHUB = 'https://github.com/RizRiyz/bohay';
+const GITHUB = 'https://github.com/RizRiyz/luvus';
 const RELEASES = `${GITHUB}/releases`;
-const title = 'Changelog — bohay';
+const title = 'Changelog — luvus';
 const description =
-  'Every bohay release: new features, fixes, and changes, straight from the GitHub Releases page.';
-const ogImage = 'https://bohay.dev/og.png';
+  'Every luvus release: new features, fixes, and changes, straight from the GitHub Releases page.';
+const ogImage = 'https://luvus.dev/og.png';
 
 // Read `changelog/*.md` from the repo at build time. `?raw` gives the file text;
 // eager so it resolves during the build rather than at runtime.
@@ -123,12 +123,12 @@ const entries = await Promise.all(
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
     <link rel="icon" type="image/png" sizes="192x192" href="/favicon.png" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-    <link rel="canonical" href="https://bohay.dev/changelog/" />
+    <link rel="canonical" href="https://luvus.dev/changelog/" />
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
     <meta property="og:type" content="website" />
-    <meta property="og:url" content="https://bohay.dev/changelog/" />
-    <meta property="og:site_name" content="bohay" />
+    <meta property="og:url" content="https://luvus.dev/changelog/" />
+    <meta property="og:site_name" content="luvus" />
     <meta property="og:image" content={ogImage} />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
@@ -144,7 +144,7 @@ const entries = await Promise.all(
          Deliberately tiny and dependency-free; it must not delay rendering. -->
     <script is:inline>
       try {
-        var t = localStorage.getItem('bohay-theme');
+        var t = localStorage.getItem('luvus-theme');
         if (t) document.documentElement.setAttribute('data-bh-theme', t);
       } catch (e) {}
     </script>
@@ -154,14 +154,14 @@ const entries = await Promise.all(
       <div class="nav-inner">
         <a class="brand" href="/">
           <span class="mark mark-luvus" aria-hidden="true" set:html={NAV_MARK}></span>
-          <span>Bohay</span>
+          <span>Luvus</span>
         </a>
         <div class="nav-links">
           <a href="/docs/">Docs</a>
           <a href="/modules/">Modules</a>
           <a href="/changelog/" aria-current="page">Changelog</a>
   
-        <a href={GITHUB} class="gh" aria-label="bohay on GitHub" title="GitHub">
+        <a href={GITHUB} class="gh" aria-label="luvus on GitHub" title="GitHub">
             <svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"
               ><path
                 fill="currentColor"
@@ -178,7 +178,7 @@ const entries = await Promise.all(
     <header class="page-hero">
       <div class="glow" aria-hidden="true"></div>
       <span class="eyebrow">Changelog</span>
-      <h1>What's new in bohay</h1>
+      <h1>What's new in luvus</h1>
       <p>
         Every release from new features, fixes, and changes pulled straight from GitHub, newest
         first.
@@ -250,12 +250,12 @@ const entries = await Promise.all(
       <div class="foot-inner">
         <div class="foot-brand">
           <Logo width={22} height={22} class="mark" aria-hidden="true" />
-          <span>Bohay</span>
+          <span>Luvus</span>
           <span class="dim">by Riz</span>
         </div>
         <div class="foot-links">
           <a href={GITHUB}>GitHub</a>
-          <a href="https://crates.io/crates/bohay">crates.io</a>
+          <a href="https://crates.io/crates/luvus">crates.io</a>
         </div>
       </div>
     </footer>
@@ -267,9 +267,9 @@ const entries = await Promise.all(
          way most product sites expose their mark. Plain links + clipboard, no
          dependency. -->
     <div class="brandmenu" id="brandmenu" hidden>
-      <a class="bm-item" id="bm-png" href="/brand/bohay-logo.png" download="bohay-logo.png">Download PNG</a>
-      <a class="bm-item" id="bm-svg" href="/brand/bohay-logo.svg" download="bohay-logo.svg">Download SVG</a>
-      <button type="button" class="bm-item" id="bm-copy" data-src="/brand/bohay-logo.svg">Copy SVG</button>
+      <a class="bm-item" id="bm-png" href="/brand/luvus-logo.png" download="luvus-logo.png">Download PNG</a>
+      <a class="bm-item" id="bm-svg" href="/brand/luvus-logo.svg" download="luvus-logo.svg">Download SVG</a>
+      <button type="button" class="bm-item" id="bm-copy" data-src="/brand/luvus-logo.svg">Copy SVG</button>
     </div>
     <div class="theme-dock" id="theme-dock">
       <ul class="td-list" id="td-list" role="listbox" aria-label="Color theme" hidden>
@@ -595,7 +595,7 @@ const entries = await Promise.all(
     </style>
 
     <script>
-      // Theme picker · palettes come from bohay's own registry, generated into
+      // Theme picker · palettes come from luvus's own registry, generated into
       // styles/themes.css, so what you preview is what the app ships. Applying a
       // theme sets `data-bh-theme` on <html>, which outranks each page's :root.
       //
@@ -603,7 +603,7 @@ const entries = await Promise.all(
       // click, so moving away or closing restores what you had.
       import { DEFAULT_THEME } from '../lib/themes';
       (() => {
-        const KEY = 'bohay-theme';
+        const KEY = 'luvus-theme';
         const dock = document.getElementById('theme-dock');
         const btn = document.getElementById('td-btn');
         const list = document.getElementById('td-list');

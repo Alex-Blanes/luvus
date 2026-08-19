@@ -1,36 +1,36 @@
-# bohay
+# Luvus
 
 <div align="center">
 
-<img src="assets/logo.png" alt="Bohay logo" width="220" />
+<img src="assets/logo.png" alt="Luvus logo" width="220" />
 
 **Mission control for your AI coding agents.**
 
-[![crates.io](https://img.shields.io/crates/v/bohay.svg)](https://crates.io/crates/bohay)
-[![ci](https://github.com/RizRiyz/bohay/actions/workflows/ci.yml/badge.svg)](https://github.com/RizRiyz/bohay/actions/workflows/ci.yml)
-[![docs](https://img.shields.io/badge/docs-bohay.dev-c6ff1a.svg)](https://bohay.dev/docs/)
+[![crates.io](https://img.shields.io/crates/v/luvus.svg)](https://crates.io/crates/luvus)
+[![ci](https://github.com/RizRiyz/luvus/actions/workflows/ci.yml/badge.svg)](https://github.com/RizRiyz/luvus/actions/workflows/ci.yml)
+[![docs](https://img.shields.io/badge/docs-luvus.dev-c6ff1a.svg)](https://luvus.dev/docs/)
 ![license](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)
 ![platforms](https://img.shields.io/badge/platforms-macOS%20·%20Linux%20·%20Windows-lightgrey.svg)
 
-**[Website](https://bohay.dev)** · **[Documentation](https://bohay.dev/docs/)** · **[Releases](https://github.com/RizRiyz/bohay/releases)**
+**[Website](https://luvus.dev)** · **[Documentation](https://luvus.dev/docs/)** · **[Releases](https://github.com/RizRiyz/luvus/releases)**
 
 <br />
 
-<a href="assets/video.mp4"><img src="assets/video.gif" alt="bohay — split panes, a live agent sidebar, and a built-in git dashboard in one terminal" width="820" /></a>
+<a href="assets/video.mp4"><img src="assets/video.gif" alt="luvus — split panes, a live agent sidebar, and a built-in git dashboard in one terminal" width="820" /></a>
 
 </div>
 
-## Why bohay?
+## Why luvus?
 
 Working with AI coding agents means juggling terminal windows — one waits for
 permission while you watch another think, and a third finished ten minutes ago
-without you noticing. bohay puts them all in one place.
+without you noticing. luvus puts them all in one place.
 
 - **See every agent at once.** One sidebar shows what each agent is doing —
   *blocked · working · done · idle* — across every project, and `Ctrl+Space .`
   jumps straight to whichever one is waiting on you. *Working* needs on-screen
   proof, so a launching CLI or your own typing never reads as busy.
-- **Never lose a session.** Close the terminal and nothing stops. Run `bohay`
+- **Never lose a session.** Close the terminal and nothing stops. Run `luvus`
   again and every pane, tab, and layout is back, with each agent's own
   conversation resumed automatically — no flags to remember. Fork a session into
   a new pane to try a second approach without giving up the first.
@@ -57,26 +57,42 @@ single-digit megabytes.
 
 ```bash
 # macOS (Intel + Apple silicon) / Linux — prebuilt binary, no Rust needed
-curl -fsSL https://bohay.dev/install.sh | sh
+curl -fsSL https://luvus.dev/install.sh | sh
 
-brew install RizRiyz/bohay/bohay      # Homebrew (also a prebuilt binary)
-cargo install bohay                   # build from source (needs Rust 1.88+)
+brew install RizRiyz/luvus/luvus      # Homebrew (also a prebuilt binary)
+cargo install luvus                   # build from source (needs Rust 1.88+)
 ```
 
 ```powershell
-# Windows (PowerShell) — use bohay inside Windows Terminal
-irm https://bohay.dev/install.ps1 | iex
+# Windows (PowerShell) — use luvus inside Windows Terminal
+irm https://luvus.dev/install.ps1 | iex
 ```
+
+### Upgrading from Bohay 0.10.2
+
+Stop the old server, install Luvus, then launch it:
+
+```bash
+bohay server stop
+curl -fsSL https://luvus.dev/install.sh | sh
+luvus
+```
+
+On first launch, Luvus copies durable state from `~/.bohay/` to `~/.luvus/`
+without deleting the old directory. Sessions, settings, manifests, modules, and
+named sessions carry over; runtime sockets, locks, and managed worktrees are not
+duplicated. Existing worktree paths remain valid because the Bohay directory is
+left untouched. Keep it until you have verified the migration.
 
 ## Quick start
 
 ```bash
-bohay          # launch — or reattach to — your session
-bohay doctor   # check your setup: git, gh, ssh
+luvus          # launch — or reattach to — your session
+luvus doctor   # check your setup: git, gh, ssh
 ```
 
-Open any folder with `Ctrl+Space` `N` (or run `bohay` inside it), split panes,
-and start your agents — bohay recognizes them automatically.
+Open any folder with `Ctrl+Space` `N` (or run `luvus` inside it), split panes,
+and start your agents — luvus recognizes them automatically.
 
 > **macOS:** free the `Ctrl+Space` prefix under *System Settings → Keyboard →
 > Keyboard Shortcuts → Input Sources* (untick *Select the previous input source*).
@@ -84,16 +100,16 @@ and start your agents — bohay recognizes them automatically.
 
 ## Codex plugin
 
-Install the `bohay` plugin from the repository marketplace so Codex can inspect
-and control your local Bohay session:
+Install the `luvus` plugin from the repository marketplace so Codex can inspect
+and control your local Luvus session:
 
 ```bash
-codex plugin marketplace add RizRiyz/bohay
-codex plugin add bohay@bohay
+codex plugin marketplace add RizRiyz/luvus
+codex plugin add luvus@luvus
 ```
 
 Start a new Codex thread after installation. See the
-[Codex plugin guide](https://bohay.dev/docs/guides/codex-plugin/) for delegation,
+[Codex plugin guide](https://luvus.dev/docs/guides/codex-plugin/) for delegation,
 permissions, and production setup.
 
 ## Supported agents
@@ -113,9 +129,9 @@ permissions, and production setup.
 Live status works out of the box for every agent, with no setup.
 
 → Full guides, keybindings, and the complete CLI reference live at
-**[bohay.dev/docs](https://bohay.dev/docs/)**. Run `bohay --help` for the compact
-overview, `bohay help <topic> [command]` for focused guidance, or
-`bohay help all` for the complete reference.
+**[luvus.dev/docs](https://luvus.dev/docs/)**. Run `luvus --help` for the compact
+overview, `luvus help <topic> [command]` for focused guidance, or
+`luvus help all` for the complete reference.
 
 ## Development
 
@@ -127,7 +143,7 @@ cargo run -- --local   # client + server in one process
 
 A headless **server** owns the panes and renders frames into an off-screen buffer;
 a thin **client** blits them to your terminal; state is pure, driven by one event
-loop. Debug builds use `~/.bohay-dev/`, so hacking never touches your real session.
+loop. Debug builds use `~/.luvus-dev/`, so hacking never touches your real session.
 
 Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Security reports:
 [SECURITY.md](SECURITY.md).
@@ -136,4 +152,4 @@ Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Security repor
 
 [GNU AGPL v3](LICENSE) (`AGPL-3.0-or-later`).
 
-bohay is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License. If you run a modified bohay as a network service, the AGPL requires you to offer its source to that service's users. See the [LICENSE](LICENSE) for the full terms.
+luvus is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License. If you run a modified luvus as a network service, the AGPL requires you to offer its source to that service's users. See the [LICENSE](LICENSE) for the full terms.

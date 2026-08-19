@@ -52,9 +52,9 @@ pub fn next_log_id() -> u64 {
 /// The always-injected identity + context + settings environment (docs/13 §3.4).
 /// Ensures the module's config/state dirs exist.
 ///
-/// Alongside `BOHAY_MODULE_CONTEXT_JSON` this flattens the ids into plain
-/// `BOHAY_WORKSPACE_ID` / `BOHAY_PANE_ID` / … vars and each declared setting
-/// into `BOHAY_SETTING_<KEY>`, so a bash module never has to parse JSON.
+/// Alongside `LUVUS_MODULE_CONTEXT_JSON` this flattens the ids into plain
+/// `LUVUS_WORKSPACE_ID` / `LUVUS_PANE_ID` / … vars and each declared setting
+/// into `LUVUS_SETTING_<KEY>`, so a bash module never has to parse JSON.
 pub fn base_env(module: &InstalledModule, ctx: &Value) -> Vec<(String, String)> {
     let config = paths::config_dir(&module.id);
     let state = paths::state_dir(&module.id);
@@ -62,38 +62,38 @@ pub fn base_env(module: &InstalledModule, ctx: &Value) -> Vec<(String, String)> 
     let _ = std::fs::create_dir_all(&state);
 
     let mut env = vec![
-        ("BOHAY_ENV".to_string(), "1".to_string()),
-        ("BOHAY_MODULE_ID".to_string(), module.id.clone()),
+        ("LUVUS_ENV".to_string(), "1".to_string()),
+        ("LUVUS_MODULE_ID".to_string(), module.id.clone()),
         (
-            "BOHAY_MODULE_ROOT".to_string(),
+            "LUVUS_MODULE_ROOT".to_string(),
             module.root.display().to_string(),
         ),
         (
-            "BOHAY_MODULE_CONFIG_DIR".to_string(),
+            "LUVUS_MODULE_CONFIG_DIR".to_string(),
             config.display().to_string(),
         ),
         (
-            "BOHAY_MODULE_STATE_DIR".to_string(),
+            "LUVUS_MODULE_STATE_DIR".to_string(),
             state.display().to_string(),
         ),
-        ("BOHAY_MODULE_CONTEXT_JSON".to_string(), ctx.to_string()),
+        ("LUVUS_MODULE_CONTEXT_JSON".to_string(), ctx.to_string()),
         (
-            "BOHAY_MODULE_VERSION".to_string(),
+            "LUVUS_MODULE_VERSION".to_string(),
             module.manifest.version.clone(),
         ),
     ];
     env.extend(super::context::env_from(ctx));
     env.extend(super::settings::env(&module.manifest, &module.id));
     if let Some(sock) = crate::ipc::api::socket_path_env() {
-        env.push(("BOHAY_SOCKET_PATH".to_string(), sock));
+        env.push(("LUVUS_SOCKET_PATH".to_string(), sock));
     }
     if let Some(name) = crate::session::active_name() {
         env.push((crate::session::SESSION_ENV_VAR.to_string(), name));
     }
     if let Ok(exe) = std::env::current_exe() {
-        env.push(("BOHAY_BIN_PATH".to_string(), exe.display().to_string()));
+        env.push(("LUVUS_BIN_PATH".to_string(), exe.display().to_string()));
     }
-    env
+    crate::compat::with_legacy_aliases(env)
 }
 
 /// Spawn `argv` in `root` on a detached thread; when it exits, send

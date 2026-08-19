@@ -125,4 +125,4 @@ plain() { printf '{"text":"%s"},' "$(esc "$1")"; }
   fi
 
   printf ']'
-} | sed 's/,]/]/g' | xargs -0 "$bohay" ui dock push --id esp-idf --title "ESP-IDF" --rows
+} | sed 's/,]/]/g' | xargs -0 "$luvus" ui dock push --id esp-idf --title "ESP-IDF" --rows

@@ -1,9 +1,9 @@
 ---
 title: Using Modules
-description: Find, install, configure, and manage bohay modules, and the trust model behind them.
+description: Find, install, configure, and manage luvus modules, and the trust model behind them.
 ---
 
-A **module** extends bohay with sidebar panels, panes, right-click actions, and
+A **module** extends luvus with sidebar panels, panes, right-click actions, and
 automations. Modules are ordinary programs in any language, declared in a small
 manifest. There's no SDK and no plugin runtime, so a module is just a repo with
 some scripts in it.
@@ -14,12 +14,12 @@ This page is about running other people's.
 ## Finding modules
 
 There is no registry and no marketplace account. A module is a public GitHub
-repo tagged with the **`bohay-module`** topic, and both the terminal and the
+repo tagged with the **`luvus-module`** topic, and both the terminal and the
 website read that same topic:
 
 ```sh
-bohay module search              # most-starred first
-bohay module search git status   # narrow it with keywords
+luvus module search              # most-starred first
+luvus module search git status   # narrow it with keywords
 ```
 
 Or browse the [module index](/modules/) on the site.
@@ -28,34 +28,37 @@ Or browse the [module index](/modules/) on the site.
 is read-only and never touches your running session, so it's safe to run any
 time.
 
+Luvus 0.11.x also searches the legacy `bohay-module` topic so existing modules
+remain discoverable during the rename.
+
 ## Installing
 
 ```sh
-bohay module install owner/repo              # the whole repo is the module
-bohay module install owner/repo/path/to      # a module in a subdirectory
-bohay module install owner/repo --ref v1.2   # pin a branch, tag, or commit
+luvus module install owner/repo              # the whole repo is the module
+luvus module install owner/repo/path/to      # a module in a subdirectory
+luvus module install owner/repo --ref v1.2   # pin a branch, tag, or commit
 ```
 
 Install is deliberately a conversation, not a one-shot. It:
 
 1. Shallow-clones the repo to a staging directory.
 2. **Prints every command the module declares** and asks you to confirm.
-3. Runs any `[[build]]` steps with a **scrubbed environment** (no `BOHAY_*`, no
+3. Runs any `[[build]]` steps with a **scrubbed environment** (no `LUVUS_*` or `BOHAY_*`, no
    socket access), so a build script can't drive your session.
 4. Verifies the manifest didn't change during the build.
-5. Moves the checkout into bohay-managed storage and records the exact commit.
+5. Moves the checkout into luvus-managed storage and records the exact commit.
 
 A real install looks like this:
 
 ```
-Install module from RizRiyz/bohay-agent-ping
+Install module from RizRiyz/luvus-agent-ping
   id:      example.agent-ping
   name:    Agent Ping 0.1.0
   commit:  5d3687f1528e
 Commands this module can run:
   action ping-now: python3 ping.py --force
   on pane.agent_status_changed: python3 ping.py
-installed example.agent-ping (RizRiyz/bohay-agent-ping@5d3687f1528e…)
+installed example.agent-ping (RizRiyz/luvus-agent-ping@5d3687f1528e…)
 ```
 
 Read that command list before you say yes. It is the whole security review, and
@@ -81,9 +84,9 @@ Settings are collapsed while a module is disabled, so the list stays short.
 The same values are reachable from the CLI, which is handy for setup scripts:
 
 ```sh
-bohay module settings you.ci               # every key, its type, current value
-bohay module settings you.ci limit         # read one
-bohay module settings you.ci limit 30      # write one
+luvus module settings you.ci               # every key, its type, current value
+luvus module settings you.ci limit         # read one
+luvus module settings you.ci limit 30      # write one
 ```
 
 A listing reports a secret only as `"set": true|false`, never its value, since
@@ -93,30 +96,30 @@ script genuinely needs it.
 Anything a module stores itself lives in its own directory:
 
 ```sh
-bohay module config-dir you.ci   # prints (and creates) it
+luvus module config-dir you.ci   # prints (and creates) it
 ```
 
 ## Managing
 
 ```sh
-bohay module list                # what's installed, and whether it's runnable
-bohay module info <id>           # its actions, panes, docks, events, source
-bohay module enable <id>
-bohay module disable <id>
-bohay module run <id> <action>   # invoke an action by hand
-bohay module log [<id>]          # captured stdout/stderr + exit status
-bohay module uninstall <id>      # unregister + delete a managed checkout
-bohay module unlink <id>         # unregister only, leave the files alone
+luvus module list                # what's installed, and whether it's runnable
+luvus module info <id>           # its actions, panes, docks, events, source
+luvus module enable <id>
+luvus module disable <id>
+luvus module run <id> <action>   # invoke an action by hand
+luvus module log [<id>]          # captured stdout/stderr + exit status
+luvus module uninstall <id>      # unregister + delete a managed checkout
+luvus module unlink <id>         # unregister only, leave the files alone
 ```
 
 :::tip[Name it however you remember it]
 Anywhere a command takes `<id>`, you can pass either the module's id or the
 `owner/repo` you installed it from. You should not have to remember that
-`RizRiyz/bohay-agent-ping` calls itself `example.agent-ping` just to remove it:
+`RizRiyz/luvus-agent-ping` calls itself `example.agent-ping` just to remove it:
 
 ```sh
-bohay module uninstall RizRiyz/bohay-agent-ping   # the name you installed with
-bohay module uninstall example.agent-ping         # the module's own id
+luvus module uninstall RizRiyz/luvus-agent-ping   # the name you installed with
+luvus module uninstall example.agent-ping         # the module's own id
 ```
 
 The two can never collide, because a module id may not contain a slash. Owner
@@ -133,7 +136,7 @@ actions, no event hooks, no startup commands, and its docks and right-click
 entries disappear. Re-enabling it lets it repaint its docks immediately, without
 a restart.
 
-`uninstall` only deletes files for modules bohay manages (installed from
+`uninstall` only deletes files for modules luvus manages (installed from
 GitHub). For a module you linked from your own working directory it refuses, and
 tells you to use `unlink` instead, so it can never delete your source.
 
@@ -144,7 +147,7 @@ Once enabled, a module appears wherever its manifest said it should:
 | Surface | Where you'll see it |
 |---|---|
 | **Dock** | A panel in either sidebar. Move it, or turn it off, in Settings → Layout |
-| **Pane** | A real pane you open with `bohay module pane open <id> <entrypoint>` |
+| **Pane** | A real pane you open with `luvus module pane open <id> <entrypoint>` |
 | **Right-click** | Extra rows below the divider in the pane, workspace, or agent menus |
 | **Settings** | Its own section in Settings → Modules |
 | **Events** | Invisible: it just runs when agents, panes, tabs, or tasks change |
@@ -158,8 +161,8 @@ never keep it.
 While writing a module, register your working directory instead of installing:
 
 ```sh
-bohay module link /path/to/my-module      # add --disabled to register it off
-bohay module unlink you.my-module         # deregister; your files are untouched
+luvus module link /path/to/my-module      # add --disabled to register it off
+luvus module unlink you.my-module         # deregister; your files are untouched
 ```
 
 `link` does **not** run `[[build]]` steps: build your own tree. Linking also
@@ -169,16 +172,16 @@ restart.
 Try the three examples that ship in the repo:
 
 ```sh
-bohay module link ./examples/modules/branch-dock
+luvus module link ./examples/modules/branch-dock
 ```
 
 ## Trust
 
 A module is ordinary code that runs on your machine, as you, with your
-environment and your full bohay CLI. That openness is the point. It's the same
+environment and your full luvus CLI. That openness is the point. It's the same
 deal as an editor extension or a shell plugin, and the same judgment applies.
 
-What bohay does for you:
+What luvus does for you:
 
 - Shows every declared command before an install, and waits for confirmation.
 - Runs build steps with a scrubbed environment and no socket access.
@@ -187,7 +190,7 @@ What bohay does for you:
 - Keeps each module's config and state in its own directory.
 - Refuses to delete files it doesn't manage.
 
-What it does not do: **sandbox**. bohay doesn't inspect or restrict what a
+What it does not do: **sandbox**. luvus doesn't inspect or restrict what a
 module's code does once you approve it. Install from authors you trust, skim the
 manifest and the scripts, and pin `--ref` when you want a specific revision.
 
@@ -200,5 +203,5 @@ manifest and the scripts, and pin `--ref` when you want a specific revision.
 | Nothing in the log | The entry stays `running` until the command exits. Output is capped at 64 KiB per stream. |
 | A dock is empty | It repaints from a startup hook. If the module has none, run its refresh action once. |
 | Right-click row missing | The module is disabled, or the action's `platforms` exclude your OS. |
-| `module search` fails | It needs `curl` or `wget`, and GitHub rate-limits anonymous search. Browse [the topic](https://github.com/topics/bohay-module) instead. |
+| `module search` fails | It needs `curl` or `wget`, and GitHub rate-limits anonymous search. Browse [the topic](https://github.com/topics/luvus-module) instead. |
 | Install refused | Installing over a locally linked module is blocked. `unlink` the local one first. |

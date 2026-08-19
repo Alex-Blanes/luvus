@@ -5,6 +5,7 @@ preview.ans
 CLAUDE.md
 RELEASING.md
 homebrew-bohay/
+homebrew-luvus/
 .claude/
 .agents/skills/
 tests/
@@ -12,6 +13,7 @@ tests/
 # Local-only maintainer identity map (contains email; not for GitHub).
 .mailmap
 bohay-notch/
+luvus-notch/
 
 # Website (Astro) build artifacts — Cloudflare Pages builds from source.
 website/node_modules/

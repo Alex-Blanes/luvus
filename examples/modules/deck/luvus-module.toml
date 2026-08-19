@@ -1,0 +1,50 @@
+id = "example.deck"
+name = "Markdown Deck"
+version = "0.1.0"
+min_luvus_version = "0.9.6"
+description = "Present a Markdown file as a slide deck in a pane. Slides split on a `---` line; arrow keys or space to navigate, r to reload, q to quit."
+platforms = ["macos", "linux"]
+
+# ── Settings (Settings → Modules → Markdown Deck) ────────────────────────────
+# Everything the presenter needs arrives as LUVUS_SETTING_<KEY>, so the script
+# never parses JSON.
+
+[[settings]]
+key = "file"
+title = "Deck file (relative to the node folder, or an absolute path)"
+type = "string"
+default = "slides.md"
+
+[[settings]]
+key = "center"
+title = "Center slides vertically"
+type = "bool"
+default = true
+
+[[settings]]
+key = "big_titles"
+title = "Big block-font slide titles (# headings)"
+type = "bool"
+default = true
+
+# ── The presenter pane ───────────────────────────────────────────────────────
+# A full-screen Markdown slideshow, so it opens as its own tab rather than
+# splitting the pane you invoked it from. `python3 deck.py` runs in the module
+# directory; it resolves the deck file from the setting + the node's folder, and
+# falls back to the bundled sample.md so it works the moment you enable it.
+
+[[panes]]
+id = "present"
+title = "deck"
+placement = "tab"
+command = ["python3", "deck.py"]
+
+# ── Right-click a node → present ──────────────────────────────────────────────
+# Convenience: opens the presenter pane for the node you clicked. The same thing
+# as `luvus module pane open example.deck present`.
+
+[[actions]]
+id = "present"
+title = "Present as slides"
+contexts = ["node"]
+command = ["sh", "present.sh"]

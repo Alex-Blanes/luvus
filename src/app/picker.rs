@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn picker_browses_and_opens_a_folder() {
-        let tmp = std::env::temp_dir().join(format!("bohay-picker-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("luvus-picker-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("sub")).unwrap();
         std::fs::write(tmp.join("readme.txt"), "hi").unwrap();

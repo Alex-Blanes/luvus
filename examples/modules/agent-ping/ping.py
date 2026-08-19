@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Post a webhook when an agent goes blocked or finishes.
 
-bohay runs this as a plain subprocess, so there is no SDK to import. Two ways in:
+luvus runs this as a plain subprocess, so there is no SDK to import. Two ways in:
 
   * the flat vars, easiest from any language:
-      BOHAY_PANE_ID / BOHAY_PANE_AGENT / BOHAY_PANE_STATUS
-      BOHAY_WORKSPACE_CWD, BOHAY_SETTING_WEBHOOK, BOHAY_SETTING_NOTIFY_ON, ...
+      LUVUS_PANE_ID / LUVUS_PANE_AGENT / LUVUS_PANE_STATUS
+      LUVUS_WORKSPACE_CWD, LUVUS_SETTING_WEBHOOK, LUVUS_SETTING_NOTIFY_ON, ...
   * the full snapshot, when you want more:
-      BOHAY_MODULE_CONTEXT_JSON, and for an event hook BOHAY_MODULE_EVENT_JSON
+      LUVUS_MODULE_CONTEXT_JSON, and for an event hook LUVUS_MODULE_EVENT_JSON
 
-Talk back to bohay through BOHAY_BIN_PATH, never a bare `bohay` on PATH -- that
+Talk back to luvus through LUVUS_BIN_PATH, never a bare `luvus` on PATH -- that
 keeps the module working on Windows named pipes as well as Unix sockets.
 """
 
@@ -20,13 +20,13 @@ import sys
 import urllib.error
 import urllib.request
 
-BOHAY = os.environ.get("BOHAY_BIN_PATH", "bohay")
+LUVUS = os.environ.get("LUVUS_BIN_PATH", "luvus")
 
 
-def bohay(*args: str) -> None:
-    """Call back into bohay, ignoring failures (a module must never wedge the UI)."""
+def luvus(*args: str) -> None:
+    """Call back into luvus, ignoring failures (a module must never wedge the UI)."""
     try:
-        subprocess.run([BOHAY, *args], check=False, capture_output=True, timeout=10)
+        subprocess.run([LUVUS, *args], check=False, capture_output=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         pass
 
@@ -35,18 +35,18 @@ def main() -> int:
     forced = "--force" in sys.argv
 
     # Settings arrive pre-resolved: manifest defaults with the user's choices on
-    # top, already type-checked and clamped by bohay.
-    webhook = os.environ.get("BOHAY_SETTING_WEBHOOK", "").strip()
-    notify_on = os.environ.get("BOHAY_SETTING_NOTIFY_ON", "blocked")
-    want_toast = os.environ.get("BOHAY_SETTING_TOAST", "true") == "true"
+    # top, already type-checked and clamped by luvus.
+    webhook = os.environ.get("LUVUS_SETTING_WEBHOOK", "").strip()
+    notify_on = os.environ.get("LUVUS_SETTING_NOTIFY_ON", "blocked")
+    want_toast = os.environ.get("LUVUS_SETTING_TOAST", "true") == "true"
 
-    agent = os.environ.get("BOHAY_PANE_AGENT") or "agent"
-    status = os.environ.get("BOHAY_PANE_STATUS") or "unknown"
-    pane = os.environ.get("BOHAY_PANE_ID") or "?"
+    agent = os.environ.get("LUVUS_PANE_AGENT") or "agent"
+    status = os.environ.get("LUVUS_PANE_STATUS") or "unknown"
+    pane = os.environ.get("LUVUS_PANE_ID") or "?"
 
     # An event hook prefers the event payload, which describes the pane that
     # actually changed rather than the one in focus.
-    raw = os.environ.get("BOHAY_MODULE_EVENT_JSON")
+    raw = os.environ.get("LUVUS_MODULE_EVENT_JSON")
     if raw:
         try:
             event = json.loads(raw)
@@ -62,16 +62,16 @@ def main() -> int:
         if status not in wanted:
             return 0
 
-    where = os.path.basename(os.environ.get("BOHAY_WORKSPACE_CWD", "") or "") or "bohay"
+    where = os.path.basename(os.environ.get("LUVUS_WORKSPACE_CWD", "") or "") or "luvus"
     message = f"{agent} is {status} in {where} (pane {pane})"
 
     if want_toast:
-        bohay("ui", "toast", message)
+        luvus("ui", "toast", message)
 
     if not webhook:
         # Nothing configured yet: point the user at where to set it, once.
         if forced:
-            bohay("ui", "toast", "set a Webhook URL in Settings > Modules")
+            luvus("ui", "toast", "set a Webhook URL in Settings > Modules")
         return 0
 
     body = json.dumps({"text": message}).encode()
@@ -81,7 +81,7 @@ def main() -> int:
     try:
         urllib.request.urlopen(request, timeout=10).close()
     except (urllib.error.URLError, OSError) as err:
-        # stderr lands in `bohay module log`, which is where you debug a module.
+        # stderr lands in `luvus module log`, which is where you debug a module.
         print(f"webhook failed: {err}", file=sys.stderr)
         return 1
     return 0

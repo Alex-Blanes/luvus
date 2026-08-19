@@ -1446,7 +1446,7 @@ mod tests {
     #[test]
     fn git_tab_opens_fetches_and_persists_safely() {
         // A temp git repo with two branches + one commit.
-        let repo = std::env::temp_dir().join(format!("bohay-gittab-{}", std::process::id()));
+        let repo = std::env::temp_dir().join(format!("luvus-gittab-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&repo);
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::write(repo.join("f.txt"), "hi").unwrap();

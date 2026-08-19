@@ -1,12 +1,12 @@
-// The `notes` pane entrypoint: a tiny scratch pad running in a real bohay pane.
+// The `notes` pane entrypoint: a tiny scratch pad running in a real luvus pane.
 //
 // A pane command owns a terminal. Read stdin, write stdout, and exit when you
-// are done -- bohay closes the pane when the process exits.
+// are done -- luvus closes the pane when the process exits.
 const fs = require("node:fs");
 const path = require("node:path");
 const readline = require("node:readline");
 
-const stateDir = process.env.BOHAY_MODULE_STATE_DIR ?? process.cwd();
+const stateDir = process.env.LUVUS_MODULE_STATE_DIR ?? process.cwd();
 fs.mkdirSync(stateDir, { recursive: true });
 const file = path.join(stateDir, "notes.md");
 

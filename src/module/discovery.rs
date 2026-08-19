@@ -1,5 +1,5 @@
-//! `bohay module search` (docs/13 MOD-5): discover modules published to the
-//! `bohay-module` GitHub topic. Discovery is **decoupled from install** — this
+//! `luvus module search` (docs/13 MOD-5): discover modules published to the
+//! `luvus-module` GitHub topic. Discovery is **decoupled from install** — this
 //! is a read-only client-side lookup that never touches the running session, and
 //! `install` never consults it. To avoid a TLS/HTTP dependency we shell out to
 //! `curl` (bundled on macOS, Windows 10+, and most Linux), falling back to
@@ -18,7 +18,7 @@ pub struct RepoHit {
     pub url: String,
 }
 
-/// Search the `bohay-module` topic, optionally narrowed by `query`.
+/// Search the `luvus-module` topic, optionally narrowed by `query`.
 pub fn search(query: Option<&str>) -> Result<Vec<RepoHit>> {
     let body = http_get(&build_url(query))?;
     parse_results(&body)
@@ -26,7 +26,10 @@ pub fn search(query: Option<&str>) -> Result<Vec<RepoHit>> {
 
 /// Build the GitHub search URL (most-starred first, capped at 30 results).
 fn build_url(query: Option<&str>) -> String {
-    let mut q = String::from("topic:bohay-module");
+    // Keep 0.10 modules discoverable during the rename window. GitHub search
+    // treats the explicit OR as a union; duplicate repositories are returned
+    // only once by the API.
+    let mut q = String::from("topic:luvus-module OR topic:bohay-module");
     if let Some(extra) = query.map(str::trim).filter(|s| !s.is_empty()) {
         q.push(' ');
         q.push_str(extra);
@@ -81,7 +84,7 @@ pub(crate) fn http_get(url: &str) -> Result<String> {
         "-H",
         "Accept: application/vnd.github+json",
         "-H",
-        "User-Agent: bohay",
+        "User-Agent: luvus",
         url,
     ];
     if let Some(out) = try_cmd("curl", &curl)? {
@@ -93,13 +96,13 @@ pub(crate) fn http_get(url: &str) -> Result<String> {
         "-",
         "--timeout=20",
         "--header=Accept: application/vnd.github+json",
-        "--header=User-Agent: bohay",
+        "--header=User-Agent: luvus",
         url,
     ];
     if let Some(out) = try_cmd("wget", &wget)? {
         return Ok(out);
     }
-    bail!("need `curl` or `wget` to search — install one, or browse https://github.com/topics/bohay-module")
+    bail!("need `curl` or `wget` to search — install one, or browse https://github.com/topics/luvus-module")
 }
 
 /// Run `prog`; `Ok(None)` if it isn't installed (so we can try the next),
@@ -135,7 +138,10 @@ mod tests {
     #[test]
     fn url_encodes_the_topic_query() {
         let url = build_url(None);
-        assert!(url.contains("q=topic%3Abohay-module"), "{url}");
+        assert!(
+            url.contains("q=topic%3Aluvus-module%20OR%20topic%3Abohay-module"),
+            "{url}"
+        );
         let url = build_url(Some("git status"));
         assert!(url.contains("topic%3Abohay-module%20git%20status"), "{url}");
         // No raw spaces or colons leak into the URL.

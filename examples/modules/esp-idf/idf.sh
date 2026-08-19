@@ -11,9 +11,9 @@ require_idf
 # Invoked two ways: from a context-menu action (`sh idf.sh build`) or from a
 # COMMANDS dock row, where the subcommand rides in as the row's `value`.
 sub="${1:-}"
-[ -n "$sub" ] || sub="${BOHAY_MODULE_ROW_VALUE:-build}"
+[ -n "$sub" ] || sub="${LUVUS_MODULE_ROW_VALUE:-build}"
 pane=$(target_pane)
 [ -n "$pane" ] || { toast "no pane to run in"; exit 1; }
 
-"$bohay" pane run "$pane" "$(idf_cmd "$sub")"
-"$bohay" pane focus "$pane" >/dev/null 2>&1 || true
+"$luvus" pane run "$pane" "$(idf_cmd "$sub")"
+"$luvus" pane focus "$pane" >/dev/null 2>&1 || true

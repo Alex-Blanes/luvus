@@ -555,7 +555,7 @@ mod tests {
 
     #[test]
     fn reads_text_binary_and_oversize() {
-        let dir = std::env::temp_dir().join(format!("bohay-fv-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("luvus-fv-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 

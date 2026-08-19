@@ -2,9 +2,9 @@
 # Walk the (expanded parts of the) tree and push it into the FILES dock.
 #
 # Only expanded directories are ever descended, so a huge repo costs what you
-# open, not the whole thing. Rendering is a flat list: bohay's dock draws rows,
+# open, not the whole thing. Rendering is a flat list: luvus's dock draws rows,
 # so depth is indentation baked into each row's text. Folders carry the "toggle"
-# action, files the "open" action -- one action per row is all bohay needs.
+# action, files the "open" action -- one action per row is all luvus needs.
 #
 # The walk is an explicit-stack DFS rather than a recursive function: POSIX sh
 # has no local variables, so a recursive walk would clobber its own loop state.
@@ -13,11 +13,11 @@ set -eu
 
 # Re-root to the node this was invoked against (startup, a node/tab event, the
 # workspace right-click item, or the in-dock refresh row).
-printf '%s' "${BOHAY_WORKSPACE_CWD:-$PWD}" >"$root_file"
+printf '%s' "${LUVUS_WORKSPACE_CWD:-$PWD}" >"$root_file"
 root=$(tree_root)
 
-show_hidden="${BOHAY_SETTING_SHOW_HIDDEN:-false}"
-max_rows="${BOHAY_SETTING_MAX_ROWS:-400}"
+show_hidden="${LUVUS_SETTING_SHOW_HIDDEN:-false}"
+max_rows="${LUVUS_SETTING_MAX_ROWS:-400}"
 TAB=$(printf '\t')
 stack="$state/stack.$$"
 : >"$stack"
@@ -99,4 +99,4 @@ done
 [ "$N" -lt "$max_rows" ] || add_row "  … (truncated)" refresh "$root"
 rm -f "$stack" "$stack.t"
 
-"$bohay" ui dock push --id files --title FILES --rows "[${ROWS%,}]"
+"$luvus" ui dock push --id files --title FILES --rows "[${ROWS%,}]"

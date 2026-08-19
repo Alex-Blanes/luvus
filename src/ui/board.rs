@@ -164,7 +164,7 @@ pub(super) fn render(
                 ]),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  CLI: bohay task add \"…\" --paths src/x/** --gate \"cargo test\"",
+                    "  CLI: luvus task add \"…\" --paths src/x/** --gate \"cargo test\"",
                     Style::new().fg(t.overlay0),
                 )),
             ]),

@@ -212,9 +212,9 @@ pub(super) fn draw_sidebar(
 }
 
 /// The left sidebar's chrome, all on the **top row** (`area.y`, aligned with the
-/// tab bar): the `«` collapse chevron at the left edge, then the `bohay` wordmark
-/// and version, then the Menu pill at the right. Sets `settings_icon_rect` and
-/// `sidebar_toggle_rect` (and `version_rect`, the changelog click target).
+/// tab bar): the `«` collapse chevron at the left edge, then the `luvus` wordmark,
+/// then the Menu pill at the right. Sets `settings_icon_rect` and
+/// `sidebar_toggle_rect`.
 fn draw_left_chrome(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) {
     let cat = app.catalog;
     let hover = app.hover;
@@ -245,37 +245,11 @@ fn draw_left_chrome(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     let menu_w = crate::ui::display_width(&menu_label) as u16;
     let menu = Rect::new(area.right().saturating_sub(menu_w + 1), area.y, menu_w, 1);
 
-    // The wordmark (two leading spaces clear the chevron pill), plus the version
-    // in a muted tone when it fits before the Menu pill. `concat!`+`env!` bakes
-    // the crate version in at compile time (no per-frame alloc), so the sidebar
-    // always matches the build. The version is a click target that opens the
-    // changelog modal; it brightens on hover to signal that. When the background
-    // update check finds a newer release, a `●` dot follows it.
-    let mut brand = vec![Span::styled("  bohay", Style::new().fg(t.text).bold())];
-    // One space before the version (not two) so it — and the update dot after it —
-    // sit a column further from the Menu pill on the right.
-    let ver = concat!(" v", env!("CARGO_PKG_VERSION"));
-    let ver_w = crate::ui::display_width(ver) as u16;
-    let dot = " ●";
-    let dot_w = if app.update_available.is_some() {
-        crate::ui::display_width(dot) as u16
-    } else {
-        0
-    };
-    app.version_rect = None;
-    if cx + 7 + ver_w <= menu.x {
-        // 7 = display width of "  bohay"; the version follows it on the same row.
-        let base = Rect::new(cx + 7, area.y, ver_w, 1);
-        let vfg = if over(base) { t.accent } else { t.overlay0 };
-        brand.push(Span::styled(ver, Style::new().fg(vfg)));
-        let mut click_w = ver_w;
-        if dot_w > 0 && cx + 7 + ver_w + dot_w <= menu.x {
-            brand.push(Span::styled(dot, Style::new().fg(t.accent).bold()));
-            click_w += dot_w;
-        }
-        app.version_rect = Some(Rect::new(cx + 7, area.y, click_w, 1));
-    }
-    f.buffer_mut().set_line(cx, area.y, &Line::from(brand), cw);
+    // The product wordmark lives here; the clickable build version now occupies
+    // the bottom-right status slot where the redundant workspace directory used
+    // to be.
+    let brand = Line::from(Span::styled("  luvus", Style::new().fg(t.text).bold()));
+    f.buffer_mut().set_line(cx, area.y, &brand, cw);
 
     // Menu drawn after the wordmark so the pill always sits on top.
     let (fg, bg) = if over(menu) {
@@ -926,7 +900,7 @@ mod tests {
     #[test]
     fn agents_all_active_toggle_filters_history() {
         // Isolate config so a concurrent test's saved sidebar layout can't leak in
-        // via the shared `BOHAY_HOME` env var (fresh temp → default docks).
+        // via the shared `LUVUS_HOME` env var (fresh temp → default docks).
         let _env = crate::persist::test_env("agents");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(120, 40, tx).unwrap();

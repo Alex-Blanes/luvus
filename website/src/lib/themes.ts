@@ -1,5 +1,5 @@
 /**
- * bohay's shipped palettes, mirroring `THEMES` and `describe()` in
+ * luvus's shipped palettes, mirroring `THEMES` and `describe()` in
  * `src/ui/theme.rs`. The colours themselves live in `../styles/themes.css`,
  * which is generated from that same Rust registry:
  *
@@ -32,7 +32,7 @@ export const THEMES: { id: string; label: string; note: string }[] = [
 export const DEFAULT_THEME = 'quattro-rally';
 
 /**
- * The palettes whose surfaces are light. bohay's registry has no light/dark
+ * The palettes whose surfaces are light. luvus's registry has no light/dark
  * flag — a theme is simply a set of colours — but Starlight keys a few of its
  * own rules (and Expressive Code's syntax theme) off `data-theme`, so the docs
  * have to say which side of the line each palette falls on.

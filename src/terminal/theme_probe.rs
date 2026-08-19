@@ -11,7 +11,7 @@ use ratatui::crossterm::event::Event;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
 
-/// Colors reported by the terminal that is displaying a bohay client.
+/// Colors reported by the terminal that is displaying a luvus client.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalColors {
     pub fg: [u8; 3],
@@ -40,9 +40,9 @@ pub fn probe() -> ProbeResult {
     use std::os::fd::AsRawFd;
     use std::time::{Duration, Instant};
 
-    // A nested bohay PTY does not answer palette queries. More importantly,
+    // A nested luvus PTY does not answer palette queries. More importantly,
     // skipping here makes the common development path instantaneous.
-    if std::env::var_os("BOHAY_ENV").as_deref() == Some(std::ffi::OsStr::new("1")) {
+    if std::env::var_os("LUVUS_ENV").as_deref() == Some(std::ffi::OsStr::new("1")) {
         return ProbeResult::default();
     }
 
@@ -130,7 +130,7 @@ fn osc_end(data: &[u8]) -> Option<usize> {
     None
 }
 
-/// Separate only the OSC replies bohay requested. Other bytes remain input.
+/// Separate only the OSC replies luvus requested. Other bytes remain input.
 #[cfg(any(unix, test))]
 fn split_responses_and_input(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let mut responses = Vec::with_capacity(data.len());
@@ -281,7 +281,7 @@ pub(crate) fn default_ansi_palette(fg: [u8; 3], bg: [u8; 3]) -> [[u8; 3]; 16] {
     }
 }
 
-/// Decode the legacy key sequences that can arrive before bohay enables mouse,
+/// Decode the legacy key sequences that can arrive before luvus enables mouse,
 /// focus, bracketed-paste, and enhanced-keyboard reporting.
 #[cfg(any(unix, test))]
 fn decode_pending_input(data: &[u8]) -> Vec<Event> {

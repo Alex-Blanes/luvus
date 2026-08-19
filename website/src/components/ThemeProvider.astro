@@ -2,7 +2,7 @@
 // Overrides Starlight's ThemeProvider (astro.config.mjs · `components`).
 //
 // Starlight ships a light/dark switch backed by `localStorage['starlight-theme']`.
-// The docs instead run on bohay's own palettes — the same 15 the app ships, the
+// The docs instead run on luvus's own palettes — the same 15 the app ships, the
 // same ones the landing page switches between — so the palette *is* the theme:
 // picking one also decides whether the page is light or dark.
 //
@@ -16,7 +16,7 @@ import { DEFAULT_THEME, LIGHT_THEMES } from '../lib/themes';
   (() => {
     var id = FALLBACK;
     try {
-      id = localStorage.getItem('bohay-theme') || FALLBACK;
+      id = localStorage.getItem('luvus-theme') || FALLBACK;
     } catch (e) {}
     var root = document.documentElement;
     // `data-bh-theme` carries the palette (styles/themes.css); `data-theme` is

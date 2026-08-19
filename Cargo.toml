@@ -1,6 +1,6 @@
 [package]
-name = "bohay"
-version = "0.10.2"
+name = "luvus"
+version = "0.11.0"
 edition = "2021"
 # ratatui 0.30 (and ratatui-core) use Rust edition 2024, so the dependency tree
 # needs rustc 1.88+. Keep this honest — a lower value makes `cargo install` fail
@@ -10,9 +10,9 @@ description = "Mission control for your AI coding agents"
 authors = ["Riz <rizflagz@gmail.com>"]
 license = "AGPL-3.0-or-later"
 readme = "README.md"
-homepage = "https://github.com/RizRiyz/bohay"
-repository = "https://github.com/RizRiyz/bohay"
-documentation = "https://bohay.dev/docs/"
+homepage = "https://github.com/RizRiyz/luvus"
+repository = "https://github.com/RizRiyz/luvus"
+documentation = "https://luvus.dev/docs/"
 keywords = ["terminal", "multiplexer", "tui", "agents", "workspace"]
 categories = ["command-line-utilities", "development-tools"]
 # Keep the published crate lean: ship source + README + license, not the design
@@ -40,7 +40,7 @@ exclude = [
 ]
 
 [[bin]]
-name = "bohay"
+name = "luvus"
 path = "src/main.rs"
 
 [features]
@@ -58,7 +58,7 @@ unicode-width = "0.2"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Module manifests (`bohay-module.toml`).
+# Module manifests (`luvus-module.toml`).
 toml = "0.8"
 # Format-preserving TOML edits (Kimi's `~/.kimi-code/config.toml` holds the
 # user's API keys + comments, so we edit it in place without a lossy round-trip).
@@ -85,10 +85,10 @@ vte = { path = "vendor/vte" }
 alacritty_terminal = { path = "vendor/alacritty_terminal" }
 
 # ── Linux packaging (docs/16) ────────────────────────────────────────────────
-# bohay is a single static (musl) binary with no shared-library dependencies, so
+# luvus is a single static (musl) binary with no shared-library dependencies, so
 # a .deb/.rpm just drops the binary in /usr/bin and declares nothing hard. The
 # external tools it *optionally* shells out to (git tab, ssh remote, clipboard)
-# are Recommends/Suggests, never hard deps: bohay degrades gracefully without
+# are Recommends/Suggests, never hard deps: luvus degrades gracefully without
 # them, and a minimal server should not be forced to pull git + gh.
 # Built + attached to each release by `.github/workflows/release.yml`.
 
@@ -104,11 +104,11 @@ Mission control for your AI coding agents: persistent panes, tabs, and \
 workspaces that survive detach, a live sidebar of agent states, zero-config \
 agent session resume, a built-in git tab, worktrees, remote attach over plain \
 SSH, and an extension system. Ships as a single static binary."""
-assets = [["target/release/bohay", "usr/bin/", "755"]]
+assets = [["target/release/luvus", "usr/bin/", "755"]]
 
 [package.metadata.generate-rpm]
-# `--target` rewrites this to target/<triple>/release/bohay automatically.
-assets = [{ source = "target/release/bohay", dest = "/usr/bin/bohay", mode = "755" }]
+# `--target` rewrites this to target/<triple>/release/luvus automatically.
+assets = [{ source = "target/release/luvus", dest = "/usr/bin/luvus", mode = "755" }]
 
 [package.metadata.generate-rpm.recommends]
 git = "*"

@@ -6,9 +6,9 @@
 set -eu
 . "$(dirname "$0")/lib.sh"
 
-chosen="${BOHAY_MODULE_ROW_VALUE:-}"
+chosen="${LUVUS_MODULE_ROW_VALUE:-}"
 [ -n "$chosen" ] || { toast "no port on that row"; exit 1; }
 
-"$bohay" module settings example.esp-idf port "$chosen" >/dev/null
+"$luvus" module settings example.esp-idf port "$chosen" >/dev/null
 toast "port: $chosen"
-BOHAY_SETTING_PORT="$chosen" sh "$(dirname "$0")/dock.sh"   # repaint the selection dot
+LUVUS_SETTING_PORT="$chosen" sh "$(dirname "$0")/dock.sh"   # repaint the selection dot

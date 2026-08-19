@@ -3,17 +3,17 @@
 #
 # State the module keeps between invocations (dock content is not persisted, and
 # each click is a fresh subprocess, so anything that must survive lives on disk):
-#   $BOHAY_MODULE_STATE_DIR/root       the folder the tree is rooted at
-#   $BOHAY_MODULE_STATE_DIR/expanded   newline-separated absolute dir paths
+#   $LUVUS_MODULE_STATE_DIR/root       the folder the tree is rooted at
+#   $LUVUS_MODULE_STATE_DIR/expanded   newline-separated absolute dir paths
 #
 # Everything else arrives in the environment, so there is no JSON to parse:
-#   BOHAY_BIN_PATH          the running bohay binary (use it, not PATH's `bohay`)
-#   BOHAY_WORKSPACE_CWD     the active node's folder
-#   BOHAY_MODULE_ROW_VALUE  a clicked row's payload (here: an absolute path)
-#   BOHAY_SETTING_*         this module's settings
+#   LUVUS_BIN_PATH          the running luvus binary (use it, not PATH's `luvus`)
+#   LUVUS_WORKSPACE_CWD     the active node's folder
+#   LUVUS_MODULE_ROW_VALUE  a clicked row's payload (here: an absolute path)
+#   LUVUS_SETTING_*         this module's settings
 
-bohay="${BOHAY_BIN_PATH:-bohay}"
-state="${BOHAY_MODULE_STATE_DIR:-/tmp/bohay-file-tree}"
+luvus="${LUVUS_BIN_PATH:-luvus}"
+state="${LUVUS_MODULE_STATE_DIR:-/tmp/luvus-file-tree}"
 mkdir -p "$state"
 root_file="$state/root"
 exp_file="$state/expanded"
@@ -23,7 +23,7 @@ exp_file="$state/expanded"
 # `toggle`/`open` read it so a click acts on the tree the user is looking at,
 # not on whatever node happens to be active at click time.
 tree_root() {
-  if [ -s "$root_file" ]; then cat "$root_file"; else printf '%s' "${BOHAY_WORKSPACE_CWD:-$PWD}"; fi
+  if [ -s "$root_file" ]; then cat "$root_file"; else printf '%s' "${LUVUS_WORKSPACE_CWD:-$PWD}"; fi
 }
 
 is_expanded() { grep -Fxq "$1" "$exp_file" 2>/dev/null; }

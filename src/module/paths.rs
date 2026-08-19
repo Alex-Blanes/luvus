@@ -1,4 +1,4 @@
-//! Module filesystem layout under `~/.bohay/modules/` and the deterministic
+//! Module filesystem layout under `~/.luvus/modules/` and the deterministic
 //! id→path-component sanitizer (docs/13 §3.11). Module ids may contain `:`/`.`
 //! which aren't always safe filesystem components, so they're encoded.
 
@@ -6,12 +6,12 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
-/// Root of all module data: `~/.bohay/modules/`.
+/// Root of all module data: `~/.luvus/modules/`.
 fn modules_root() -> PathBuf {
     crate::persist::config_dir().join("modules")
 }
 
-/// The registry file: `~/.bohay/modules.json`.
+/// The registry file: `~/.luvus/modules.json`.
 pub fn registry_path() -> PathBuf {
     crate::persist::config_dir().join("modules.json")
 }

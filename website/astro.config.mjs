@@ -1,4 +1,4 @@
-// The bohay website: a custom product landing at `/` (src/pages/index.astro)
+// The luvus website: a custom product landing at `/` (src/pages/index.astro)
 // plus Starlight documentation under `/docs/…` (all content lives in the
 // `docs/` subfolder of the content collection, so its slugs — and URLs — are
 // prefixed with /docs/ and the root stays free for the landing page).
@@ -6,31 +6,28 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
 export default defineConfig({
-  site: 'https://bohay.dev',
+  site: 'https://luvus.dev',
   integrations: [
     starlight({
-      title: 'Bohay',
+      title: 'Luvus',
       description:
         'Mission control for your AI coding agents. Run Claude Code, Copilot, Codex, and opencode side by side, with a live view of every agent, session resume, and multi-agent orchestration.',
-      // No `logo` option: Starlight would ship the full-resolution artwork to
-      // draw a 34px mark. The SiteTitle override renders it through the same
-      // `Logo` component the landing pages use, which optimises and rounds it.
-      // The brand mark, as PNGs: the artwork is a raster illustration, so there
-      // is no vector icon to serve. `favicon` covers the default <link>; the
-      // small and Apple sizes are added by hand, as the landing pages do.
+      // No `logo` option: the SiteTitle override renders the canonical,
+      // theme-aware Luvus SVG shared with the landing pages. `favicon` covers
+      // the default <link>; the small and Apple sizes are added by hand.
       favicon: '/favicon.png',
       head: [
         { tag: 'link', attrs: { rel: 'icon', type: 'image/png', sizes: '32x32', href: '/favicon-32.png' } },
         { tag: 'link', attrs: { rel: 'apple-touch-icon', href: '/apple-touch-icon.png' } },
-        { tag: 'meta', attrs: { property: 'og:image', content: 'https://bohay.dev/og.png' } },
+        { tag: 'meta', attrs: { property: 'og:image', content: 'https://luvus.dev/og.png' } },
         { tag: 'meta', attrs: { property: 'og:image:width', content: '1200' } },
         { tag: 'meta', attrs: { property: 'og:image:height', content: '630' } },
-        { tag: 'meta', attrs: { property: 'og:image:alt', content: 'bohay: mission control for your AI coding agents' } },
+        { tag: 'meta', attrs: { property: 'og:image:alt', content: 'luvus: mission control for your AI coding agents' } },
         { tag: 'meta', attrs: { name: 'twitter:card', content: 'summary_large_image' } },
-        { tag: 'meta', attrs: { name: 'twitter:image', content: 'https://bohay.dev/og.png' } },
+        { tag: 'meta', attrs: { name: 'twitter:image', content: 'https://luvus.dev/og.png' } },
       ],
       social: [
-        { icon: 'github', label: 'GitHub', href: 'https://github.com/RizRiyz/bohay' },
+        { icon: 'github', label: 'GitHub', href: 'https://github.com/RizRiyz/luvus' },
       ],
       customCss: [
         // Inter for running prose, JetBrains Mono for code, IBM Plex Mono for
@@ -46,12 +43,12 @@ export default defineConfig({
         '@fontsource/ibm-plex-mono/700.css',
         // Orbit for the wordmark only. One weight, one place: the brand.
         '@fontsource/orbit/400.css',
-        // bohay's shipped palettes (generated from src/ui/theme.rs) followed by
+        // luvus's shipped palettes (generated from src/ui/theme.rs) followed by
         // the brand layer that maps their tokens onto Starlight's variables.
         './src/styles/themes.css',
         './src/styles/custom.css',
       ],
-      // The docs wear the landing page's chrome: bohay's own palettes instead
+      // The docs wear the landing page's chrome: luvus's own palettes instead
       // of a light/dark switch (ThemeProvider paints the saved one before first
       // paint, ThemeSelect is the palette picker in the navbar), and the site
       // nav in place of the social-icon row. See src/styles/custom.css for how
@@ -78,7 +75,7 @@ export default defineConfig({
             { label: 'Panes, Tabs & Workspaces', slug: 'docs/guides/layout' },
             { label: 'Working with Agents', slug: 'docs/guides/agents' },
             { label: 'Agents Talking to Agents', slug: 'docs/guides/agent-messaging' },
-            { label: 'Control Bohay from Codex', slug: 'docs/guides/codex-plugin' },
+            { label: 'Control Luvus from Codex', slug: 'docs/guides/codex-plugin' },
             { label: 'Multi-Agent Orchestration', slug: 'docs/guides/orchestration' },
             { label: 'The Git Tab', slug: 'docs/guides/git' },
             { label: 'Browsing & Opening Files', slug: 'docs/guides/files' },
@@ -87,7 +84,7 @@ export default defineConfig({
             { label: 'The macOS Notch App', slug: 'docs/guides/notch' },
             { label: 'Scrollback & Copy', slug: 'docs/guides/scrollback' },
             { label: 'Settings & Theming', slug: 'docs/guides/settings' },
-            { label: 'Scripting bohay', slug: 'docs/guides/scripting' },
+            { label: 'Scripting luvus', slug: 'docs/guides/scripting' },
           ],
         },
         {

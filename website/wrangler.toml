@@ -1,5 +1,5 @@
 "$schema" = "./node_modules/wrangler/config-schema.json"
-name = "bohay"
+name = "luvus"
 pages_build_output_dir = "./dist"
 
 # Optional: add KV namespaces, D1 databases, environment vars, or bindings below.

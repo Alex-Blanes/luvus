@@ -12,5 +12,5 @@ pane=$(target_pane)
 [ -n "$pane" ] || { toast "no pane to run in"; exit 1; }
 
 printf '%s' "$pane" > "$state/monitor-pane"
-"$bohay" pane run "$pane" "$(idf_cmd monitor)"
-"$bohay" pane focus "$pane" >/dev/null 2>&1 || true
+"$luvus" pane run "$pane" "$(idf_cmd monitor)"
+"$luvus" pane focus "$pane" >/dev/null 2>&1 || true

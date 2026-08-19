@@ -90,7 +90,7 @@ impl AlacrittyEngine {
             title: title.clone(),
         };
         // Alacritty retains history by rows, not bytes. Derive a conservative
-        // capacity from Bohay's per-pane byte budget and current width. The
+        // capacity from Luvus's per-pane byte budget and current width. The
         // estimate deliberately overcharges each row; metrics identify it as an
         // estimate until an engine provides native byte accounting.
         let config = Config {
@@ -670,7 +670,7 @@ mod tests {
     fn cold_history_compacts_losslessly_and_survives_reflow() {
         let (tx, _rx) = channel();
         let mut e = AlacrittyEngine::new(40, 5, tx, budget_for_rows(40, 500));
-        e.advance(b"\x1b[38;2;12;200;155mCOLOR\x1b[0m cafe\xcc\x81 \x1b]8;;https://bohay.dev\x1b\\LINK\x1b]8;;\x1b\\\r\n");
+        e.advance(b"\x1b[38;2;12;200;155mCOLOR\x1b[0m cafe\xcc\x81 \x1b]8;;https://luvus.dev\x1b\\LINK\x1b]8;;\x1b\\\r\n");
         assert!(e.detection_text(100).contains("cafe\u{301}"));
         feed_lines(&mut e, 80);
 
@@ -930,7 +930,7 @@ mod tests {
         // Any-motion tracking (1003) adds hover reporting too.
         e.advance(b"\x1b[?1003h");
         assert!(e.mouse_motion());
-        // Disabling it hands the wheel back to bohay's scrollback.
+        // Disabling it hands the wheel back to luvus's scrollback.
         e.advance(b"\x1b[?1003l\x1b[?1002l\x1b[?1000l");
         assert!(!e.mouse_report());
         assert!(!e.mouse_drag());

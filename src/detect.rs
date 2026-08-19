@@ -13,7 +13,7 @@
 //! title or the recent bottom text), a priority, and one or more conditions
 //! (substrings / a spinner glyph). The highest-priority matching rule wins. Built-in rules cover the
 //! markers common to modern agent CLIs plus a few per-agent quirks; **users can
-//! add or override rules** by dropping `*.toml` files in `~/.bohay/manifests/`
+//! add or override rules** by dropping `*.toml` files in `~/.luvus/manifests/`
 //! (loaded at startup, merged by priority) so detection can be fixed or extended
 //! for any agent without recompiling.
 //!
@@ -21,7 +21,7 @@
 //! interrupt hint) — raw output never counts, so a launching CLI's welcome
 //! screen or a scrolling log can't fake the state. Plain shells (no markers to
 //! match) fall back to output activity, gated by whether the user typed
-//! recently, so keystroke echo at a prompt is never misread as work. bohay's
+//! recently, so keystroke echo at a prompt is never misread as work. luvus's
 //! status debounce (docs/07, `QUIET_DWELL`) supplies stability: a momentary
 //! non-match can't flip a working agent to idle.
 
@@ -31,7 +31,7 @@ use serde::Deserialize;
 
 use crate::ui::theme::State;
 
-/// One agent bohay can recognise, and how far each identifying string may be
+/// One agent luvus can recognise, and how far each identifying string may be
 /// trusted. Splitting the two matters because the haystack for `screen` is
 /// *whatever the pane happens to be printing*, which nobody controls.
 struct KnownAgent {
@@ -125,8 +125,8 @@ const KNOWN_AGENTS: &[KnownAgent] = &[
     },
 ];
 
-/// The runtime form of [`KnownAgent`]: owned, so `~/.bohay/manifests/*.toml` can
-/// refine a built-in agent or teach bohay one it has never heard of.
+/// The runtime form of [`KnownAgent`]: owned, so `~/.luvus/manifests/*.toml` can
+/// refine a built-in agent or teach luvus one it has never heard of.
 #[derive(Clone)]
 struct AgentIdent {
     name: String,
@@ -280,7 +280,7 @@ struct Rule {
 
 /// The active detection set: which agents exist and how to recognise them
 /// (`agents`), plus the state rules (`rules`). Both come from the built-ins
-/// merged with `~/.bohay/manifests/*.toml`.
+/// merged with `~/.luvus/manifests/*.toml`.
 pub struct Manifests {
     rules: Vec<Rule>,
     agents: Vec<AgentIdent>,
@@ -301,7 +301,7 @@ impl Manifests {
     pub fn load(dir: &Path) -> Manifests {
         let mut rules = builtin_rules();
         let mut agents = builtin_agents();
-        // Official OTA manifests (`bohay server update-manifest`) live in a
+        // Official OTA manifests (`luvus server update-manifest`) live in a
         // `managed/` subdir, kept apart from the user's own `*.toml` so an update
         // never clobbers a hand-written rule. Load managed first, then the user's,
         // so equal-priority user rules can still override.
@@ -573,7 +573,7 @@ fn load_dir(dir: &Path) -> Vec<ManifestFile> {
         match parsed {
             Some(mf) => out.push(mf),
             None => eprintln!(
-                "bohay: skipping invalid detection manifest {}",
+                "luvus: skipping invalid detection manifest {}",
                 path.display()
             ),
         }
@@ -583,7 +583,7 @@ fn load_dir(dir: &Path) -> Vec<ManifestFile> {
 
 impl ManifestFile {
     /// Merge this file's `[identity]` into the live registry. A manifest may
-    /// refine a built-in agent or introduce one bohay has never heard of, so
+    /// refine a built-in agent or introduce one luvus has never heard of, so
     /// detection can follow a new CLI without waiting for a release.
     fn apply_identity(&self, agents: &mut Vec<AgentIdent>) {
         let Some(id) = &self.identity else { return };
@@ -820,7 +820,7 @@ impl Manifests {
     /// Mirrors `agent_in_processes` -- the same per-token binary match and the
     /// same interpreter unwrap (`node .../cli.js --flag`) -- but returns the tail
     /// for the requested agent instead of a name. `None` when no running command
-    /// line belongs to that agent, so a pane bohay cannot pin to it captures
+    /// line belongs to that agent, so a pane luvus cannot pin to it captures
     /// nothing rather than guessing.
     pub fn launch_args_for(&self, running: &[String], agent: &str) -> Option<Vec<String>> {
         for cmd in running {
@@ -1036,7 +1036,7 @@ mod tests {
     #[test]
     fn managed_ota_manifests_load_from_the_managed_subdir() {
         use std::fs;
-        let dir = std::env::temp_dir().join(format!("bohay-managed-mf-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("luvus-managed-mf-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let managed = dir.join("managed");
         fs::create_dir_all(&managed).unwrap();
@@ -1408,7 +1408,7 @@ mod tests {
 
     /// Identity is configurable, not hardcoded: a manifest can tighten a
     /// built-in agent (drop the ambiguous `cursor`, keep `cursor-agent`) and can
-    /// teach bohay an agent it has never heard of, so detection follows a new
+    /// teach luvus an agent it has never heard of, so detection follows a new
     /// CLI without waiting for a release.
     #[test]
     fn user_manifest_can_refine_and_add_agent_identity() {

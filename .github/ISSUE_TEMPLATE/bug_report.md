@@ -6,7 +6,7 @@ labels: bug
 ---
 
 <!--
-Thanks for reporting a Bohay problem. Please remove anything sensitive from
+Thanks for reporting a Luvus problem. Please remove anything sensitive from
 commands, paths, logs, or screenshots before submitting.
 -->
 
@@ -22,8 +22,8 @@ your workflow.
 **Environment**
 - OS + version (for macOS, run `sw_vers`):
 - Terminal app + version (for example Ghostty, iTerm2, Windows Terminal, or kitty):
-- Bohay version and server status (`bohay server status`):
-- Diagnostic output (`bohay doctor`):
+- Luvus version and server status (`luvus server status`):
+- Diagnostic output (`luvus doctor`):
 
 ```text
 Paste command output here, with secrets removed.

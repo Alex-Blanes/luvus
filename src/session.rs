@@ -1,6 +1,6 @@
 //! Named server-session selection and lifecycle.
 //!
-//! A session is one independent Bohay server namespace. Selection happens once
+//! A session is one independent Luvus server namespace. Selection happens once
 //! at process startup, before normal CLI routing, so sockets, persistence, PTYs,
 //! and child processes all agree on the same owner without background polling.
 
@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-pub const SESSION_ENV_VAR: &str = "BOHAY_SESSION";
+pub const SESSION_ENV_VAR: &str = "LUVUS_SESSION";
+pub const LEGACY_SESSION_ENV_VAR: &str = "BOHAY_SESSION";
 pub const DEFAULT_SESSION_NAME: &str = "default";
 
 const MAX_SESSION_NAME_LEN: usize = 64;
@@ -42,10 +43,10 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
             return Ok(args.to_vec());
         }
         let Some(name) = args.get(3) else {
-            return Err("usage: bohay session attach <name>".to_string());
+            return Err("usage: luvus session attach <name>".to_string());
         };
         if args.len() != 4 {
-            return Err("usage: bohay session attach <name>".to_string());
+            return Err("usage: luvus session attach <name>".to_string());
         }
         apply_explicit_name(name)?;
         return Ok(vec![args[0].clone()]);
@@ -90,9 +91,12 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
     }
 
     EXPLICIT_SESSION_REQUESTED.store(false, Ordering::Relaxed);
-    let inherited_socket = std::env::var_os("BOHAY_SOCKET_PATH").is_some_and(|v| !v.is_empty());
+    let inherited_socket = crate::compat::inherited("LUVUS_SOCKET_PATH", "BOHAY_SOCKET_PATH")
+        .is_some_and(|v| !v.is_empty());
     if !inherited_socket {
-        if let Ok(name) = std::env::var(SESSION_ENV_VAR) {
+        if let Some(name) = crate::compat::inherited(SESSION_ENV_VAR, LEGACY_SESSION_ENV_VAR)
+            .and_then(|value| value.into_string().ok())
+        {
             match normalize_name(&name)? {
                 Some(name) => std::env::set_var(SESSION_ENV_VAR, name),
                 None => std::env::remove_var(SESSION_ENV_VAR),
@@ -104,8 +108,14 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
 
 fn apply_explicit_name(name: &str) -> Result<(), String> {
     match normalize_name(name)? {
-        Some(name) => std::env::set_var(SESSION_ENV_VAR, name),
-        None => std::env::remove_var(SESSION_ENV_VAR),
+        Some(name) => {
+            std::env::set_var(SESSION_ENV_VAR, name);
+            std::env::remove_var(LEGACY_SESSION_ENV_VAR);
+        }
+        None => {
+            std::env::remove_var(SESSION_ENV_VAR);
+            std::env::remove_var(LEGACY_SESSION_ENV_VAR);
+        }
     }
     EXPLICIT_SESSION_REQUESTED.store(true, Ordering::Relaxed);
     Ok(())
@@ -116,8 +126,8 @@ pub fn explicit_session_requested() -> bool {
 }
 
 pub fn active_name() -> Option<String> {
-    std::env::var(SESSION_ENV_VAR)
-        .ok()
+    crate::compat::inherited(SESSION_ENV_VAR, LEGACY_SESSION_ENV_VAR)
+        .and_then(|value| value.into_string().ok())
         .filter(|name| name != DEFAULT_SESSION_NAME)
         .filter(|name| validate_name(name).is_ok())
 }
@@ -173,11 +183,11 @@ pub fn active_dir() -> PathBuf {
 }
 
 pub fn api_socket_path_for(name: Option<&str>) -> PathBuf {
-    socket_path_for(name, "bohay.sock", "api")
+    socket_path_for(name, "luvus.sock", "api")
 }
 
 pub fn client_socket_path_for(name: Option<&str>) -> PathBuf {
-    socket_path_for(name, "bohay-client.sock", "client")
+    socket_path_for(name, "luvus-client.sock", "client")
 }
 
 fn socket_path_for(name: Option<&str>, file_name: &str, role: &str) -> PathBuf {
@@ -188,7 +198,7 @@ fn socket_path_for(name: Option<&str>, file_name: &str, role: &str) -> PathBuf {
 
         // macOS allows only 103 bytes plus the terminating NUL in `sun_path`.
         // Keep ordinary paths readable and backward-compatible, but make long
-        // custom BOHAY_HOME values usable through a stable owner-scoped alias.
+        // custom LUVUS_HOME values usable through a stable owner-scoped alias.
         if logical.as_os_str().as_bytes().len() >= 100 {
             let mut hash = 0xcbf29ce484222325u64;
             for byte in logical.as_os_str().as_bytes() {
@@ -196,7 +206,7 @@ fn socket_path_for(name: Option<&str>, file_name: &str, role: &str) -> PathBuf {
                 hash = hash.wrapping_mul(0x100000001b3);
             }
             let uid = unsafe { libc::geteuid() };
-            return PathBuf::from(format!("/tmp/bohay-{uid}/{hash:016x}-{role}.sock"));
+            return PathBuf::from(format!("/tmp/luvus-{uid}/{hash:016x}-{role}.sock"));
         }
     }
     logical
@@ -344,10 +354,10 @@ mod tests {
     #[test]
     fn explicit_selector_is_stripped_and_overrides_inherited_socket() {
         let _env = crate::persist::test_env("session-explicit");
-        std::env::set_var("BOHAY_SOCKET_PATH", "/tmp/other.sock");
+        std::env::set_var("LUVUS_SOCKET_PATH", "/tmp/other.sock");
         let cleaned =
-            configure_from_args(&argv(&["bohay", "--session", "alpha", "pane", "list"])).unwrap();
-        assert_eq!(cleaned, argv(&["bohay", "pane", "list"]));
+            configure_from_args(&argv(&["luvus", "--session", "alpha", "pane", "list"])).unwrap();
+        assert_eq!(cleaned, argv(&["luvus", "pane", "list"]));
         assert_eq!(active_name().as_deref(), Some("alpha"));
         assert!(explicit_session_requested());
         assert_eq!(
@@ -360,9 +370,9 @@ mod tests {
     fn inherited_socket_wins_without_an_explicit_selector() {
         let _env = crate::persist::test_env("session-inherited");
         std::env::set_var(SESSION_ENV_VAR, "alpha");
-        std::env::set_var("BOHAY_SOCKET_PATH", "/tmp/inherited.sock");
-        let cleaned = configure_from_args(&argv(&["bohay", "pane", "list"])).unwrap();
-        assert_eq!(cleaned, argv(&["bohay", "pane", "list"]));
+        std::env::set_var("LUVUS_SOCKET_PATH", "/tmp/inherited.sock");
+        let cleaned = configure_from_args(&argv(&["luvus", "pane", "list"])).unwrap();
+        assert_eq!(cleaned, argv(&["luvus", "pane", "list"]));
         assert!(!explicit_session_requested());
         assert_eq!(
             crate::persist::cli_socket_path(),
@@ -373,8 +383,8 @@ mod tests {
     #[test]
     fn attach_reuses_the_normal_tui_path() {
         let _env = crate::persist::test_env("session-attach");
-        let cleaned = configure_from_args(&argv(&["bohay", "session", "attach", "docs"])).unwrap();
-        assert_eq!(cleaned, argv(&["bohay"]));
+        let cleaned = configure_from_args(&argv(&["luvus", "session", "attach", "docs"])).unwrap();
+        assert_eq!(cleaned, argv(&["luvus"]));
         assert_eq!(active_name().as_deref(), Some("docs"));
         assert!(explicit_session_requested());
     }
@@ -384,16 +394,16 @@ mod tests {
         let _env = crate::persist::test_env("session-paths");
         #[cfg(unix)]
         std::env::set_var(
-            "BOHAY_HOME",
-            format!("/tmp/bohay-session-paths-{}", std::process::id()),
+            "LUVUS_HOME",
+            format!("/tmp/luvus-session-paths-{}", std::process::id()),
         );
         let root = crate::persist::config_dir();
         assert_eq!(session_dir_for(None), root);
         assert_eq!(session_dir_for(Some("api")), root.join("sessions/api"));
-        assert_eq!(api_socket_path_for(None), root.join("bohay.sock"));
+        assert_eq!(api_socket_path_for(None), root.join("luvus.sock"));
         assert_eq!(
             client_socket_path_for(Some("api")),
-            root.join("sessions/api/bohay-client.sock")
+            root.join("sessions/api/luvus-client.sock")
         );
     }
 
@@ -402,7 +412,7 @@ mod tests {
     fn long_unix_socket_paths_get_stable_distinct_short_aliases() {
         let _env = crate::persist::test_env("session-long-socket-paths");
         let long_root = crate::persist::config_dir().join("x".repeat(120));
-        std::env::set_var("BOHAY_HOME", &long_root);
+        std::env::set_var("LUVUS_HOME", &long_root);
 
         let alpha_api = api_socket_path_for(Some("alpha"));
         let alpha_client = client_socket_path_for(Some("alpha"));
@@ -418,7 +428,7 @@ mod tests {
     fn duplicate_selectors_are_rejected() {
         let _env = crate::persist::test_env("session-duplicate");
         let err = configure_from_args(&argv(&[
-            "bohay",
+            "luvus",
             "--session",
             "one",
             "--session=two",
@@ -433,8 +443,8 @@ mod tests {
     fn environment_selector_is_used_only_without_an_inherited_socket() {
         let _env = crate::persist::test_env("session-environment");
         std::env::set_var(SESSION_ENV_VAR, "docs");
-        let cleaned = configure_from_args(&argv(&["bohay", "ping"])).unwrap();
-        assert_eq!(cleaned, argv(&["bohay", "ping"]));
+        let cleaned = configure_from_args(&argv(&["luvus", "ping"])).unwrap();
+        assert_eq!(cleaned, argv(&["luvus", "ping"]));
         assert_eq!(active_name().as_deref(), Some("docs"));
         assert_eq!(
             crate::persist::cli_socket_path(),
@@ -445,11 +455,13 @@ mod tests {
     #[test]
     fn default_selector_preserves_the_legacy_root() {
         let _env = crate::persist::test_env("session-default-selector");
+        std::env::set_var(LEGACY_SESSION_ENV_VAR, "old-inherited");
         let cleaned =
-            configure_from_args(&argv(&["bohay", "--session=default", "server", "status"]))
+            configure_from_args(&argv(&["luvus", "--session=default", "server", "status"]))
                 .unwrap();
-        assert_eq!(cleaned, argv(&["bohay", "server", "status"]));
+        assert_eq!(cleaned, argv(&["luvus", "server", "status"]));
         assert_eq!(active_name(), None);
+        assert!(std::env::var_os(LEGACY_SESSION_ENV_VAR).is_none());
         assert_eq!(active_dir(), crate::persist::config_dir());
         assert!(explicit_session_requested());
     }
@@ -458,7 +470,7 @@ mod tests {
     fn invalid_environment_selector_is_rejected_before_routing() {
         let _env = crate::persist::test_env("session-invalid-environment");
         std::env::set_var(SESSION_ENV_VAR, "../other");
-        let err = configure_from_args(&argv(&["bohay", "ping"])).unwrap_err();
+        let err = configure_from_args(&argv(&["luvus", "ping"])).unwrap_err();
         assert!(err.contains("ASCII letters"));
     }
 

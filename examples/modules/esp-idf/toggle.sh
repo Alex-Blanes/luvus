@@ -10,7 +10,7 @@
 set -eu
 . "$(dirname "$0")/lib.sh"
 
-want="${BOHAY_MODULE_ROW_VALUE:-}"
+want="${LUVUS_MODULE_ROW_VALUE:-}"
 [ -n "$want" ] || exit 0
 
 now=$(cat "$state/expanded" 2>/dev/null || printf '')

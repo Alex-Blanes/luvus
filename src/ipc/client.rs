@@ -21,7 +21,7 @@ use crate::ipc::transport;
 
 /// Attach to the local server over its Unix socket.
 pub fn run(sock: &Path) -> Result<()> {
-    let stream = transport::connect(sock).map_err(|_| anyhow!("cannot connect to bohay server"))?;
+    let stream = transport::connect(sock).map_err(|_| anyhow!("cannot connect to luvus server"))?;
     // `Conn` is a cloneable duplex handle: one clone reads, the other writes.
     attach(stream.clone(), stream)
 }
@@ -70,8 +70,8 @@ where
         // upgrade — tell them the fix, not just the symptom.
         ServerMessage::Welcome { error: Some(e), .. } => {
             return Err(anyhow!(
-                "server: {e}\nAn older bohay server is likely still running — \
-                 run `bohay server restart` to load this version (your session is saved)."
+                "server: {e}\nAn older luvus server is likely still running — \
+                 run `luvus server restart` to load this version (your session is saved)."
             ))
         }
         ServerMessage::Welcome { .. } => {}
@@ -174,7 +174,7 @@ fn event_message(event: Event) -> Option<ClientMessage> {
         Event::Resize(cols, rows) => Some(ClientMessage::Resize { cols, rows }),
         Event::Paste(s) => Some(ClientMessage::Paste(s)),
         // Regained focus: the window may have moved or been repainted while we
-        // were away, and bohay never saw it. Re-send the current size, which the
+        // were away, and luvus never saw it. Re-send the current size, which the
         // server treats as a forced full repaint, healing any stale cells.
         Event::FocusGained => crossterm::terminal::size()
             .ok()
@@ -185,10 +185,10 @@ fn event_message(event: Event) -> Option<ClientMessage> {
 
 /// The remote-side bridge (docs/18 RA-1): connect to the local server socket and
 /// relay it byte-for-byte to/from this process's stdin/stdout, which `ssh` has
-/// wired back to the `bohay --remote` client. The binary frame protocol flows
+/// wired back to the `luvus --remote` client. The binary frame protocol flows
 /// over the pipe unchanged.
 pub fn remote_bridge(sock: &Path) -> Result<()> {
-    let conn = transport::connect(sock).map_err(|_| anyhow!("cannot connect to bohay server"))?;
+    let conn = transport::connect(sock).map_err(|_| anyhow!("cannot connect to luvus server"))?;
     relay(conn.clone(), conn, std::io::stdin(), std::io::stdout())
 }
 
@@ -412,7 +412,7 @@ mod tests {
         use std::process::{Command, Stdio};
 
         let bin = std::env::current_exe().unwrap();
-        let home = std::env::temp_dir().join(format!("bohay-remote-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("luvus-remote-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         let config = crate::config::Config {
@@ -433,11 +433,11 @@ mod tests {
                 "--nocapture",
                 "--test-threads=1",
             ])
-            .env("BOHAY_TEST_PALETTE_SERVER", "1")
-            .env("BOHAY_HOME", &home)
+            .env("LUVUS_TEST_PALETTE_SERVER", "1")
+            .env("LUVUS_HOME", &home)
             // An agent pane inherits the live session's socket. The scratch
             // server and its cleanup must never escape this test home.
-            .env_remove("BOHAY_SOCKET_PATH")
+            .env_remove("LUVUS_SOCKET_PATH")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -458,7 +458,7 @@ mod tests {
             child: server,
             home: home.clone(),
         };
-        let sock = home.join("bohay-client.sock");
+        let sock = home.join("luvus-client.sock");
         for _ in 0..50 {
             if sock.exists() {
                 break;
@@ -538,7 +538,7 @@ mod tests {
     /// explicitly marked child process enters the blocking server loop.
     #[test]
     fn terminal_palette_server_helper() {
-        if std::env::var_os("BOHAY_TEST_PALETTE_SERVER").is_some() {
+        if std::env::var_os("LUVUS_TEST_PALETTE_SERVER").is_some() {
             crate::ipc::server::run().expect("scratch server failed");
         }
     }

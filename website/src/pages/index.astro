@@ -3,7 +3,7 @@ import jetbrainsLatin from '@fontsource-variable/jetbrains-mono/files/jetbrains-
 import plexLatin600 from '@fontsource/ibm-plex-mono/files/ibm-plex-mono-latin-600-normal.woff2?url';
 import '../styles/themes.css';
 import { THEMES, DEFAULT_THEME } from '../lib/themes';
-// The bohay product homepage — a custom landing page, independent of the
+// The luvus product homepage — a custom landing page, independent of the
 // Starlight docs layout (docs live under /docs/…). Dark-first, the app's own
 // terminal-native aesthetic. The palette is switchable: every colour comes
 // from tokens in styles/themes.css, generated from the app's own registry.
@@ -14,14 +14,12 @@ import '@fontsource/ibm-plex-mono/600.css';
 import '@fontsource/ibm-plex-mono/700.css';
 import '@fontsource/orbit/400.css'; // the wordmark face
 import Logo from '../components/Logo.astro';
-import heroArtSrc from '../assets/logo-black-nobg.png';
-// TRIAL: the luvus mark. Imported raw and retinted at build time so it can be a
+// The surviving Luvus mark. Imported raw and retinted at build time so it can be a
 // theme-aware line drawing rather than a flat image:
 //   * the white backing rect goes, or it would be a white square on a dark page;
 //   * `#272727` becomes `currentColor`, so CSS decides the ink;
 //   * the `white` knockout fills (they hide the antennae behind the circles)
 //     become `var(--bg)`, so they still occlude but match whatever the page is.
-// Revert by dropping this and putting `heroArt` back on the .hero-art div.
 import luvusRaw from '../assets/luvus-logo.svg?raw';
 const luvusTinted = luvusRaw
   .replace(/<rect width="1000" height="1000" fill="white"\/>/, '')
@@ -51,12 +49,8 @@ const luvusSvg =
           close
       )
     : luvusTinted;
-// The solid cut, for the nav. At 34px the outline version's 20-unit strokes come
-// out at 0.68px, which is sub-pixel: it greys out next to the wordmark. Already
-// authored in currentColor/var(--bg), so it needs no retint.
 import { NAV_MARK } from '../lib/mark';
 import FeatureIcon from '../components/FeatureIcon.astro';
-import { Image, getImage } from 'astro:assets';
 // Authentic brand marks (24×24 SVGs) for the "works with" grid. The `-color`
 // ones carry their own fills; the rest are `currentColor` (recolored via CSS,
 // flagged `mono`). `hook` marks agents that get native session resume (a dot in
@@ -78,26 +72,7 @@ import IconAider from '../assets/icons/aider.svg';
 // so the mark still inherits `currentColor` like the inline SVGs do.
 import droidMask from '../assets/icons/droid-mask.png';
 
-// The hero mark is 1286px of black line art on transparency. It is used as a
-// CSS *mask* rather than an <img>, so it takes `var(--text)` and therefore comes
-// out light on a dark palette and dark on a light one, with no second asset.
-// Optimised here because the source is ~1.5 MB.
-const heroArt = await getImage({ src: heroArtSrc, width: 720, format: 'webp' });
-
-const GITHUB = 'https://github.com/RizRiyz/bohay';
-
-
-
-// Artwork for the closing call to action. Resolved through a glob rather than a
-// plain import so the page still builds when the file is not in the tree.
-// Drawn as a CSS mask like the hero mark, so it takes the palette instead of
-// shipping a light and a dark copy.
-const ctaArtSrc = Object.values(
-  import.meta.glob('../assets/bohay-cta-black-nobg.{png,jpg,jpeg,webp}', { eager: true, import: 'default' })
-)[0] as { src: string; width: number; height: number } | undefined;
-const ctaArt = ctaArtSrc
-  ? await getImage({ src: ctaArtSrc, width: 720, format: 'webp' })
-  : undefined;
+const GITHUB = 'https://github.com/RizRiyz/luvus';
 
 // Every agent in `detect::KNOWN_AGENTS` (14), which CLAUDE.md requires this
 // grid to stay truthful to. `aider` and `droid` have no icon in assets/icons,
@@ -121,18 +96,10 @@ const AGENTS = [
 
 const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
-// The bohay-notch demo panel — mirrors the real app's NotchModel.sample
-// (bohay-notch/…/AgentModel.swift): model · project · context% · cost · state.
-const NOTCH_AGENTS = [
-  { id: 'claude', model: 'Sonnet 4.6', proj: 'sudos', state: 'blocked', cost: '0.67', ctx: 25, Icon: IconClaudeCode, slug: 'claudecode' },
-  { id: 'codex', model: 'GPT-5', proj: 'esp-sol', state: 'working', cost: '1.20', ctx: 61, Icon: IconCodex, slug: 'codex' },
-  { id: 'copilot', model: 'Claude', proj: 'notch', state: 'done', cost: '0.09', ctx: 12, Icon: IconCopilot, slug: 'copilot' },
-  { id: 'opencode', model: 'Sonnet 4.6', proj: 'docs', state: 'idle', cost: '2.03', ctx: 88, Icon: IconOpencode, slug: 'opencode' },
-];
-const title = 'bohay: mission control for your AI coding agents';
+const title = 'luvus: mission control for your AI coding agents';
 const description =
   'Mission control for your AI coding agents. Run, watch, resume, and orchestrate Claude Code, Codex, Copilot, opencode and more from one terminal, with a live view of every agent.';
-const ogImage = 'https://bohay.dev/og.png';
+const ogImage = 'https://luvus.dev/og.png';
 ---
 
 <!doctype html>
@@ -154,12 +121,12 @@ const ogImage = 'https://bohay.dev/og.png';
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
     <link rel="icon" type="image/png" sizes="192x192" href="/favicon.png" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-    <link rel="canonical" href="https://bohay.dev/" />
+    <link rel="canonical" href="https://luvus.dev/" />
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
     <meta property="og:type" content="website" />
-    <meta property="og:url" content="https://bohay.dev/" />
-    <meta property="og:site_name" content="bohay" />
+    <meta property="og:url" content="https://luvus.dev/" />
+    <meta property="og:site_name" content="luvus" />
     <meta property="og:image" content={ogImage} />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
@@ -176,7 +143,7 @@ const ogImage = 'https://bohay.dev/og.png';
          Deliberately tiny and dependency-free; it must not delay rendering. -->
     <script is:inline>
       try {
-        var t = localStorage.getItem('bohay-theme');
+        var t = localStorage.getItem('luvus-theme');
         if (t) document.documentElement.setAttribute('data-bh-theme', t);
       } catch (e) {}
     </script>
@@ -185,16 +152,15 @@ const ogImage = 'https://bohay.dev/og.png';
     <nav>
       <div class="nav-inner">
       <a class="brand" href="/">
-        <!-- TRIAL: luvus mark in the nav too, same retint as the hero. Revert to
-             `<Logo width={34} height={34} class="mark" aria-hidden="true" />`. -->
+        <!-- Canonical Luvus mark, retinted with the active theme. -->
         <span class="mark mark-luvus" aria-hidden="true" set:html={NAV_MARK}></span>
-        <span>Bohay</span>
+        <span>Luvus</span>
       </a>
       <div class="nav-links">
         <a href="/docs/">Docs</a>
         <a href="/modules/">Modules</a>
         <a href="/changelog/">Changelog</a>
-        <a href={GITHUB} class="gh" aria-label="bohay on GitHub" title="GitHub">
+        <a href={GITHUB} class="gh" aria-label="luvus on GitHub" title="GitHub">
           <svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"
             ><path
               fill="currentColor"
@@ -219,11 +185,11 @@ const ogImage = 'https://bohay.dev/og.png';
           </p>
 
           <div class="install" id="install">
-            <code>curl -fsSL https://bohay.dev/install.sh | sh</code>
+            <code>curl -fsSL https://luvus.dev/install.sh | sh</code>
             <button id="copy" aria-label="Copy install command" title="Copy">⧉</button>
           </div>
           <p class="alt-install">
-            or <code>brew install RizRiyz/bohay/bohay</code> · <code>cargo install bohay</code> ·
+            or <code>brew install RizRiyz/luvus/luvus</code> · <code>cargo install luvus</code> ·
             <a href="/docs/getting-started/installation/">Windows &amp; more</a>
           </p>
         </div>
@@ -235,14 +201,14 @@ const ogImage = 'https://bohay.dev/og.png';
       <div class="demo" id="demo">
         <div class="demo-chrome">
           <span class="tl r"></span><span class="tl y"></span><span class="tl g"></span>
-          <span class="demo-title">bohay · sudos</span>
+          <span class="demo-title">luvus · sudos</span>
           <span class="demo-hint">● live demo · click around</span>
         </div>
         <div class="demo-body">
           <aside class="demo-side">
             <div class="side-brand">
               <Logo width={16} height={16} class="mark" aria-hidden="true" />
-              <span class="side-name">bohay</span>
+              <span class="side-name">luvus</span>
               <span class="side-ver">v0.7</span>
               <button class="menu-pill" id="menu-pill" title="Settings · theme · keys · language">Menu</button>
             </div>
@@ -527,7 +493,7 @@ const ogImage = 'https://bohay.dev/og.png';
           <span class="fr-k">Resume</span>
           <div class="fr-text">
             <h3>Agents pick up where they stopped</h3>
-            <p>bohay finds each agent's own session store on disk and runs its resume command for you. Nothing to configure, no session flag to paste. Works for claude, codex, copilot, opencode, kimi, grok and pi.</p>
+            <p>luvus finds each agent's own session store on disk and runs its resume command for you. Nothing to configure, no session flag to paste. Works for claude, codex, copilot, opencode, kimi, grok and pi.</p>
             <a class="fc-go" href="/docs/guides/agents/#session-resume--the-flagship">Session resume →</a>
           </div>
           <div class="fm" aria-hidden="true">
@@ -570,7 +536,7 @@ const ogImage = 'https://bohay.dev/og.png';
           </div>
           <div class="fm" aria-hidden="true">
             <div class="fm-head"><span>REMOTE</span><em>plain ssh</em></div>
-            <div class="fm-cmd">$ bohay --remote devbox</div>
+            <div class="fm-cmd">$ luvus --remote devbox</div>
             <div class="fm-row"><span class="d run"></span>attached<b>devbox</b><em>3 panes</em></div>
             <div class="fm-row"><span class="d done"></span>frame diff<b>~22 B</b><em>per keystroke</em></div>
             <div class="fm-foot">the server keeps running when you detach</div>
@@ -581,7 +547,7 @@ const ogImage = 'https://bohay.dev/og.png';
           <span class="fr-k">Mobile</span>
           <div class="fr-text">
             <h3>Your session, from a phone</h3>
-            <p>SSH in from any terminal app (Termius, Blink, Mosh) and run <code>bohay</code>. Under 50 columns it goes compact on its own: sidebars away, one pane full screen, and a <code>≡</code> switcher built for thumbs. It is the same session your laptop left running.</p>
+            <p>SSH in from any terminal app (Termius, Blink, Mosh) and run <code>luvus</code>. Under 50 columns it goes compact on its own: sidebars away, one pane full screen, and a <code>≡</code> switcher built for thumbs. It is the same session your laptop left running.</p>
             <a class="fc-go" href="/docs/guides/remote/">Working remotely →</a>
           </div>
           <div class="fm phone" aria-hidden="true">
@@ -594,30 +560,14 @@ const ogImage = 'https://bohay.dev/og.png';
           </div>
         </article>
 
-        <article class="frow">
-          <span class="fr-k">Notch</span>
-          <div class="fr-text">
-            <h3>The same team, in the notch</h3>
-            <p><strong>bohay-notch</strong> mirrors every agent into a native macOS panel that drops out of the MacBook notch. Watch what each one is doing, answer a request or grant permission, and jump straight to its pane, without leaving the app you are in.</p>
-            <a class="fc-go" href="/docs/guides/notch/">How the notch app works →</a>
-          </div>
-          <div class="fm notch" aria-hidden="true">
-            <div class="fm-notch" aria-hidden="true"></div>
-            <div class="fm-head"><span>AGENTS</span><em>4 · $3.99</em></div>
-            <div class="fm-row"><span class="d run"></span><b>claude</b><i class="ok">28%</i><em>Working</em></div>
-            <div class="fm-row"><span class="d blk"></span><b>copilot</b><i class="hot">86%</i><em>Blocked</em></div>
-            <div class="fm-row"><span class="d done"></span><b>codex</b><i class="ok">54%</i><em>Done</em></div>
-            <div class="fm-cmd">brew install --cask RizRiyz/bohay/bohay-notch</div>
-            <div class="fm-foot">macOS 15+ · Apple silicon</div>
-          </div>
-        </article>
       </div>
 
       <p class="also">
         Also: <a href="/docs/guides/worktrees/">a worktree per branch</a> ·
         <a href="/docs/extend/writing-modules/">modules in any language</a> ·
         <a href="/docs/reference/keybindings/">remappable keys</a> ·
-        <a href="/docs/guides/layout/">movable panels and themes</a>
+        <a href="/docs/guides/layout/">movable panels and themes</a> ·
+        <a href="/docs/guides/notch/">the macOS notch companion</a>
       </p>
     </section>
 
@@ -677,8 +627,8 @@ const ogImage = 'https://bohay.dev/og.png';
         </div>
         <div class="oc-rows">
           <div class="oc-row"><i class="d done"></i><b>t1</b><span class="pill done">done</span><span class="oc-name">OAuth token module</span><span class="oc-meta">gate ✓</span></div>
-          <div class="oc-row"><i class="d run"></i><b>t2</b><span class="pill run">running</span><span class="oc-name">API layer</span><span class="oc-meta">bohay/t2</span></div>
-          <div class="oc-row"><i class="d run"></i><b>t3</b><span class="pill run">running</span><span class="oc-name">Docs + examples</span><span class="oc-meta">bohay/t3</span></div>
+          <div class="oc-row"><i class="d run"></i><b>t2</b><span class="pill run">running</span><span class="oc-name">API layer</span><span class="oc-meta">luvus/t2</span></div>
+          <div class="oc-row"><i class="d run"></i><b>t3</b><span class="pill run">running</span><span class="oc-name">Docs + examples</span><span class="oc-meta">luvus/t3</span></div>
           <div class="oc-row"><i class="d queue"></i><b>t4</b><span class="pill queue">queued</span><span class="oc-name">Integration tests</span><span class="oc-meta">⟶ t2 t3</span></div>
         </div>
         <div class="oc-leases">
@@ -711,23 +661,23 @@ const ogImage = 'https://bohay.dev/og.png';
 
     <section class="cta-repo">
       <div class="cta-card" aria-labelledby="name-note-title">
-        {ctaArt && <div class="cta-art" style={`--art:url(${ctaArt.src})`} aria-hidden="true"></div>}
+        <div class="cta-art" aria-hidden="true" set:html={luvusTinted}></div>
 
         <div class="cta-copy">
         <div class="name-dictionary">
           <div class="name-entry">
-            <span class="name-word">Bohay</span>
-            <span class="name-ipa" aria-label="pronounced boh AI">/boʊˈaɪ/</span>
+            <span class="name-word">Luvus</span>
+            <span class="name-ipa" aria-label="pronounced luv us">/ˈlʌv.ʌs/</span>
           </div>
-          <span class="name-respell">boh-AI · proper noun</span>
+          <span class="name-respell">luv-us · proper noun</span>
         </div>
 
         <div class="name-story">
-          <h2 id="name-note-title">It is short enough to type and strange enough to remember.</h2>
+          <h2 id="name-note-title">One short name for the place your agents work together.</h2>
           <p>
             <strong>Why the name?</strong>
-            Search for “bohay” today and you may find something else. We want to
-            change that result with something more useful and much cooler.
+            Luvus is compact, distinct, and easy to type. It fits a mission
+            control that keeps you and your AI coding agents in sync.
           </p>
         </div>
 
@@ -747,12 +697,12 @@ const ogImage = 'https://bohay.dev/og.png';
       <div class="foot-inner">
         <div class="foot-brand">
           <Logo width={22} height={22} class="mark" aria-hidden="true" />
-          <span>Bohay</span>
+          <span>Luvus</span>
           <span class="dim">by Riz</span>
         </div>
         <div class="foot-links">
           <a href={GITHUB}>github</a>
-          <a href="https://crates.io/crates/bohay">crates.io</a>
+          <a href="https://crates.io/crates/luvus">crates.io</a>
         </div>
       </div>
     </footer>
@@ -764,9 +714,9 @@ const ogImage = 'https://bohay.dev/og.png';
          way most product sites expose their mark. Plain links + clipboard, no
          dependency. -->
     <div class="brandmenu" id="brandmenu" hidden>
-      <a class="bm-item" id="bm-png" href="/brand/bohay-logo.png" download="bohay-logo.png">Download PNG</a>
-      <a class="bm-item" id="bm-svg" href="/brand/bohay-logo.svg" download="bohay-logo.svg">Download SVG</a>
-      <button type="button" class="bm-item" id="bm-copy" data-src="/brand/bohay-logo.svg">Copy SVG</button>
+      <a class="bm-item" id="bm-png" href="/brand/luvus-logo.png" download="luvus-logo.png">Download PNG</a>
+      <a class="bm-item" id="bm-svg" href="/brand/luvus-logo.svg" download="luvus-logo.svg">Download SVG</a>
+      <button type="button" class="bm-item" id="bm-copy" data-src="/brand/luvus-logo.svg">Copy SVG</button>
     </div>
     <div class="theme-dock" id="theme-dock">
       <ul class="td-list" id="td-list" role="listbox" aria-label="Color theme" hidden>
@@ -982,7 +932,7 @@ const ogImage = 'https://bohay.dev/og.png';
       );
       $('session-row')?.addEventListener('click', () => {
         const note = $('status-note');
-        if (note) note.textContent = 'resume reopens that conversation in a pane · try it in the real bohay';
+        if (note) note.textContent = 'resume reopens that conversation in a pane · try it in the real luvus';
       });
       $('menu-pill')?.addEventListener('click', () => {
         const note = $('status-note');
@@ -1001,27 +951,27 @@ const ogImage = 'https://bohay.dev/og.png';
         flow: [
           '<div class="tline"><span class="c-acc">main</span> ──●──●──●──●──▶</div>',
           '<div class="tline c-dim">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\\</div>',
-          '<div class="tline">&nbsp;&nbsp;<span class="c-mint">bohay/t2</span> ●──● &nbsp;<span class="c-dim">↑2 ·</span> PR <span class="c-acc">#14</span></div>',
+          '<div class="tline">&nbsp;&nbsp;<span class="c-mint">luvus/t2</span> ●──● &nbsp;<span class="c-dim">↑2 ·</span> PR <span class="c-acc">#14</span></div>',
           '<div class="tline c-dim">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\\</div>',
-          '<div class="tline">&nbsp;&nbsp;<span class="c-mint">bohay/t3</span> ● &nbsp;<span class="c-dim">↑1</span></div>',
+          '<div class="tline">&nbsp;&nbsp;<span class="c-mint">luvus/t3</span> ● &nbsp;<span class="c-dim">↑1</span></div>',
         ].join(''),
         branches: [
           '<div class="grow"><span class="c-acc">● main</span> <span class="c-dim">↑0 ↓0</span> &nbsp;release: v0.7.0 <span class="grow-meta">2h</span></div>',
           '<div class="grow">&nbsp;&nbsp;audit-release <span class="c-dim">↑2 ↓0</span> &nbsp;fix: socket perms <span class="grow-meta">5h</span></div>',
-          '<div class="grow">&nbsp;&nbsp;bohay/t2 <span class="c-dim">↑1 ↓0</span> &nbsp;wip: api layer <span class="grow-meta">1h</span></div>',
-          '<div class="grow">&nbsp;&nbsp;bohay/t3 <span class="c-dim">↑1 ↓0</span> &nbsp;docs + examples <span class="grow-meta">30m</span></div>',
+          '<div class="grow">&nbsp;&nbsp;luvus/t2 <span class="c-dim">↑1 ↓0</span> &nbsp;wip: api layer <span class="grow-meta">1h</span></div>',
+          '<div class="grow">&nbsp;&nbsp;luvus/t3 <span class="c-dim">↑1 ↓0</span> &nbsp;docs + examples <span class="grow-meta">30m</span></div>',
         ].join(''),
         prs: [
           '<div class="grow"><span class="c-dim">#14</span> feat: api layer <span class="c-amber">● checks running</span> <span class="grow-meta">open</span></div>',
           '<div class="grow"><span class="c-dim">#13</span> fix: close audit findings <span class="c-grn">✓ checks</span> <span class="grow-meta">merged</span></div>',
-          '<div class="grow"><span class="c-dim">#12</span> feat: bohay-notch config <span class="c-grn">✓ checks</span> <span class="grow-meta">merged</span></div>',
+          '<div class="grow"><span class="c-dim">#12</span> feat: luvus-notch config <span class="c-grn">✓ checks</span> <span class="grow-meta">merged</span></div>',
         ].join(''),
         issues: [
           '<div class="grow"><span class="c-dim">#9</span> scroll mode on Windows Terminal <span class="grow-meta">enhancement</span></div>',
           '<div class="grow"><span class="c-dim">#7</span> gemini session resume <span class="grow-meta">help wanted</span></div>',
         ].join(''),
         status: [
-          '<div class="tline"><span class="c-dim">origin</span> &nbsp;github.com/RizRiyz/bohay <span class="c-dim">· 47 commits · 4 weeks</span></div>',
+          '<div class="tline"><span class="c-dim">origin</span> &nbsp;github.com/RizRiyz/luvus <span class="c-dim">· 47 commits · 4 weeks</span></div>',
           '<div class="tline">RizRiyz &nbsp;<span class="c-acc">████████████░</span> 46</div>',
           '<div class="tline"><span class="c-dim">bot</span> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;░ 1</div>',
           '<div class="tline c-grn">working tree: clean</div>',
@@ -1029,8 +979,8 @@ const ogImage = 'https://bohay.dev/og.png';
       };
       const ORCH_ROWS = [
         '<span class="c-mint">●</span> t1 <span class="c-mint">done</span>&nbsp;&nbsp;&nbsp; OAuth token module <span class="grow-meta">gate ✓ cargo test auth</span>',
-        '<span class="c-amber">◐</span> t2 <span class="c-amber">running</span> API layer <span class="grow-meta">⟶t1 · pane 4 · bohay/t2</span>',
-        '<span class="c-amber">◐</span> t3 <span class="c-amber">running</span> Docs + examples <span class="grow-meta">pane 5 · bohay/t3</span>',
+        '<span class="c-amber">◐</span> t2 <span class="c-amber">running</span> API layer <span class="grow-meta">⟶t1 · pane 4 · luvus/t2</span>',
+        '<span class="c-amber">◐</span> t3 <span class="c-amber">running</span> Docs + examples <span class="grow-meta">pane 5 · luvus/t3</span>',
         '<span class="c-dim">○</span> t4 <span class="c-dim">queued</span>&nbsp; Integration tests <span class="grow-meta">⟶t2 t3</span>',
       ];
       const STATUS_HINTS: Record<string, () => string> = {
@@ -1156,160 +1106,6 @@ const ogImage = 'https://bohay.dev/og.png';
         // Deep-linkable demo state: /?demo=git or /?demo=orch opens that tab.
         const deep = new URLSearchParams(location.search).get('demo');
         if (deep === 'git' || deep === 'orch') switchTab(deep);
-      }
-
-      // ── The bohay-notch Mac-screen showcase: Monitor · Approve · Ask · Jump. ──
-      const island = $('island');
-      if (island) {
-        type Cap = 'monitor' | 'approve' | 'jump';
-
-        // Terminal pane content per focused agent (+ special claude states).
-        const PANE: Record<string, string[]> = {
-          claude: [
-            '<span class="c-dim">⏺</span> Reading <span class="c-acc">src/app/dispatch.rs</span>…',
-            '<span class="c-grn">✓</span> Edit <span class="c-acc">src/app/mod.rs</span> <span class="c-dim">(+14 -3)</span>',
-            '<span class="c-dim">⏺</span> Running <span class="c-acc">cargo test</span>… <span class="c-grn">143 passed</span>',
-          ],
-          'claude-approve': [
-            '<span class="c-dim">⏺</span> Ready to run the test suite…',
-            '<span class="c-amber">⏸ waiting · answer in the notch ↑</span>',
-          ],
-          'claude-done': [
-            '<span class="c-dim">⏺</span> Running <span class="c-acc">cargo test</span>…',
-            '<span class="c-grn">✓</span> 143 passed <span class="c-dim">· 2.1s</span>',
-          ],
-          codex: [
-            '<span class="c-dim">⏺</span> Editing <span class="c-acc">firmware.rs</span>…',
-            '<span class="c-dim">⏺</span> Flashing ESP32 <span class="c-dim">· 61% ctx</span>',
-          ],
-          copilot: [
-            '<span class="c-grn">✓</span> Build finished <span class="c-dim">in 14s</span>',
-            '<span class="c-mint">done · ready to review</span>',
-          ],
-          opencode: ['<span class="c-dim">idle · waiting for input</span>'],
-        };
-        const CWD: Record<string, string> = { claude: '~/sudos', codex: '~/esp-sol', copilot: '~/notch', opencode: '~/docs' };
-
-        // The island height hugs whichever view is visible (no dead space).
-        const sizeIsland = () => {
-          if (island.classList.contains('open'))
-            island.style.height = ($('npanel') as HTMLElement).scrollHeight + 'px';
-        };
-        const showView = (v: 'list' | 'approve') => {
-          ($('nview-list') as HTMLElement).hidden = v !== 'list';
-          ($('nview-approve') as HTMLElement).hidden = v !== 'approve';
-          sizeIsland();
-        };
-        const setSummary = (blocked: boolean) => {
-          const d = $('sumdot');
-          if (d) d.className = 'sumdot ' + (blocked ? 'blocked' : 'working');
-        };
-        const setClaudePill = (state: string) => {
-          const pill = document.querySelector('[data-pill="claude"]');
-          if (pill) { pill.className = 'npill ' + state; pill.textContent = state.charAt(0).toUpperCase() + state.slice(1); }
-          document.querySelector('[data-sd="claude"]')?.setAttribute('class', 'tsd ' + state);
-          const foot = { work: 1, done: 1, idle: 1 };
-          if (state === 'blocked' || state === 'working') foot.work += 1;
-          else if (state === 'done') foot.done += 1; else foot.idle += 1;
-          ($('f-run') as HTMLElement).textContent = String(foot.work);
-          ($('f-done') as HTMLElement).textContent = String(foot.done);
-          ($('f-idle') as HTMLElement).textContent = String(foot.idle);
-        };
-
-        // Focus a terminal pane (the "Jump" payoff): swap title/body, flash a ring.
-        let focused = 'claude';
-        const focusTerminal = (id: string, variant = '') => {
-          focused = id;
-          ($('tw-title') as HTMLElement).textContent = `${id} · ${CWD[id] ?? '~'}`;
-          const lines = PANE[variant || id] ?? PANE[id] ?? [];
-          const pane = $('tw-pane') as HTMLElement;
-          pane.innerHTML = lines.map((l) => `<div class="tline">${l}</div>`).join('');
-          document.querySelectorAll('.tw-agent').forEach((a) =>
-            a.classList.toggle('on', a.getAttribute('data-jump') === id)
-          );
-          const win = $('termwin');
-          win?.classList.remove('flash'); void win?.offsetWidth; win?.classList.add('flash');
-        };
-        const toast = (msg: string) => {
-          const t = $('jtoast') as HTMLElement;
-          t.textContent = msg; t.classList.add('show');
-          setTimeout(() => t.classList.remove('show'), 1600);
-        };
-
-        // Open / close the notch. Hovering the screen opens it; leaving closes
-        // it unless a click "pinned" it open for a beat (so a tap on a cap or a
-        // card answer stays visible even with the cursor off the screen).
-        let hovering = false, pinned = false;
-        let pinT: ReturnType<typeof setTimeout> | undefined;
-        let closeT: ReturnType<typeof setTimeout> | undefined;
-        const openIsland = () => { island.classList.add('open'); sizeIsland(); };
-        const closeIsland = () => { island.classList.remove('open'); island.style.height = ''; };
-        const pin = (ms = 2600) => {
-          pinned = true; clearTimeout(pinT);
-          pinT = setTimeout(() => { pinned = false; if (!hovering) closeIsland(); }, ms);
-        };
-        const maybeClose = () => {
-          clearTimeout(closeT);
-          closeT = setTimeout(() => { if (!hovering && !pinned) closeIsland(); }, 240);
-        };
-
-        // The three capabilities.
-        const setCap = (cap: Cap) => {
-          setActiveCap(cap);
-          if (cap === 'monitor') {
-            showView('list'); setSummary(false); setClaudePill('working'); focusTerminal('claude');
-          } else if (cap === 'approve') {
-            showView('approve'); setSummary(true); setClaudePill('blocked'); focusTerminal('claude', 'claude-approve');
-          } else if (cap === 'jump') {
-            showView('list'); setSummary(false); setClaudePill('working');
-            focusTerminal('copilot'); toast('Jumped to copilot');
-          }
-        };
-
-        // Answering the card → Claude resumes; approve runs to Done, deny keeps
-        // it working. Back to the Monitor view either way.
-        const answer = (deny: boolean) => {
-          setActiveCap('monitor'); showView('list'); setSummary(false);
-          setClaudePill('working'); focusTerminal('claude');
-          if (!deny) setTimeout(() => { setClaudePill('done'); focusTerminal('claude', 'claude-done'); }, 2200);
-        };
-        function setActiveCap(cap: Cap) {
-          document.querySelectorAll('#caps .cap').forEach((c) =>
-            c.classList.toggle('on', c.getAttribute('data-cap') === cap));
-        }
-
-        // Wiring — hover the Mac screen to reveal / hide the notch.
-        const mac = document.querySelector('.mac');
-        mac?.addEventListener('mouseenter', () => { hovering = true; openIsland(); });
-        mac?.addEventListener('mouseleave', () => { hovering = false; maybeClose(); });
-
-        $('caps')?.addEventListener('click', (e) => {
-          const b = (e.target as HTMLElement).closest('[data-cap]');
-          if (b) { setCap(b.getAttribute('data-cap') as Cap); openIsland(); pin(); }
-        });
-        $('nview-approve')?.addEventListener('click', (e) => {
-          const b = (e.target as HTMLElement).closest('[data-answer]');
-          if (b) { answer(b.getAttribute('data-answer') === 'no'); openIsland(); pin(); }
-        });
-        // Click any agent (notch row or terminal sidebar) to jump to its pane.
-        document.querySelectorAll('[data-jump]').forEach((el) =>
-          el.addEventListener('click', () => {
-            const id = el.getAttribute('data-jump') as string;
-            focusTerminal(id); toast(`Jumped to ${id}`);
-            setActiveCap('jump'); openIsland(); pin();
-          })
-        );
-
-        // Seed Monitor. On a plain load, peek the island open once so first-time
-        // visitors see it drop from the notch (double-rAF paints collapsed first
-        // so the transition animates), then it tucks away unless hovered. A
-        // `?cap=approve|jump` deep-link opens it straight away, held open.
-        const params = new URLSearchParams(location.search);
-        const startCap = (params.get('cap') as Cap) || 'monitor';
-        setCap(['monitor', 'approve', 'jump'].includes(startCap) ? startCap : 'monitor');
-        setClaudePill('working');
-        if (params.has('cap')) { openIsland(); pin(6e5); }
-        else requestAnimationFrame(() => requestAnimationFrame(() => { openIsland(); pin(3400); }));
       }
 
       // Copy the install one-liner.
@@ -1547,7 +1343,7 @@ const ogImage = 'https://bohay.dev/og.png';
       }
       /* Inline SVG logo mark · crisp at any size, sits flush with the wordmark. */
       .mark { display: block; flex-shrink: 0; }
-      /* TRIAL: the nav mark as inline line art. Ink follows the wordmark, so it
+      /* The nav mark is inline line art. Ink follows the wordmark, so it
          reads as one lockup rather than an image sat beside text. */
       .mark-luvus { width: 42px; height: 42px; }
       .mark-luvus svg { width: 100%; height: 100%; display: block; }
@@ -1599,7 +1395,7 @@ const ogImage = 'https://bohay.dev/og.png';
         -webkit-mask: var(--art) center / contain no-repeat;
         mask: var(--art) center / contain no-repeat;
       }
-      /* TRIAL: the inline luvus mark. Real SVG rather than a masked image, so the
+      /* The inline Luvus mark uses real SVG rather than a masked image, so the
          knockout fills can sit at `--bg` and read as line art. `color` is the ink,
          the same `--overlay1` the masked mark used, so the weight is comparable.
          Not mirrored: the mark is near-symmetric, so flipping it does nothing. */
@@ -1717,7 +1513,7 @@ const ogImage = 'https://bohay.dev/og.png';
 
       /* The app's own window is about 1.72:1 (2258x1310 in the captures), but
          matching that exactly pushes the demo past the fold. 380px was a 3.5:1
-         letterbox that looked nothing like running bohay; this lands between
+         letterbox that looked nothing like running luvus; this lands between
          the two, tracking the viewport so it stays sane on a narrow column. */
       .demo-body { display: flex; min-height: clamp(330px, 48vw, 560px); }
       .demo-side {
@@ -1894,7 +1690,7 @@ const ogImage = 'https://bohay.dev/og.png';
       .demo-panes { flex: 1; display: flex; gap: 0; min-height: 0; }
       .pane {
         flex: 1; display: flex; flex-direction: column; min-width: 0; cursor: pointer;
-        /* Every pane is framed, the focused one brighter, which is what bohay
+        /* Every pane is framed, the focused one brighter, which is what luvus
            itself does (`border` vs `border_focus`). A transparent default left
            unfocused panes with no edge at all. */
         border: 1px solid var(--line); margin: 0.5rem;
@@ -2051,7 +1847,7 @@ const ogImage = 'https://bohay.dev/og.png';
       .fm-row i.ok { color: var(--accent); }
       .fm-row i.hot { color: var(--coral); }
       /* Two panes side by side, framed like the real thing: every pane carries an
-         edge, and the divider between them is the seam bohay draws. */
+         edge, and the divider between them is the seam luvus draws. */
       .fm-panes { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; margin-top: 0.35rem; }
       .fm-pane { border: 1px solid var(--line); padding: 0.4rem 0.5rem; min-width: 0; }
       .fm-pt {
@@ -2164,19 +1960,6 @@ const ogImage = 'https://bohay.dev/og.png';
         padding: 0; margin: 0.25rem 0.5rem; height: 1px;
         background: var(--line); border-radius: 0;
       }
-      /* The notch mock wears the panel's own shape: rounded only at the bottom,
-         with the camera pill above it, so it reads as something that dropped
-         out of the top of a screen rather than another card. */
-      .fm.notch {
-        border-top: 0; border-radius: 0 0 12px 12px; position: relative;
-        padding-top: 1.5rem; margin-top: 0.6rem;
-      }
-      .fm-notch {
-        position: absolute; top: 0.45rem; left: 50%; transform: translateX(-50%);
-        width: 3.6rem; height: 0.5rem; border-radius: 999px; background: var(--bg);
-        border: 1px solid var(--line); border-top: 0;
-      }
-      .fm.notch .fm-cmd { font-size: 0.62rem; color: var(--accent); word-break: break-all; }
       .fm-foot {
         margin-top: 0.3rem; padding-top: 0.35rem; border-top: 1px solid var(--line);
         color: var(--overlay1); font-size: 0.62rem;
@@ -2306,7 +2089,7 @@ const ogImage = 'https://bohay.dev/og.png';
       .ic-kiro svg path[fill='#000'] { fill: var(--bg); }
       .aname { color: var(--sub); font-size: 0.75rem; text-align: left; letter-spacing: -0.01em; white-space: nowrap; }
       .atile:hover .aname { color: var(--text); }
-      /* Marks an agent bohay ships a session hook for. Sits on the mark itself,
+      /* Marks an agent luvus ships a session hook for. Sits on the mark itself,
          as a badge on its top-right corner — anchored to the tile it drifted out
          past the name and read as belonging to the next tile along. */
       .atile.hook .aicon { position: relative; }
@@ -2364,17 +2147,16 @@ const ogImage = 'https://bohay.dev/og.png';
       .name-story strong { color: var(--text); font-weight: 600; }
 
       /* ── closing call to action ──────────────────────────────────────── */
-      /* Two columns across the frame: copy left, the mark right. Restores the
-         card styles lost when the notch showcase's CSS block was removed. */
+      /* Two columns across the frame: copy left, the mark right. */
       .cta-repo { padding-block: 4rem; }
       .cta-card {
-        display: grid; grid-template-columns: minmax(0, 0.68fr) minmax(0, 1fr);
+        display: grid; grid-template-columns: minmax(12rem, 0.58fr) minmax(0, 1fr);
         gap: 2rem; align-items: center;
         border: 1px solid var(--line);
-        /* No bottom padding: the mark runs to the card's lower edge. */
-        padding: 2rem var(--gut) 0;
+        padding: 2.25rem var(--gut);
+        overflow: hidden;
       }
-      .cta-copy { min-width: 0; padding-bottom: 2rem; }
+      .cta-copy { min-width: 0; }
       .cta-card h2 { font-size: clamp(1.25rem, 2.5vw, 1.7rem); letter-spacing: -0.035em; margin: 0 0 0.65rem; }
       .cta-card p { color: var(--sub); max-width: 40rem; margin: 0; font-size: 0.88rem; line-height: 1.7; }
       .cta-actions { display: flex; gap: 0.8rem; flex-wrap: wrap; margin-top: 1.15rem; }
@@ -2386,26 +2168,25 @@ const ogImage = 'https://bohay.dev/og.png';
       .cta-actions .btn:hover { transform: translateY(-2px); }
       .cta-ic { width: 18px; height: 18px; flex-shrink: 0; }
 
-      /* Same treatment as the hero mark: the art is a mask, so one asset takes
-         the palette on every theme. */
+      /* Same canonical, theme-aware SVG as the hero and docs header. */
       .cta-art {
-        /* Bottom-aligned and flush: `align-self: end` puts its lower edge on the
-           card's, and the card drops its bottom padding to meet it. */
-        aspect-ratio: 1; width: 100%; max-width: 28rem;
-        justify-self: center; align-self: end;
-        background: var(--overlay1);
-        -webkit-mask: var(--art) center / contain no-repeat;
-        mask: var(--art) center / contain no-repeat;
+        aspect-ratio: 1; width: min(100%, 19rem);
+        justify-self: center; align-self: center;
+        color: var(--overlay1);
+        overflow: hidden;
+      }
+      .cta-art svg {
+        display: block;
+        width: 100%; height: 100%; max-width: 100%;
       }
 
       @media (max-width: 900px) {
-        .cta-card { grid-template-columns: minmax(0, 1fr); gap: 1.1rem; text-align: center; padding-bottom: 0; }
-        .cta-copy { padding-bottom: 1.8rem; }
+        .cta-card { grid-template-columns: minmax(0, 1fr); gap: 1.4rem; text-align: center; }
         .name-dictionary { align-items: center; }
         .name-entry { justify-content: center; }
         .cta-actions { justify-content: center; }
         .cta-card p { margin-inline: auto; }
-        .cta-art { order: -1; justify-self: center; max-width: 9rem; }
+        .cta-art { order: -1; width: min(100%, 9rem); }
       }
 
 
@@ -2420,7 +2201,7 @@ const ogImage = 'https://bohay.dev/og.png';
       .foot-links a:hover { color: var(--accent); }
 
       @media (max-width: 900px) {
-        .orch, .notch { grid-template-columns: 1fr; }
+        .orch { grid-template-columns: 1fr; }
         section, header.hero { padding: 3rem var(--gut); }
         .agent-grid { grid-template-columns: repeat(4, max-content); gap: 0.4rem 1.4rem; }
       }
@@ -2498,7 +2279,7 @@ const ogImage = 'https://bohay.dev/og.png';
     </style>
 
     <script>
-      // Theme picker · palettes come from bohay's own registry, generated into
+      // Theme picker · palettes come from luvus's own registry, generated into
       // styles/themes.css, so what you preview is what the app ships. Applying a
       // theme sets `data-bh-theme` on <html>, which outranks each page's :root.
       //
@@ -2506,7 +2287,7 @@ const ogImage = 'https://bohay.dev/og.png';
       // click, so moving away or closing restores what you had.
       import { DEFAULT_THEME } from '../lib/themes';
       (() => {
-        const KEY = 'bohay-theme';
+        const KEY = 'luvus-theme';
         const dock = document.getElementById('theme-dock');
         const btn = document.getElementById('td-btn');
         const list = document.getElementById('td-list');

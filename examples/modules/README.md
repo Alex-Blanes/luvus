@@ -1,6 +1,6 @@
 # Example modules
 
-Three complete, working bohay modules — one per language — each covering a
+Three complete, working luvus modules — one per language — each covering a
 different part of the extension surface. They are meant to be **copied and
 edited**, not installed as-is.
 
@@ -17,8 +17,8 @@ itself (`sh`, `python3`, `node`).
 ## Try one
 
 ```sh
-bohay module link ./examples/modules/branch-dock
-bohay module list
+luvus module link ./examples/modules/branch-dock
+luvus module list
 ```
 
 `branch-dock` paints its dock immediately (its startup hook runs on link), so
@@ -30,24 +30,24 @@ for its "Refresh branches" entry.
 Remove it again with:
 
 ```sh
-bohay module unlink example.branch-dock
+luvus module unlink example.branch-dock
 ```
 
 ## Reading them
 
 Start with `branch-dock/refresh.sh`. It is the shortest demonstration of the
-whole idea: read the injected `BOHAY_*` variables, do some work, and call back
-through `$BOHAY_BIN_PATH`. There is no SDK to import in any of these files.
+whole idea: read the injected `LUVUS_*` variables, do some work, and call back
+through `$LUVUS_BIN_PATH`. There is no SDK to import in any of these files.
 
 ## Writing your own
 
-Full reference: **[bohay.dev/docs/extend/writing-modules](https://bohay.dev/docs/extend/writing-modules/)**.
+Full reference: **[luvus.dev/docs/extend/writing-modules](https://luvus.dev/docs/extend/writing-modules/)**.
 
 Two rules worth knowing up front:
 
-- Call back through `$BOHAY_BIN_PATH`, never a bare `bohay` on `PATH`. It points
+- Call back through `$LUVUS_BIN_PATH`, never a bare `luvus` on `PATH`. It points
   at the running binary, so your module works across Unix sockets and Windows
   named pipes.
-- Write durable data to `$BOHAY_MODULE_STATE_DIR` or `$BOHAY_MODULE_CONFIG_DIR`,
+- Write durable data to `$LUVUS_MODULE_STATE_DIR` or `$LUVUS_MODULE_CONFIG_DIR`,
   never into the module directory. For a git-installed module that directory is
   a managed checkout a reinstall replaces.

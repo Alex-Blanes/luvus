@@ -4,14 +4,14 @@ description: The JSON control API, covering wire format, methods, and the event 
 ---
 
 Everything the CLI does goes over a local socket speaking newline-delimited
-JSON. The default server remains at `~/.bohay/bohay.sock`. A named server
-normally uses `~/.bohay/sessions/<name>/bohay.sock`. On Unix, an unusually long
-custom `BOHAY_HOME` gets a deterministic short socket alias under an owner-only
+JSON. The default server remains at `~/.luvus/luvus.sock`. A named server
+normally uses `~/.luvus/sessions/<name>/luvus.sock`. On Unix, an unusually long
+custom `LUVUS_HOME` gets a deterministic short socket alias under an owner-only
 directory in `/tmp` to stay within the operating system's path limit.
 
-The resolved path is injected into every pane as `$BOHAY_SOCKET_PATH`. That
+The resolved path is injected into every pane as `$LUVUS_SOCKET_PATH`. That
 socket is the authority boundary, so methods do not need a session parameter.
-Use `bohay --session <name> <command>` from outside a pane. Inside a pane, keep
+Use `luvus --session <name> <command>` from outside a pane. Inside a pane, keep
 the inherited socket so commands cannot drift to another server. The CLI is a
 thin wrapper: **every server command maps to one method**, so the easiest way
 to learn the API is to use the CLI and read its JSON output. Session list,
@@ -34,7 +34,7 @@ Errors come back structured:
 
 ```sh
 # Try it raw (macOS/Linux):
-printf '%s\n' '{"id":"1","method":"ping","params":{}}' | nc -U ~/.bohay/bohay.sock
+printf '%s\n' '{"id":"1","method":"ping","params":{}}' | nc -U ~/.luvus/luvus.sock
 ```
 
 ## Method families
@@ -51,9 +51,9 @@ printf '%s\n' '{"id":"1","method":"ping","params":{}}' | nc -U ~/.bohay/bohay.so
 | modules | `module.list` · `module.info` · `module.link` · `module.unlink` · `module.enable` · `module.disable` · `module.action.list` · `module.action.invoke` · `module.pane.open` · `module.pane.focus` · `module.pane.close` · `module.config_dir` · `module.settings.list` · `module.settings.get` · `module.settings.set` · `module.log.list` |
 | ui / server | `ui.sidebar` · `ui.dock.push` · `ui.dock.list` · `ui.dock.move` · `ui.toast` · `ping` · `server.stop` · `events.subscribe` |
 
-Parameter shapes mirror the CLI flags (`bohay task add --paths x` →
+Parameter shapes mirror the CLI flags (`luvus task add --paths x` →
 `{"paths": ["x"]}`). For CLI commands, an omitted pane uses
-`$BOHAY_PANE_ID` when available; a raw API request with no pane uses the
+`$LUVUS_PANE_ID` when available; a raw API request with no pane uses the
 currently focused pane.
 
 ## Organizing workspaces
@@ -65,8 +65,8 @@ Workspace indices are 0-based and remain stable when sidebar ordering changes.
 | `workspace.rename` | `{workspace, name}` | `{type:"workspace_rename", workspace, name, cwd, pinned, display_position}` |
 | `workspace.pin` | `{workspace, pinned}` | `{type:"workspace_pin", workspace, name, cwd, pinned, display_position}` |
 
-The equivalent CLI commands are `bohay workspace rename <i> <name>`,
-`bohay workspace pin <i>`, and `bohay workspace unpin <i>`. Renaming changes
+The equivalent CLI commands are `luvus workspace rename <i> <name>`,
+`luvus workspace pin <i>`, and `luvus workspace unpin <i>`. Renaming changes
 only the display label, trims surrounding whitespace, rejects empty or
 over-40-character labels, and never renames the folder on disk. Pinning changes
 sidebar display order without changing the API index or stealing focus. A pin
@@ -132,7 +132,7 @@ fields observe state only; they do not grant remote control of a pane viewport.
 |---|---|---|
 | `agent.fork` | `{target, name?, focus?}` | `{type:"agent_fork", from, pane, agent, name, workspace, tab, focused}` |
 
-`target` is a live alias, numeric pane ID, or a unique agent kind. Bohay uses
+`target` is a live alias, numeric pane ID, or a unique agent kind. Luvus uses
 the agent's native fork command and creates the sibling to the right of the
 source pane in that pane's own workspace and tab. The parent stays running.
 `name` optionally assigns the new fork a live alias. `focus` defaults to `true`;
@@ -146,7 +146,7 @@ ID cannot be resolved returns `session_unknown`; and PTY launch failure returns
 
 For plugins that contribute a **sidebar dock** (a panel in the left or right
 sidebar. See [Writing a Module](/docs/extend/writing-modules/)). A module
-declares the dock in its manifest and pushes its content here, and bohay owns the
+declares the dock in its manifest and pushes its content here, and luvus owns the
 rendering.
 
 | Method | Params | Result |
@@ -170,21 +170,21 @@ A `Row` is:
 Only `text` is required. The first `push` mounts the dock into `placement`
 (default left); later pushes refresh its rows. A row's `action` is a module
 action id run when the row is **left-clicked**, with `value` handed to it as
-`BOHAY_MODULE_ROW_VALUE` so one action can serve every row.
+`LUVUS_MODULE_ROW_VALUE` so one action can serve every row.
 
 `menu` gives the row a **right-click** menu. Each entry runs an action id, an
 entry with an empty `action` is a divider, and `destructive` tints the label. An
 absent `menu` means the row has no context menu. An entry's own `value`
 overrides the row's, so one action can back a menu of variants. Menu entries
-also set `BOHAY_MODULE_ACTION_ID`, so one script can handle the whole menu.
+also set `LUVUS_MODULE_ACTION_ID`, so one script can handle the whole menu.
 
-The CLI wrappers are `bohay ui dock push|list|move` (`push` also reads its rows
+The CLI wrappers are `luvus ui dock push|list|move` (`push` also reads its rows
 from stdin).
 
 ## The event stream
 
 `events.subscribe` turns the connection into a stream: after one
-acknowledgment line, every event arrives as a JSON line. `bohay events` is
+acknowledgment line, every event arrives as a JSON line. `luvus events` is
 exactly this.
 
 ```json
@@ -204,7 +204,7 @@ still spell these `node.created` / `node.closed`) · `tab.created` · `tab.close
 
 ## Practical notes
 
-- **Prefer the CLI** in scripts (`bohay --verbose`-free, stable JSON to
+- **Prefer the CLI** in scripts (`luvus --verbose`-free, stable JSON to
   stdout). Talk raw JSON only when embedding (e.g. a native companion app:
   the macOS notch app is just another socket client).
 - The socket is **owner-only** (`0600`, in a `0700` dir). Access equals

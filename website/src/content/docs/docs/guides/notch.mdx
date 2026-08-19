@@ -1,15 +1,15 @@
 ---
 title: The macOS Notch App
-description: bohay-notch mirrors every agent into a native macOS panel that drops out of the MacBook notch, so you can watch them, answer them, and jump to them without leaving the app you are in.
+description: luvus-notch mirrors every agent into a native macOS panel that drops out of the MacBook notch, so you can watch them, answer them, and jump to them without leaving the app you are in.
 ---
 
 import NotchDemo from '../../../../components/NotchDemo.astro';
 
-**bohay-notch** is a small native macOS app that ships alongside bohay. It puts
+**luvus-notch** is a small native macOS app that ships alongside luvus. It puts
 your agents where you are already looking: a panel that drops out of the
 MacBook notch, showing what every agent is doing right now.
 
-It is a *companion*, not a requirement. bohay works fully without it, and the
+It is a *companion*, not a requirement. luvus works fully without it, and the
 notch app is read-mostly: everything it does, you can also do in the terminal.
 
 ## Try it
@@ -26,7 +26,7 @@ An agent that is *working* needs nothing from you. An agent that is **blocked**
 needs you now, and the cost of not noticing is the whole point: it sits there,
 burning nothing, until you happen to look.
 
-bohay already solves this inside the terminal: the agents sidebar, the `⠶ ctrl`
+luvus already solves this inside the terminal: the agents sidebar, the `⠶ ctrl`
 tab, an optional chime. But all of those assume the terminal is on screen. The
 notch app covers the case where it is not: you are in a browser, a design tool,
 a meeting. The panel stays above every app and every Space, so the answer to
@@ -65,21 +65,21 @@ straight from the notch and the agent carries on. This is the feature that earns
 the app. The gap between "an agent asked" and "you answered" is usually the
 biggest dead time in a long session.
 
-**Jump.** Click any row to focus that agent's pane in bohay. The terminal comes
+**Jump.** Click any row to focus that agent's pane in luvus. The terminal comes
 forward with the right workspace, tab and pane already selected.
 
 ## How it connects
 
 The app is a **client of the same socket the CLI uses**. On launch it resolves
-bohay's control socket, sends `events.subscribe`, and keeps a live model of
+luvus's control socket, sends `events.subscribe`, and keeps a live model of
 every pane from the event stream, seeded by one `agent.list` snapshot.
 
 That has a few consequences worth knowing:
 
-- **No extra configuration.** If bohay is running, the app finds it.
+- **No extra configuration.** If luvus is running, the app finds it.
 - **No accessibility permission, no daemon, no private APIs.** It is a normal
   signed app.
-- **bohay does not need to be running.** The app reconnects with backoff and
+- **luvus does not need to be running.** The app reconnects with backoff and
   shows a disconnected state until a server appears.
 - **Everything is local.** The socket is a Unix domain socket on your machine;
   nothing about your agents leaves it.
@@ -90,11 +90,11 @@ never disagree: there is one source of truth, and the panel is a view of it.
 ## Install
 
 ```bash
-brew install --cask --no-quarantine RizRiyz/bohay/bohay-notch
+brew install --cask --no-quarantine RizRiyz/luvus/luvus-notch
 ```
 
 Or download the `.dmg` from the
-[releases page](https://github.com/RizRiyz/bohay/releases).
+[releases page](https://github.com/RizRiyz/luvus/releases).
 
 `--no-quarantine` is there because the app is not notarized through the App
 Store; without it macOS will refuse the first launch. If you would rather not
@@ -123,7 +123,7 @@ Worth stating plainly:
 
 - **macOS only.** It uses AppKit and SwiftUI, so there is no Linux or Windows
   equivalent. Everything it surfaces is in the terminal too.
-- **It is not a second bohay.** No panes, no layout, no git. It answers "who
+- **It is not a second luvus.** No panes, no layout, no git. It answers "who
   needs me?" and gets you to them.
 - **Cost and context figures come from the agents' own session files**, so they
   are as complete as what each agent records, the same data

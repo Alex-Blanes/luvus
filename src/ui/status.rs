@@ -1,11 +1,11 @@
 //! The bottom status line: prefix hint, key cheatsheet, and right-aligned
-//! mode / pane / tab / workspace readout.
+//! mode / pane / tab / version readout.
 
 use super::*;
 
 // ── status ──────────────────────────────────────────────────────────────────
 
-pub(super) fn draw_status(f: &mut RenderTarget, area: Rect, app: &App, t: &Theme) {
+pub(super) fn draw_status(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) {
     // Compact/touch mode collapses this row to nothing (docs/18) to reclaim it
     // for content — the status readout is keyboard-oriented and redundant on a
     // phone (the tab bar shows tabs, the switcher shows panes/nodes).
@@ -123,7 +123,39 @@ pub(super) fn draw_status(f: &mut RenderTarget, area: Rect, app: &App, t: &Theme
     // bar owns the full width so nothing collides.
     if !prefix {
         let panes = app.layout().len();
-        let ws = app.ws();
+        let (active_tab, tab_count) = {
+            let ws = app.ws();
+            (ws.active_tab, ws.tabs.len())
+        };
+        let version = concat!("v", env!("CARGO_PKG_VERSION"));
+        let version_w = crate::ui::display_width(version) as u16;
+        let dot = " ●";
+        let dot_w = if app.update_available.is_some() {
+            crate::ui::display_width(dot) as u16
+        } else {
+            0
+        };
+        // The version is the rightmost meaningful item, followed by one padding
+        // cell. It therefore remains fully visible even when a narrow status row
+        // clips older metadata on the left.
+        let click_w = version_w + dot_w;
+        let version_rect = Rect::new(
+            area.right().saturating_sub(click_w + 1),
+            area.y,
+            click_w.min(area.width.saturating_sub(1)),
+            1,
+        );
+        app.version_rect = (click_w < area.width).then_some(version_rect);
+        let version_fg = if app.hover.is_some_and(|(x, y)| {
+            x >= version_rect.x
+                && x < version_rect.right()
+                && y >= version_rect.y
+                && y < version_rect.bottom()
+        }) {
+            t.accent
+        } else {
+            t.subtext1
+        };
         let right = Line::from(vec![
             Span::styled(cat.mode_normal, Style::new().fg(t.overlay1).bold()),
             Span::styled("  ·  ", Style::new().fg(t.overlay0)),
@@ -133,11 +165,19 @@ pub(super) fn draw_status(f: &mut RenderTarget, area: Rect, app: &App, t: &Theme
             ),
             Span::styled("  ·  ", Style::new().fg(t.overlay0)),
             Span::styled(
-                format!("{} {}/{}", cat.act_tab, ws.active_tab + 1, ws.tabs.len()),
+                format!("{} {}/{}", cat.act_tab, active_tab + 1, tab_count),
                 Style::new().fg(t.subtext0),
             ),
             Span::styled("  ·  ", Style::new().fg(t.overlay0)),
-            Span::styled(ws.name.clone(), Style::new().fg(t.subtext1)),
+            Span::styled(version, Style::new().fg(version_fg)),
+            Span::styled(
+                if app.update_available.is_some() {
+                    dot
+                } else {
+                    ""
+                },
+                Style::new().fg(t.accent).bold(),
+            ),
             Span::raw(" "),
         ]);
         f.render_widget(Paragraph::new(right).alignment(Alignment::Right), area);

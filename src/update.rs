@@ -1,9 +1,9 @@
 //! Background "update available" check. Fetches a small version manifest from
-//! the product website (`bohay.dev/latest.json`, emitted at deploy time) and, if
+//! the product website (`luvus.dev/latest.json`, emitted at deploy time) and, if
 //! it names a newer release than this build, tells the UI to show the indicator
 //! by the sidebar version number.
 //!
-//! Notify-only by design: bohay is installed via cargo / brew / the install
+//! Notify-only by design: luvus is installed via cargo / brew / the install
 //! script / Nix, so it never replaces its own binary — it points the user at the
 //! changelog and their installer's upgrade command. The check is a single
 //! `curl`/`wget` GET on its own thread, so it never touches the event loop, and
@@ -17,20 +17,20 @@ use std::time::Duration;
 use crate::event::AppEvent;
 
 /// The version manifest the product site publishes at deploy time.
-const MANIFEST_URL: &str = "https://bohay.dev/latest.json";
+const MANIFEST_URL: &str = "https://luvus.dev/latest.json";
 /// This build's version (no leading `v`).
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
-/// The manifest URL to check, honoring `$BOHAY_UPDATE_MANIFEST` — an override for
+/// The manifest URL to check, honoring `$LUVUS_UPDATE_MANIFEST` — an override for
 /// testing (point it at a local `file://…/latest.json` or a dev server to see the
 /// indicator without deploying the site). Falls back to the production URL.
 fn manifest_url() -> String {
-    std::env::var("BOHAY_UPDATE_MANIFEST").unwrap_or_else(|_| MANIFEST_URL.to_string())
+    std::env::var("LUVUS_UPDATE_MANIFEST").unwrap_or_else(|_| MANIFEST_URL.to_string())
 }
 
 /// How often the background checker re-runs.
 ///
-/// Deliberately not a day. The bohay **server outlives its windows** and can run
+/// Deliberately not a day. The luvus **server outlives its windows** and can run
 /// for weeks, so the check has to assume the release it is looking for will be
 /// published *while the process is already running*, not before it started. At a
 /// 24-hour interval a release cut twenty minutes after a server start stayed
@@ -131,7 +131,7 @@ fn semver(s: &str) -> (u32, u32, u32) {
 /// Fetch a URL with `curl`, then `wget` — whichever is installed. `None` on any
 /// failure (offline, tool missing, non-200): a missed check is a silent no-op.
 fn http_get(url: &str) -> Option<String> {
-    let curl = ["-fsSL", "--max-time", "15", "-H", "User-Agent: bohay", url];
+    let curl = ["-fsSL", "--max-time", "15", "-H", "User-Agent: luvus", url];
     if let Some(out) = try_cmd("curl", &curl) {
         return Some(out);
     }
@@ -140,7 +140,7 @@ fn http_get(url: &str) -> Option<String> {
         "-O",
         "-",
         "--timeout=15",
-        "--header=User-Agent: bohay",
+        "--header=User-Agent: luvus",
         url,
     ];
     try_cmd("wget", &wget)
@@ -173,7 +173,7 @@ mod tests {
     #[test]
     fn check_once_reports_only_a_newer_release() {
         use std::sync::mpsc::channel;
-        let dir = std::env::temp_dir().join(format!("bohay-upd-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("luvus-upd-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("latest.json");
         let url = format!("file://{}", path.display());

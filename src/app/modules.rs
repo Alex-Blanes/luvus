@@ -79,7 +79,7 @@ impl App {
             .ok_or_else(|| format!("no module {id}"))?;
         if !crate::module::install::is_removable(&root) {
             return Err(format!(
-                "{id} is a linked module (its files aren't managed by bohay) — use `module unlink`"
+                "{id} is a linked module (its files aren't managed by luvus) — use `module unlink`"
             ));
         }
         let dock_ids = self.module_dock_ids(id);
@@ -189,7 +189,7 @@ impl App {
             self.show_toast(format!("{} is unavailable", a.module_id));
             return;
         };
-        let extra = vec![("BOHAY_MODULE_ACTION_ID".to_string(), a.action_id.clone())];
+        let extra = vec![("LUVUS_MODULE_ACTION_ID".to_string(), a.action_id.clone())];
         let label = format!("action:{}", a.action_id);
         let source = format!("menu:{context}");
         if let Err(e) =
@@ -268,14 +268,14 @@ impl App {
             return;
         };
         let extra = vec![
-            ("BOHAY_MODULE_DOCK_ID".to_string(), menu.dock_id.clone()),
+            ("LUVUS_MODULE_DOCK_ID".to_string(), menu.dock_id.clone()),
             (
-                "BOHAY_MODULE_ROW_INDEX".to_string(),
+                "LUVUS_MODULE_ROW_INDEX".to_string(),
                 menu.row_index.to_string(),
             ),
-            ("BOHAY_MODULE_ROW_TEXT".to_string(), menu.row_text.clone()),
+            ("LUVUS_MODULE_ROW_TEXT".to_string(), menu.row_text.clone()),
             (
-                "BOHAY_MODULE_ROW_VALUE".to_string(),
+                "LUVUS_MODULE_ROW_VALUE".to_string(),
                 // An item's own value wins: the row says *which board*, the
                 // item says *which variant*.
                 item.value
@@ -283,7 +283,7 @@ impl App {
                     .or_else(|| menu.row_value.clone())
                     .unwrap_or_else(|| menu.row_text.clone()),
             ),
-            ("BOHAY_MODULE_ACTION_ID".to_string(), item.action.clone()),
+            ("LUVUS_MODULE_ACTION_ID".to_string(), item.action.clone()),
         ];
         if let Err(e) = self.module_invoke_dock_action(&item.action, menu.owner.as_deref(), extra) {
             self.show_toast(e);
@@ -339,7 +339,7 @@ impl App {
             // Mark done even with no commands, so the scan stays cheap.
             self.module_startup_done.insert(id.clone());
             for argv in cmds {
-                let extra = vec![("BOHAY_MODULE_EVENT".to_string(), "startup".to_string())];
+                let extra = vec![("LUVUS_MODULE_EVENT".to_string(), "startup".to_string())];
                 let _ = self.run_module_command(&id, argv, "startup".to_string(), extra, "startup");
             }
         }
@@ -413,7 +413,7 @@ impl App {
                 ))
             }
         };
-        let mut extra = vec![("BOHAY_MODULE_ACTION_ID".to_string(), action_id.to_string())];
+        let mut extra = vec![("LUVUS_MODULE_ACTION_ID".to_string(), action_id.to_string())];
         extra.extend(extra_env);
         self.run_module_command(
             &module_id,
@@ -426,7 +426,7 @@ impl App {
 
     /// Publish a lifecycle event to `events.subscribe` subscribers **and** run
     /// any enabled module's matching `[[events]]` hook (MOD-3). The payload is
-    /// passed to hooks as `BOHAY_MODULE_EVENT_JSON`.
+    /// passed to hooks as `LUVUS_MODULE_EVENT_JSON`.
     pub fn emit_event(&mut self, name: &str, data: serde_json::Value) {
         let event_json = data.to_string();
         api::publish(
@@ -452,15 +452,15 @@ impl App {
         }
         for (module_id, argv) in targets {
             let extra = vec![
-                ("BOHAY_MODULE_EVENT".to_string(), name.to_string()),
-                ("BOHAY_MODULE_EVENT_JSON".to_string(), event_json.clone()),
+                ("LUVUS_MODULE_EVENT".to_string(), name.to_string()),
+                ("LUVUS_MODULE_EVENT_JSON".to_string(), event_json.clone()),
             ];
             let _ =
                 self.run_module_command(&module_id, argv, format!("event:{name}"), extra, "event");
         }
     }
 
-    /// Open a module's `[[panes]]` entrypoint as a real bohay pane (MOD-2),
+    /// Open a module's `[[panes]]` entrypoint as a real luvus pane (MOD-2),
     /// placed per `placement` (split | overlay | tab; default split). Returns the
     /// new pane id.
     pub fn module_open_pane(
@@ -498,7 +498,7 @@ impl App {
             (m.root.clone(), runtime::base_env(m, &ctx))
         };
         env.push((
-            "BOHAY_MODULE_ENTRYPOINT_ID".to_string(),
+            "LUVUS_MODULE_ENTRYPOINT_ID".to_string(),
             entrypoint.to_string(),
         ));
 
@@ -663,19 +663,19 @@ mod tests {
     #[test]
     fn dock_menu_click_spawns_the_action_with_the_clicked_rows_env() {
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("bohay-dockmenu-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("luvus-dockmenu-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::env::set_var("BOHAY_HOME", &home);
+        std::env::set_var("LUVUS_HOME", &home);
 
         let dir = home.join("boards-mod");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("bohay-module.toml"),
+            dir.join("luvus-module.toml"),
             r#"
 id = "you.boards"
 name = "Boards"
 version = "0.1.0"
-min_bohay_version = "0.1.0"
+min_luvus_version = "0.1.0"
 
 [[docks]]
 id = "boards"
@@ -685,7 +685,7 @@ placement = "sidebar.left"
 [[actions]]
 id = "erase"
 title = "Erase"
-command = ["sh", "-c", "echo ran=$BOHAY_MODULE_ACTION_ID port=$BOHAY_MODULE_ROW_VALUE row=$BOHAY_MODULE_ROW_TEXT dock=$BOHAY_MODULE_DOCK_ID"]
+command = ["sh", "-c", "echo ran=$LUVUS_MODULE_ACTION_ID port=$LUVUS_MODULE_ROW_VALUE row=$LUVUS_MODULE_ROW_TEXT dock=$LUVUS_MODULE_DOCK_ID"]
 "#,
         )
         .unwrap();
@@ -802,7 +802,7 @@ command = ["sh", "-c", "echo ran=$BOHAY_MODULE_ACTION_ID port=$BOHAY_MODULE_ROW_
             log.out
         );
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -813,9 +813,9 @@ command = ["sh", "-c", "echo ran=$BOHAY_MODULE_ACTION_ID port=$BOHAY_MODULE_ROW_
     #[test]
     fn turned_off_module_dock_is_not_resurrected_by_a_repush() {
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("bohay-dockoff-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("luvus-dockoff-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::env::set_var("BOHAY_HOME", &home);
+        std::env::set_var("LUVUS_HOME", &home);
 
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
@@ -858,27 +858,27 @@ command = ["sh", "-c", "echo ran=$BOHAY_MODULE_ACTION_ID port=$BOHAY_MODULE_ROW_
         app.push_module_dock("esp-idf", None, crate::app::Side::Left, vec![row()]);
         assert_eq!(app.sidebars.side_of(&kind), Some(crate::app::Side::Right));
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn link_then_run_action_captures_output() {
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("bohay-modtest-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("luvus-modtest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::env::set_var("BOHAY_HOME", &home);
+        std::env::set_var("LUVUS_HOME", &home);
 
         // A module dir: manifest + one echo action.
         let dir = home.join("echo-mod");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("bohay-module.toml"),
+            dir.join("luvus-module.toml"),
             r#"
 id = "you.echo"
 name = "Echo"
 version = "0.1.0"
-min_bohay_version = "0.1.0"
+min_luvus_version = "0.1.0"
 
 [[actions]]
 id = "refresh"
@@ -935,26 +935,26 @@ command = ["sh", "-c", "echo hello-from-module; echo oops 1>&2"]
         app.module_unlink(&id).unwrap();
         assert!(app.modules.find(&id).is_none());
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn open_module_pane_tracks_and_cleans_up() {
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("bohay-panetest-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("luvus-panetest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::env::set_var("BOHAY_HOME", &home);
+        std::env::set_var("LUVUS_HOME", &home);
 
         let dir = home.join("board-mod");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("bohay-module.toml"),
+            dir.join("luvus-module.toml"),
             r#"
 id = "you.board"
 name = "Board"
 version = "0.1.0"
-min_bohay_version = "0.1.0"
+min_luvus_version = "0.1.0"
 
 [[panes]]
 id = "board"
@@ -992,7 +992,7 @@ command = ["sh", "-c", "sleep 5"]
         assert!(!app.panes.contains_key(&pid));
         assert!(!app.module_panes.contains_key(&pid), "record auto-removed");
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1000,23 +1000,23 @@ command = ["sh", "-c", "sleep 5"]
     fn event_hook_runs_with_event_env() {
         use std::time::{Duration, Instant};
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("bohay-evtest-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("luvus-evtest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::env::set_var("BOHAY_HOME", &home);
+        std::env::set_var("LUVUS_HOME", &home);
 
         let dir = home.join("notify-mod");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("bohay-module.toml"),
+            dir.join("luvus-module.toml"),
             r#"
 id = "you.notify"
 name = "Notify"
 version = "0.1.0"
-min_bohay_version = "0.1.0"
+min_luvus_version = "0.1.0"
 
 [[events]]
 on = "pane.agent_status_changed"
-command = ["sh", "-c", "echo event=$BOHAY_MODULE_EVENT json=$BOHAY_MODULE_EVENT_JSON"]
+command = ["sh", "-c", "echo event=$LUVUS_MODULE_EVENT json=$LUVUS_MODULE_EVENT_JSON"]
 "#,
         )
         .unwrap();
@@ -1065,26 +1065,26 @@ command = ["sh", "-c", "echo event=$BOHAY_MODULE_EVENT json=$BOHAY_MODULE_EVENT_
             log.out
         );
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn module_pane_survives_snapshot_restore() {
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("bohay-restoretest-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("luvus-restoretest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::env::set_var("BOHAY_HOME", &home);
+        std::env::set_var("LUVUS_HOME", &home);
 
         let dir = home.join("board-mod");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("bohay-module.toml"),
+            dir.join("luvus-module.toml"),
             r#"
 id = "you.board"
 name = "Board"
 version = "0.1.0"
-min_bohay_version = "0.1.0"
+min_luvus_version = "0.1.0"
 
 [[panes]]
 id = "board"
@@ -1120,7 +1120,7 @@ command = ["sh", "-c", "sleep 5"]
             "it re-ran the module command, not the login shell"
         );
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1131,16 +1131,16 @@ command = ["sh", "-c", "sleep 5"]
         use ratatui::Terminal;
 
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("bohay-modtab-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("luvus-modtab-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::env::set_var("BOHAY_HOME", &home);
+        std::env::set_var("LUVUS_HOME", &home);
 
         for n in ["alpha", "beta"] {
             let dir = home.join(n);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
-                dir.join("bohay-module.toml"),
-                format!("id = \"you.{n}\"\nname = \"{n}\"\nversion = \"0.1.0\"\nmin_bohay_version = \"0.1.0\"\n"),
+                dir.join("luvus-module.toml"),
+                format!("id = \"you.{n}\"\nname = \"{n}\"\nversion = \"0.1.0\"\nmin_luvus_version = \"0.1.0\"\n"),
             )
             .unwrap();
         }
@@ -1193,7 +1193,7 @@ command = ["sh", "-c", "sleep 5"]
             !before
         );
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1201,7 +1201,7 @@ command = ["sh", "-c", "sleep 5"]
     fn link(app: &mut App, home: &Path, name: &str, toml: &str) -> String {
         let dir = home.join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("bohay-module.toml"), toml).unwrap();
+        std::fs::write(dir.join("luvus-module.toml"), toml).unwrap();
         app.module_link_with(&dir, true, None).unwrap()
     }
 
@@ -1226,9 +1226,9 @@ command = ["sh", "-c", "sleep 5"]
     #[test]
     fn module_actions_appear_in_the_right_click_menus() {
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("bohay-modmenu-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("luvus-modmenu-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::env::set_var("BOHAY_HOME", &home);
+        std::env::set_var("LUVUS_HOME", &home);
 
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
@@ -1245,19 +1245,19 @@ command = ["sh", "-c", "sleep 5"]
 id = "you.ctx"
 name = "Ctx"
 version = "0.1.0"
-min_bohay_version = "0.1.0"
+min_luvus_version = "0.1.0"
 
 [[actions]]
 id = "on-pane"
 title = "Do pane thing"
 contexts = ["pane"]
-command = ["sh", "-c", "echo pane=$BOHAY_PANE_ID src=$BOHAY_MODULE_CONTEXT_JSON"]
+command = ["sh", "-c", "echo pane=$LUVUS_PANE_ID src=$LUVUS_MODULE_CONTEXT_JSON"]
 
 [[actions]]
 id = "on-node"
 title = "Do node thing"
 contexts = ["node"]
-command = ["sh", "-c", "echo ws=$BOHAY_WORKSPACE_ID"]
+command = ["sh", "-c", "echo ws=$LUVUS_WORKSPACE_ID"]
 
 [[actions]]
 id = "headless"
@@ -1317,7 +1317,7 @@ command = ["true"]
         assert_eq!(log.status, ModuleStatus::Succeeded, "stderr: {}", log.err);
         assert!(
             log.out.contains(&format!("pane={}", target.0)),
-            "flat BOHAY_PANE_ID points at the clicked pane: {:?}",
+            "flat LUVUS_PANE_ID points at the clicked pane: {:?}",
             log.out
         );
         assert!(
@@ -1348,16 +1348,16 @@ command = ["true"]
         app.open_pane_menu(target, 1, 1);
         app.pane_menu_action(PaneMenuItem::Module(99));
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn startup_hooks_run_once_and_again_after_re_enable() {
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("bohay-modboot-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("luvus-modboot-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::env::set_var("BOHAY_HOME", &home);
+        std::env::set_var("LUVUS_HOME", &home);
 
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
@@ -1369,10 +1369,10 @@ command = ["true"]
 id = "you.boot"
 name = "Boot"
 version = "0.1.0"
-min_bohay_version = "0.1.0"
+min_luvus_version = "0.1.0"
 
 [[startup]]
-command = ["sh", "-c", "echo booted event=$BOHAY_MODULE_EVENT"]
+command = ["sh", "-c", "echo booted event=$LUVUS_MODULE_EVENT"]
 "#,
         );
 
@@ -1406,16 +1406,16 @@ command = ["sh", "-c", "echo booted event=$BOHAY_MODULE_EVENT"]
         app.module_set_enabled(&id, true).unwrap();
         assert_eq!(count(&app), 2, "re-enabling re-runs it");
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn declared_settings_reach_a_command_as_env() {
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("bohay-modsetenv-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("luvus-modsetenv-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::env::set_var("BOHAY_HOME", &home);
+        std::env::set_var("LUVUS_HOME", &home);
 
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
@@ -1427,7 +1427,7 @@ command = ["sh", "-c", "echo booted event=$BOHAY_MODULE_EVENT"]
 id = "you.cfg"
 name = "Cfg"
 version = "0.1.0"
-min_bohay_version = "0.1.0"
+min_luvus_version = "0.1.0"
 
 [[settings]]
 key = "token"
@@ -1446,7 +1446,7 @@ max = 10
 [[actions]]
 id = "show"
 title = "Show"
-command = ["sh", "-c", "echo t=$BOHAY_SETTING_TOKEN l=$BOHAY_SETTING_LIMIT"]
+command = ["sh", "-c", "echo t=$LUVUS_SETTING_TOKEN l=$LUVUS_SETTING_LIMIT old_t=$BOHAY_SETTING_TOKEN old_l=$BOHAY_SETTING_LIMIT"]
 "#,
         );
 
@@ -1469,21 +1469,21 @@ command = ["sh", "-c", "echo t=$BOHAY_SETTING_TOKEN l=$BOHAY_SETTING_LIMIT"]
         let log = app.module_logs.iter().find(|l| l.id == log_id).unwrap();
         assert_eq!(log.status, ModuleStatus::Succeeded, "stderr: {}", log.err);
         assert!(
-            log.out.contains("t=abc123 l=10"),
+            log.out.contains("t=abc123 l=10 old_t=abc123 old_l=10"),
             "settings reached the command: {:?}",
             log.out
         );
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn listing_settings_masks_secrets_but_get_returns_them() {
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("bohay-modsec-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("luvus-modsec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::env::set_var("BOHAY_HOME", &home);
+        std::env::set_var("LUVUS_HOME", &home);
 
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
@@ -1495,7 +1495,7 @@ command = ["sh", "-c", "echo t=$BOHAY_SETTING_TOKEN l=$BOHAY_SETTING_LIMIT"]
 id = "you.sec"
 name = "Sec"
 version = "0.1.0"
-min_bohay_version = "0.1.0"
+min_luvus_version = "0.1.0"
 
 [[settings]]
 key = "token"
@@ -1538,16 +1538,16 @@ default = "example.com"
             .unwrap();
         assert_eq!(got["value"], "s3cret");
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn item_platforms_gate_panes_and_events() {
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("bohay-modplat-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("luvus-modplat-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::env::set_var("BOHAY_HOME", &home);
+        std::env::set_var("LUVUS_HOME", &home);
 
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
@@ -1559,7 +1559,7 @@ default = "example.com"
 id = "you.plat"
 name = "Plat"
 version = "0.1.0"
-min_bohay_version = "0.1.0"
+min_luvus_version = "0.1.0"
 
 [[panes]]
 id = "nope"
@@ -1603,7 +1603,7 @@ command = ["sh", "-c", "echo legacy-alias-fired"]
             "the legacy node.* alias still fires"
         );
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1613,9 +1613,9 @@ command = ["sh", "-c", "echo legacy-alias-fired"]
         use ratatui::Terminal;
 
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("bohay-modsettab-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("luvus-modsettab-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::env::set_var("BOHAY_HOME", &home);
+        std::env::set_var("LUVUS_HOME", &home);
 
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(100, 30, tx).unwrap();
@@ -1627,7 +1627,7 @@ command = ["sh", "-c", "echo legacy-alias-fired"]
 id = "you.ui"
 name = "Ui"
 version = "0.1.0"
-min_bohay_version = "0.1.0"
+min_luvus_version = "0.1.0"
 
 [[settings]]
 key = "loud"
@@ -1755,16 +1755,16 @@ secret = true
         assert!(app.settings.as_ref().unwrap().cursor < app.module_rows().len());
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn modules_resolve_by_owner_repo_as_well_as_id() {
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("bohay-modspec-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("luvus-modspec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::env::set_var("BOHAY_HOME", &home);
+        std::env::set_var("LUVUS_HOME", &home);
 
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
@@ -1772,12 +1772,12 @@ secret = true
         let dir = home.join("spec-mod");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("bohay-module.toml"),
+            dir.join("luvus-module.toml"),
             r#"
 id = "example.agent-ping"
 name = "Ping"
 version = "0.1.0"
-min_bohay_version = "0.1.0"
+min_luvus_version = "0.1.0"
 
 [[settings]]
 key = "token"
@@ -1787,7 +1787,7 @@ type = "string"
         )
         .unwrap();
         // Registered as if installed from GitHub: source is `<spec>@<sha>`.
-        app.module_link_with(&dir, true, Some("Riz/bohay-agent-ping@abc123".into()))
+        app.module_link_with(&dir, true, Some("Riz/luvus-agent-ping@abc123".into()))
             .unwrap();
 
         // Both names resolve to the same module.
@@ -1796,23 +1796,23 @@ type = "string"
             "example.agent-ping"
         );
         assert_eq!(
-            app.module_id_for("Riz/bohay-agent-ping").unwrap(),
+            app.module_id_for("Riz/luvus-agent-ping").unwrap(),
             "example.agent-ping"
         );
         // GitHub owner/repo is case-insensitive.
         assert_eq!(
-            app.module_id_for("riz/BOHAY-agent-ping").unwrap(),
+            app.module_id_for("riz/LUVUS-agent-ping").unwrap(),
             "example.agent-ping"
         );
         // A trailing slash is forgiven.
-        assert!(app.module_id_for("Riz/bohay-agent-ping/").is_ok());
+        assert!(app.module_id_for("Riz/luvus-agent-ping/").is_ok());
         // Something that matches neither is still an error.
         assert!(app.module_id_for("someone/else").is_err());
         assert!(app.module_id_for("no.such.module").is_err());
 
         // Settings and the config dir key off the *canonical* id either way, so
         // `owner/repo` can't create a second directory beside the real one.
-        app.module_set_setting("Riz/bohay-agent-ping", "token", "t1".into())
+        app.module_set_setting("Riz/luvus-agent-ping", "token", "t1".into())
             .unwrap();
         assert_eq!(
             app.module_settings("example.agent-ping")
@@ -1822,33 +1822,33 @@ type = "string"
             "t1"
         );
         assert_eq!(
-            app.module_config_dir("Riz/bohay-agent-ping").unwrap(),
+            app.module_config_dir("Riz/luvus-agent-ping").unwrap(),
             app.module_config_dir("example.agent-ping").unwrap()
         );
 
         // Enable/disable resolves too.
-        app.module_set_enabled("Riz/bohay-agent-ping", false)
+        app.module_set_enabled("Riz/luvus-agent-ping", false)
             .unwrap();
         assert!(!app.modules.find("example.agent-ping").unwrap().enabled);
-        app.module_set_enabled("Riz/bohay-agent-ping", true)
+        app.module_set_enabled("Riz/luvus-agent-ping", true)
             .unwrap();
 
         // And unlink by owner/repo actually removes it, rather than reporting
         // success while the module stays registered.
-        app.module_unlink("Riz/bohay-agent-ping").unwrap();
+        app.module_unlink("Riz/luvus-agent-ping").unwrap();
         assert!(app.modules.find("example.agent-ping").is_none());
-        assert!(app.module_unlink("Riz/bohay-agent-ping").is_err());
+        assert!(app.module_unlink("Riz/luvus-agent-ping").is_err());
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn a_linked_module_has_no_source_to_resolve_by() {
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("bohay-modnosrc-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("luvus-modnosrc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::env::set_var("BOHAY_HOME", &home);
+        std::env::set_var("LUVUS_HOME", &home);
 
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
@@ -1856,7 +1856,7 @@ type = "string"
             &mut app,
             &home,
             "local-mod",
-            "id = \"you.local\"\nname = \"Local\"\nversion = \"0.1.0\"\nmin_bohay_version = \"0.1.0\"\n",
+            "id = \"you.local\"\nname = \"Local\"\nversion = \"0.1.0\"\nmin_luvus_version = \"0.1.0\"\n",
         );
 
         // A locally linked module was never installed from anywhere, so only its
@@ -1864,7 +1864,7 @@ type = "string"
         assert!(app.module_id_for("you.local").is_ok());
         assert!(app.module_id_for("someone/you.local").is_err());
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1872,20 +1872,20 @@ type = "string"
     fn git_install_builds_and_uninstall_removes_checkout() {
         use std::process::Command;
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("bohay-gittest-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("luvus-gittest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::env::set_var("BOHAY_HOME", &home);
+        std::env::set_var("LUVUS_HOME", &home);
 
         // A local "remote" git repo with a manifest + a build step.
         let remote = home.join("remote");
         std::fs::create_dir_all(&remote).unwrap();
         std::fs::write(
-            remote.join("bohay-module.toml"),
+            remote.join("luvus-module.toml"),
             r#"
 id = "you.installed"
 name = "Installed"
 version = "0.1.0"
-min_bohay_version = "0.1.0"
+min_luvus_version = "0.1.0"
 
 [[build]]
 command = ["sh", "-c", "touch built.txt"]
@@ -1950,7 +1950,7 @@ command = ["echo", "hi"]
         assert!(app.modules.find("you.installed").is_none());
         assert!(!installed.root.exists(), "managed checkout removed");
 
-        std::env::remove_var("BOHAY_HOME");
+        std::env::remove_var("LUVUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 }

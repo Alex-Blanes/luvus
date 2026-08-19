@@ -1,8 +1,8 @@
-# Official bohay agent-detection manifest for Claude Code.
-# Served at https://bohay.dev/manifests/claude.toml and fetched by
-# `bohay server update-manifest`, so detection keeps up with Claude Code UI
-# changes without waiting for a bohay binary release. Merged on top of bohay's
-# built-in rules; a user's own ~/.bohay/manifests/*.toml still wins.
+# Official luvus agent-detection manifest for Claude Code.
+# Served at https://luvus.dev/manifests/claude.toml and fetched by
+# `luvus server update-manifest`, so detection keeps up with Claude Code UI
+# changes without waiting for a luvus binary release. Merged on top of luvus's
+# built-in rules; a user's own ~/.luvus/manifests/*.toml still wins.
 agent = "claude"
 
 # Working (token-counter builds). Newer Claude Code shows a line like:
@@ -18,7 +18,7 @@ region = "screen"
 all = ["↓ ", "tokens)"]
 
 # Working (half-circle spinner builds, e.g. 2.1.228). Some Claude Code builds
-# animate a half-circle busy spinner (◐◑◒◓) instead of braille. Newer bohay
+# animate a half-circle busy spinner (◐◑◒◓) instead of braille. Newer luvus
 # binaries recognize these glyphs natively, but they are matched here as
 # substrings too so this rule reaches a binary that predates that support (a
 # manifest cannot check line-start for a custom glyph). These half-circles appear

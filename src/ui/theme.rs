@@ -1,4 +1,4 @@
-//! Color palette. "bohay vr46" — a near-black dark UI with a fluorescent
+//! Color palette. "luvus vr46" — a near-black dark UI with a fluorescent
 //! stabilo/Valentino-Rossi green accent for active/selected elements.
 
 use crate::terminal::theme_probe::TerminalColors;
@@ -22,7 +22,7 @@ fn pal(c: [u8; 3]) -> Color {
 }
 
 impl Theme {
-    /// The intentionally soft composer treatment used by Bohay's default
+    /// The intentionally soft composer treatment used by Luvus's default
     /// Quattro Rally palette. Preserve its original low-contrast character.
     pub fn subtle_composer_surface(&self) -> Color {
         match (self.mantle, self.surface0) {
@@ -37,7 +37,7 @@ impl Theme {
 
     /// A zero-probe terminal theme. `Reset` follows the terminal's configured
     /// foreground/background and ANSI indices follow its palette, so selecting
-    /// Terminal never flashes or falls back to a bundled bohay theme. A
+    /// Terminal never flashes or falls back to a bundled luvus theme. A
     /// successful OSC probe replaces this with the richer derived palette.
     pub fn terminal_native() -> Self {
         let ansi = Color::Indexed;
@@ -1017,7 +1017,7 @@ mod tests {
 mod theme_css {
     /// Dev tool (not a CI check), mirroring `generate_preview`: emit every
     /// palette in [`super::THEMES`] as CSS custom properties for the website's
-    /// theme picker, so bohay.dev shows the *real* palettes rather than
+    /// theme picker, so luvus.dev shows the *real* palettes rather than
     /// hand-copied approximations that drift.
     ///
     /// `cargo test --features dev-tools emit_theme_css -- --nocapture`
@@ -1042,7 +1042,7 @@ mod theme_css {
             println!("  --base: {};", hex(t.base));
             println!("  --surface: {};", hex(t.surface0));
             // The site's hairline is `surface1`; `border` is the brighter rule
-            // bohay uses for focused pane edges.
+            // luvus uses for focused pane edges.
             println!("  --line: {};", hex(t.surface1));
             println!("  --border: {};", hex(t.border));
             println!("  --overlay0: {};", hex(t.overlay0));

@@ -1,11 +1,11 @@
-/* bohay brand for Starlight.
+/* luvus brand for Starlight.
  *
  * The docs run on the same palettes the app ships and the landing page
- * switches between: `styles/themes.css` (generated from bohay's own registry)
+ * switches between: `styles/themes.css` (generated from luvus's own registry)
  * puts a set of palette tokens — --bg, --text, --accent, … — on <html> for the
  * palette named in `data-bh-theme`, and everything below is written in terms of
  * those tokens. Nothing here hardcodes a colour, so picking a theme in the
- * header repaints the docs, and the choice (localStorage `bohay-theme`) carries
+ * header repaints the docs, and the choice (localStorage `luvus-theme`) carries
  * across to the landing page and back.
  *
  * `src/components/ThemeProvider.astro` sets the attribute before first paint;
@@ -47,7 +47,7 @@
 
 :root:root {
   /* Starlight's ramp runs from the text colour (`white`) to the page
-     background (`black`); bohay's runs the same way. */
+     background (`black`); luvus's runs the same way. */
   --sl-color-white: var(--text);
   --sl-color-gray-1: var(--sub2);
   --sl-color-gray-2: var(--sub);

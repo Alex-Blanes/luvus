@@ -100,7 +100,7 @@ pub fn render_into(f: &mut RenderTarget, app: &mut App) {
 /// Render a secondary client's viewport without letting that projection become
 /// the interactive view or resize the shared PTYs.
 ///
-/// Bohay deliberately keeps one server-owned application state. Multi-client
+/// Luvus deliberately keeps one server-owned application state. Multi-client
 /// displays may have different dimensions, though, so the server renders each
 /// secondary viewport independently. The renderer records hit-test geometry and
 /// clamps a handful of scroll offsets as part of an ordinary interactive draw;
@@ -324,11 +324,11 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     // No nodes at all (docs/43 §3.3): the last one was closed, so the session is
     // over and every client has been told to detach. A client can still be
     // attached for the frame or two before it goes (or attach fresh via
-    // `bohay attach` / `--remote` before opening a folder), and every draw fn
+    // `luvus attach` / `--remote` before opening a folder), and every draw fn
     // below assumes an active node — `app.ws()` indexes `workspaces[active_ws]`.
     // One guard here covers the whole tree rather than each call site.
     if app.workspaces.is_empty() {
-        let msg = "no folders open — run `bohay` in a folder";
+        let msg = "no folders open — run `luvus` in a folder";
         let y = area.y + area.height / 2;
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(msg, Style::new().fg(t.overlay1))))

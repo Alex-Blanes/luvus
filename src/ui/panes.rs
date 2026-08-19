@@ -296,7 +296,7 @@ fn draw_one_pane(
                         style = style.bg(t.sel_bg);
                     }
                     // The terminal's own cursor belongs to the child. During
-                    // copy mode, draw Bohay's selection cursor instead.
+                    // copy mode, draw Luvus's selection cursor instead.
                     if copy.is_some_and(|copy| {
                         copy_top.is_some_and(|top| {
                             copy.cursor == (top.saturating_add(row as usize), col as usize)

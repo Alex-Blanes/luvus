@@ -1,6 +1,6 @@
-//! The bohay **module** system: an extension is a directory with a
-//! `bohay-module.toml` manifest declaring argv commands; bohay runs them as
-//! subprocesses with `BOHAY_*` context env and they call back through the same
+//! The luvus **module** system: an extension is a directory with a
+//! `luvus-module.toml` manifest declaring argv commands; luvus runs them as
+//! subprocesses with `LUVUS_*` context env and they call back through the same
 //! socket API the CLI uses. No SDK, no scripting engine. See docs/13.
 //!
 //! MOD-1 (this layer): local `link`/`list`/`enable`/`disable`/`unlink` + action

@@ -1,4 +1,4 @@
-//! The changelog modal (click the sidebar version number): a centered,
+//! The changelog modal (click the status-line version number): a centered,
 //! scrollable view of the **most recent** releases' notes, drawn last over a
 //! dimmed backdrop. Release text is embedded at build time (see
 //! `crate::changelog` / `build.rs`); this module turns it into styled, wrapped
@@ -20,7 +20,7 @@ pub const RECENT: usize = 3;
 
 /// Where the footer link goes. The site renders the same `changelog/*.md` files,
 /// so it can never disagree with what is embedded here.
-pub const CHANGELOG_URL: &str = "https://bohay.dev/changelog";
+pub const CHANGELOG_URL: &str = "https://luvus.dev/changelog";
 
 pub(super) fn draw_changelog(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) {
     dim_backdrop(f, area, t);
@@ -86,7 +86,7 @@ pub(super) fn draw_changelog(f: &mut RenderTarget, area: Rect, app: &mut App, t:
     hline(f, inner.x, inner.y + 1, inner.width, t);
 
     // ── "how to update" header, always shown above the notes ──
-    // Notify-only: bohay is installed via cargo/brew/etc, so we name the upgrade
+    // Notify-only: luvus is installed via cargo/brew/etc, so we name the upgrade
     // commands rather than offer a self-update that can't work. When the
     // background check found a newer release, an accent headline leads.
     let mut top = inner.y + 2;
@@ -109,11 +109,11 @@ pub(super) fn draw_changelog(f: &mut RenderTarget, area: Rect, app: &mut App, t:
     let update_guide = [
         (cat.update_hint, Style::new().fg(t.subtext0)),
         (
-            "curl -fsSL https://bohay.dev/install.sh | sh",
+            "curl -fsSL https://luvus.dev/install.sh | sh",
             Style::new().fg(t.text),
         ),
-        ("brew upgrade bohay", Style::new().fg(t.text)),
-        ("cargo install bohay", Style::new().fg(t.text)),
+        ("brew upgrade luvus", Style::new().fg(t.text)),
+        ("cargo install luvus", Style::new().fg(t.text)),
     ];
     for (line, style) in update_guide {
         f.render_widget(
@@ -763,9 +763,9 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(screen.contains("curl -fsSL https://bohay.dev/install.sh | sh"));
-        assert!(screen.contains("brew upgrade bohay"));
-        assert!(screen.contains("cargo install bohay"));
+        assert!(screen.contains("curl -fsSL https://luvus.dev/install.sh | sh"));
+        assert!(screen.contains("brew upgrade luvus"));
+        assert!(screen.contains("cargo install luvus"));
     }
 
     #[test]

@@ -15,7 +15,7 @@ use interprocess::local_socket::{ListenerOptions, Stream};
 
 pub use interprocess::local_socket::Listener;
 
-/// Exclusive, process-scoped guard for creating Bohay's two server sockets.
+/// Exclusive, process-scoped guard for creating Luvus's two server sockets.
 ///
 /// The lock file remains on disk after the holder exits; the OS releases the
 /// advisory lock automatically, including after a crash. Keeping the file
@@ -24,7 +24,7 @@ pub struct ServerStartupLock {
     _file: File,
 }
 
-/// Acquire exclusive ownership of server startup for one Bohay state directory.
+/// Acquire exclusive ownership of server startup for one Luvus state directory.
 /// Hold the returned guard while checking, reclaiming, and binding both sockets.
 pub fn acquire_server_startup_lock(state_dir: &Path) -> io::Result<ServerStartupLock> {
     fs::create_dir_all(state_dir)?;
@@ -71,7 +71,7 @@ impl ServerStartupLock {
             if connect(path).is_ok() {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
-                    format!("a Bohay listener is already active at {}", path.display()),
+                    format!("a Luvus listener is already active at {}", path.display()),
                 ));
             }
             fs::remove_file(path)
@@ -111,7 +111,7 @@ fn pipe_id(path: &Path) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut h);
-    format!("bohay-{:016x}", h.finish())
+    format!("luvus-{:016x}", h.finish())
 }
 
 /// Connect to a server socket identified by a per-session filesystem path.
@@ -180,7 +180,7 @@ mod tests {
         let env = crate::persist::test_env(name);
         let dir = crate::persist::ensure_config_dir();
         let lock = acquire_server_startup_lock(&dir).unwrap();
-        (env, lock, dir.join("bohay.sock"))
+        (env, lock, dir.join("luvus.sock"))
     }
 
     #[test]
@@ -222,12 +222,12 @@ mod windows_tests {
 
     #[test]
     fn named_session_paths_derive_distinct_stable_pipe_ids() {
-        let alpha = pipe_id(Path::new(r"C:\Users\riz\.bohay\sessions\alpha\bohay.sock"));
-        let beta = pipe_id(Path::new(r"C:\Users\riz\.bohay\sessions\beta\bohay.sock"));
+        let alpha = pipe_id(Path::new(r"C:\Users\riz\.luvus\sessions\alpha\luvus.sock"));
+        let beta = pipe_id(Path::new(r"C:\Users\riz\.luvus\sessions\beta\luvus.sock"));
         assert_ne!(alpha, beta);
         assert_eq!(
             alpha,
-            pipe_id(Path::new(r"C:\Users\riz\.bohay\sessions\alpha\bohay.sock"))
+            pipe_id(Path::new(r"C:\Users\riz\.luvus\sessions\alpha\luvus.sock"))
         );
     }
 }

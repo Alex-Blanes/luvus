@@ -1,18 +1,18 @@
 #Requires -Version 5
-# bohay installer for Windows — downloads the prebuilt binary from the GitHub
+# luvus installer for Windows — downloads the prebuilt binary from the GitHub
 # releases and adds it to your PATH (no admin needed).
 #
-#   irm https://raw.githubusercontent.com/RizRiyz/bohay/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/RizRiyz/luvus/main/install.ps1 | iex
 #
 # Overrides (set before running):
-#   $env:BOHAY_VERSION     = 'v0.1.0'    # a specific tag (default: latest release)
-#   $env:BOHAY_INSTALL_DIR = 'C:\tools'  # where to put bohay.exe (default: %LOCALAPPDATA%\bohay)
+#   $env:LUVUS_VERSION     = 'v0.1.0'    # a specific tag (default: latest release)
+#   $env:LUVUS_INSTALL_DIR = 'C:\tools'  # where to put luvus.exe (default: %LOCALAPPDATA%\luvus)
 $ErrorActionPreference = 'Stop'
 # Older Windows PowerShell defaults to TLS 1.0/1.1, which GitHub rejects.
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$Repo = 'RizRiyz/bohay'
-$Bin  = 'bohay'
+$Repo = 'RizRiyz/luvus'
+$Bin  = 'luvus'
 
 function Fail($msg) { Write-Host "error: $msg" -ForegroundColor Red; exit 1 }
 
@@ -23,25 +23,26 @@ if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
 $target = 'x86_64-pc-windows-msvc'
 
 # ── resolve version ──
-if ($env:BOHAY_VERSION) {
-  $tag = $env:BOHAY_VERSION
+if (-not $env:LUVUS_VERSION -and $env:BOHAY_VERSION) { $env:LUVUS_VERSION = $env:BOHAY_VERSION }
+if ($env:LUVUS_VERSION) {
+  $tag = $env:LUVUS_VERSION
 } else {
   try {
     $rel = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest" `
-      -Headers @{ 'User-Agent' = 'bohay-installer' }
+      -Headers @{ 'User-Agent' = 'luvus-installer' }
     $tag = $rel.tag_name
   } catch {
     Fail "could not reach the GitHub API ($($_.Exception.Message))"
   }
 }
-if (-not $tag) { Fail "could not find the latest release (set BOHAY_VERSION to a tag like v0.1.0)" }
+if (-not $tag) { Fail "could not find the latest release (set LUVUS_VERSION to a tag like v0.1.0)" }
 
 $asset = "$Bin-$tag-$target.zip"
 $url   = "https://github.com/$Repo/releases/download/$tag/$asset"
 Write-Host "Installing $Bin $tag ($target)..."
 
 # ── download + extract ──
-$tmp = Join-Path $env:TEMP ("bohay-" + [Guid]::NewGuid().ToString('N'))
+$tmp = Join-Path $env:TEMP ("luvus-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp -Force | Out-Null
 try {
   $zip = Join-Path $tmp $asset
@@ -54,7 +55,8 @@ try {
   $exe = Join-Path $tmp "$Bin.exe"
   if (-not (Test-Path $exe)) { Fail "archive did not contain $Bin.exe" }
 
-  $dir = if ($env:BOHAY_INSTALL_DIR) { $env:BOHAY_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'bohay' }
+  if (-not $env:LUVUS_INSTALL_DIR -and $env:BOHAY_INSTALL_DIR) { $env:LUVUS_INSTALL_DIR = $env:BOHAY_INSTALL_DIR }
+  $dir = if ($env:LUVUS_INSTALL_DIR) { $env:LUVUS_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'luvus' }
   New-Item -ItemType Directory -Path $dir -Force | Out-Null
   Copy-Item $exe (Join-Path $dir "$Bin.exe") -Force
 } finally {

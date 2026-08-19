@@ -178,7 +178,7 @@ impl FileTree {
     ///
     /// A read that matches the cached listing byte-for-byte is dropped without
     /// marking the tree dirty, so the periodic rescan (which catches files
-    /// created or removed outside bohay) costs nothing on screen when a folder
+    /// created or removed outside luvus) costs nothing on screen when a folder
     /// hasn't changed.
     pub fn apply_dir(&mut self, path: PathBuf, entries: Vec<Entry>) {
         self.pending.remove(&path);
@@ -199,7 +199,7 @@ impl FileTree {
 
     /// Directories that are on screen right now and already read — the root plus
     /// every expanded, loaded directory. A periodic rescan re-reads exactly these
-    /// to notice files created or deleted outside bohay, without ever descending
+    /// to notice files created or deleted outside luvus, without ever descending
     /// into folders the user has collapsed (still O(what you can see)).
     pub fn loaded_visible_dirs(&self) -> Vec<PathBuf> {
         let mut out = Vec::new();

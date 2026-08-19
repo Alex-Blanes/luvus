@@ -1,13 +1,7 @@
 ---
-// The Bohay mark. Every call site across the landing pages and the docs goes
-// through here, so the artwork changes in one place.
-//
-// A plain <img> pointing at the vector in public/, not `astro:assets`. This used
-// to wrap `<Image>` for one reason: the source was a 1286x1286 illustration and
-// something had to stop Starlight shipping the whole thing to draw a 34px mark.
-// The mark is now a 2 KB SVG, so it is already smaller than any raster the
-// optimiser would emit, and it stays sharp at every size it is used at here
-// (16px in the demo tab strip up to 34px in a header) with one request.
+// The Luvus mark. Every call site across the landing pages and docs resolves the
+// surviving canonical SVG through here, so deleted legacy artwork cannot drift
+// back into one surface.
 //
 // Same props as before (`width` / `height` / `class`), so no call site changed.
 interface Props {
@@ -17,11 +11,13 @@ interface Props {
   [key: string]: unknown;
 }
 
+import logoUrl from '../assets/luvus-logo.svg?url';
+
 const { width = 32, height, class: className, ...rest } = Astro.props;
 ---
 
 <img
-  src="/logo.svg"
+  src={logoUrl}
   width={width}
   height={height ?? width}
   alt=""

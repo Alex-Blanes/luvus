@@ -1,9 +1,9 @@
 ---
 title: Architecture
-description: Why bohay is fast and why sessions survive, thanks to the server/client split, one event loop, and frame diffs.
+description: Why luvus is fast and why sessions survive, thanks to the server/client split, one event loop, and frame diffs.
 ---
 
-Three design decisions explain most of bohay's behavior.
+Three design decisions explain most of luvus's behavior.
 
 ## A headless server, a thin client
 
@@ -17,7 +17,7 @@ Named sessions preserve the same boundary instead of adding a global manager.
 Each running name owns one server process, startup lock, pair of sockets,
 snapshot, PTY tree, and orchestration ledger. Stopped names consume no CPU or
 memory. Shared preferences, detection manifests, skills, and module installs
-remain at the Bohay root.
+remain at the Luvus root.
 
 ## One event loop, pure state
 

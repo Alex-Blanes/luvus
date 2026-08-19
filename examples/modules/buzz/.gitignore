@@ -1,8 +1,8 @@
 /target
 Cargo.lock
 # Generated from Cargo.toml.example by the module's build step. It is NOT committed
-# on purpose: a file named `Cargo.toml` anywhere in the bohay repo makes
-# `cargo install --git <bohay>` see two binary packages (bohay + bohay-buzz) and
+# on purpose: a file named `Cargo.toml` anywhere in the luvus repo makes
+# `cargo install --git <luvus>` see two binary packages (luvus + luvus-buzz) and
 # refuse to pick one. Shipping the manifest as `.example` and generating this at
 # build time keeps the top-level install unambiguous.
 /Cargo.toml

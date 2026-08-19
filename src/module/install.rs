@@ -1,4 +1,4 @@
-//! `bohay module install owner/repo[/sub]` (docs/13 MOD-4): shallow-clone a git
+//! `luvus module install owner/repo[/sub]` (docs/13 MOD-4): shallow-clone a git
 //! source into a staging dir, **preview every command + confirm**, run
 //! `[[build]]` with a scrubbed env, verify the manifest didn't change, then
 //! atomically move it into the managed modules dir with a pinned commit. The CLI
@@ -74,7 +74,7 @@ fn install_inner(
     };
 
     // 2. Load + validate the manifest, and snapshot it for the immutability check.
-    let manifest_path = module_root.join(MANIFEST_FILE);
+    let manifest_path = ModuleManifest::path(&module_root);
     let before = fs::read(&manifest_path)
         .with_context(|| format!("no {MANIFEST_FILE} at {}", module_root.display()))?;
     let manifest = ModuleManifest::load(&module_root).map_err(|e| anyhow!("{e}"))?;
@@ -87,7 +87,7 @@ fn install_inner(
         bail!("aborted");
     }
 
-    // 4. Run [[build]] with a scrubbed environment (no BOHAY_*/socket access).
+    // 4. Run [[build]] with a scrubbed environment (no LUVUS_*/socket access).
     // A step gated to other platforms is skipped, so one manifest can carry
     // both a `npm.cmd` step for Windows and a `make` step for Unix.
     for b in &manifest.build {
@@ -126,7 +126,7 @@ fn install_inner(
 fn parse_spec(spec: &str) -> Result<(String, String, String)> {
     let spec = spec.trim();
     if spec.is_empty() {
-        bail!("usage: bohay module install owner/repo[/sub]");
+        bail!("usage: luvus module install owner/repo[/sub]");
     }
     // A path or explicit URL is cloned as-is, with no subdirectory.
     let is_url_or_path = spec.contains("://")
@@ -188,8 +188,8 @@ fn confirm() -> Result<bool> {
     Ok(matches!(line.trim(), "y" | "Y" | "yes"))
 }
 
-/// Run a build command in `dir` with a scrubbed environment — no `BOHAY_*` and
-/// no socket access, so build steps can't drive bohay.
+/// Run a build command in `dir` with a scrubbed environment — no `LUVUS_*` and
+/// no socket access, so build steps can't drive luvus.
 fn run_build(dir: &Path, argv: &[String]) -> Result<()> {
     let Some((program, args)) = argv.split_first() else {
         bail!("empty build command");
@@ -198,7 +198,7 @@ fn run_build(dir: &Path, argv: &[String]) -> Result<()> {
     cmd.args(args).current_dir(dir);
     cmd.env_clear();
     for (k, v) in std::env::vars() {
-        if !k.starts_with("BOHAY_") {
+        if !k.starts_with("LUVUS_") && !k.starts_with("BOHAY_") {
             cmd.env(k, v);
         }
     }
