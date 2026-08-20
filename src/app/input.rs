@@ -2818,8 +2818,11 @@ fn encode_key(key: &KeyEvent, newline: &[u8], app_cursor: bool) -> Option<Vec<u8
     // AltGr arrives as Ctrl+Alt on Windows (`keys::is_ctrl_chord`) and types a
     // character — it is neither a Ctrl chord nor an `ESC`-prefixed Alt key.
     let ctrl = super::keys::is_ctrl_chord(key.modifiers);
-    let alt = key.modifiers.contains(KeyModifiers::ALT)
-        && !(cfg!(windows) && key.modifiers.contains(KeyModifiers::CONTROL));
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    // True exactly when `is_ctrl_chord` refused a Ctrl+Alt press as AltGr. Only
+    // the `Char` arm may act on it: every other key keeps both modifiers, so
+    // `Ctrl+Alt+Enter` is still a modified Enter and sends the newline sequence.
+    let altgr = alt && !ctrl && key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
     let bytes: Vec<u8> = match key.code {
@@ -2842,7 +2845,7 @@ fn encode_key(key: &KeyEvent, newline: &[u8], app_cursor: bool) -> Option<Vec<u8
                 }
             } else {
                 let mut s = c.to_string().into_bytes();
-                if alt {
+                if alt && !altgr {
                     let mut v = vec![0x1b];
                     v.append(&mut s);
                     v
@@ -3203,6 +3206,13 @@ mod tests {
         // A real Ctrl chord is untouched on every platform.
         assert_eq!(enc('\\', KeyModifiers::CONTROL), Some(vec![0x1c]));
         assert_eq!(enc('c', KeyModifiers::CONTROL), Some(vec![0x03]));
+        // The exception is for characters only: every other key keeps both
+        // modifiers, so Ctrl+Alt+Enter is still a modified Enter.
+        assert_eq!(
+            encode_key(&KeyEvent::new(KeyCode::Enter, altgr), nl),
+            Some(nl.to_vec()),
+            "Ctrl+Alt+Enter still sends the configured newline"
+        );
     }
 
     /// The Shift/Alt+Enter sequence is whatever `config::shift_enter` selects —
