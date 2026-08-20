@@ -3195,9 +3195,10 @@ mod tests {
                 );
             }
         } else {
-            // Elsewhere AltGr arrives unmodified, so Ctrl+Alt is a real chord:
-            // `ESC` + the control byte, exactly as before.
-            assert_eq!(enc('\\', altgr), Some(vec![0x1b, 0x1c]));
+            // Elsewhere AltGr arrives unmodified, so Ctrl+Alt stays the real
+            // chord it always was: the control byte, with Ctrl winning over Alt
+            // exactly as before this change.
+            assert_eq!(enc('\\', altgr), Some(vec![0x1c]));
         }
         // A real Ctrl chord is untouched on every platform.
         assert_eq!(enc('\\', KeyModifiers::CONTROL), Some(vec![0x1c]));
