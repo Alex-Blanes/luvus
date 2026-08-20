@@ -5519,18 +5519,8 @@ mod tests {
         // A Claude store holding exactly one session for that folder.
         let store = std::env::temp_dir().join(format!("luvus-dupsess-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
-        let enc: String = cwd
-            .to_string_lossy()
-            .chars()
-            .map(|c| {
-                if matches!(c, '/' | '\\' | '.') {
-                    '-'
-                } else {
-                    c
-                }
-            })
-            .collect();
-        let proj = store.join("projects").join(enc);
+        // The real encoder, so a test can never drift from what luvus looks up.
+        let proj = crate::agent::claude_project_dir(&store, &cwd);
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(proj.join("only-session.jsonl"), "{}").unwrap();
         std::env::set_var("CLAUDE_CONFIG_DIR", &store);
@@ -5574,18 +5564,8 @@ mod tests {
         let cwd = app.panes.get(&older).unwrap().cwd.clone();
         let store = std::env::temp_dir().join(format!("luvus-hooksess-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
-        let enc: String = cwd
-            .to_string_lossy()
-            .chars()
-            .map(|c| {
-                if matches!(c, '/' | '\\' | '.') {
-                    '-'
-                } else {
-                    c
-                }
-            })
-            .collect();
-        let proj = store.join("projects").join(enc);
+        // The real encoder, so a test can never drift from what luvus looks up.
+        let proj = crate::agent::claude_project_dir(&store, &cwd);
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(proj.join("owned.jsonl"), "{}").unwrap();
         std::env::set_var("CLAUDE_CONFIG_DIR", &store);
@@ -5641,18 +5621,8 @@ mod tests {
         // A Claude store holding the parent's session.
         let store = std::env::temp_dir().join(format!("luvus-forksess-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
-        let enc: String = cwd
-            .to_string_lossy()
-            .chars()
-            .map(|c| {
-                if matches!(c, '/' | '\\' | '.') {
-                    '-'
-                } else {
-                    c
-                }
-            })
-            .collect();
-        let proj = store.join("projects").join(enc);
+        // The real encoder, so a test can never drift from what luvus looks up.
+        let proj = crate::agent::claude_project_dir(&store, &cwd);
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(proj.join("parent-sess.jsonl"), "{}").unwrap();
         std::env::set_var("CLAUDE_CONFIG_DIR", &store);
@@ -5721,18 +5691,8 @@ mod tests {
 
         let store = std::env::temp_dir().join(format!("luvus-forknewer-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
-        let enc: String = cwd
-            .to_string_lossy()
-            .chars()
-            .map(|c| {
-                if matches!(c, '/' | '\\' | '.') {
-                    '-'
-                } else {
-                    c
-                }
-            })
-            .collect();
-        let proj = store.join("projects").join(enc);
+        // The real encoder, so a test can never drift from what luvus looks up.
+        let proj = crate::agent::claude_project_dir(&store, &cwd);
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(proj.join("parent-sess.jsonl"), "{}").unwrap();
         std::env::set_var("CLAUDE_CONFIG_DIR", &store);
@@ -5787,18 +5747,8 @@ mod tests {
 
         let store = std::env::temp_dir().join(format!("luvus-pairing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
-        let enc: String = cwd
-            .to_string_lossy()
-            .chars()
-            .map(|c| {
-                if matches!(c, '/' | '\\' | '.') {
-                    '-'
-                } else {
-                    c
-                }
-            })
-            .collect();
-        let proj = store.join("projects").join(enc);
+        // The real encoder, so a test can never drift from what luvus looks up.
+        let proj = crate::agent::claude_project_dir(&store, &cwd);
         std::fs::create_dir_all(&proj).unwrap();
         // The older pane's session was written first.
         std::fs::write(proj.join("old-sess.jsonl"), "{}").unwrap();
