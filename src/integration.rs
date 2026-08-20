@@ -13,6 +13,25 @@ use serde_json::{json, Value};
 /// socket using the pane's injected `LUVUS_*` env). Shared by Claude and Copilot —
 /// their hook formats are compatible (docs/23). The id key varies, so we try the
 /// common ones.
+/// The `command` string an agent stores for the hook script. Agents run it
+/// through a shell, and on Windows that shell is bash: a native path arrives as
+/// `C:\Users\me\.claude\luvus-agent-hook.sh` and bash eats `\U`, `\.`, `\l`… so
+/// the hook fires as `C:Usersme.claudeluvus-agent-hook.sh: No such file or
+/// directory` and no session id is ever reported. Forward slashes are what bash
+/// wants (and Windows accepts them everywhere), and the quotes keep a home
+/// directory with a space in it from splitting into two arguments.
+///
+/// Unix is left exactly as it was: its paths need neither, and an agent that
+/// execs the script directly instead of through a shell would choke on quotes.
+fn hook_command(script: &Path) -> String {
+    let path = script.to_string_lossy();
+    if cfg!(windows) {
+        format!("\"{}\"", path.replace('\\', "/"))
+    } else {
+        path.into_owned()
+    }
+}
+
 fn agent_hook_script(agent: &str) -> String {
     format!(
         r#"#!/usr/bin/env bash
@@ -223,12 +242,7 @@ fn install_shell_hook(agent: &str) -> Result<PathBuf> {
         Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| json!({})),
         Err(_) => json!({}),
     };
-    register_hook(
-        &mut cfg,
-        spec.event,
-        spec.matcher,
-        &script.to_string_lossy(),
-    );
+    register_hook(&mut cfg, spec.event, spec.matcher, &hook_command(&script));
     fs::write(&cfg_path, serde_json::to_string_pretty(&cfg)?)?;
     let _ = fs::remove_file(spec.dir.join("bohay-agent-hook.sh"));
     Ok(spec.dir)
@@ -245,7 +259,7 @@ pub fn install_claude() -> Result<PathBuf> {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| json!({}));
     for evt in ["Notification", "Stop"] {
-        register_hook(&mut cfg, evt, None, &script.to_string_lossy());
+        register_hook(&mut cfg, evt, None, &hook_command(&script));
     }
     fs::write(&cfg_path, serde_json::to_string_pretty(&cfg)?)?;
     Ok(dir)
@@ -310,7 +324,7 @@ pub fn install_kimi() -> Result<PathBuf> {
     let script = dir.join("luvus-agent-hook.sh");
     fs::write(&script, agent_hook_script("kimi"))?;
     set_executable(&script)?;
-    let cmd = script.to_string_lossy().into_owned();
+    let cmd = hook_command(&script);
 
     let cfg_path = kimi_config_path();
     let mut doc: DocumentMut = fs::read_to_string(&cfg_path)
@@ -354,7 +368,7 @@ pub fn install_grok() -> Result<PathBuf> {
     let script = dir.join("luvus-agent-hook.sh");
     fs::write(&script, agent_hook_script("grok"))?;
     set_executable(&script)?;
-    let cmd = script.to_string_lossy();
+    let cmd = hook_command(&script);
 
     // SessionStart resumes; Notification/Stop/SubagentStop feed the notch
     // companion (docs/24), matching what install_claude registers.
@@ -639,6 +653,26 @@ mod tests {
 
         std::env::remove_var("CLAUDE_CONFIG_DIR");
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// The stored command is what the agent hands to bash, so a native Windows
+    /// path loses its separators there (`\U`, `\.`, `\l`… are escapes) and the
+    /// hook fires as `C:Usersme.claudeluvus-agent-hook.sh: No such file or
+    /// directory` — silently, since a failed hook only means no session id.
+    #[test]
+    fn the_registered_hook_command_survives_a_shell() {
+        let native = if cfg!(windows) {
+            r"C:\Users\me\.claude\luvus-agent-hook.sh"
+        } else {
+            "/home/me/.claude/luvus-agent-hook.sh"
+        };
+        let cmd = hook_command(Path::new(native));
+        assert!(!cmd.contains('\\'), "nothing for bash to eat: {cmd}");
+        if cfg!(windows) {
+            assert_eq!(cmd, "\"C:/Users/me/.claude/luvus-agent-hook.sh\"");
+        } else {
+            assert_eq!(cmd, native, "unix is untouched");
+        }
     }
 
     #[test]
