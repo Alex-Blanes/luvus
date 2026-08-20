@@ -206,14 +206,21 @@ impl App {
     /// Accepts what a file manager or a shell actually puts on the clipboard:
     /// surrounding whitespace and quotes are stripped, and a pasted *file* lands
     /// on its parent folder (dragging a file in is a normal way to mean "this
-    /// project"). Anything that doesn't resolve leaves the browsed folder alone
-    /// and reports it in the modal rather than silently doing nothing.
+    /// project"). A relative path resolves against the folder being browsed, so
+    /// pasting `src/app` walks down from here — and a bare `Cargo.toml` can't
+    /// leave the picker on the empty parent path. Anything that doesn't resolve
+    /// leaves the browsed folder alone and reports it in the modal rather than
+    /// silently doing nothing.
     pub fn picker_goto(&mut self, raw: &str) {
         let text = raw.trim().trim_matches(['"', '\'']).trim();
         if text.is_empty() {
             return;
         }
         let path = PathBuf::from(text);
+        let path = match self.picker.as_ref() {
+            Some(p) if path.is_relative() => p.path.join(path),
+            _ => path,
+        };
         let target = if path.is_dir() {
             Some(path)
         } else if path.is_file() {
@@ -795,6 +802,21 @@ mod tests {
         app.handle_event(crate::event::AppEvent::Paste("nope-not-a-path".into()));
         assert_eq!(app.picker.as_ref().unwrap().path, deep);
         assert!(app.picker.as_ref().unwrap().error.is_some());
+
+        // A relative path resolves against the browsed folder — including a bare
+        // filename, whose parent is the empty path and would otherwise strand
+        // the picker on a folder that does not exist.
+        app.handle_event(crate::event::AppEvent::Paste("f.txt".into()));
+        assert_eq!(app.picker.as_ref().unwrap().path, deep);
+        assert!(app.picker.as_ref().unwrap().error.is_none());
+        app.picker.as_mut().unwrap().path = tmp.clone();
+        app.picker_refresh();
+        app.handle_event(crate::event::AppEvent::Paste("a/b".into()));
+        assert_eq!(
+            app.picker.as_ref().unwrap().path,
+            deep,
+            "walked down from here"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
