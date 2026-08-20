@@ -5519,18 +5519,8 @@ mod tests {
         // A Claude store holding exactly one session for that folder.
         let store = std::env::temp_dir().join(format!("luvus-dupsess-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
-        let enc: String = cwd
-            .to_string_lossy()
-            .chars()
-            .map(|c| {
-                if matches!(c, '/' | '\\' | '.') {
-                    '-'
-                } else {
-                    c
-                }
-            })
-            .collect();
-        let proj = store.join("projects").join(enc);
+        // The real encoder, so a test can never drift from what luvus looks up.
+        let proj = crate::agent::claude_project_dir(&store, &cwd);
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(proj.join("only-session.jsonl"), "{}").unwrap();
         std::env::set_var("CLAUDE_CONFIG_DIR", &store);
@@ -5574,18 +5564,8 @@ mod tests {
         let cwd = app.panes.get(&older).unwrap().cwd.clone();
         let store = std::env::temp_dir().join(format!("luvus-hooksess-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
-        let enc: String = cwd
-            .to_string_lossy()
-            .chars()
-            .map(|c| {
-                if matches!(c, '/' | '\\' | '.') {
-                    '-'
-                } else {
-                    c
-                }
-            })
-            .collect();
-        let proj = store.join("projects").join(enc);
+        // The real encoder, so a test can never drift from what luvus looks up.
+        let proj = crate::agent::claude_project_dir(&store, &cwd);
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(proj.join("owned.jsonl"), "{}").unwrap();
         std::env::set_var("CLAUDE_CONFIG_DIR", &store);
@@ -5641,18 +5621,8 @@ mod tests {
         // A Claude store holding the parent's session.
         let store = std::env::temp_dir().join(format!("luvus-forksess-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
-        let enc: String = cwd
-            .to_string_lossy()
-            .chars()
-            .map(|c| {
-                if matches!(c, '/' | '\\' | '.') {
-                    '-'
-                } else {
-                    c
-                }
-            })
-            .collect();
-        let proj = store.join("projects").join(enc);
+        // The real encoder, so a test can never drift from what luvus looks up.
+        let proj = crate::agent::claude_project_dir(&store, &cwd);
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(proj.join("parent-sess.jsonl"), "{}").unwrap();
         std::env::set_var("CLAUDE_CONFIG_DIR", &store);
@@ -5721,18 +5691,8 @@ mod tests {
 
         let store = std::env::temp_dir().join(format!("luvus-forknewer-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
-        let enc: String = cwd
-            .to_string_lossy()
-            .chars()
-            .map(|c| {
-                if matches!(c, '/' | '\\' | '.') {
-                    '-'
-                } else {
-                    c
-                }
-            })
-            .collect();
-        let proj = store.join("projects").join(enc);
+        // The real encoder, so a test can never drift from what luvus looks up.
+        let proj = crate::agent::claude_project_dir(&store, &cwd);
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(proj.join("parent-sess.jsonl"), "{}").unwrap();
         std::env::set_var("CLAUDE_CONFIG_DIR", &store);
@@ -5787,18 +5747,8 @@ mod tests {
 
         let store = std::env::temp_dir().join(format!("luvus-pairing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
-        let enc: String = cwd
-            .to_string_lossy()
-            .chars()
-            .map(|c| {
-                if matches!(c, '/' | '\\' | '.') {
-                    '-'
-                } else {
-                    c
-                }
-            })
-            .collect();
-        let proj = store.join("projects").join(enc);
+        // The real encoder, so a test can never drift from what luvus looks up.
+        let proj = crate::agent::claude_project_dir(&store, &cwd);
         std::fs::create_dir_all(&proj).unwrap();
         // The older pane's session was written first.
         std::fs::write(proj.join("old-sess.jsonl"), "{}").unwrap();
@@ -8058,6 +8008,9 @@ mod tests {
     // Clicking a pane's title opens the running-command overlay. The point is
     // that the command comes from the OS, not the screen: an agent's own UI
     // elides long commands and those characters never reach luvus at all.
+    /// Unix only: `platform::process_tree` returns an empty vec off unix, so the
+    /// overlay degrades to the pane's own command and has no tree to assert.
+    #[cfg(unix)]
     #[test]
     fn clicking_a_pane_title_shows_the_real_command() {
         use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
@@ -8814,17 +8767,23 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         app.open_settings();
         app.handle_event(AppEvent::Key(KeyEvent::new(
-            KeyCode::Char('2'),
+            KeyCode::Char('3'),
             KeyModifiers::NONE,
-        ))); // Layout
+        ))); // Layout — `1` General, `2` Theme, `3` Layout (`SettingsTab::ALL`)
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
 
         assert_eq!(app.config.shell, "default");
-        // The Shell row (control index 5) cycles forward on click.
+        // The Shell row cycles forward on click. Ask the row list where it is:
+        // a hardcoded index silently clicks whatever moved into its place.
+        let shell_idx = app
+            .layout_rows()
+            .iter()
+            .position(|r| matches!(r, crate::app::settings::LayoutRow::Shell))
+            .expect("the Layout tab has a Shell row on Windows");
         let row = app
             .settings_ctl_rects
             .iter()
-            .find(|(i, _)| *i == 5)
+            .find(|(i, _)| *i == shell_idx)
             .unwrap()
             .1;
         app.handle_event(AppEvent::Mouse(MouseEvent {
@@ -9076,6 +9035,9 @@ mod tests {
 mod cwd_test {
     use super::*;
 
+    /// Unix only: `platform::process_cwd` has no Windows implementation, so a
+    /// pane there never follows a `cd` and there is nothing to assert.
+    #[cfg(unix)]
     #[test]
     fn pane_cwd_follows_cd_without_moving_its_workspace() {
         let _env = crate::persist::test_env("pane-cwd-follows-cd");
