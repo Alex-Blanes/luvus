@@ -437,12 +437,16 @@ fn fx_base() -> PathBuf {
 // Conversations live at `<base>/projects/<encoded-cwd>/<session-uuid>.jsonl`,
 // where the cwd is encoded by replacing every `/` and `.` with `-`.
 
-fn claude_project_dir(base: &Path, cwd: &Path) -> PathBuf {
+pub(crate) fn claude_project_dir(base: &Path, cwd: &Path) -> PathBuf {
     let enc: String = cwd
         .to_string_lossy()
         .chars()
         .map(|c| {
-            if matches!(c, '/' | '\\' | '.') {
+            // `:` matters on Windows: Claude itself encodes `C:\Users\me` as
+            // `C--Users-me`, and leaving the colon in also makes `join` treat the
+            // component as a *drive-relative* path, so the lookup silently
+            // escaped `base` and landed next to the process working directory.
+            if matches!(c, '/' | '\\' | '.' | ':') {
                 '-'
             } else {
                 c
