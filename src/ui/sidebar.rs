@@ -85,6 +85,28 @@ fn draw_scrollbar(
     }
 }
 
+/// The inverse of `draw_scrollbar`'s thumb placement: which scroll offset a
+/// click at row `r` on the bar column of a dock list `area` means. `None` when
+/// the click misses the bar column or the list does not overflow (no bar drawn).
+/// Rows span the full dock width, so callers must test this *before* the row
+/// hit-tests or the bar click just selects whatever row it lands on.
+pub(crate) fn bar_offset(area: Rect, total: usize, c: u16, r: u16) -> Option<usize> {
+    let cap = list_capacity(area.height);
+    if total <= cap || c != area.right().saturating_sub(2) || r < area.y || r >= area.bottom() {
+        return None;
+    }
+    let len = area.height as usize;
+    let thumb = (len * cap / total).clamp(1, len);
+    let span = total - cap;
+    // `travel == 0` (the thumb fills the track) means every row is the end.
+    Some(
+        ((r - area.y) as usize * span)
+            .checked_div(len - thumb)
+            .unwrap_or(span)
+            .min(span),
+    )
+}
+
 /// Split a sidebar `body` rect into `n` stacked dock slots with a one-row
 /// divider between each. Reduces to the legacy 50/50 split for two docks (the
 /// divider is taken from the remainder, so `slot0 = body.height / n`).
@@ -539,6 +561,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     } else {
         live.len() + app.resumable.len()
     };
+    app.agents_total = atotal;
     app.agents_scroll = app.agents_scroll.min(atotal.saturating_sub(acap));
     let ascroll = app.agents_scroll;
 
@@ -738,8 +761,9 @@ fn header(text: &str, t: &Theme) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
+    use super::{bar_offset, list_capacity};
     use crate::app::App;
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{backend::TestBackend, layout::Rect, Terminal};
 
     fn buffer_contains(term: &Terminal<TestBackend>, needle: &str) -> bool {
         let buf = term.backend().buffer();
@@ -932,6 +956,46 @@ mod tests {
             !buffer_contains(&term, "resume"),
             "Active hides session history"
         );
+    }
+
+    /// A click on the bar must land the thumb where it was clicked — i.e.
+    /// `bar_offset` inverts the thumb placement `draw_scrollbar` computes.
+    #[test]
+    fn bar_click_maps_back_to_the_thumb_position() {
+        let area = Rect::new(0, 3, 30, 20); // 10 visible items, bar at x = 28
+        let (total, cap) = (25usize, list_capacity(area.height));
+        assert_eq!(cap, 10);
+        let (len, span) = (area.height as usize, total - cap);
+        let thumb = (len * cap / total).clamp(1, len);
+
+        assert_eq!(bar_offset(area, total, 28, area.y), Some(0), "top → start");
+        assert_eq!(
+            bar_offset(area, total, 28, area.bottom() - 1),
+            Some(span),
+            "bottom → end, so the last agent is reachable"
+        );
+        assert_eq!(
+            bar_offset(area, total, 27, area.y),
+            None,
+            "not the bar column"
+        );
+        assert_eq!(
+            bar_offset(area, cap, 28, area.y),
+            None,
+            "no bar when it fits"
+        );
+
+        for r in area.y..area.bottom() {
+            let off = bar_offset(area, total, 28, r).unwrap();
+            let pos = ((len - thumb) * off.min(span)) / span; // draw_scrollbar's thumb top
+            let clicked = (r - area.y) as usize;
+            // Within a row: more offsets than thumb positions, so both the
+            // click→offset and offset→thumb maps floor.
+            assert!(
+                pos.abs_diff(clicked.min(len - thumb)) <= 1,
+                "row {r}: thumb at {pos}, clicked {clicked}"
+            );
+        }
     }
 }
 

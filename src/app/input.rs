@@ -893,6 +893,10 @@ impl App {
                     }
                     return;
                 }
+                if let Some(which) = self.bar_drag {
+                    self.update_bar_drag(which, m.row);
+                    return;
+                }
                 if self.sidebar_resize.is_some() {
                     self.update_sidebar_resize(m.column, m.row);
                     return;
@@ -924,6 +928,9 @@ impl App {
                     if (m.column, m.row) == p.at {
                         self.activate_link(p.target);
                     }
+                    return;
+                }
+                if self.bar_drag.take().is_some() {
                     return;
                 }
                 if self.sidebar_resize.is_some() {
@@ -1191,6 +1198,15 @@ impl App {
             }
             return;
         }
+        // A press on a sidebar list's scrollbar jumps that list to the clicked
+        // position and grabs the thumb, so the drag that follows keeps scrolling.
+        // Rows span the full dock width (bar column included), so this has to come
+        // before the row hit-tests below.
+        if let Some(which) = self.bar_hit(c, r) {
+            self.bar_drag = Some(which);
+            self.update_bar_drag(which, r);
+            return;
+        }
         // The AGENTS All/Active filter toggle.
         if let Some((val, _)) = self.agents_filter_rects.iter().find(|(_, rect)| hit(*rect)) {
             let val = *val;
@@ -1337,6 +1353,35 @@ impl App {
 
     /// Scroll the focused pane's scrollback for a fixed prefix key (PageUp/Down
     /// a page at a time, Home/End to the top / live bottom).
+    /// Which sidebar list a scrollbar press at `(c, r)` grabbed, if any.
+    fn bar_hit(&self, c: u16, r: u16) -> Option<BarDrag> {
+        crate::ui::sidebar::bar_offset(self.agents_area, self.agents_total, c, r)
+            .map(|_| BarDrag::Agents)
+            .or_else(|| {
+                crate::ui::sidebar::bar_offset(self.workspaces_area, self.workspaces.len(), c, r)
+                    .map(|_| BarDrag::Workspaces)
+            })
+    }
+
+    /// Scroll the grabbed list to wherever the pointer is now. The row is clamped
+    /// into the track first, so the thumb keeps following a drag that wanders off
+    /// the 1-cell-wide bar or past either end.
+    fn update_bar_drag(&mut self, which: BarDrag, r: u16) {
+        let (area, total) = match which {
+            BarDrag::Agents => (self.agents_area, self.agents_total),
+            BarDrag::Workspaces => (self.workspaces_area, self.workspaces.len()),
+        };
+        let r = r.clamp(area.y, area.bottom().saturating_sub(1));
+        let bar = area.right().saturating_sub(2);
+        let Some(off) = crate::ui::sidebar::bar_offset(area, total, bar, r) else {
+            return;
+        };
+        match which {
+            BarDrag::Agents => self.agents_scroll = off,
+            BarDrag::Workspaces => self.workspaces_scroll = off,
+        }
+    }
+
     fn scroll_focused_pane(&mut self, code: KeyCode) {
         self.search_flash = None; // scrolling dismisses the search-jump marker
         let focus = self.layout().focus;

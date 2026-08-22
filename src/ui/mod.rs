@@ -68,7 +68,7 @@ mod panes;
 mod picker;
 mod search;
 mod settings;
-mod sidebar;
+pub(crate) mod sidebar;
 mod status;
 pub(crate) mod switcher;
 mod tabbar;
@@ -183,6 +183,7 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     let files_area = app.files_area;
     let workspaces_area = app.workspaces_area;
     let agents_area = app.agents_area;
+    let agents_total = app.agents_total;
     let pane_close_rect = app.pane_close_rect;
     let pane_zoom_rect = app.pane_zoom_rect;
     let tab_prev_rect = app.tab_prev_rect;
@@ -276,6 +277,7 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     app.files_area = files_area;
     app.workspaces_area = workspaces_area;
     app.agents_area = agents_area;
+    app.agents_total = agents_total;
     app.pane_close_rect = pane_close_rect;
     app.pane_zoom_rect = pane_zoom_rect;
     app.tab_prev_rect = tab_prev_rect;
