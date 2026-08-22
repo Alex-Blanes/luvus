@@ -128,11 +128,23 @@ pub enum Side {
     Right,
 }
 
-/// Which sidebar list a scrollbar drag is scrolling (docs/29).
+/// Which sidebar list a scrollbar belongs to (docs/29).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BarDrag {
-    Agents,
     Workspaces,
+    Agents,
+    Files,
+}
+
+/// A sidebar scrollbar as drawn last frame: the 1-cell track, how many items the
+/// list holds and how many of them fit. Recorded by the renderer so a click or
+/// drag on the bar can be mapped back to a scroll offset.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SidebarBar {
+    pub list: BarDrag,
+    pub track: Rect,
+    pub total: usize,
+    pub cap: usize,
 }
 
 /// One row a module pushes into its dock (docs/29, DOCK-4). `dot` is an optional
@@ -1311,9 +1323,9 @@ pub struct App {
     pub agents_scroll: usize,
     pub workspaces_area: Rect,
     pub agents_area: Rect,
-    /// Items the AGENTS list held on the last frame (live agents + resumable
-    /// sessions), so a click on its scrollbar can map a row to a scroll offset.
-    pub agents_total: usize,
+    /// The scrollbars the sidebar docks drew last frame, for the click/drag that
+    /// scrolls them. Re-recorded every frame; empty means no list overflows.
+    pub sidebar_bars: Vec<SidebarBar>,
     /// The FILES dock (docs/38): the tree model, its scroll region, and the
     /// clickable rect per visible row (`(row index, rect)`), re-set each frame.
     pub file_tree: crate::files::FileTree,
@@ -1633,7 +1645,7 @@ impl App {
             agents_active_only: false,
             workspaces_area: Rect::ZERO,
             agents_area: Rect::ZERO,
-            agents_total: 0,
+            sidebar_bars: Vec::new(),
             // Rooted at nothing; the first detect tick re-roots it to the active
             // node (set_root is a no-op when already correct).
             file_tree: {
@@ -2064,7 +2076,7 @@ impl App {
             agents_active_only: false,
             workspaces_area: Rect::ZERO,
             agents_area: Rect::ZERO,
-            agents_total: 0,
+            sidebar_bars: Vec::new(),
             // Rooted at nothing; the first detect tick re-roots it to the active
             // node (set_root is a no-op when already correct).
             file_tree: {

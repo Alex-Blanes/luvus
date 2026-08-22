@@ -140,6 +140,7 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     let session_rects = std::mem::take(&mut app.session_rects);
     let file_tree_rects = std::mem::take(&mut app.file_tree_rects);
     let module_dock_rects = std::mem::take(&mut app.module_dock_rects);
+    let sidebar_bars = std::mem::take(&mut app.sidebar_bars);
     let picker_rects = std::mem::take(&mut app.picker_rects);
     let settings_tab_rects = std::mem::take(&mut app.settings_tab_rects);
     let settings_ctl_rects = std::mem::take(&mut app.settings_ctl_rects);
@@ -183,7 +184,6 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     let files_area = app.files_area;
     let workspaces_area = app.workspaces_area;
     let agents_area = app.agents_area;
-    let agents_total = app.agents_total;
     let pane_close_rect = app.pane_close_rect;
     let pane_zoom_rect = app.pane_zoom_rect;
     let tab_prev_rect = app.tab_prev_rect;
@@ -240,6 +240,7 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     app.session_rects = session_rects;
     app.file_tree_rects = file_tree_rects;
     app.module_dock_rects = module_dock_rects;
+    app.sidebar_bars = sidebar_bars;
     app.picker_rects = picker_rects;
     app.settings_tab_rects = settings_tab_rects;
     app.settings_ctl_rects = settings_ctl_rects;
@@ -277,7 +278,6 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     app.files_area = files_area;
     app.workspaces_area = workspaces_area;
     app.agents_area = agents_area;
-    app.agents_total = agents_total;
     app.pane_close_rect = pane_close_rect;
     app.pane_zoom_rect = pane_zoom_rect;
     app.tab_prev_rect = tab_prev_rect;
@@ -441,6 +441,7 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     app.version_rect = None;
     app.workspaces_area = Rect::ZERO;
     app.agents_area = Rect::ZERO;
+    app.sidebar_bars.clear();
     app.agents_filter_rects.clear();
     app.workspace_branch_rects.clear();
     app.module_dock_rects.clear();

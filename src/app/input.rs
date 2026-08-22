@@ -1353,32 +1353,27 @@ impl App {
 
     /// Scroll the focused pane's scrollback for a fixed prefix key (PageUp/Down
     /// a page at a time, Home/End to the top / live bottom).
-    /// Which sidebar list a scrollbar press at `(c, r)` grabbed, if any.
+    /// The sidebar scrollbar under `(c, r)`, if any. Only bars actually drawn
+    /// last frame are recorded, so a list that fits is never hit.
     fn bar_hit(&self, c: u16, r: u16) -> Option<BarDrag> {
-        crate::ui::sidebar::bar_offset(self.agents_area, self.agents_total, c, r)
-            .map(|_| BarDrag::Agents)
-            .or_else(|| {
-                crate::ui::sidebar::bar_offset(self.workspaces_area, self.workspaces.len(), c, r)
-                    .map(|_| BarDrag::Workspaces)
-            })
+        self.sidebar_bars
+            .iter()
+            .find(|b| c == b.track.x && r >= b.track.y && r < b.track.bottom())
+            .map(|b| b.list)
     }
 
-    /// Scroll the grabbed list to wherever the pointer is now. The row is clamped
-    /// into the track first, so the thumb keeps following a drag that wanders off
+    /// Scroll the grabbed list to wherever the pointer is now. `bar_offset` clamps
+    /// the row into the track, so the thumb keeps following a drag that wanders off
     /// the 1-cell-wide bar or past either end.
     fn update_bar_drag(&mut self, which: BarDrag, r: u16) {
-        let (area, total) = match which {
-            BarDrag::Agents => (self.agents_area, self.agents_total),
-            BarDrag::Workspaces => (self.workspaces_area, self.workspaces.len()),
-        };
-        let r = r.clamp(area.y, area.bottom().saturating_sub(1));
-        let bar = area.right().saturating_sub(2);
-        let Some(off) = crate::ui::sidebar::bar_offset(area, total, bar, r) else {
+        let Some(bar) = self.sidebar_bars.iter().find(|b| b.list == which).copied() else {
             return;
         };
+        let off = crate::ui::sidebar::bar_offset(bar, r);
         match which {
-            BarDrag::Agents => self.agents_scroll = off,
             BarDrag::Workspaces => self.workspaces_scroll = off,
+            BarDrag::Agents => self.agents_scroll = off,
+            BarDrag::Files => self.file_tree.scroll = off,
         }
     }
 
