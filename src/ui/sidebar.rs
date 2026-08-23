@@ -5,7 +5,7 @@
 //! single-purpose left sidebar.
 
 use super::*;
-use crate::app::{BarDrag, SidebarBar};
+use crate::app::{AgentsFilter, BarDrag, SidebarBar};
 
 fn attention(s: State) -> u8 {
     match s {
@@ -500,31 +500,54 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
 
     let aheader = area.y;
     line_at(f, aheader, header(cat.agents, t));
-    // All/Active filter toggle, right-aligned in the header row. "All" shows the
-    // session history too; "Active" shows only live agents.
+    // Filter toggle, right-aligned in the header row. "Space" lists only the
+    // active workspace's agents and sessions, "All" adds the whole session
+    // history, "Active" shows only live agents.
     app.agents_filter_rects.clear();
-    let active_only = app.agents_active_only;
-    if area.width >= 22 {
-        let segs = [
-            (format!(" {} ", cat.all), false),
-            (format!(" {} ", cat.active), true),
-        ];
-        let total: u16 = segs
-            .iter()
-            .map(|(l, _)| crate::ui::display_width(l) as u16)
-            .sum();
+    let filter = app.agents_filter;
+    let label = |v: AgentsFilter| {
+        format!(
+            " {} ",
+            match v {
+                AgentsFilter::Workspace => cat.scope_workspace,
+                AgentsFilter::All => cat.all,
+                AgentsFilter::Active => cat.active,
+            }
+        )
+    };
+    let width = |v: AgentsFilter| crate::ui::display_width(&label(v)) as u16;
+    let every = [
+        AgentsFilter::Workspace,
+        AgentsFilter::All,
+        AgentsFilter::Active,
+    ];
+    // Room left of the toggle once the dock title has its own: the title must stay
+    // readable. Three segments don't fit a default 26-column sidebar, so there they
+    // collapse to a single chip showing the current filter, which cycles on click.
+    let room = area
+        .width
+        .saturating_sub(3 + crate::ui::display_width(cat.agents) as u16);
+    let segs: &[AgentsFilter] = if every.iter().map(|v| width(*v)).sum::<u16>() <= room {
+        &every
+    } else {
+        std::slice::from_ref(&filter)
+    };
+    let total: u16 = segs.iter().map(|v| width(*v)).sum();
+    if total <= room {
         let mut x = area.right().saturating_sub(1 + total);
-        for (label, val) in &segs {
-            let (label, val) = (label.as_str(), *val);
-            let w = crate::ui::display_width(label) as u16;
+        for val in segs {
+            let (label, val) = (label(*val), *val);
+            let w = crate::ui::display_width(&label) as u16;
             let rect = Rect::new(x, aheader, w, 1);
-            let style = if active_only == val {
+            let style = if filter == val {
                 Style::new().fg(t.crust).bg(t.accent).bold()
             } else {
                 Style::new().fg(t.overlay1).bg(t.surface1)
             };
             f.render_widget(Paragraph::new(Span::styled(label, style)), rect);
-            app.agents_filter_rects.push((val, rect));
+            // Collapsed, the lone chip is the cycle button: clicking it advances.
+            app.agents_filter_rects
+                .push((if segs.len() == 1 { val.next() } else { val }, rect));
             x = x.saturating_add(w);
         }
     }
@@ -539,8 +562,14 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     // The row's second line is `workspace · mention`, where the mention is how you
     // delegate to the pane (`=name` or `=<id>`). The tab is intentionally dropped here
     // in favor of the pane token, which is what a script or delegation needs.
+    // "Space" keeps the list to the workspace in front of you; the other two
+    // filters sweep every workspace.
+    let scope = (filter == AgentsFilter::Workspace).then_some(app.active_ws);
     let mut live: Vec<(PaneId, String)> = Vec::new();
-    for ws in app.workspaces.iter() {
+    for (wi, ws) in app.workspaces.iter().enumerate() {
+        if scope.is_some_and(|a| a != wi) {
+            continue;
+        }
         for tab in ws.tabs.iter() {
             for id in tab.layout.leaves() {
                 if let Some(s) = app.status.get(&id) {
@@ -558,12 +587,21 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     if !app.pinned_agents.is_empty() {
         live.sort_by_key(|(id, _)| !app.pinned_agents.contains(id));
     }
-    // In "Active" mode, hide the on-disk resumable session history.
-    let atotal = if active_only {
-        live.len()
+    // "Active" hides the on-disk resumable history entirely; "Space" keeps the
+    // sessions rooted at the active workspace's folder. Indices into `resumable`
+    // are carried through, since the row menu resumes and deletes by index.
+    let sessions: Vec<usize> = if filter == AgentsFilter::Active {
+        Vec::new()
     } else {
-        live.len() + app.resumable.len()
+        let root = scope.map(|i| app.workspaces[i].cwd.clone());
+        app.resumable
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| root.as_ref().is_none_or(|r| s.cwd == *r))
+            .map(|(i, _)| i)
+            .collect()
     };
+    let atotal = live.len() + sessions.len();
     app.agents_scroll = app.agents_scroll.min(atotal.saturating_sub(acap));
     let ascroll = app.agents_scroll;
 
@@ -572,7 +610,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
             f,
             alist_top,
             Line::from(Span::styled(
-                if active_only {
+                if filter == AgentsFilter::Active {
                     cat.no_active_agents
                 } else {
                     cat.no_agents_or_sessions
@@ -639,7 +677,12 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                     .then(|| app.pane_title(id))
                     .flatten()
                     .map(|ttl| format!("  {ttl}"))
-                    .unwrap_or_else(|| format!("  {wsname} · {mention}"));
+                    // Scoped to one workspace, its name on every row is noise —
+                    // the pane token identifies the agent, which is what you need.
+                    .unwrap_or_else(|| match scope {
+                        Some(_) => format!("  {mention}"),
+                        None => format!("  {wsname} · {mention}"),
+                    });
                 line_at(
                     f,
                     y + 1,
@@ -658,7 +701,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 }
             } else {
                 // A resumable session discovered on disk — click to reopen.
-                let si = k - live.len();
+                let si = sessions[k - live.len()];
                 let s = &app.resumable[si];
                 let proj = s
                     .cwd
@@ -821,6 +864,8 @@ mod tests {
         let mut app = App::new(120, 40, tx).unwrap();
         let id = app.layout().focus;
         app.status.get_mut(&id).unwrap().agent = "claude".into();
+        // "All" spans every workspace, so rows carry `workspace · token`.
+        app.agents_filter = crate::app::AgentsFilter::All;
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
 
         // Unnamed: the row's second line shows the pane token (how you mention it),
@@ -837,6 +882,16 @@ mod tests {
         assert!(
             buffer_contains(&term, "· =worker"),
             "a named agent row shows =name"
+        );
+
+        // Scoped to the active workspace, its name on every row is redundant —
+        // the token stays, the `workspace ·` prefix goes.
+        app.agents_filter = crate::app::AgentsFilter::Workspace;
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(buffer_contains(&term, "=worker"), "the token survives");
+        assert!(
+            !buffer_contains(&term, "· =worker"),
+            "the workspace prefix is dropped when the list is workspace-scoped"
         );
     }
 
@@ -875,6 +930,7 @@ mod tests {
         let mut app = App::new(120, 40, tx).unwrap();
         let id = app.layout().focus;
         app.status.get_mut(&id).unwrap().agent = "claude".into();
+        app.agents_filter = crate::app::AgentsFilter::All;
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
 
@@ -928,6 +984,49 @@ mod tests {
     }
 
     #[test]
+    fn agents_workspace_filter_is_the_default_and_scopes_the_history() {
+        let _env = crate::persist::test_env("agents-scope");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let sess = |p: &str| crate::agent::SessionInfo {
+            agent: "claude".into(),
+            session_id: p.into(),
+            cwd: std::path::PathBuf::from(p),
+            updated: std::time::SystemTime::UNIX_EPOCH,
+        };
+        // One session in the active workspace's folder, one somewhere else.
+        let here = app.ws().cwd.clone();
+        app.resumable = vec![sess("/tmp/elsewhere"), sess(here.to_str().unwrap())];
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+
+        assert_eq!(app.agents_filter, crate::app::AgentsFilter::Workspace);
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert_eq!(
+            app.session_rects.len(),
+            1,
+            "only the active workspace's session is listed"
+        );
+        // The row still points at the right entry in `resumable`, which is what
+        // the row menu resumes and deletes by.
+        assert_eq!(app.session_rects[0].0, 1);
+
+        // The default 26-column sidebar has no room for three segments, so the
+        // toggle collapses to one chip that cycles: Workspace → All → Active.
+        assert_eq!(app.agents_filter_rects.len(), 1, "collapsed to one chip");
+        assert_eq!(app.agents_filter_rects[0].0, crate::app::AgentsFilter::All);
+        assert!(buffer_contains(&term, app.catalog.scope_workspace));
+
+        app.agents_filter = crate::app::AgentsFilter::All;
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert_eq!(app.session_rects.len(), 2, "All lists the whole history");
+
+        // Widen the sidebar and all three segments fit, each picking its own filter.
+        app.sidebars.left.width = 44;
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert_eq!(app.agents_filter_rects.len(), 3, "three filter segments");
+    }
+
+    #[test]
     fn agents_all_active_toggle_filters_history() {
         // Isolate config so a concurrent test's saved sidebar layout can't leak in
         // via the shared `LUVUS_HOME` env var (fresh temp → default docks).
@@ -943,11 +1042,12 @@ mod tests {
         }];
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
 
-        // Default = All: retained sessions remain visible after a fresh start or
-        // snapshot restore, so history never appears to have been lost.
-        assert!(!app.agents_active_only);
+        // All: retained sessions remain visible after a fresh start or snapshot
+        // restore, so history never appears to have been lost.
+        app.agents_filter = crate::app::AgentsFilter::All;
+        app.sidebars.left.width = 44;
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert_eq!(app.agents_filter_rects.len(), 2, "All/Active toggle drawn");
+        assert_eq!(app.agents_filter_rects.len(), 3, "filter toggle drawn");
         assert!(buffer_contains(&term, "Active"), "toggle label present");
         assert!(
             buffer_contains(&term, "resume"),
@@ -956,7 +1056,7 @@ mod tests {
 
         // Active: history is hidden when the user explicitly asks for live
         // agents only.
-        app.agents_active_only = true;
+        app.agents_filter = crate::app::AgentsFilter::Active;
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
         assert!(
             !buffer_contains(&term, "resume"),

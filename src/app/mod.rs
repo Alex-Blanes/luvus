@@ -128,6 +128,31 @@ pub enum Side {
     Right,
 }
 
+/// AGENTS list filter: which agents and sessions the dock lists.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum AgentsFilter {
+    /// Only what belongs to the active workspace — live agents running in it and
+    /// resumable sessions rooted at its folder. The default: the common way to
+    /// work is resuming an agent of the workspace you are already in.
+    #[default]
+    Workspace,
+    /// Every live agent plus the whole on-disk resumable session history.
+    All,
+    /// Live agents only, across every workspace.
+    Active,
+}
+
+impl AgentsFilter {
+    /// The next filter in the header order, for the keyboard toggle.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Workspace => Self::All,
+            Self::All => Self::Active,
+            Self::Active => Self::Workspace,
+        }
+    }
+}
+
 /// Which sidebar list a scrollbar belongs to (docs/29).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BarDrag {
@@ -1384,9 +1409,8 @@ pub struct App {
     /// The reused single-click **preview** file pane, if one is open — clicking
     /// another file replaces its content instead of spawning a second pane.
     pub preview_view: Option<PaneId>,
-    /// AGENTS list filter: `true` shows only live (active) agents; `false`
-    /// (the default) also shows the resumable session history.
-    pub agents_active_only: bool,
+    /// AGENTS list filter: workspace-scoped (the default), all, or live only.
+    pub agents_filter: AgentsFilter,
     /// Last active workspace shown, to auto-reveal it on a programmatic change.
     pub last_active_ws_shown: usize,
     /// Last mouse position, for hover affordances (the session delete ✕).
@@ -1431,8 +1455,8 @@ pub struct App {
     pub workspace_branch_rects: Vec<(usize, Rect)>,
     /// Clickable view-selector tabs in the active git tab (Commits/Flow/…).
     pub git_section_rects: Vec<(crate::git::Section, Rect)>,
-    /// The All/Active filter toggle in the AGENTS header (`bool` = active_only).
-    pub agents_filter_rects: Vec<(bool, Rect)>,
+    /// The filter toggle in the AGENTS header (which filter each segment picks).
+    pub agents_filter_rects: Vec<(AgentsFilter, Rect)>,
     pub agent_rects: Vec<(PaneId, Rect)>,
     /// Resumable-session rows in the sidebar (index into `resumable`).
     pub session_rects: Vec<(usize, Rect)>,
@@ -1642,7 +1666,7 @@ impl App {
             last_output_wait_scan: Instant::now(),
             workspaces_scroll: 0,
             agents_scroll: 0,
-            agents_active_only: false,
+            agents_filter: AgentsFilter::default(),
             workspaces_area: Rect::ZERO,
             agents_area: Rect::ZERO,
             sidebar_bars: Vec::new(),
@@ -2073,7 +2097,7 @@ impl App {
             last_output_wait_scan: Instant::now(),
             workspaces_scroll: 0,
             agents_scroll: 0,
-            agents_active_only: false,
+            agents_filter: AgentsFilter::default(),
             workspaces_area: Rect::ZERO,
             agents_area: Rect::ZERO,
             sidebar_bars: Vec::new(),
@@ -6749,7 +6773,7 @@ mod tests {
         app.agents_area = junk;
         app.files_area = junk;
         app.file_tree_rects = vec![(0, junk)];
-        app.agents_filter_rects = vec![(true, junk)];
+        app.agents_filter_rects = vec![(AgentsFilter::Active, junk)];
         app.workspace_branch_rects = vec![(0, junk)];
         app.module_dock_rects = vec![("example.buzz".into(), 0, junk)]; // a user module dock
 
@@ -7679,7 +7703,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
         app.resumable = vec![sess("s0", "/p/a"), sess("s1", "/p/b")];
-        app.agents_active_only = false; // show the resumable history
+        app.agents_filter = AgentsFilter::All; // show the resumable history
 
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
