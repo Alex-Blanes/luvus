@@ -864,6 +864,8 @@ mod tests {
         let mut app = App::new(120, 40, tx).unwrap();
         let id = app.layout().focus;
         app.status.get_mut(&id).unwrap().agent = "claude".into();
+        // The token line is the fallback shown when the agent set no session title.
+        app.config.layout.agent_title = false;
         // "All" spans every workspace, so rows carry `workspace · token`.
         app.agents_filter = crate::app::AgentsFilter::All;
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
@@ -930,6 +932,7 @@ mod tests {
         let mut app = App::new(120, 40, tx).unwrap();
         let id = app.layout().focus;
         app.status.get_mut(&id).unwrap().agent = "claude".into();
+        app.config.layout.agent_title = false;
         app.agents_filter = crate::app::AgentsFilter::All;
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
