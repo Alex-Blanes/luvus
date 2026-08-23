@@ -5,6 +5,7 @@
 //! single-purpose left sidebar.
 
 use super::*;
+use crate::app::{BarDrag, SidebarBar};
 
 fn attention(s: State) -> u8 {
     match s {
@@ -59,17 +60,22 @@ fn list_capacity(rows: u16) -> usize {
 /// renders as a solid line in every terminal (no box-drawing glyph to dash on
 /// macOS Terminal.app). A faint full-height track carries a small brighter
 /// thumb sized to the visible fraction of the list.
-fn draw_scrollbar(
+pub(crate) fn draw_scrollbar(
     f: &mut RenderTarget,
-    track: Rect,
-    total: usize,
-    cap: usize,
+    bars: &mut Vec<SidebarBar>,
+    bar: SidebarBar,
     scroll: usize,
     t: &Theme,
 ) {
+    let SidebarBar {
+        track, total, cap, ..
+    } = bar;
     if total <= cap || track.height == 0 {
         return;
     }
+    // Only a drawn bar is recorded, so the hit-test never fires on a list that
+    // fits (no bar on screen to aim at).
+    bars.push(bar);
     let len = track.height as usize;
     let thumb = (len * cap / total).clamp(1, len);
     let span = total - cap;
@@ -83,6 +89,21 @@ fn draw_scrollbar(
         cell.set_symbol(" ");
         cell.set_bg(if on { t.overlay1 } else { t.surface1 });
     }
+}
+
+/// The inverse of `draw_scrollbar`'s thumb placement: which scroll offset a click
+/// at row `r` on `bar`'s track means. Rows span the full dock width, so callers
+/// must test this *before* the row hit-tests or a bar click just selects whatever
+/// row it lands on.
+pub(crate) fn bar_offset(bar: SidebarBar, r: u16) -> usize {
+    let (len, span) = (bar.track.height as usize, bar.total - bar.cap);
+    let thumb = (len * bar.cap / bar.total).clamp(1, len);
+    let r = r.clamp(bar.track.y, bar.track.bottom().saturating_sub(1));
+    // `len == thumb` (the thumb fills the track) means every row is the end.
+    ((r - bar.track.y) as usize * span)
+        .checked_div(len - thumb)
+        .unwrap_or(span)
+        .min(span)
 }
 
 /// Split a sidebar `body` rect into `n` stacked dock slots with a one-row
@@ -448,9 +469,13 @@ fn draw_workspaces_dock(
     }
     draw_scrollbar(
         f,
-        Rect::new(bar_col, nlist_top, 1, nrows),
-        ntotal,
-        ncap,
+        &mut app.sidebar_bars,
+        SidebarBar {
+            list: BarDrag::Workspaces,
+            track: Rect::new(bar_col, nlist_top, 1, nrows),
+            total: ntotal,
+            cap: ncap,
+        },
         nscroll,
         t,
     );
@@ -668,9 +693,13 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
         }
         draw_scrollbar(
             f,
-            Rect::new(bar_col, alist_top, 1, arows),
-            atotal,
-            acap,
+            &mut app.sidebar_bars,
+            SidebarBar {
+                list: BarDrag::Agents,
+                track: Rect::new(bar_col, alist_top, 1, arows),
+                total: atotal,
+                cap: acap,
+            },
             ascroll,
             t,
         );
@@ -738,8 +767,9 @@ fn header(text: &str, t: &Theme) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
-    use crate::app::App;
-    use ratatui::{backend::TestBackend, Terminal};
+    use super::{bar_offset, list_capacity};
+    use crate::app::{App, BarDrag, SidebarBar};
+    use ratatui::{backend::TestBackend, layout::Rect, Terminal};
 
     fn buffer_contains(term: &Terminal<TestBackend>, needle: &str) -> bool {
         let buf = term.backend().buffer();
@@ -932,6 +962,46 @@ mod tests {
             !buffer_contains(&term, "resume"),
             "Active hides session history"
         );
+    }
+
+    /// A click on the bar must land the thumb where it was clicked — i.e.
+    /// `bar_offset` inverts the thumb placement `draw_scrollbar` computes.
+    #[test]
+    fn bar_click_maps_back_to_the_thumb_position() {
+        let track = Rect::new(28, 3, 1, 20);
+        let bar = SidebarBar {
+            list: BarDrag::Agents,
+            track,
+            total: 25,
+            cap: list_capacity(track.height), // 10 items in a 20-row, 2-rows-per-item list
+        };
+        assert_eq!(bar.cap, 10);
+        let (len, span) = (track.height as usize, bar.total - bar.cap);
+        let thumb = (len * bar.cap / bar.total).clamp(1, len);
+
+        assert_eq!(bar_offset(bar, track.y), 0, "top → start");
+        assert_eq!(
+            bar_offset(bar, track.bottom() - 1),
+            span,
+            "bottom → end, so the last agent is reachable"
+        );
+        assert_eq!(
+            bar_offset(bar, track.bottom() + 50),
+            span,
+            "a drag past the end pins to the end"
+        );
+
+        for r in track.y..track.bottom() {
+            let off = bar_offset(bar, r);
+            let pos = ((len - thumb) * off.min(span)) / span; // draw_scrollbar's thumb top
+            let clicked = (r - track.y) as usize;
+            // Within a row: more offsets than thumb positions, so both the
+            // click→offset and offset→thumb maps floor.
+            assert!(
+                pos.abs_diff(clicked.min(len - thumb)) <= 1,
+                "row {r}: thumb at {pos}, clicked {clicked}"
+            );
+        }
     }
 }
 

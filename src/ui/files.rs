@@ -57,6 +57,20 @@ pub(super) fn draw_files_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t
     }
     let scroll = app.file_tree.scroll;
     let hover = app.hover;
+    // Same bar the other docks get (docs/29): drawn only when the tree overflows,
+    // and recorded so a click or drag on it scrolls the tree.
+    crate::ui::sidebar::draw_scrollbar(
+        f,
+        &mut app.sidebar_bars,
+        crate::app::SidebarBar {
+            list: crate::app::BarDrag::Files,
+            track: Rect::new(area.right().saturating_sub(2), list_top, 1, cap as u16),
+            total: n,
+            cap,
+        },
+        scroll,
+        t,
+    );
 
     let rows = app.file_tree.visible_rows();
     for (i, row) in rows.iter().enumerate().skip(scroll).take(cap) {
