@@ -3873,7 +3873,20 @@ impl App {
         let on_disk: HashSet<&str> = found.iter().map(|s| s.session_id.as_str()).collect();
         self.dismissed_sessions
             .retain(|id| on_disk.contains(id.as_str()));
-        let open: HashSet<(String, PathBuf)> = self
+        // A session already running in a pane must not also offer itself as
+        // resumable: resuming it a second time is what makes the agent refuse the
+        // id as in use, leaving forking as the only way back in. The session id is
+        // the exact identity, so it decides first.
+        let live_ids: HashSet<String> = self
+            .status
+            .values()
+            .filter_map(|s| s.agent_session.as_ref().map(|a| a.session_id.clone()))
+            .collect();
+        // An agent that never reported its id is still recognisable by where it
+        // runs. `same_path`, not `PathBuf` equality: the same folder reaches us
+        // spelled differently (`~`, a drive letter in another case, a trailing
+        // separator) and a spelling difference was enough to miss the match.
+        let open: Vec<(String, PathBuf)> = self
             .status
             .iter()
             .filter(|(_, s)| crate::agent::is_resumable(&s.agent))
@@ -3884,7 +3897,10 @@ impl App {
             .into_iter()
             .filter(|s| {
                 !dismissed.contains(&s.session_id)
-                    && !open.contains(&(s.agent.clone(), s.cwd.clone()))
+                    && !live_ids.contains(&s.session_id)
+                    && !open.iter().any(|(agent, cwd)| {
+                        *agent == s.agent && crate::platform::same_path(cwd, &s.cwd)
+                    })
             })
             .collect();
         let changed = fresh.len() != self.resumable.len()
@@ -7695,6 +7711,57 @@ mod tests {
         );
     }
 
+    /// A session that is already open in a pane must not also sit in the
+    /// resumable list. Resuming it a second time is what makes the agent refuse
+    /// the id as in use, and forking becomes the only way back in. Neither the
+    /// spelling of the folder nor a missing reported id may break the match.
+    #[test]
+    fn a_live_session_is_never_offered_as_resumable() {
+        let _env = crate::persist::test_env("live-session-not-resumable");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let cwd = app.panes[&pane].cwd.clone();
+        let sess = |id: &str, cwd: &std::path::Path| crate::agent::SessionInfo {
+            agent: "claude".into(),
+            session_id: id.into(),
+            cwd: cwd.to_path_buf(),
+            updated: std::time::SystemTime::UNIX_EPOCH,
+        };
+
+        // Matched by id: the pane reported which session it is running, so the
+        // folder it runs in doesn't even come into it.
+        app.status.get_mut(&pane).unwrap().agent = "claude".into();
+        app.status.get_mut(&pane).unwrap().agent_session = Some(AgentSession {
+            agent: "claude".into(),
+            session_id: "live".into(),
+        });
+        app.apply_scanned_sessions(vec![
+            sess("live", std::path::Path::new("/somewhere/else")),
+            sess("other", std::path::Path::new("/somewhere/else")),
+        ]);
+        assert_eq!(
+            app.resumable
+                .iter()
+                .map(|s| &s.session_id)
+                .collect::<Vec<_>>(),
+            vec!["other"],
+            "the running session is hidden, the unrelated one stays"
+        );
+
+        // Matched by folder, for an agent that reported no id — and the folder
+        // reaches us spelled differently, which is the regression: a trailing
+        // separator (or `~`, or another case on Windows) used to miss the match
+        // and leave the running session offered for resume.
+        app.status.get_mut(&pane).unwrap().agent_session = None;
+        let spelled = std::path::PathBuf::from(format!("{}/", cwd.display()));
+        app.apply_scanned_sessions(vec![sess("here", &spelled)]);
+        assert!(
+            app.resumable.is_empty(),
+            "same folder, different spelling — still the session in this pane"
+        );
+    }
+
     /// The WORKSPACES/AGENTS scrollbar is interactive: a press jumps the list to
     /// the clicked position (instead of selecting the row under the bar) and the
     /// drag that follows keeps the list glued to the pointer until release.
@@ -7704,6 +7771,10 @@ mod tests {
         use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         use ratatui::Terminal;
 
+        // The bar's geometry depends on how many docks share the sidebar, so this
+        // needs the default layout, not whatever the machine running the tests has
+        // in its real config. Without it the test passes or fails on run order.
+        let _env = crate::persist::test_env("scrollbar-drag");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
         for _ in 0..9 {
