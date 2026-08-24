@@ -38,7 +38,9 @@ fn path_key(p: &Path) -> String {
     // that escapes backslashes (a shell, a JSON string) arrives doubled. Two
     // spellings of one folder used to sit in the sidebar as two workspaces.
     // A *leading* run is kept: `\\server\share` is a UNC host, not a root.
-    let s = collapse_separators(&s);
+    // `&s[..]` and not `&s`: on Windows `s` is a `String` (the case fold above
+    // returns one) and elsewhere it is already a `&str`.
+    let s = collapse_separators(&s[..]);
     // Drop trailing separators so `proj\` == `proj`, but never eat a bare root
     // (`/` or `C:\`), which would make every root compare equal to the empty path.
     let sep: &[char] = &['/', '\\'];
