@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -795,11 +795,29 @@ pub fn save(app: &App) {
 /// Load a saved session, if one exists and parses at a known version.
 pub fn load() -> Option<SessionSnapshot> {
     let data = fs::read_to_string(session_path()).ok()?;
-    let snap: SessionSnapshot = serde_json::from_str(&data).ok()?;
+    let mut snap: SessionSnapshot = serde_json::from_str(&data).ok()?;
     if snap.version > SNAPSHOT_VERSION {
         return None; // newer than we understand — ignore rather than misparse
     }
+    // A `~` that reached an older luvus unexpanded was saved as the literal path.
+    // Resolve it on the way back in so the restored workspace is the home folder
+    // and not a second one standing beside it.
+    for ws in snap.workspaces.iter_mut() {
+        ws.cwd = expand_home(&ws.cwd);
+        for tab in ws.tabs.iter_mut() {
+            for (_, pane) in tab.panes.iter_mut() {
+                pane.cwd = expand_home(&pane.cwd);
+            }
+        }
+    }
     Some(snap)
+}
+
+fn expand_home(p: &Path) -> PathBuf {
+    match p.to_str() {
+        Some(s) => crate::platform::user_path(s),
+        None => p.to_path_buf(),
+    }
 }
 
 #[cfg(all(test, unix))]
