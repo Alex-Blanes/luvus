@@ -626,6 +626,16 @@ impl App {
                 }
                 true
             }
+            AppEvent::SelfUpdateInstalled(label) => {
+                self.update_available = None; // it is no longer *available*, it is installed
+                self.show_toast(format!("{} v{label}", self.catalog.update_installed));
+                true
+            }
+            AppEvent::UpstreamUpdateAvailable(version) => {
+                let changed = self.upstream_available.as_deref() != Some(version.as_str());
+                self.upstream_available = Some(version);
+                changed
+            }
             // Handled by the server loop; never reaches here at runtime.
             AppEvent::ClientConnected { .. }
             | AppEvent::ClientDetach { .. }
@@ -2973,6 +2983,12 @@ fn encode_key(key: &KeyEvent, newline: &[u8], app_cursor: bool) -> Option<Vec<u8
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Tab => vec![b'\t'],
         KeyCode::BackTab => vec![0x1b, b'[', b'Z'],
+        // Ctrl/Alt+Backspace is "delete the word behind the cursor" in every
+        // editor, and readline binds exactly one sequence to it
+        // (`backward-kill-word` on `ESC DEL`) — which is also what the agent
+        // CLIs listen for. Dropping the modifiers here sent a bare `DEL` and
+        // deleted a single character instead, with no way to erase a word.
+        KeyCode::Backspace if ctrl || alt => vec![0x1b, 0x7f],
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Esc => vec![0x1b],
         // Keep navigation modifiers intact. Crossterm reports these directly
@@ -3357,6 +3373,27 @@ mod tests {
                 Some(vec![0x1b, 0x01])
             );
         }
+    }
+
+    /// Ctrl+Backspace has to erase a word, not a character: `encode_key` used to
+    /// drop the modifiers and send a bare `DEL`, so there was no way to rub out
+    /// a word inside a pane at all.
+    #[test]
+    fn ctrl_backspace_kills_the_word_behind_the_cursor() {
+        let key = |modifiers| {
+            encode_key(
+                &KeyEvent::new(KeyCode::Backspace, modifiers),
+                b"\x1b\r",
+                false,
+            )
+        };
+
+        assert_eq!(key(KeyModifiers::NONE), Some(vec![0x7f]));
+        assert_eq!(key(KeyModifiers::SHIFT), Some(vec![0x7f]));
+        // `ESC DEL` is readline's `backward-kill-word`, which is what the agent
+        // CLIs and every shell understand.
+        assert_eq!(key(KeyModifiers::CONTROL), Some(vec![0x1b, 0x7f]));
+        assert_eq!(key(KeyModifiers::ALT), Some(vec![0x1b, 0x7f]));
     }
 
     #[test]
