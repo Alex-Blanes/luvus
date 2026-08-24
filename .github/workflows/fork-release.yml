@@ -5,10 +5,17 @@
 # push to `main` that changes the code becomes an installable build. Assets are
 # bare executables rather than archives: nothing to extract, and one less tool
 # the updater has to find on the target machine.
+#
+# Runs *after* `ci`, not alongside it. Both used to start on the same push, so a
+# commit whose tests failed still published a release — and since the updater
+# installs the newest one on its own, a red build reached the desktop before
+# anyone read the CI mail. That happened once already, with `build-54`.
 name: fork release
 
 on:
-  push:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
     branches: [main]
   workflow_dispatch:
 
@@ -23,6 +30,11 @@ permissions:
 jobs:
   release:
     name: build ${{ matrix.target }}
+    # `workflow_run` fires for a failed run too, so the conclusion is the guard.
+    # A manual dispatch has no run to inspect and is always deliberate.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -35,10 +47,16 @@ jobs:
     steps:
       # Full history *and* tags: `build.rs` counts commits since the `v<version>`
       # tag to get the build number, and a shallow clone has neither.
+      #
+      # `ref` is not optional here: a `workflow_run` event checks out the default
+      # branch tip by default, which is not necessarily the commit `ci` just went
+      # green on. Building something other than what was tested is the exact
+      # thing this workflow was reordered to prevent.
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
           fetch-tags: true
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -71,7 +89,7 @@ jobs:
             "version": "${{ steps.build.outputs.version }}",
             "build": ${{ steps.build.outputs.build }},
             "tag": "${{ steps.build.outputs.tag }}",
-            "commit": "${{ github.sha }}"
+            "commit": "${{ github.event.workflow_run.head_sha || github.sha }}"
           }
           EOF
 
@@ -84,7 +102,7 @@ jobs:
           name: ${{ steps.build.outputs.version }} - 0.${{ steps.build.outputs.build }}
           body: |
             Fork build `${{ steps.build.outputs.build }}` on top of upstream
-            v${{ steps.build.outputs.version }} (`${{ github.sha }}`).
+            v${{ steps.build.outputs.version }} (`${{ github.event.workflow_run.head_sha || github.sha }}`).
 
             Installed automatically by `luvus update`, or by the in-app check
             when **Install updates automatically** is on.
