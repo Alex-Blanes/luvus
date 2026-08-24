@@ -54,6 +54,36 @@ fn main() {
     }
     src.push_str("];\n");
     fs::write(&out, src).expect("write changelog_gen.rs");
+
+    emit_fork_build();
+}
+
+/// Emit `LUVUS_VERSION_LABEL`: the release plus how many commits this checkout
+/// carries on top of the upstream tag `v<version>` — the fork's own build
+/// number, so the sidebar says `0.12.0 - 0.44` and you always know which of
+/// *your* builds is running. Every commit or merge on the branch bumps it.
+/// Falls back to the bare version when the tag is missing (crates.io tarball,
+/// shallow CI clone) — the label is only ever cosmetic, `CARGO_PKG_VERSION`
+/// stays the semver everything else compares.
+fn emit_fork_build() {
+    let git = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join(".git");
+    // Rebuild when HEAD moves — a new commit or a merge is a new build number.
+    println!("cargo:rerun-if-changed={}", git.join("HEAD").display());
+    let tag = format!("v{}", env::var("CARGO_PKG_VERSION").unwrap());
+    let count = std::process::Command::new("git")
+        .args(["rev-list", "--count", &format!("{tag}..HEAD")])
+        .current_dir(env::var("CARGO_MANIFEST_DIR").unwrap())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let version = env::var("CARGO_PKG_VERSION").unwrap();
+    let label = match count.parse::<u32>() {
+        Ok(n) => format!("{version} - 0.{n:02}"),
+        Err(_) => version,
+    };
+    println!("cargo:rustc-env=LUVUS_VERSION_LABEL={label}");
 }
 
 /// Split a note into `(version, date, body)`. Front matter is an optional

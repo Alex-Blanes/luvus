@@ -49,7 +49,7 @@ pub(super) fn draw_changelog(f: &mut RenderTarget, area: Rect, app: &mut App, t:
                 Style::new().fg(t.text).bold(),
             ),
             Span::styled(
-                concat!("   v", env!("CARGO_PKG_VERSION")),
+                concat!("   v", env!("LUVUS_VERSION_LABEL")),
                 Style::new().fg(t.overlay0),
             ),
         ])),
@@ -70,7 +70,8 @@ pub(super) fn draw_changelog(f: &mut RenderTarget, area: Rect, app: &mut App, t:
     // label so the two can never drift apart.
     let label = cat.set_check_updates;
     let btn_w = display_width(label) as u16 + 2; // one space either side
-    let title_w = display_width(cat.changelog) as u16 + 4 + env!("CARGO_PKG_VERSION").len() as u16;
+    let title_w =
+        display_width(cat.changelog) as u16 + 4 + env!("LUVUS_VERSION_LABEL").len() as u16;
     app.changelog_check_rect = None;
     if close.x > inner.x + title_w + btn_w {
         let btn = Rect::new(close.x.saturating_sub(btn_w), inner.y, btn_w, 1);

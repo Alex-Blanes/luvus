@@ -10,7 +10,7 @@ pub(super) fn draw_status(f: &mut RenderTarget, area: Rect, app: &mut App, t: &T
     f.render_widget(Block::new().style(Style::new().bg(t.crust)), area);
     app.version_rect = None;
 
-    let version_text = concat!("v", env!("CARGO_PKG_VERSION"));
+    let version_text = concat!("v", env!("LUVUS_VERSION_LABEL"));
     let dot = if app.update_available.is_some() {
         " ●"
     } else {
@@ -217,11 +217,28 @@ mod tests {
         assert!(
             status
                 .trim_end()
-                .ends_with(concat!("v", env!("CARGO_PKG_VERSION"))),
+                .ends_with(concat!("v", env!("LUVUS_VERSION_LABEL"))),
             "unexpected version suffix: {status:?}"
         );
         let version = app.version_rect.expect("version stays clickable");
         assert_eq!(version.right(), 119);
+    }
+
+    /// `build.rs` builds the shown label as `<version> - 0.<commits since the
+    /// upstream tag>`; without the tag it degrades to the bare version. Either
+    /// way it must start with the real semver, or the sidebar would advertise a
+    /// release the binary is not.
+    #[test]
+    fn the_shown_label_is_the_version_plus_a_build_number() {
+        let label = env!("LUVUS_VERSION_LABEL");
+        let version = env!("CARGO_PKG_VERSION");
+        assert!(label.starts_with(version), "unexpected label: {label:?}");
+        let build = &label[version.len()..];
+        assert!(
+            build.is_empty()
+                || (build.starts_with(" - 0.") && build[5..].chars().all(|c| c.is_ascii_digit())),
+            "unexpected build suffix: {build:?}"
+        );
     }
 
     #[test]
