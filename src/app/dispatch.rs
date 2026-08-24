@@ -569,16 +569,23 @@ impl App {
                     }
                 };
                 let tab = param_usize(p, "tab");
-                if new_tab == tab.is_some() {
+                let ws = param_usize(p, "workspace");
+                if [new_tab, tab.is_some(), ws.is_some()]
+                    .iter()
+                    .filter(|given| **given)
+                    .count()
+                    != 1
+                {
                     return Err((
                         "invalid_request".to_string(),
-                        "pass exactly one destination: tab (1-based) or new_tab=true".to_string(),
+                        "pass exactly one destination: tab (1-based), workspace, or new_tab=true"
+                            .to_string(),
                     ));
                 }
-                let target = if new_tab {
-                    MoveTarget::NewTab
-                } else {
-                    MoveTarget::Tab(required_one_based_param(p, "tab")?)
+                let target = match (new_tab, ws) {
+                    (true, _) => MoveTarget::NewTab,
+                    (_, Some(wi)) => MoveTarget::Workspace(wi),
+                    _ => MoveTarget::Tab(required_one_based_param(p, "tab")?),
                 };
                 let moved = self.move_pane_to_tab(id, target).map_err(pane_move_error)?;
                 Ok(json!({
@@ -2079,6 +2086,7 @@ fn pane_move_error(err: PaneMoveError) -> (String, String) {
         PaneMoveError::SameTab => "source and destination tabs must differ",
         PaneMoveError::TargetNotPaneTab => "destination must be a normal pane tab",
         PaneMoveError::NoChange => "moving the only pane to a new tab would not change the layout",
+        PaneMoveError::WorkspaceOutOfRange => "destination workspace is out of range",
     };
     let code = if err == PaneMoveError::PaneNotFound {
         "not_found"

@@ -676,6 +676,11 @@ pub struct PaneMenu {
 pub enum MoveTarget {
     Tab(usize),
     NewTab,
+    /// Another workspace, by index: the pane lands in a fresh tab there. A folder
+    /// is the workspace's identity and a running process cannot change directory,
+    /// so a moved agent keeps working in the folder it was started in — the move
+    /// is about where you *look* for it.
+    Workspace(usize),
 }
 
 /// Why an existing pane could not be re-parented to another tab. Indices in
@@ -689,6 +694,8 @@ pub enum PaneMoveError {
     SameTab,
     TargetNotPaneTab,
     NoChange,
+    /// The target workspace index is not a workspace.
+    WorkspaceOutOfRange,
 }
 
 /// The pane's new location after a successful move (internal zero-based indices).
@@ -3392,8 +3399,9 @@ impl App {
     }
 
     /// The tabs this pane could move into: every other real pane tab in the
-    /// workspace (not the current one, not a dashboard), then a fresh tab. Empty
-    /// when there's nowhere useful to move (one pane in one tab).
+    /// workspace (not the current one, not a dashboard), then a fresh tab, then
+    /// every other workspace. Empty only when there is nowhere useful to move: a
+    /// lone pane in a lone tab in the only workspace.
     fn pane_move_targets(&self) -> Vec<(MoveTarget, String)> {
         let wsi = self.active_ws;
         let cur = self.workspaces[wsi].active_tab;
@@ -3416,6 +3424,14 @@ impl App {
             .is_some_and(|t| t.layout.len() > 1);
         if other_tabs || many_panes {
             targets.push((MoveTarget::NewTab, self.catalog.menu_new_tab.to_string()));
+        }
+        // Then every other workspace. Always offered — unlike a new tab, moving to
+        // another workspace changes something even for a lone pane. Arrowed so a
+        // workspace row can't be read as a tab name.
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            if wi != wsi {
+                targets.push((MoveTarget::Workspace(wi), format!("→ {}", ws.name)));
+            }
         }
         targets
     }
@@ -3465,11 +3481,22 @@ impl App {
                     return Err(PaneMoveError::NoChange);
                 }
             }
+            MoveTarget::Workspace(wi) => {
+                if wi >= self.workspaces.len() {
+                    return Err(PaneMoveError::WorkspaceOutOfRange);
+                }
+                if wi == wsi {
+                    return Err(PaneMoveError::NoChange);
+                }
+            }
         }
 
         // Detach only after every fallible check has passed. The pane remains in
         // `App.panes`; only its layout-tree parent changes.
         let emptied = self.workspaces[wsi].tabs[src].layout.remove(pane);
+        // Where the pane ends up: its own workspace, unless the move crosses to
+        // another one (whose index can shift if the source workspace is closed).
+        let mut target_ws = wsi;
         let final_tab = match target {
             MoveTarget::Tab(mut ti) => {
                 if emptied {
@@ -3492,8 +3519,33 @@ impl App {
                     .push(Tab::panes(TileLayout::new(pane)));
                 self.workspaces[wsi].tabs.len() - 1
             }
+            // Another workspace: a fresh tab there, and the source is tidied the
+            // way closing its last tab would have tidied it — a workspace with no
+            // tabs left is closed (`close_tab` already works that way), so moving
+            // a lone pane out is a move, not a refusal.
+            MoveTarget::Workspace(mut wi) => {
+                if emptied {
+                    let source = &mut self.workspaces[wsi];
+                    source.tabs.remove(src);
+                    if source.tabs.is_empty() {
+                        self.workspaces.remove(wsi);
+                        // Removing an earlier workspace shifts the target down.
+                        if wsi < wi {
+                            wi -= 1;
+                        }
+                    } else if source.active_tab >= source.tabs.len() {
+                        source.active_tab = source.tabs.len() - 1;
+                    }
+                }
+                target_ws = wi;
+                self.workspaces[wi]
+                    .tabs
+                    .push(Tab::panes(TileLayout::new(pane)));
+                self.workspaces[wi].tabs.len() - 1
+            }
         };
 
+        let wsi = target_ws;
         self.active_ws = wsi;
         self.workspaces[wsi].active_tab = final_tab;
         self.workspaces[wsi].tabs[final_tab].layout.focus = pane;
@@ -7141,6 +7193,88 @@ mod tests {
     /// Moving a pane to another tab re-parents its id between layout trees — the
     /// process/PTY survives (never through `close_pane`) — and if the source tab
     /// empties it collapses, with focus following the pane.
+    /// A pane can cross into another workspace, keeping its process. Its folder
+    /// does not change — a running program cannot chdir — so the move is about
+    /// where you look for the agent, not what it works on.
+    #[test]
+    fn move_pane_to_another_workspace_keeps_the_process_and_its_folder() {
+        let _env = crate::persist::test_env("pane-move-ws");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+
+        let dir = std::env::temp_dir().join("luvus-move-ws-3c1");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(app.create_workspace_at(dir.clone()), "second workspace");
+        app.active_ws = 0;
+        let p = app.layout().focus;
+        let cwd = app.panes[&p].cwd.clone();
+        // A second pane, so workspace 0 does not empty out on the move.
+        app.run_cmd(crate::app::keys::Cmd::NewTab);
+        app.workspaces[0].active_tab = 0;
+
+        let targets = app.pane_move_targets();
+        assert!(
+            targets.iter().any(|(t, _)| *t == MoveTarget::Workspace(1)),
+            "the other workspace is a move target"
+        );
+
+        let moved = app
+            .move_pane_to_tab(p, MoveTarget::Workspace(1))
+            .expect("valid destination workspace");
+        assert_eq!(moved.workspace, 1);
+        assert!(app.panes.contains_key(&p), "the process survived");
+        assert_eq!(app.panes[&p].cwd, cwd, "the pane keeps its own folder");
+        assert!(
+            app.workspaces[1].tabs[moved.tab]
+                .layout
+                .leaves()
+                .contains(&p),
+            "the pane lives in the destination workspace now"
+        );
+        assert_eq!(app.active_ws, 1, "focus follows the pane");
+        assert!(
+            !app.workspaces[0]
+                .tabs
+                .iter()
+                .any(|t| t.layout.leaves().contains(&p)),
+            "and no longer in the source"
+        );
+    }
+
+    /// Moving the last pane out closes the workspace it emptied — the same rule
+    /// closing its last tab already follows — and the destination index survives
+    /// that removal even though it shifts down.
+    #[test]
+    fn moving_the_last_pane_out_closes_the_emptied_workspace() {
+        let _env = crate::persist::test_env("pane-move-ws-empty");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+
+        let dir = std::env::temp_dir().join("luvus-move-ws-empty-9f4");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(app.create_workspace_at(dir.clone()), "second workspace");
+        app.active_ws = 0;
+        let p = app.layout().focus;
+        assert_eq!(app.workspaces.len(), 2);
+
+        // Workspace 0 holds only `p`; moving it to workspace 1 leaves nothing
+        // behind, so workspace 0 goes — and workspace 1 slides to index 0.
+        let moved = app
+            .move_pane_to_tab(p, MoveTarget::Workspace(1))
+            .expect("valid destination workspace");
+        assert_eq!(app.workspaces.len(), 1, "the emptied workspace closed");
+        assert_eq!(moved.workspace, 0, "the destination shifted down with it");
+        assert_eq!(app.workspaces[0].cwd, dir);
+        assert!(
+            app.workspaces[0].tabs[moved.tab]
+                .layout
+                .leaves()
+                .contains(&p),
+            "the pane arrived"
+        );
+        assert!(app.panes.contains_key(&p), "the process survived");
+    }
+
     #[test]
     fn move_pane_to_tab_reparents_and_keeps_the_process() {
         let _env = crate::persist::test_env("pane-move");
