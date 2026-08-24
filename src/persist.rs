@@ -950,13 +950,99 @@ pub fn load() -> Option<SessionSnapshot> {
             }
         }
     }
+    merge_duplicate_workspaces(&mut snap);
     Some(snap)
+}
+
+/// Fold workspaces that name the same folder into the first of them.
+///
+/// Two spellings of one path used to be two workspaces — a `~` an older luvus
+/// never expanded, or the doubled backslashes a path picks up on its way
+/// through something that escapes them. Expanding on load fixes new sessions,
+/// but the pair is already written down, so the sidebar would keep showing both
+/// forever. Their tabs move over rather than being dropped: the row is a
+/// duplicate, the panes in it are real work.
+fn merge_duplicate_workspaces(snap: &mut SessionSnapshot) {
+    let mut kept: Vec<WsSnap> = Vec::with_capacity(snap.workspaces.len());
+    let mut active = snap.active_ws;
+    for (was, ws) in std::mem::take(&mut snap.workspaces).into_iter().enumerate() {
+        let now = match kept
+            .iter()
+            .position(|k| crate::platform::same_path(&k.cwd, &ws.cwd))
+        {
+            Some(i) => {
+                kept[i].tabs.extend(ws.tabs);
+                i
+            }
+            None => {
+                kept.push(ws);
+                kept.len() - 1
+            }
+        };
+        // The active workspace follows wherever its row ended up.
+        if was == snap.active_ws {
+            active = now;
+        }
+    }
+    snap.active_ws = active.min(kept.len().saturating_sub(1));
+    snap.workspaces = kept;
 }
 
 fn expand_home(p: &Path) -> PathBuf {
     match p.to_str() {
         Some(s) => crate::platform::user_path(s),
         None => p.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+mod workspace_dedupe_tests {
+    use super::*;
+
+    fn ws(cwd: &str) -> WsSnap {
+        WsSnap {
+            id: cwd.to_string(),
+            name: cwd.to_string(),
+            cwd: PathBuf::from(cwd),
+            active_tab: 0,
+            tabs: Vec::new(),
+            pinned: false,
+        }
+    }
+
+    /// The saved session that started this: the same folder written twice, once
+    /// with the backslashes doubled, sitting in the sidebar as two workspaces.
+    #[test]
+    fn one_folder_saved_under_two_spellings_restores_as_one_row() {
+        let (a, b) = if cfg!(windows) {
+            (r"C:\Users\me\proj", r"C:\\Users\\me\\proj")
+        } else {
+            ("/home/me/proj", "/home/me//proj")
+        };
+        let mut snap = SessionSnapshot {
+            version: SNAPSHOT_VERSION,
+            active_ws: 2,
+            workspaces: vec![ws(a), ws("/elsewhere"), ws(b)],
+            session_titles: Vec::new(),
+        };
+        merge_duplicate_workspaces(&mut snap);
+        assert_eq!(snap.workspaces.len(), 2);
+        assert_eq!(snap.workspaces[0].cwd, PathBuf::from(a));
+        // Focus followed the duplicate into the row it merged with.
+        assert_eq!(snap.active_ws, 0);
+    }
+
+    #[test]
+    fn distinct_folders_are_left_alone() {
+        let mut snap = SessionSnapshot {
+            version: SNAPSHOT_VERSION,
+            active_ws: 1,
+            workspaces: vec![ws("/a"), ws("/b")],
+            session_titles: Vec::new(),
+        };
+        merge_duplicate_workspaces(&mut snap);
+        assert_eq!(snap.workspaces.len(), 2);
+        assert_eq!(snap.active_ws, 1);
     }
 }
 

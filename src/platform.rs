@@ -33,6 +33,12 @@ fn path_key(p: &Path) -> String {
     #[cfg(windows)]
     // Windows accepts `/` as a separator and is case-insensitive.
     let s = s.replace('/', "\\").to_lowercase();
+    // `C:\\Users\\me` is the same folder as `C:\Users\me` — the OS collapses a
+    // run of separators, and a path that made a round trip through something
+    // that escapes backslashes (a shell, a JSON string) arrives doubled. Two
+    // spellings of one folder used to sit in the sidebar as two workspaces.
+    // A *leading* run is kept: `\\server\share` is a UNC host, not a root.
+    let s = collapse_separators(&s);
     // Drop trailing separators so `proj\` == `proj`, but never eat a bare root
     // (`/` or `C:\`), which would make every root compare equal to the empty path.
     let sep: &[char] = &['/', '\\'];
@@ -41,6 +47,30 @@ fn path_key(p: &Path) -> String {
         return s.to_string();
     }
     trimmed.to_string()
+}
+
+/// Is this exactly a drive designator (`C:`, `d:`)? Windows only: on Unix a
+/// directory may legitimately be named `D:`, and there are no drives to mean.
+fn is_drive_letter(s: &str) -> bool {
+    let b = s.as_bytes();
+    cfg!(windows) && b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
+/// Squeeze runs of `/` or `\` down to one, leaving any leading run alone (a UNC
+/// path starts with two and means a host by it).
+fn collapse_separators(s: &str) -> String {
+    let lead = s.len() - s.trim_start_matches(['/', '\\']).len();
+    let mut out = String::with_capacity(s.len());
+    let mut last_sep = false;
+    for (i, c) in s.char_indices() {
+        let sep = c == '/' || c == '\\';
+        if sep && last_sep && i >= lead {
+            continue;
+        }
+        last_sep = sep;
+        out.push(c);
+    }
+    out
 }
 
 /// Keep a spawned console program from flashing a window on Windows.
@@ -81,6 +111,15 @@ pub fn home_dir() -> Option<PathBuf> {
 /// Only a leading `~` alone or followed by a separator: `~foo` is another user's
 /// home on Unix, which is not ours to guess, and a real folder named `~x` here.
 pub fn user_path(s: &str) -> PathBuf {
+    // `D:` is what a drive change is typed as — cmd has meant "go to D:" by it
+    // for forty years — but to the path API it is *drive-relative*: the current
+    // directory of D:, which for a program that never chdir'd there resolves
+    // against the current drive and lands nowhere. Left as it was, entering a
+    // drive letter in the picker only ever said "no such folder", and a machine
+    // with the projects on another drive could not leave `C:`.
+    if is_drive_letter(s) {
+        return PathBuf::from(format!("{s}\\"));
+    }
     let rest = match s.strip_prefix('~') {
         Some("") => "",
         Some(r) if r.starts_with('/') || r.starts_with('\\') => &r[1..],
@@ -864,6 +903,38 @@ mod tests {
             super::user_path("/work/~/x"),
             std::path::PathBuf::from("/work/~/x")
         );
+    }
+
+    #[test]
+    fn one_folder_spelled_with_doubled_separators_is_not_two() {
+        use std::path::Path;
+        // What a path picks up on its way through something that escapes
+        // backslashes — and what put the same folder in the sidebar twice.
+        assert!(super::same_path(
+            Path::new(r"C:\\Users\\me\\proj"),
+            Path::new(r"C:\Users\me\proj")
+        ));
+        assert!(super::same_path(
+            Path::new("/work//app"),
+            Path::new("/work/app")
+        ));
+        // A leading run is a UNC host, not a squeezable separator.
+        assert!(!super::same_path(
+            Path::new(r"\\server\share"),
+            Path::new(r"\server\share")
+        ));
+    }
+
+    #[test]
+    fn a_bare_drive_letter_means_that_drive() {
+        let entered = super::user_path("D:");
+        if cfg!(windows) {
+            assert_eq!(entered, std::path::PathBuf::from(r"D:\"));
+            assert!(entered.is_absolute(), "or the picker joins it onto C:");
+        } else {
+            // No drives to mean, and `D:` is a legal directory name.
+            assert_eq!(entered, std::path::PathBuf::from("D:"));
+        }
     }
 
     #[test]
