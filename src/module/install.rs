@@ -40,6 +40,31 @@ pub fn is_removable(root: &Path) -> bool {
     paths::is_managed_git_path(root)
 }
 
+/// Split a registry `source` back into its `owner/repo[/sub]` spec and the
+/// commit it was pinned at. `None` for a locally linked module, which has no
+/// upstream to check against.
+pub fn split_source(source: &str) -> Option<(&str, &str)> {
+    source.rsplit_once('@').filter(|(spec, sha)| {
+        !spec.is_empty() && sha.len() >= 7 && sha.bytes().all(|b| b.is_ascii_hexdigit())
+    })
+}
+
+/// The commit a module's source points at right now, without cloning it. One
+/// `ls-remote` is the whole check: re-installing a module at the commit it is
+/// already pinned to would mean a clone, an arbitrary build, and a relink to
+/// arrive back where it started.
+pub fn remote_head(spec: &str, git_ref: Option<&str>) -> Result<String> {
+    let (url, _, _) = parse_spec(spec)?;
+    let reference = git_ref.unwrap_or("HEAD");
+    let out = git_capture(&["ls-remote", &url, reference])?;
+    let sha = out
+        .split_whitespace()
+        .next()
+        .filter(|s| s.len() >= 7 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| anyhow!("{url} has no {reference} to update to"))?;
+    Ok(sha.to_string())
+}
+
 fn install_inner(
     url: &str,
     slug: &str,
@@ -283,5 +308,29 @@ mod tests {
             .to_string();
         assert!(error.contains("manifest changed during build"), "{error}");
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// `module update` reads the pinned commit back out of the registry's
+    /// `source`. Getting this wrong either skips a real update or reinstalls a
+    /// module that was already current, so the shape is pinned here.
+    #[test]
+    fn source_splits_into_a_spec_and_the_commit_it_is_pinned_at() {
+        assert_eq!(
+            split_source("you/git-status@0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c"),
+            Some(("you/git-status", "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c"))
+        );
+        // A subdirectory spec keeps its path; only the last `@` splits.
+        assert_eq!(
+            split_source("you/mono/modules/git@0f1e2d3c4b5a"),
+            Some(("you/mono/modules/git", "0f1e2d3c4b5a"))
+        );
+
+        // A locally linked module has no source at all, and anything that is
+        // not `<spec>@<hex sha>` must not be mistaken for one — an email-shaped
+        // git URL and a branch name both end up here.
+        assert_eq!(split_source("you/git-status"), None);
+        assert_eq!(split_source("you/git-status@main"), None);
+        assert_eq!(split_source("@0f1e2d3c4b5a"), None);
+        assert_eq!(split_source("you/git-status@0f1e2d"), None); // too short to be a sha
     }
 }

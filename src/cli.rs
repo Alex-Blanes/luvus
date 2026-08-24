@@ -4,7 +4,7 @@
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
 /// Returns true if `argv[1]` is a CLI noun we handle (so `main` should not
@@ -76,7 +76,7 @@ Commands:
   api          Inspect the automation protocol and live capabilities
   attach       Open the TUI focused on one pane
   doctor       Check optional external tools
-  update       Check for and install a newer Luvus release
+  update       Reload config, themes, and modules live; install a newer release
   ping         Check whether the selected server responds
 
 Examples:
@@ -692,8 +692,14 @@ fn write_topic_help(
             "Check optional external tools used by Luvus.\n",
         ),
         "update" => (
-            "luvus update",
-            "Check for a newer release and install it through the detected safe update channel.\n",
+            "luvus update [--yes]",
+            "Update everything that can be updated, cheapest first.\n\n\
+             The running session re-reads its config, themes, and agent manifests\n\
+             live. Git-installed modules are pulled to their newest commit and\n\
+             swapped in without a restart; `--yes` skips their build prompts.\n\
+             A newer Luvus binary is installed last and takes effect at the next\n\
+             launch — it is one static executable, so it cannot replace itself\n\
+             in place.\n",
         ),
         _ => unreachable!("normalized help topic"),
     };
@@ -2102,6 +2108,133 @@ fn api_response_exit_code(response: &str) -> i32 {
         1
     } else {
         0
+    }
+}
+
+/// Re-read everything the running session can swap without being restarted:
+/// the config file, the installed themes, and the agent manifests. Each is
+/// reported on its own line, because "reloaded" covering a step that silently
+/// failed is worse than no report at all.
+///
+/// `Err` means there is no server to talk to, which is not a failure — the
+/// files are read at startup anyway, so a session started later picks them up.
+pub(crate) fn reload_running_session() -> Result<Vec<(&'static str, String)>> {
+    // Probe first: without a server every request below fails identically, and
+    // three copies of the same connection error read like three broken features.
+    send_request("ping", json!({})).context("no running Luvus session to reload")?;
+
+    let steps: [(&str, &str); 3] = [
+        ("config", "server.reload_config"),
+        ("themes", "theme.reload"),
+        ("agent manifests", "manifest.reload"),
+    ];
+    Ok(steps
+        .iter()
+        .map(|(label, method)| {
+            let outcome = match send_request(method, json!({})) {
+                Ok(v) if v.get("error").is_some() => {
+                    let message = v["error"]["message"].as_str().unwrap_or("failed");
+                    format!("failed: {message}")
+                }
+                Ok(_) => "reloaded".to_string(),
+                Err(error) => format!("failed: {error}"),
+            };
+            (*label, outcome)
+        })
+        .collect())
+}
+
+/// Pull every git-installed module up to its source's newest commit and swap it
+/// into the running session. Locally linked modules are skipped: luvus does not
+/// own their files and has no upstream to pull from.
+///
+/// Each update is a fresh clone at the new commit, so the build steps run
+/// against exactly what will be registered — the same path `module install`
+/// takes, prompt included, since a module build is arbitrary code.
+pub(crate) fn update_modules(yes: bool) -> Vec<(String, String)> {
+    use crate::module::{install, registry};
+
+    let mut report = Vec::new();
+    for module in registry::load().modules {
+        let id = module.id.clone();
+        let Some(source) = module.source.as_deref() else {
+            report.push((id, "linked locally, nothing to pull".to_string()));
+            continue;
+        };
+        let Some((spec, pinned)) = install::split_source(source) else {
+            report.push((id, format!("unrecognized source {source:?}")));
+            continue;
+        };
+        let head = match install::remote_head(spec, None) {
+            Ok(head) => head,
+            Err(error) => {
+                report.push((id, format!("could not check {spec}: {error}")));
+                continue;
+            }
+        };
+        if head.starts_with(pinned) {
+            report.push((id, "up to date".to_string()));
+            continue;
+        }
+
+        let outcome = update_one_module(&module, spec, &head, yes)
+            .unwrap_or_else(|error| format!("failed: {error}"));
+        report.push((id, outcome));
+    }
+    report
+}
+
+/// Install `spec` at its new commit, then hand the running session the new
+/// checkout in place of the old one. The old entry is dropped only once the new
+/// one is registered, so a failure mid-way leaves the working module in place.
+fn update_one_module(
+    module: &crate::module::InstalledModule,
+    spec: &str,
+    head: &str,
+    yes: bool,
+) -> Result<String> {
+    let installed = crate::module::install::install(spec, Some(head), yes)?;
+    let previous_root = module.root.clone();
+    let params = json!({
+        "path": installed.root.display().to_string(),
+        "source": installed.source,
+    });
+
+    let short: String = head.chars().take(12).collect();
+
+    // `module.link` refuses an id that is already registered, so the running
+    // session has to let go of the old checkout first. Only the registry entry
+    // is dropped here; the files stay until the new one is in.
+    let live = send_request("module.unlink", json!({"id": module.id}))
+        .and_then(|_| send_request("module.link", params.clone()));
+    match live {
+        Ok(v) if v.get("error").is_some() => {
+            // The old entry is already gone from the session. Put it back, or
+            // an update that failed halfway would leave no module registered
+            // at all — strictly worse than the version we set out to replace.
+            let restore = json!({
+                "path": previous_root.display().to_string(),
+                "source": module.source,
+            });
+            let _ = send_request("module.link", restore);
+            let message = v["error"]["message"].as_str().unwrap_or("failed");
+            bail!("{message} (kept the installed version)")
+        }
+        Ok(_) => {
+            if previous_root != installed.root {
+                let _ = std::fs::remove_dir_all(&previous_root);
+            }
+            Ok(format!("updated to {short}"))
+        }
+        // No server, or it went away mid-update: the registry file is the same
+        // source of truth the next start reads, so finish there instead.
+        Err(_) => {
+            register_directly(&installed)?;
+            if previous_root != installed.root {
+                let _ = std::fs::remove_dir_all(&previous_root);
+            }
+            Ok(format!("updated to {short} — start luvus to load it"))
+        }
     }
 }
 

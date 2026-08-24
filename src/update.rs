@@ -141,20 +141,50 @@ fn is_newer_build(release: &ForkRelease) -> bool {
     current_build().is_some_and(|build| release.build > build)
 }
 
-/// `luvus update`: check first, then use the installation's own safe update
-/// path. This is deliberately a single command rather than an update command
-/// tree; the background check stays notify-only unless `auto_update` is on.
+/// `luvus update`: bring everything as up to date as it can be from inside a
+/// running session, and be explicit about the one part that cannot.
+///
+/// Three tiers, cheapest first. The config, the installed themes and the agent
+/// manifests are re-read live — no restart, no network. Git-installed modules
+/// are pulled to their newest commit and swapped into the session, because they
+/// are separate processes luvus only talks to. The core binary is the exception:
+/// it is one statically linked executable with no dynamic loading, so a new one
+/// can be put in place immediately but only takes effect at the next launch.
 ///
 /// The fork publishes one bare binary per target and nothing else, so the
 /// package-manager channels can only be reported, not driven: Homebrew and
 /// crates.io serve upstream's luvus, which by definition never carries this
 /// build.
 pub fn run_cli(args: &[String]) -> Result<i32> {
-    if !args.is_empty() {
-        eprintln!("usage: luvus update");
+    let yes = args.iter().any(|a| a == "--yes" || a == "-y");
+    if args.iter().any(|a| a != "--yes" && a != "-y") {
+        eprintln!("usage: luvus update [--yes]");
         return Ok(2);
     }
 
+    // ── what a running session can swap without restarting ──
+    match crate::cli::reload_running_session() {
+        Ok(steps) => {
+            println!("Reloaded in the running session:");
+            for (label, outcome) in steps {
+                println!("  {label:<16} {outcome}");
+            }
+        }
+        Err(error) => println!("No running session to reload ({error})."),
+    }
+
+    // ── modules: separate processes, so a new version needs no restart ──
+    let modules = crate::cli::update_modules(yes);
+    if modules.is_empty() {
+        println!("No modules installed.");
+    } else {
+        println!("Modules:");
+        for (id, outcome) in modules {
+            println!("  {id:<16} {outcome}");
+        }
+    }
+
+    // ── the core binary, which does need one ──
     println!("Checking for Luvus updates...");
     let manifest = manifest_url();
     let current = current_build();
