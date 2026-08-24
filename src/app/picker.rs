@@ -186,7 +186,7 @@ impl App {
         if text.is_empty() {
             return;
         }
-        let path = PathBuf::from(text);
+        let path = crate::platform::user_path(text);
         let path = match self.picker.as_ref() {
             Some(p) if path.is_relative() => p.path.join(path),
             _ => path,
@@ -332,7 +332,8 @@ impl App {
     }
 
     /// Resolve an entered path and browse to it. Absolute paths, paths relative
-    /// to the currently browsed folder, and `~` / `~/...` are supported.
+    /// to the currently browsed folder, `~` / `~/...`, and a bare drive letter
+    /// (`D:`, the way a drive change is typed) are supported.
     fn picker_go_to(&mut self, input: String) {
         let entered = input.trim();
         if entered.is_empty() {
@@ -344,29 +345,22 @@ impl App {
         }
 
         let current = self.picker.as_ref().map(|p| p.path.clone());
-        let target = if entered == "~" {
-            crate::platform::home_dir()
-        } else if let Some(rest) = entered
-            .strip_prefix("~/")
-            .or_else(|| entered.strip_prefix("~\\"))
-        {
-            crate::platform::home_dir().map(|home| home.join(rest))
+        // `~`, `~/…` and a bare drive letter all resolve here, in the one place
+        // that knows what a path typed by a person means.
+        let path = crate::platform::user_path(entered);
+        let target = if path.is_absolute() {
+            path
         } else {
-            let path = PathBuf::from(entered);
-            Some(if path.is_absolute() {
-                path
-            } else {
-                current.unwrap_or_default().join(path)
-            })
+            current.unwrap_or_default().join(path)
         };
 
-        let Some(target) = target.filter(|path| path.is_dir()) else {
+        if !target.is_dir() {
             let error = format!("{}: {entered}", self.catalog.folder_not_found);
             if let Some(p) = self.picker.as_mut() {
                 p.error = Some(error);
             }
             return;
-        };
+        }
 
         if let Some(p) = self.picker.as_mut() {
             p.path = target;
