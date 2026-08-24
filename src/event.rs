@@ -222,7 +222,10 @@ pub enum AppEvent {
     /// only validates and swaps the resulting live configuration.
     ConfigReloaded {
         id: String,
-        config: crate::config::Config,
+        /// Boxed: this is by far the largest payload any event carries, and an
+        /// enum is as big as its widest variant — inline it made every key
+        /// press and mouse move drag 664 bytes around.
+        config: Box<crate::config::Config>,
         reply: Sender<String>,
     },
     /// Agent manifest IO and parsing completed on the socket worker.
