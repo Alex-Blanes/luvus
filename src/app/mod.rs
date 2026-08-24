@@ -2844,6 +2844,28 @@ impl App {
     /// pointed at whatever was focused before, and the user saw the *previous*
     /// folder with no error anywhere — indistinguishable from luvus ignoring
     /// them. A toast is raised here so every caller reports it the same way.
+    /// Open `cwd` as a workspace, or focus the one already on it. "Open this
+    /// folder" is what the picker, the board and `workspace.open` all mean, and a
+    /// folder is one workspace — a second row on the same path is two names for one
+    /// place, with the panes split arbitrarily between them.
+    ///
+    /// Distinct from [`Self::create_workspace_at`], which always makes a new one:
+    /// `workspace.new` is an explicit "give me another", and a fresh worktree or a
+    /// just-created folder can't collide by construction.
+    pub fn open_workspace_at(&mut self, cwd: PathBuf) -> bool {
+        match self
+            .workspaces
+            .iter()
+            .position(|w| crate::platform::same_path(&w.cwd, &cwd))
+        {
+            Some(i) => {
+                self.active_ws = i;
+                true
+            }
+            None => self.create_workspace_at(cwd),
+        }
+    }
+
     pub fn create_workspace_at(&mut self, cwd: PathBuf) -> bool {
         let name = ws_name(&cwd);
         let branch = git_branch(&cwd);
