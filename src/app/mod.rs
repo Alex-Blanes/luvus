@@ -1429,6 +1429,15 @@ pub struct App {
     pub last_cursor: Option<(u16, u16)>,
     /// Foreground client asked to detach (prefix+q). Distinct from quit.
     pub detach_requested: bool,
+    /// Restart the server onto the installed binary, bringing the foreground
+    /// client straight back. Distinct from quit: the session is snapshotted and
+    /// restored, so this is how a new version gets loaded without ending the
+    /// day's work. Set through [`App::request_relaunch`], never directly — the
+    /// confirmation for busy agents lives there.
+    pub relaunch_requested: bool,
+    /// A restart was asked for while agents were still working, and is waiting
+    /// for the ask to be repeated. Cleared by any other action.
+    pub relaunch_confirm: bool,
     /// The foreground client selected another named session in the global
     /// finder. The server consumes this once and sends a logical handoff only
     /// to that client.
@@ -1715,6 +1724,8 @@ pub struct App {
     /// The changelog modal's "check for updates" button. `None` when the modal is
     /// shut, and also when the title row is too narrow to hold it.
     pub changelog_check_rect: Option<Rect>,
+    /// The changelog modal's "restart to load the installed version" button.
+    pub changelog_restart_rect: Option<Rect>,
     /// Clickable links on the changelog modal's **visible** rows: commit and PR
     /// refs from the notes, plus the "read it all on luvus.dev" row at the end.
     /// Rebuilt each frame from the rows actually on screen, so scrolling a link
@@ -1900,6 +1911,8 @@ impl App {
             usage_mtimes: std::collections::HashMap::new(),
             last_cursor: None,
             detach_requested: false,
+            relaunch_requested: false,
+            relaunch_confirm: false,
             pending_session_switch: None,
             end_session: false,
             force_redraw: false,
@@ -2026,6 +2039,7 @@ impl App {
             changelog_modal_rect: None,
             changelog_close_rect: None,
             changelog_check_rect: None,
+            changelog_restart_rect: None,
             changelog_link_rects: Vec::new(),
             changelog_copy_rects: Vec::new(),
             changelog_rows: None,
@@ -2429,6 +2443,8 @@ impl App {
             usage_mtimes: std::collections::HashMap::new(),
             last_cursor: None,
             detach_requested: false,
+            relaunch_requested: false,
+            relaunch_confirm: false,
             pending_session_switch: None,
             end_session: false,
             force_redraw: false,
@@ -2555,6 +2571,7 @@ impl App {
             changelog_modal_rect: None,
             changelog_close_rect: None,
             changelog_check_rect: None,
+            changelog_restart_rect: None,
             changelog_link_rects: Vec::new(),
             changelog_copy_rects: Vec::new(),
             changelog_rows: None,
@@ -2806,6 +2823,29 @@ impl App {
         self.status
             .values()
             .any(|s| s.state == crate::ui::theme::State::Working)
+    }
+
+    /// Ask for a restart onto the installed binary.
+    ///
+    /// A restart snapshots and restores the session — layout, agent resume ids,
+    /// each pane's last screen — but the panes' *live processes* do not survive
+    /// it: they are children of the server. That is cheap to accept for an idle
+    /// session and expensive in the middle of a build, so a working agent turns
+    /// the first ask into a confirmation rather than a restart. Returns what to
+    /// tell the user, or `None` when the restart is already under way.
+    pub fn request_relaunch(&mut self) -> Option<String> {
+        let working = self
+            .status
+            .values()
+            .filter(|s| s.state == crate::ui::theme::State::Working)
+            .count();
+        if working > 0 && !self.relaunch_confirm {
+            self.relaunch_confirm = true;
+            return Some(format!("{} {working}", self.catalog.restart_busy));
+        }
+        self.relaunch_confirm = false;
+        self.relaunch_requested = true;
+        None
     }
 
     /// Re-arm every pane's PTY wake-coalescing flag (see `Pane.data_pending`),

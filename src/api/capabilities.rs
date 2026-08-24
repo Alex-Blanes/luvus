@@ -10,6 +10,7 @@ pub const METHODS: &[&str] = &[
     "socket.token.revoke",
     "ping",
     "server.stop",
+    "server.relaunch",
     "server.reload_config",
     "server.agent_manifests",
     "server.reload_agent_manifests",

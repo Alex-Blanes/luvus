@@ -840,6 +840,7 @@ impl App {
             "session.snapshot",
             "search.capabilities",
             "server.stop",
+            "server.relaunch",
             "server.reload_config",
             "server.agent_manifests",
             "server.reload_agent_manifests",
@@ -1022,6 +1023,17 @@ impl App {
             "server.stop" => {
                 self.should_quit = true;
                 Ok(json!({"type":"ok"}))
+            }
+            // Restart onto the installed binary, session preserved. Unlike
+            // `server.stop` this brings the foreground client back by itself,
+            // so it is the only way to load a new build from inside luvus.
+            // Reports the confirmation instead of acting while agents work.
+            "server.relaunch" => {
+                reject_api_fields(p, &[])?;
+                match self.request_relaunch() {
+                    Some(warning) => Ok(json!({"type":"confirm_required","message":warning})),
+                    None => Ok(json!({"type":"ok"})),
+                }
             }
             "pane.get" => {
                 reject_api_fields(p, &["pane"])?;

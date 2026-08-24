@@ -168,6 +168,27 @@ pub(super) fn draw_changelog(f: &mut RenderTarget, area: Rect, app: &mut App, t:
         app.changelog_copy_rects.push((row, command.to_string()));
         top += 1;
     }
+
+    // ── the restart button ──
+    // A new binary is on disk the moment the updater finishes, but the running
+    // server is still the old one — this is the click that swaps them. The
+    // session is snapshotted and restored either way, so it is offered
+    // unconditionally rather than only after an update: the same button reloads
+    // a build installed from a pane, or from the other machine.
+    let restart = Rect::new(inner.x + 1, top, inner.width.saturating_sub(2), 1);
+    let hot = app
+        .hover
+        .is_some_and(|(x, y)| restart.contains(Position::new(x, y)));
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            format!(" ⟳ {}", app.catalog.restart_now),
+            Style::new().fg(if hot { t.accent } else { t.subtext0 }),
+        )),
+        restart,
+    );
+    app.changelog_restart_rect = Some(restart);
+    top += 1;
+
     hline(f, inner.x, top, inner.width, t);
     top += 1;
 
@@ -904,6 +925,54 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         }));
         assert!(app.changelog_open, "the modal stayed up");
+    }
+
+    /// The restart button is the whole point of the update flow: it swaps the
+    /// running server for the installed binary and brings the session back. An
+    /// idle session goes straight through; a working agent turns the first
+    /// click into a confirmation, because a restart does kill the live
+    /// processes even though it restores the layout around them.
+    #[test]
+    fn the_restart_button_asks_first_only_while_agents_work() {
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let _env = crate::persist::test_env("cl-restart-click");
+        let (mut app, _term) = open();
+        let btn = app.changelog_restart_rect.expect("restart button drawn");
+        let click = |app: &mut App| {
+            app.handle_event(crate::event::AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: btn.x + 1,
+                row: btn.y,
+                modifiers: KeyModifiers::NONE,
+            }));
+        };
+
+        // A pane mid-turn: the first click warns and changes nothing.
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).unwrap().state = crate::ui::theme::State::Working;
+        click(&mut app);
+        assert!(
+            !app.relaunch_requested,
+            "a working agent is not interrupted"
+        );
+        assert!(app.toast.is_some(), "and the click said why");
+
+        // Asked again, it goes.
+        click(&mut app);
+        assert!(app.relaunch_requested, "the repeated ask restarts anyway");
+
+        // An idle session never sees the confirmation step.
+        let (mut app, _term) = open();
+        let btn = app.changelog_restart_rect.expect("restart button drawn");
+        let idle = app.layout().focus;
+        app.status.get_mut(&idle).unwrap().state = crate::ui::theme::State::Idle;
+        app.handle_event(crate::event::AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: btn.x + 1,
+            row: btn.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(app.relaunch_requested, "an idle session restarts at once");
     }
 
     /// Every outcome of an asked-for check says something. A button that can

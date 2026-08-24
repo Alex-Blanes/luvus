@@ -392,7 +392,14 @@ fn run_local() -> Result<()> {
         DisableBracketedPaste
     );
     ratatui::restore();
-    result
+    // `--local` is its own server, so there is no separate client to bring the
+    // session back: this process has to replace itself. The snapshot is already
+    // written by `run`, and the successor restores from it.
+    if result? {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        return ipc::client::spawn_successor(&args);
+    }
+    Ok(())
 }
 
 fn autodetect_and_attach() -> Result<()> {
@@ -712,6 +719,13 @@ fn server_restart() -> Result<()> {
 /// Poll (bounded) until the server releases its socket, so `stop`/`restart`
 /// return only once the old server is truly gone.
 fn wait_for_shutdown(sock: &Path) {
+    wait_for_server_shutdown(sock)
+}
+
+/// Block until nothing answers on `sock`, or five seconds pass. Shared with the
+/// display client, which has to outlive a server restart and must not race the
+/// old server's exit when it comes back up.
+pub(crate) fn wait_for_server_shutdown(sock: &Path) {
     for _ in 0..100 {
         if !server_running(sock) {
             return;
@@ -776,7 +790,9 @@ fn server_version() -> Option<String> {
     v.get("result")?.get("version")?.as_str().map(String::from)
 }
 
-fn run(terminal: &mut DefaultTerminal) -> Result<()> {
+/// Returns whether the session asked to restart onto the installed binary, so
+/// the caller can replace this process once the terminal is back to normal.
+fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
     let (tx, rx) = mpsc::channel::<AppEvent>();
 
     let size = terminal.size()?;
@@ -866,7 +882,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         app.tick_agent_waits(Instant::now());
         app.tick_agent_workflows(Instant::now());
         app.tick_backend_revision_waits(Instant::now());
-        if app.should_quit || app.detach_requested {
+        if app.should_quit || app.detach_requested || app.relaunch_requested {
             break;
         }
 
@@ -921,7 +937,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     }
 
     persist::save(&app);
-    Ok(())
+    Ok(app.relaunch_requested)
 }
 
 /// Clean up a just-bound Unix socket before a local startup aborts. The caller

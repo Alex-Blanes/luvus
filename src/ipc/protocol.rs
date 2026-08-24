@@ -65,6 +65,11 @@ pub enum ServerMessage {
     },
     /// Tell the client to detach (server keeps running).
     Detach,
+    /// The server is exiting so a newly-installed binary can take over: relaunch
+    /// this client once it is gone, rather than quitting to the shell. The
+    /// display client is a separate process from the server, so it is the one
+    /// thing that can survive the swap and bring the session straight back.
+    Relaunch,
     ServerShutdown {
         reason: String,
     },

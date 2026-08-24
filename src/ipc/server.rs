@@ -268,6 +268,32 @@ pub fn run() -> Result<()> {
             );
             break;
         }
+        // Restart onto a newly-installed binary. The snapshot is written before
+        // anyone is told to go, so the successor restores from a session that
+        // is current rather than up to two seconds stale. Only the foreground
+        // client comes back: it is the one whose terminal the user is looking
+        // at, and two clients racing to respawn the server would fight over the
+        // startup lock.
+        if app.relaunch_requested {
+            // Nothing is attached, so nothing can bring the server back: the
+            // display client is the process that survives the swap and respawns
+            // it. Exiting here would be `server.stop` wearing another name, and
+            // the session would stay down until someone ran `luvus` again.
+            app.relaunch_requested = false;
+            match relaunch_plan(&clients, foreground) {
+                None => app.show_toast("no attached client to restart".to_string()),
+                Some(plan) => {
+                    persist::save(&app);
+                    app.session_dirty = false;
+                    for (id, message) in plan {
+                        if let Some(client) = clients.remove(&id) {
+                            let _ = client.send_control(message);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
         // A termination signal (kill, logout, system shutdown) requests a clean
         // exit: notify clients and fall through to the final session save below,
         // so the snapshot is current when the machine comes back.
@@ -541,6 +567,35 @@ fn apply(
 
 fn broadcast(clients: &mut Clients, msg: ServerMessage) {
     clients.retain(|_, client| client.send_control(msg.clone()).is_ok());
+}
+
+/// What each attached client is told when the server restarts onto a newly
+/// installed binary. The foreground client is the one process that survives the
+/// swap and respawns the server, so it gets [`ServerMessage::Relaunch`]; any
+/// other client is told the server is going away, because two clients racing to
+/// respawn it would fight over the startup lock.
+///
+/// `None` means the restart cannot happen: with nothing attached, exiting would
+/// be `server.stop` under another name and the session would stay down until
+/// someone launched luvus again. Every attached client appears in the plan, so
+/// the caller never leaves one holding a socket to a server that has gone.
+fn relaunch_plan(clients: &Clients, foreground: Option<u64>) -> Option<Vec<(u64, ServerMessage)>> {
+    let foreground = foreground.filter(|id| clients.contains_key(id))?;
+    Some(
+        clients
+            .keys()
+            .map(|&id| {
+                let message = if id == foreground {
+                    ServerMessage::Relaunch
+                } else {
+                    ServerMessage::ServerShutdown {
+                        reason: "server restarting".into(),
+                    }
+                };
+                (id, message)
+            })
+            .collect(),
+    )
 }
 
 fn latest_client(clients: &Clients) -> Option<u64> {
@@ -825,6 +880,7 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
                 ServerMessage::Detach
                     | ServerMessage::ServerShutdown { .. }
                     | ServerMessage::SwitchSession { .. }
+                    | ServerMessage::Relaunch
             );
             match protocol::write_message_counted(&mut writer, &msg) {
                 Ok(bytes) => {
@@ -954,8 +1010,9 @@ mod shutdown {
 mod tests {
     use super::ServerMessage;
     use super::{
-        apply, broadcast, frame_interval, needs_render, next_background_only, render_clients,
-        ClientSender, ClientState, FrameSendError, BACKGROUND_FRAME_INTERVAL, FRAME_INTERVAL,
+        apply, broadcast, frame_interval, needs_render, next_background_only, relaunch_plan,
+        render_clients, ClientSender, ClientState, FrameSendError, BACKGROUND_FRAME_INTERVAL,
+        FRAME_INTERVAL,
     };
     use crate::app::App;
     use crate::event::{AppEvent, ClientInput};
@@ -986,6 +1043,32 @@ mod tests {
             ),
             rx,
         )
+    }
+
+    /// A restart hands the session to a new binary by way of the one process
+    /// that outlives the swap: the foreground client. Getting this wrong either
+    /// strands the user at a shell prompt with their session gone, or has two
+    /// clients race to respawn the server.
+    #[test]
+    fn a_restart_brings_back_only_the_foreground_client() {
+        let mut clients = HashMap::new();
+        let (front, _front_rx) = display_client(80, 24, 2);
+        let (back, _back_rx) = display_client(80, 24, 1);
+        clients.insert(7, front);
+        clients.insert(9, back);
+
+        let plan: HashMap<u64, ServerMessage> = relaunch_plan(&clients, Some(7))
+            .expect("a foreground client can restart")
+            .into_iter()
+            .collect();
+        assert_eq!(plan.len(), 2, "every attached client is accounted for");
+        assert!(matches!(plan[&7], ServerMessage::Relaunch));
+        assert!(matches!(plan[&9], ServerMessage::ServerShutdown { .. }));
+
+        // Headless, or a foreground id that has already gone away: refuse, so
+        // the restart never degrades into a plain stop.
+        assert!(relaunch_plan(&clients, None).is_none());
+        assert!(relaunch_plan(&clients, Some(404)).is_none());
     }
 
     fn received_frame_size(rx: &mpsc::Receiver<ServerMessage>) -> (u16, u16) {

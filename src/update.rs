@@ -157,8 +157,12 @@ fn is_newer_build(release: &ForkRelease) -> bool {
 /// build.
 pub fn run_cli(args: &[String]) -> Result<i32> {
     let yes = args.iter().any(|a| a == "--yes" || a == "-y");
-    if args.iter().any(|a| a != "--yes" && a != "-y") {
-        eprintln!("usage: luvus update [--yes]");
+    let restart = args.iter().any(|a| a == "--restart");
+    if args
+        .iter()
+        .any(|a| !matches!(a.as_str(), "--yes" | "-y" | "--restart"))
+    {
+        eprintln!("usage: luvus update [--yes] [--restart]");
         return Ok(2);
     }
 
@@ -233,7 +237,28 @@ pub fn run_cli(args: &[String]) -> Result<i32> {
     }
 
     println!("Updated Luvus {} -> {latest}.", installed_label());
-    println!("Restart Luvus to load it (`luvus server restart` for a running server).");
+    if !restart {
+        println!("Restart to load it: the ⟳ button in the changelog, or `luvus update --restart`.");
+        return Ok(0);
+    }
+
+    // The restart tears down the server that owns the pane this command is
+    // running in, so say what is about to happen before it happens.
+    println!("Restarting — your session is saved and comes straight back.");
+    match crate::cli::send_request("server.relaunch", serde_json::json!({})) {
+        Ok(v) if v["result"]["type"] == "confirm_required" => {
+            let message = v["result"]["message"]
+                .as_str()
+                .unwrap_or("agents are working");
+            println!("{message} — run `luvus update --restart` again to restart anyway.");
+        }
+        Ok(v) if v.get("error").is_some() => {
+            let message = v["error"]["message"].as_str().unwrap_or("failed");
+            bail!("could not restart the running session: {message}")
+        }
+        Ok(_) => {}
+        Err(_) => println!("No running session; the new binary loads on the next launch."),
+    }
     Ok(0)
 }
 

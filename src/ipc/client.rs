@@ -48,12 +48,28 @@ where
     match result? {
         ClientExit::Done => Ok(()),
         ClientExit::SwitchSession(name) => switch_session_process(&name),
+        ClientExit::Relaunch => relaunch_after_shutdown(),
     }
 }
 
 enum ClientExit {
     Done,
     SwitchSession(String),
+    Relaunch,
+}
+
+/// Come back up on the newly-installed binary. The old server acknowledged the
+/// restart before it finished exiting, so wait for it to release the socket
+/// first — a successor that starts too early just attaches to the corpse and
+/// the update appears not to have happened.
+fn relaunch_after_shutdown() -> Result<()> {
+    crate::wait_for_server_shutdown(&crate::persist::client_socket_path());
+    // Verbatim: coming back the way you came in is the whole promise, and the
+    // arguments are not all single tokens — `--session <name>` is two, so any
+    // attempt to keep "just the flags" drops the value and the successor dies
+    // on a selector with nothing after it.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    spawn_successor(&args)
 }
 
 fn run_inner<R, W>(reader: R, mut writer: W, terminal: &mut DefaultTerminal) -> Result<ClientExit>
@@ -148,6 +164,7 @@ where
             Ok(ServerMessage::Clipboard(text)) => crate::emit_clipboard(&text),
             Ok(ServerMessage::OpenUrl(url)) => crate::platform::open_url(&url),
             Ok(ServerMessage::SwitchSession { name }) => break ClientExit::SwitchSession(name),
+            Ok(ServerMessage::Relaunch) => break ClientExit::Relaunch,
             Ok(ServerMessage::Detach) | Ok(ServerMessage::ServerShutdown { .. }) => {
                 break ClientExit::Done
             }
@@ -166,7 +183,15 @@ where
 fn switch_session_process(name: &str) -> Result<()> {
     crate::session::validate_name(name).map_err(anyhow::Error::msg)?;
     let raw: Vec<String> = std::env::args().collect();
-    let args = switched_args(&raw, name);
+    spawn_successor(&switched_args(&raw, name))
+}
+
+/// Replace this client with a fresh one carrying `args`. Unix replaces the
+/// process; Windows starts the successor and immediately lets this process
+/// exit, so the old terminal-input thread is never left reading alongside the
+/// new client. Resolving the executable path again is deliberate: after an
+/// update that is where the *new* binary lives.
+pub(crate) fn spawn_successor(args: &[String]) -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut command = std::process::Command::new(exe);
     command

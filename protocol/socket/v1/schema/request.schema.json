@@ -12,7 +12,7 @@
       "type": "string",
       "enum": [
         "socket.capabilities", "socket.stats", "socket.token.create", "socket.token.list", "socket.token.revoke",
-        "ping", "server.stop", "server.reload_config", "server.agent_manifests", "server.reload_agent_manifests", "config.get", "config.patch",
+        "ping", "server.stop", "server.relaunch", "server.reload_config", "server.agent_manifests", "server.reload_agent_manifests", "config.get", "config.patch",
         "runtime.capabilities", "session.snapshot", "events.subscribe", "events.wait", "wait.output",
         "workspace.list", "workspace.get", "workspace.new", "workspace.open", "workspace.focus", "workspace.rename", "workspace.pin", "workspace.move", "workspace.move_block", "workspace.report_metadata", "workspace.close",
         "node.list", "node.new", "node.open", "node.focus", "node.rename", "node.pin", "node.close",

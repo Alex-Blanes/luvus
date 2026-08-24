@@ -775,6 +775,7 @@ impl App {
             return self
                 .changelog_check_rect
                 .filter(|rect| hit(*rect))
+                .or_else(|| self.changelog_restart_rect.filter(|rect| hit(*rect)))
                 .or_else(|| {
                     self.changelog_copy_rects
                         .iter()
@@ -944,6 +945,15 @@ impl App {
                     // answer lands where it was asked for.
                     if self.changelog_check_rect.is_some_and(hit_rect) {
                         crate::update::check_now_reporting(self.app_tx.clone());
+                        return;
+                    }
+                    // Restart onto the installed binary. The session is saved
+                    // and restored, so the modal going away with the whole
+                    // screen is the expected outcome, not a lost click.
+                    if self.changelog_restart_rect.is_some_and(hit_rect) {
+                        if let Some(warning) = self.request_relaunch() {
+                            self.show_toast(warning);
+                        }
                         return;
                     }
                     // Installer/update rows copy the exact command, even when a
