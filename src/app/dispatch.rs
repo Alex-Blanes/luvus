@@ -757,29 +757,22 @@ impl App {
                 // explicit `luvus workspace open <path>` omits it and still focuses.
                 let path = crate::platform::user_path(req_str(p, "path")?);
                 let focus = p.get("focus").and_then(|v| v.as_bool()).unwrap_or(true);
-                match self
-                    .workspaces
-                    .iter()
-                    .position(|w| crate::platform::same_path(&w.cwd, &path))
-                {
-                    Some(i) => {
-                        if focus {
-                            self.active_ws = i;
-                        }
-                    }
-                    // Report a failed open instead of answering with the
-                    // *previously* active node, which read as success and left
-                    // the caller (and the user) looking at the wrong folder.
-                    None if !self.create_workspace_at(path.clone()) => {
-                        return Err((
-                            "spawn_failed".to_string(),
-                            format!(
-                                "couldn't open {} — the shell failed to start there",
-                                path.display()
-                            ),
-                        ));
-                    }
-                    None => {}
+                let before_len = self.workspaces.len();
+                let was = self.active_ws;
+                // Report a failed open instead of answering with the *previously*
+                // active node, which read as success and left the caller (and the
+                // user) looking at the wrong folder.
+                if !self.open_workspace_at(path.clone()) {
+                    return Err((
+                        "spawn_failed".to_string(),
+                        format!(
+                            "couldn't open {} — the shell failed to start there",
+                            path.display()
+                        ),
+                    ));
+                }
+                if !focus && self.workspaces.len() == before_len {
+                    self.active_ws = was;
                 }
                 Ok(json!({"type":"workspace","workspace": self.active_ws.to_string()}))
             }

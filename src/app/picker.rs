@@ -291,7 +291,7 @@ impl App {
             // Open the current folder as a new static workspace.
             Row::OpenFolder => {
                 if let Some(p) = self.picker.take() {
-                    self.create_workspace_at(p.path);
+                    self.open_workspace_at(p.path);
                 }
             }
             Row::OpenWorktree => self.picker_make_worktree(),
@@ -333,6 +333,37 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+
+    /// Regression: "Open folder" on a folder that is already a workspace focused
+    /// a second row on the same path. `workspace.open` had the check; the picker —
+    /// the way you actually open a folder — did not, so the duplicates arrived
+    /// through the `+` button and then rode along in the snapshot.
+    #[test]
+    fn opening_an_already_open_folder_from_the_picker_focuses_it() {
+        let _env = crate::persist::test_env("picker-dedupe");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        let dir = std::env::temp_dir().join("luvus-picker-dedupe-7a2");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(app.create_workspace_at(dir.clone()), "opened once");
+        let count = app.workspaces.len();
+        let opened = app.active_ws;
+        app.active_ws = 0;
+
+        app.open_folder_picker();
+        if let Some(p) = app.picker.as_mut() {
+            p.path = dir.clone();
+        }
+        app.picker_activate();
+
+        assert_eq!(
+            app.workspaces.len(),
+            count,
+            "no second row on the same folder"
+        );
+        assert_eq!(app.active_ws, opened, "the existing workspace is focused");
+    }
     use super::*;
 
     #[test]
