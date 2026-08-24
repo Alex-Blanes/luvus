@@ -400,7 +400,7 @@ fn fetch_https_bounded(url: &str, limit: usize, accept: &str, label: &str) -> Re
 }
 
 fn try_fetch(program: &str, args: &[&str], limit: usize, label: &str) -> Result<Option<Vec<u8>>> {
-    let mut child = match Command::new(program)
+    let mut child = match crate::platform::no_window(&mut Command::new(program))
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

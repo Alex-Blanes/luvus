@@ -21,6 +21,23 @@ use ratatui::crossterm::event::{self, Event};
 #[cfg(windows)]
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+/// How long a run already known to be a paste waits for its next character
+/// before deciding the paste is over.
+///
+/// The console does not hand a large paste over in one go: it refills its input
+/// buffer in blocks, and between two blocks there is a moment with nothing
+/// queued. Ending the run there chops one paste into several, each of which goes
+/// to the pane wrapped in its own `ESC[200~ … ESC[201~` — and an agent CLI that
+/// coalesces paste input drops most of them, which looks like a paste that lost
+/// its text rather than one that arrived in pieces.
+///
+/// Only ever applied *after* a burst has been identified, so ordinary typing is
+/// unaffected: the first character still has to have input queued behind it the
+/// instant it is read. The cost of being wrong is a keystroke typed within a few
+/// milliseconds of a paste joining it, against a paste that arrives intact.
+#[cfg(windows)]
+const BURST_GRACE: std::time::Duration = std::time::Duration::from_millis(15);
+
 /// The character a key press contributes to a pasted run, or `None` if it can't
 /// be part of one and must end it. Deliberately narrow: pasted text is printable
 /// characters and the line breaks and tabs between them, so a chord or a function
@@ -30,11 +47,20 @@ pub(crate) fn paste_char(k: &KeyEvent) -> Option<char> {
     if k.kind == KeyEventKind::Release {
         return None;
     }
-    // Shift is what produces the capitals in the pasted text; the rest change what
-    // the key *means*, so they can't be part of one.
-    if k.modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    // Shift is what produces the capitals in the pasted text, and AltGr — which
+    // Windows reports as Ctrl+Alt — is what produces `\ @ # [ ] { } | ~` on a
+    // Spanish or German layout, so a pasted Windows path is full of them
+    // (`super::app::keys::is_ctrl_chord`). Any *other* modifier changes what the
+    // key means, so it cannot be part of a paste.
+    let altgr =
+        k.modifiers.contains(KeyModifiers::CONTROL) && k.modifiers.contains(KeyModifiers::ALT);
+    if !altgr
+        && k.modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
+        return None;
+    }
+    if k.modifiers.contains(KeyModifiers::SUPER) {
         return None;
     }
     match k.code {
@@ -63,14 +89,40 @@ pub fn read() -> io::Result<Event> {
     event::read()
 }
 
+/// Where [`read_burst`] gets its events. Exists so the burst logic can be tested
+/// against a scripted console: the real one needs a person holding Ctrl+V.
+#[cfg(windows)]
+pub(crate) trait EventSource {
+    fn poll(&mut self, timeout: std::time::Duration) -> io::Result<bool>;
+    fn read(&mut self) -> io::Result<Event>;
+}
+
+#[cfg(windows)]
+struct Console;
+
+#[cfg(windows)]
+impl EventSource for Console {
+    fn poll(&mut self, timeout: std::time::Duration) -> io::Result<bool> {
+        event::poll(timeout)
+    }
+    fn read(&mut self) -> io::Result<Event> {
+        event::read()
+    }
+}
+
 /// Read one terminal event, rebuilding a paste from the key burst the Windows
 /// console delivers instead of one.
 #[cfg(windows)]
 pub fn read() -> io::Result<Event> {
+    read_burst(&mut Console)
+}
+
+#[cfg(windows)]
+pub(crate) fn read_burst<S: EventSource>(source: &mut S) -> io::Result<Event> {
     if let Some(parked) = PARKED.with(|p| p.borrow_mut().take()) {
         return Ok(parked);
     }
-    let first = event::read()?;
+    let first = source.read()?;
     let Event::Key(k) = &first else {
         return Ok(first);
     };
@@ -78,13 +130,16 @@ pub fn read() -> io::Result<Event> {
         return Ok(first);
     };
     // Nothing queued behind it → someone is typing. This is the check that keeps
-    // ordinary input ordinary, so it comes before anything else.
-    if !event::poll(std::time::Duration::ZERO)? {
+    // ordinary input ordinary, so it comes before anything else, and it is the
+    // only one that uses a zero timeout.
+    if !source.poll(std::time::Duration::ZERO)? {
         return Ok(first);
     }
     let mut text = String::from(c);
-    while event::poll(std::time::Duration::ZERO)? {
-        let ev = event::read()?;
+    // Past here the run is a paste, so a momentary gap in the console's input
+    // buffer is a refill, not the end of it. See [`BURST_GRACE`].
+    while source.poll(BURST_GRACE)? {
+        let ev = source.read()?;
         match &ev {
             // Key-ups are interleaved through the burst and mean nothing to luvus
             // (`handle_key` drops them), so they don't end the run.
@@ -113,9 +168,66 @@ pub fn read() -> io::Result<Event> {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::time::Duration;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// A scripted console. `Step::Gap` is a moment with nothing queued: a zero
+    /// poll sees an empty buffer, a poll that waits sees the refill.
+    enum Step {
+        Event(Event),
+        Gap,
+    }
+
+    struct Script {
+        steps: VecDeque<Step>,
+        zero_polls_during_gap: usize,
+    }
+
+    impl Script {
+        fn new(steps: Vec<Step>) -> Self {
+            Self {
+                steps: steps.into(),
+                zero_polls_during_gap: 0,
+            }
+        }
+        fn chars(text: &str) -> Vec<Step> {
+            text.chars()
+                .map(|c| Step::Event(Event::Key(key(KeyCode::Char(c)))))
+                .collect()
+        }
+    }
+
+    impl EventSource for Script {
+        fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+            match self.steps.front() {
+                None => Ok(false),
+                Some(Step::Event(_)) => Ok(true),
+                Some(Step::Gap) => {
+                    if timeout.is_zero() {
+                        self.zero_polls_during_gap += 1;
+                        return Ok(false);
+                    }
+                    // Waiting outlasts the gap, exactly as it does against the
+                    // console refilling its buffer.
+                    self.steps.pop_front();
+                    Ok(matches!(self.steps.front(), Some(Step::Event(_))))
+                }
+            }
+        }
+        fn read(&mut self) -> io::Result<Event> {
+            match self.steps.pop_front() {
+                Some(Step::Event(ev)) => Ok(ev),
+                _ => Err(io::Error::other("script exhausted")),
+            }
+        }
+    }
+
+    fn clear_parked() {
+        PARKED.with(|p| *p.borrow_mut() = None);
     }
 
     #[test]
@@ -133,6 +245,22 @@ mod tests {
         assert_eq!(paste_char(&key(KeyCode::Tab)), Some('\t'));
     }
 
+    /// AltGr arrives as Ctrl+Alt on Windows, and it is how a Spanish or German
+    /// layout types `\ @ # [ ] { } | ~`. Treating it as a chord ended the run at
+    /// every backslash, so a pasted Windows path lost its separators — and the
+    /// text after them went out as a separate paste.
+    #[test]
+    fn altgr_characters_stay_inside_a_paste() {
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        for c in ['\\', '@', '#', '[', ']', '{', '}', '|', '~'] {
+            assert_eq!(
+                paste_char(&KeyEvent::new(KeyCode::Char(c), altgr)),
+                Some(c),
+                "AltGr+{c} is pasted text, not a chord"
+            );
+        }
+    }
+
     #[test]
     fn a_chord_or_a_key_up_can_never_be_part_of_one() {
         assert_eq!(
@@ -145,5 +273,68 @@ mod tests {
         let mut up = key(KeyCode::Char('a'));
         up.kind = KeyEventKind::Release;
         assert_eq!(paste_char(&up), None);
+    }
+
+    /// The console refills its input buffer in blocks, so a large paste has gaps
+    /// in it. Ending the run at the first gap split one paste into several, each
+    /// separately bracketed — which is how a paste arrives at an agent with most
+    /// of its text missing.
+    #[test]
+    fn a_gap_mid_burst_does_not_end_the_paste() {
+        clear_parked();
+        let mut steps = Script::chars("Traza WMI");
+        steps.push(Step::Gap);
+        steps.extend(Script::chars(" de procesos"));
+        steps.push(Step::Gap);
+        steps.extend(Script::chars(", 30 s"));
+        let mut script = Script::new(steps);
+
+        match read_burst(&mut script).unwrap() {
+            Event::Paste(text) => assert_eq!(text, "Traza WMI de procesos, 30 s"),
+            other => panic!("expected one whole paste, got {other:?}"),
+        }
+        assert_eq!(
+            script.zero_polls_during_gap, 0,
+            "only the very first check may use a zero timeout"
+        );
+    }
+
+    /// The grace period must not swallow typing. A single key with nothing behind
+    /// it is a keystroke, and stays one however long we would have been willing
+    /// to wait afterwards.
+    #[test]
+    fn a_lone_keystroke_is_never_a_paste() {
+        clear_parked();
+        let mut script = Script::new(vec![Step::Event(Event::Key(key(KeyCode::Char('a'))))]);
+        match read_burst(&mut script).unwrap() {
+            Event::Key(k) => assert_eq!(k.code, KeyCode::Char('a')),
+            other => panic!("expected a keystroke, got {other:?}"),
+        }
+    }
+
+    /// A chord in the middle of a burst ends the paste and survives as itself on
+    /// the next read, rather than being folded into the text or dropped.
+    #[test]
+    fn a_chord_mid_burst_is_parked_not_swallowed() {
+        clear_parked();
+        let mut steps = Script::chars("hola");
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        steps.push(Step::Event(Event::Key(ctrl_c)));
+        steps.extend(Script::chars("mundo"));
+        let mut script = Script::new(steps);
+
+        match read_burst(&mut script).unwrap() {
+            Event::Paste(text) => assert_eq!(text, "hola"),
+            other => panic!("expected the run before the chord, got {other:?}"),
+        }
+        match read_burst(&mut script).unwrap() {
+            Event::Key(k) => assert_eq!(k, ctrl_c, "the chord itself comes next"),
+            other => panic!("expected the parked chord, got {other:?}"),
+        }
+        match read_burst(&mut script).unwrap() {
+            Event::Paste(text) => assert_eq!(text, "mundo", "and the rest still arrives"),
+            other => panic!("expected the remainder, got {other:?}"),
+        }
+        clear_parked();
     }
 }

@@ -503,6 +503,7 @@ fn run_git_bytes_truncating(
     cap: usize,
 ) -> Result<(Vec<u8>, bool), String> {
     let mut command = Command::new("git");
+    crate::platform::no_window(&mut command);
     command
         .arg("--no-pager")
         .arg("-c")

@@ -338,7 +338,7 @@ fn validate_release_version(version: &str) -> Result<String> {
 }
 
 fn verify_path_version(program: &Path, expected: &str) -> Result<()> {
-    let output = Command::new(program)
+    let output = crate::platform::no_window(&mut Command::new(program))
         .arg("--version")
         .output()
         .with_context(|| format!("verify updated binary `{}`", program.display()))?;
@@ -395,7 +395,7 @@ fn release_target() -> Result<&'static str> {
 }
 
 fn download_file(url: &str, destination: &Path) -> Result<()> {
-    let curl = Command::new("curl")
+    let curl = crate::platform::no_window(&mut Command::new("curl"))
         .args(["-fsSL", "--max-time", "120", "-H", "User-Agent: luvus"])
         .arg("-o")
         .arg(destination)
@@ -405,7 +405,7 @@ fn download_file(url: &str, destination: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let wget = Command::new("wget")
+    let wget = crate::platform::no_window(&mut Command::new("wget"))
         .args(["-q", "--timeout=120", "--header=User-Agent: luvus"])
         .arg("-O")
         .arg(destination)
