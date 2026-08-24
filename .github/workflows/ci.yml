@@ -5,6 +5,21 @@ on:
     branches: [main]
   pull_request:
 
+# One run per branch at a time; a new push supersedes the one still going.
+#
+# Not really about runner minutes — this repository is public, so they are free.
+# It is about ordering: `fork-release` starts when a `ci` run goes green, and two
+# overlapping runs can finish out of order, which would publish an older build
+# after a newer one and leave `releases/latest` pointing at the wrong one. The
+# updater reads exactly that.
+#
+# Cancelling means an intermediate commit ends up with no status of its own. On
+# a fork where commits reach main in merge batches that is the right trade: the
+# newer run contains the older commit anyway, and the answer arrives sooner.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   # Harden dependency downloads: retry transient failures and disable HTTP/2
