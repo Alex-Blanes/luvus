@@ -1,6 +1,13 @@
 name: release
 
 # Tag a version to ship binaries:  git tag v0.1.0 && git push origin v0.1.0
+#
+# Every job below is fenced to the upstream repository. A fork needs upstream's
+# version tags in reach — `build.rs` counts commits since the newest one to get
+# its build number — but pushing one here would otherwise fire this pipeline,
+# publishing a `v*` Release that both duplicates upstream's artifacts and
+# shadows the fork's own `build-N` release on the `releases/latest` URL the
+# in-app updater reads.
 on:
   push:
     tags: ["v*"]
@@ -16,6 +23,7 @@ jobs:
   # The matrix upload jobs attach assets to an existing GitHub Release, so create
   # it first (idempotent — safe to re-run a tag).
   create-release:
+    if: github.repository == 'RizRiyz/luvus'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -35,6 +43,7 @@ jobs:
           fi
 
   upload:
+    if: github.repository == 'RizRiyz/luvus'
     name: ${{ matrix.target }}
     needs: create-release
     runs-on: ${{ matrix.os }}
@@ -77,6 +86,7 @@ jobs:
   # binary (`--no-build`) and repoint asset paths at target/<triple>/release via
   # `--target`.
   linux-packages:
+    if: github.repository == 'RizRiyz/luvus'
     name: pkg ${{ matrix.target }}
     needs: create-release
     runs-on: ubuntu-latest
