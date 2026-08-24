@@ -703,11 +703,23 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 // A resumable session discovered on disk — click to reopen.
                 let si = sessions[k - live.len()];
                 let s = &app.resumable[si];
-                let proj = s
-                    .cwd
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("project");
+                // The name the session carried while it was live (its own title),
+                // remembered across restarts. Nothing to fall back on but the
+                // project folder, for a session luvus never hosted.
+                let meta = app
+                    .config
+                    .layout
+                    .agent_title
+                    .then(|| app.session_titles.get(&s.session_id))
+                    .flatten()
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        s.cwd
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("project")
+                            .to_string()
+                    });
                 let row = Rect::new(area.x, y, area.width, 2);
                 session_rects.push((si, row));
                 let label = " resume  ";
@@ -726,7 +738,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                     f,
                     y + 1,
                     Line::from(Span::styled(
-                        crate::ui::truncate(&format!("  {proj}"), cw as usize),
+                        crate::ui::truncate(&format!("  {meta}"), cw as usize),
                         Style::new().fg(t.overlay0),
                     )),
                 );
@@ -1022,6 +1034,12 @@ mod tests {
         app.agents_filter = crate::app::AgentsFilter::All;
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
         assert_eq!(app.session_rects.len(), 2, "All lists the whole history");
+
+        // A remembered title names the history row in place of the project folder.
+        app.session_titles
+            .insert("/tmp/elsewhere".into(), "Ship the release".into());
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(buffer_contains(&term, "Ship the rel"));
 
         // Widen the sidebar and all three segments fit, each picking its own filter.
         app.sidebars.left.width = 44;

@@ -1310,6 +1310,13 @@ pub struct App {
     last_cwd_at: Instant,
     /// Resumable agent sessions discovered on disk (for the AGENTS sidebar).
     pub resumable: Vec<crate::agent::SessionInfo>,
+    /// `session_id → title`: the last title an agent session showed while it was
+    /// live, polled off the pane's OSC title on the 1s tick. Agents rewrite that
+    /// title as the work moves on (Claude does it again after `/compact`), so the
+    /// name a resumable row carries is the session's own latest description of
+    /// itself — no naming step for the user. Persisted; pruned to what the sidebar
+    /// can still show.
+    pub session_titles: HashMap<String, String>,
     /// A resumable-session disk scan is running on a worker thread; don't start
     /// another until its `SessionsScanned` result arrives.
     sessions_scan_inflight: bool,
@@ -1649,6 +1656,7 @@ impl App {
             downsample: false,
             last_cwd_at: Instant::now(),
             resumable: Vec::new(),
+            session_titles: HashMap::new(),
             sessions_scan_inflight: false,
             proc_commands: HashMap::new(),
             proc_scan_inflight: false,
@@ -2080,6 +2088,7 @@ impl App {
             downsample: false,
             last_cwd_at: Instant::now(),
             resumable: Vec::new(),
+            session_titles: snap.session_titles.into_iter().collect(),
             sessions_scan_inflight: false,
             proc_commands: HashMap::new(),
             proc_scan_inflight: false,
@@ -3838,6 +3847,20 @@ impl App {
                 .zip(&self.resumable)
                 .any(|(a, b)| a.session_id != b.session_id);
         self.resumable = fresh;
+        // Remembered titles are only ever read for a session the sidebar can show,
+        // so drop the rest here — otherwise the map grows for the life of the
+        // server (and of the snapshot) with names nothing will ever render.
+        let keep: HashSet<String> = self
+            .resumable
+            .iter()
+            .map(|s| s.session_id.clone())
+            .chain(
+                self.status
+                    .values()
+                    .filter_map(|s| s.agent_session.as_ref().map(|a| a.session_id.clone())),
+            )
+            .collect();
+        self.session_titles.retain(|id, _| keep.contains(id));
         changed
     }
 

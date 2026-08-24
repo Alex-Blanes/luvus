@@ -22,6 +22,11 @@ pub struct SessionSnapshot {
     pub version: u32,
     pub active_ws: usize,
     pub workspaces: Vec<WsSnap>,
+    /// `session_id → title`, the last title each agent session showed while it was
+    /// live. It names the session's row in the AGENTS history after the pane is
+    /// gone, which the agent's own store cannot tell us.
+    #[serde(default)]
+    pub session_titles: Vec<(String, String)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -754,6 +759,11 @@ pub fn snapshot(app: &App) -> SessionSnapshot {
         version: SNAPSHOT_VERSION,
         active_ws: app.active_ws,
         workspaces,
+        session_titles: app
+            .session_titles
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
     }
 }
 
