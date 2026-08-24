@@ -106,22 +106,61 @@ pub(crate) fn bar_offset(bar: SidebarBar, r: u16) -> usize {
         .min(span)
 }
 
-/// Split a sidebar `body` rect into `n` stacked dock slots with a one-row
-/// divider between each. Reduces to the legacy 50/50 split for two docks (the
-/// divider is taken from the remainder, so `slot0 = body.height / n`).
-/// Returns `(slots, divider_rows)`.
-fn dock_slots(body: Rect, n: usize) -> (Vec<Rect>, Vec<u16>) {
+/// Rows a dock keeps when the user drags a divider all the way onto it: its
+/// header plus one item. Below that the dock is a label with nothing under it —
+/// collapsing is the way to reclaim the space, not a zero-height slot.
+pub(crate) const MIN_DOCK_ROWS: u16 = 3;
+
+/// Split a sidebar `body` rect into one slot per dock, with a one-row divider
+/// between each. `docks` is `(rows the dock asked for, collapsed)`: `0` rows means
+/// "an equal share", so a sidebar nobody has dragged still splits evenly. A
+/// collapsed dock keeps exactly its header row and drops out of the split, which
+/// is what makes folding one worth doing. Returns `(slots, divider_rows)`.
+fn dock_slots(body: Rect, docks: &[(u16, bool)]) -> (Vec<Rect>, Vec<u16>) {
+    let n = docks.len();
     let mut slots = Vec::with_capacity(n);
     let mut dividers = Vec::new();
     if n == 0 {
         return (slots, dividers);
     }
-    let bottom = body.bottom();
+    let folded = docks.iter().filter(|(_, c)| *c).count() as u16;
+    // Dividers and folded headers come off the top; the rest is what the open
+    // docks share.
+    let avail = body
+        .height
+        .saturating_sub(n as u16 - 1)
+        .saturating_sub(folded);
+    let open: Vec<u16> = docks.iter().filter(|(_, c)| !*c).map(|(w, _)| *w).collect();
+    let equal = if open.is_empty() {
+        0
+    } else {
+        (avail / open.len() as u16).max(1)
+    };
+    // Requested rows are a *ratio*, not an absolute: the terminal resizes, and a
+    // height dragged at one size has to mean the same thing at another.
+    let want: Vec<u32> = open
+        .iter()
+        .map(|w| if *w == 0 { equal } else { *w } as u32)
+        .collect();
+    let sum: u32 = want.iter().sum::<u32>().max(1);
+    let mut heights: Vec<u16> = want
+        .iter()
+        .map(|w| (w * avail as u32 / sum) as u16)
+        .collect();
+    // The rounding remainder goes to the last open dock, so the slots always fill
+    // the body exactly and no row is left unpainted.
+    let used: u16 = heights.iter().sum();
+    if let Some(last) = heights.last_mut() {
+        *last += avail.saturating_sub(used);
+    }
+    let mut heights = heights.into_iter();
     let mut y = body.y;
-    for i in 0..n {
-        let remaining = bottom.saturating_sub(y);
-        let docks_left = (n - i) as u16;
-        let h = remaining / docks_left;
+    for (i, (_, collapsed)) in docks.iter().enumerate() {
+        let h = if *collapsed {
+            1
+        } else {
+            heights.next().unwrap_or(0)
+        };
         slots.push(Rect::new(body.x, y, body.width, h));
         y += h;
         if i + 1 < n {
@@ -132,17 +171,37 @@ fn dock_slots(body: Rect, n: usize) -> (Vec<Rect>, Vec<u16>) {
     (slots, dividers)
 }
 
+/// The heights a divider drag leaves: the pointer at `row` sets where docks
+/// `i` and `i + 1` meet, and the pair's total is conserved so the rest of the
+/// sidebar doesn't move. Both keep at least [`MIN_DOCK_ROWS`]; dragging past
+/// that just parks the divider at the limit.
+pub(crate) fn split_pair(top: Rect, bottom: Rect, row: u16) -> (u16, u16) {
+    let total = top.height + bottom.height;
+    // `total` can be under two minimums on a short terminal — then there is
+    // nothing to give, and the split stays where it is.
+    if total < MIN_DOCK_ROWS * 2 {
+        return (top.height, bottom.height);
+    }
+    let h = row
+        .saturating_sub(top.y)
+        .clamp(MIN_DOCK_ROWS, total - MIN_DOCK_ROWS);
+    (h, total - h)
+}
+
 /// A one-row horizontal rule between two stacked docks.
 ///
 /// Drawn in `border`, the same colour a pane frame uses, so every rule in the
 /// chrome belongs to one family and a theme that tints its borders (quattro-rally
 /// gold, matrix green) tints this too.
-fn draw_dock_divider(f: &mut RenderTarget, area: Rect, y: u16, t: &Theme) {
+/// `hot` (hovered or being dragged) lights the rule in `border_focus`, the same
+/// colour the sidebar's own resize seam uses — it is the same kind of handle.
+fn draw_dock_divider(f: &mut RenderTarget, area: Rect, y: u16, hot: bool, t: &Theme) {
+    let fg = if hot { t.border_focus } else { t.border };
     let buf = f.buffer_mut();
     for x in (area.x + 1)..area.right().saturating_sub(1) {
         buf[(x, y)]
             .set_symbol("─")
-            .set_style(Style::new().fg(t.border).bg(t.base));
+            .set_style(Style::new().fg(fg).bg(t.base));
     }
 }
 
@@ -203,9 +262,30 @@ pub(super) fn draw_sidebar(
         area.bottom().saturating_sub(body_top),
     );
     let docks = app.sidebars.get(side).docks.clone();
-    let (slots, dividers) = dock_slots(body, docks.len());
-    for &dy in &dividers {
-        draw_dock_divider(f, body, dy, t);
+    let spec: Vec<(u16, bool)> = {
+        let st = app.sidebars.get(side);
+        docks
+            .iter()
+            .map(|d| {
+                (
+                    st.dock_rows.get(d.id()).copied().unwrap_or(0),
+                    st.is_collapsed(d),
+                )
+            })
+            .collect()
+    };
+    let (slots, dividers) = dock_slots(body, &spec);
+    for (i, &dy) in dividers.iter().enumerate() {
+        let dragging = app.dock_drag == Some((side, i));
+        draw_dock_divider(
+            f,
+            body,
+            dy,
+            dragging || app.hover_dock_divider == Some((side, i)),
+            t,
+        );
+        app.dock_dividers
+            .push((side, i, Rect::new(body.x, dy, body.width, 1)));
     }
 
     let mut ws_rects = Vec::new();
@@ -213,20 +293,33 @@ pub(super) fn draw_sidebar(
     let mut session_rects = Vec::new();
     let mut new_ws_rect = None;
     for (kind, slot) in docks.iter().zip(slots) {
-        match kind {
-            DockKind::Workspaces => {
-                let (w, n) = draw_workspaces_dock(f, slot, app, t);
-                ws_rects = w;
-                new_ws_rect = n;
+        // The header row is the fold handle for every dock, built-in or module.
+        app.dock_slots_geom.push((side, kind.clone(), slot));
+        let folded = app.sidebars.get(side).is_collapsed(kind);
+        if folded {
+            line_at(f, slot, slot.y, header(&dock_title(kind, app), t));
+        } else {
+            match kind {
+                DockKind::Workspaces => {
+                    let (w, n) = draw_workspaces_dock(f, slot, app, t);
+                    ws_rects = w;
+                    new_ws_rect = n;
+                }
+                DockKind::Agents => {
+                    let (a, s) = draw_agents_dock(f, slot, app, t);
+                    agent_rects = a;
+                    session_rects = s;
+                }
+                DockKind::Files => super::files::draw_files_dock(f, slot, app, t),
+                DockKind::Module(id) => draw_module_dock(f, slot, id, app, t),
             }
-            DockKind::Agents => {
-                let (a, s) = draw_agents_dock(f, slot, app, t);
-                agent_rects = a;
-                session_rects = s;
-            }
-            DockKind::Files => super::files::draw_files_dock(f, slot, app, t),
-            DockKind::Module(id) => draw_module_dock(f, slot, id, app, t),
         }
+        // Drawn last so it sits on top of whatever the dock painted. Every dock
+        // indents its own header by two columns, which is exactly this slot.
+        let chevron = if folded { "▸" } else { "▾" };
+        f.buffer_mut()[(slot.x, slot.y)]
+            .set_symbol(chevron)
+            .set_style(Style::new().fg(t.overlay1).bg(t.base));
     }
 
     (ws_rects, agent_rects, session_rects, new_ws_rect)
@@ -813,6 +906,29 @@ fn state_from_name(s: &str) -> State {
     }
 }
 
+/// A dock's own name, for the folded header (its draw fn never runs).
+fn dock_title(kind: &DockKind, app: &App) -> String {
+    let cat = app.catalog;
+    match kind {
+        DockKind::Workspaces => cat.workspaces.to_string(),
+        DockKind::Agents => cat.agents.to_string(),
+        DockKind::Files => cat.files.to_string(),
+        DockKind::Module(id) => app
+            .module_docks
+            .get(id)
+            .map(|d| d.title.clone())
+            .unwrap_or_else(|| id.clone()),
+    }
+}
+
+/// Write one line into a dock slot, indented the two columns every dock uses.
+fn line_at(f: &mut RenderTarget, area: Rect, y: u16, line: Line) {
+    if y < area.bottom() {
+        f.buffer_mut()
+            .set_line(area.x + 2, y, &line, area.width.saturating_sub(3));
+    }
+}
+
 fn header(text: &str, t: &Theme) -> Line<'static> {
     Line::from(Span::styled(
         text.to_string(),
@@ -1083,6 +1199,145 @@ mod tests {
             !buffer_contains(&term, "resume"),
             "Active hides session history"
         );
+    }
+
+    /// End to end with the mouse: the header row folds its dock, and the rule
+    /// between two docks drags to resize them. Both survive a restart, which is
+    /// the point — a layout you have to redo every session is not a layout.
+    #[test]
+    fn dock_headers_fold_and_dividers_resize_with_the_mouse() {
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let _env = crate::persist::test_env("dock-resize");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.sidebars.left.docks = vec![
+            crate::app::DockKind::Workspaces,
+            crate::app::DockKind::Agents,
+        ];
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let click = |app: &mut App, kind, c, r| {
+            app.handle_event(crate::event::AppEvent::Mouse(MouseEvent {
+                kind,
+                column: c,
+                row: r,
+                modifiers: KeyModifiers::NONE,
+            }));
+        };
+
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let (_, _, agents) = app.dock_slots_geom[1];
+        let divider = app.dock_dividers[0].2;
+        let before = agents.height;
+
+        // Drag the rule up three rows: AGENTS gains what WORKSPACES gives up.
+        click(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            4,
+            divider.y,
+        );
+        click(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            4,
+            divider.y - 3,
+        );
+        click(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            4,
+            divider.y - 3,
+        );
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert_eq!(app.dock_slots_geom[1].2.height, before + 3);
+        assert_eq!(
+            app.dock_slots_geom[0].2.bottom() + 1,
+            app.dock_dividers[0].2.y + 1,
+            "the rule follows the dock above it"
+        );
+
+        // Click the AGENTS header: the dock folds to that single row and the one
+        // above takes the rest.
+        let header = app.dock_slots_geom[1].2;
+        click(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            header.x + 6,
+            header.y,
+        );
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert_eq!(app.dock_slots_geom[1].2.height, 1, "folded to its header");
+        assert!(app
+            .sidebars
+            .left
+            .is_collapsed(&crate::app::DockKind::Agents));
+
+        // Both the fold and the dragged heights are in the saved config.
+        let saved = crate::config::load();
+        let left = saved.sidebars.unwrap().left;
+        assert_eq!(left.collapsed, vec!["agents".to_string()]);
+        assert_eq!(left.dock_rows.get("agents").copied(), Some(before + 3));
+
+        // Clicking the header again unfolds it, back to the dragged heights. The
+        // folded dock sits lower now — its neighbour grew — so aim at where the
+        // header actually is, not where it was.
+        let header = app.dock_slots_geom[1].2;
+        click(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            header.x + 6,
+            header.y,
+        );
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert_eq!(app.dock_slots_geom[1].2.height, before + 3);
+    }
+
+    /// Docks split the body evenly until someone drags a rule; after that the
+    /// heights recorded per dock are honoured, and a folded dock keeps only its
+    /// header row so the others get everything it gave up.
+    #[test]
+    fn dock_slots_split_evenly_then_follow_the_recorded_heights() {
+        let body = Rect::new(0, 2, 26, 21);
+        // Untouched: two docks, one divider, an even split of the rest.
+        let (slots, dividers) = super::dock_slots(body, &[(0, false), (0, false)]);
+        assert_eq!(dividers.len(), 1);
+        assert_eq!(slots[0].height, 10);
+        assert_eq!(slots[1].height, 10);
+        assert_eq!(slots[1].y, dividers[0] + 1);
+
+        // Dragged: the pair's rows are honoured and still fill the body.
+        let (slots, _) = super::dock_slots(body, &[(6, false), (14, false)]);
+        assert_eq!((slots[0].height, slots[1].height), (6, 14));
+
+        // Folded: the header row is all it takes, the rest goes to its neighbour.
+        let (slots, _) = super::dock_slots(body, &[(0, true), (0, false)]);
+        assert_eq!(slots[0].height, 1);
+        assert_eq!(slots[1].height, 19);
+        assert_eq!(
+            slots[1].bottom(),
+            body.bottom(),
+            "the slots always fill the body exactly"
+        );
+    }
+
+    /// A rule drag conserves the pair's rows — the sidebar below it must not
+    /// shift — and neither dock is squeezed past its minimum.
+    #[test]
+    fn a_divider_drag_moves_rows_between_the_pair_only() {
+        let top = Rect::new(0, 2, 26, 10);
+        let bottom = Rect::new(0, 13, 26, 10);
+        let total = top.height + bottom.height;
+
+        let (a, b) = super::split_pair(top, bottom, 8);
+        assert_eq!((a, b), (6, 14));
+        assert_eq!(a + b, total, "rows are traded, never created");
+
+        // Dragged past the top dock's floor: it parks at the minimum.
+        let (a, b) = super::split_pair(top, bottom, top.y);
+        assert_eq!((a, b), (super::MIN_DOCK_ROWS, total - super::MIN_DOCK_ROWS));
+        // …and past the bottom one's.
+        let (a, b) = super::split_pair(top, bottom, 999);
+        assert_eq!((a, b), (total - super::MIN_DOCK_ROWS, super::MIN_DOCK_ROWS));
     }
 
     /// A click on the bar must land the thumb where it was clicked — i.e.

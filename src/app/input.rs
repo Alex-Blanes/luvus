@@ -893,6 +893,10 @@ impl App {
                     }
                     return;
                 }
+                if let Some((side, i)) = self.dock_drag {
+                    self.update_dock_drag(side, i, m.row);
+                    return;
+                }
                 if let Some(which) = self.bar_drag {
                     self.update_bar_drag(which, m.row);
                     return;
@@ -928,6 +932,10 @@ impl App {
                     if (m.column, m.row) == p.at {
                         self.activate_link(p.target);
                     }
+                    return;
+                }
+                if self.dock_drag.take().is_some() {
+                    self.save_sidebars();
                     return;
                 }
                 if self.bar_drag.take().is_some() {
@@ -1198,6 +1206,17 @@ impl App {
             }
             return;
         }
+        // A press on the rule between two docks grabs it; the drag that follows
+        // moves rows from one dock to the other.
+        if let Some((side, i, _)) = self
+            .dock_dividers
+            .iter()
+            .find(|(_, _, rect)| hit(*rect))
+            .copied()
+        {
+            self.dock_drag = Some((side, i));
+            return;
+        }
         // A press on a sidebar list's scrollbar jumps that list to the clicked
         // position and grabs the thumb, so the drag that follows keeps scrolling.
         // Rows span the full dock width (bar column included), so this has to come
@@ -1214,6 +1233,19 @@ impl App {
                 self.agents_filter = val;
                 self.agents_scroll = 0;
             }
+            return;
+        }
+        // Anywhere else on a dock's header row folds/unfolds it. The header's own
+        // controls (the `+` button, the AGENTS filter) are tested above, so they
+        // still win on the cells they occupy.
+        if let Some((side, kind)) = self
+            .dock_slots_geom
+            .iter()
+            .find(|(_, _, rect)| r == rect.y && c >= rect.x && c < rect.right())
+            .map(|(s, k, _)| (*s, k.clone()))
+        {
+            self.sidebars.get_mut(side).toggle_collapsed(&kind);
+            self.save_sidebars();
             return;
         }
         if let Some((id, _)) = self.agent_rects.iter().find(|(_, rect)| hit(*rect)) {
@@ -1365,6 +1397,37 @@ impl App {
     /// Scroll the grabbed list to wherever the pointer is now. `bar_offset` clamps
     /// the row into the track, so the thumb keeps following a drag that wanders off
     /// the 1-cell-wide bar or past either end.
+    /// Move the grabbed rule to the pointer: docks `i` and `i + 1` trade rows and
+    /// nothing else on the sidebar moves. The first drag freezes every open dock's
+    /// current height into `dock_rows` — until then heights are "an equal share",
+    /// and setting an absolute value for one pair alone would rescale the rest.
+    fn update_dock_drag(&mut self, side: Side, i: usize, row: u16) {
+        let slots: Vec<(DockKind, Rect)> = self
+            .dock_slots_geom
+            .iter()
+            .filter(|(s, _, _)| *s == side)
+            .map(|(_, k, r)| (k.clone(), *r))
+            .collect();
+        let (Some((ka, ra)), Some((kb, rb))) = (slots.get(i), slots.get(i + 1)) else {
+            return;
+        };
+        // A folded dock is a header row; it has no rows to trade.
+        let st = self.sidebars.get(side);
+        if st.is_collapsed(ka) || st.is_collapsed(kb) {
+            return;
+        }
+        let (a, b) = crate::ui::sidebar::split_pair(*ra, *rb, row);
+        let frozen: Vec<(String, u16)> = slots
+            .iter()
+            .filter(|(k, _)| !st.is_collapsed(k))
+            .map(|(k, r)| (k.id().to_string(), r.height))
+            .collect();
+        let st = self.sidebars.get_mut(side);
+        st.dock_rows.extend(frozen);
+        st.dock_rows.insert(ka.id().to_string(), a);
+        st.dock_rows.insert(kb.id().to_string(), b);
+    }
+
     fn update_bar_drag(&mut self, which: BarDrag, r: u16) {
         let Some(bar) = self.sidebar_bars.iter().find(|b| b.list == which).copied() else {
             return;

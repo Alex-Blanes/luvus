@@ -255,6 +255,13 @@ pub struct SideState {
     pub visible: bool,
     pub width: u16,
     pub docks: Vec<DockKind>,
+    /// Rows each dock asked for, by dock id — what the last divider drag left.
+    /// A dock with no entry takes an equal share, so an untouched sidebar splits
+    /// evenly exactly as before. Keyed by id, not position: mounting or reordering
+    /// a dock must not shift anyone else's height.
+    pub dock_rows: HashMap<String, u16>,
+    /// Docks folded to their header row, by dock id.
+    pub collapsed: HashSet<String>,
 }
 
 impl SideState {
@@ -268,6 +275,8 @@ impl SideState {
             visible: c.visible,
             width: c.width.clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX),
             docks,
+            dock_rows: c.dock_rows.clone(),
+            collapsed: c.collapsed.iter().cloned().collect(),
         }
     }
     fn to_config(&self) -> crate::config::SideConfig {
@@ -275,7 +284,24 @@ impl SideState {
             visible: self.visible,
             width: self.width,
             docks: self.docks.iter().map(|d| d.id().to_string()).collect(),
+            dock_rows: self.dock_rows.clone(),
+            collapsed: self.collapsed.iter().cloned().collect(),
         }
+    }
+
+    /// Whether `kind` is folded to its header row.
+    pub fn is_collapsed(&self, kind: &DockKind) -> bool {
+        self.collapsed.contains(kind.id())
+    }
+
+    /// Fold/unfold a dock. Returns the new state.
+    pub fn toggle_collapsed(&mut self, kind: &DockKind) -> bool {
+        let id = kind.id().to_string();
+        if !self.collapsed.remove(&id) {
+            self.collapsed.insert(id);
+            return true;
+        }
+        false
     }
     /// True if this sidebar should occupy screen space (shown and non-empty).
     pub fn shown(&self) -> bool {
@@ -1458,6 +1484,18 @@ pub struct App {
     pub tab_rects: Vec<(usize, Rect)>,
     pub tab_close_rects: Vec<(usize, Rect)>,
     pub ws_rects: Vec<(usize, Rect)>,
+    /// The rules between stacked docks, as drawn last frame: `(side, index of the
+    /// dock above, the row)`. Dragging one moves rows between that pair.
+    pub dock_dividers: Vec<(Side, usize, Rect)>,
+    /// Each dock's slot, as laid out last frame. Its first row is the header —
+    /// click that to fold/unfold the dock — and the full rect is what a divider
+    /// drag moves rows between. Header controls (the `+` button, the AGENTS
+    /// filter) are hit-tested first, so they keep the cells they occupy.
+    pub dock_slots_geom: Vec<(Side, DockKind, Rect)>,
+    /// A divider drag in progress (which side, which pair).
+    pub dock_drag: Option<(Side, usize)>,
+    /// The divider the pointer is over, so it lights up before you grab it.
+    pub hover_dock_divider: Option<(Side, usize)>,
     /// Clickable git-branch text per workspace (opens the git tab — docs/17).
     pub workspace_branch_rects: Vec<(usize, Rect)>,
     /// Clickable view-selector tabs in the active git tab (Commits/Flow/…).
@@ -1603,6 +1641,10 @@ impl App {
             pane_menu: None,
             agent_menu: None,
             pinned_agents: std::collections::HashSet::new(),
+            dock_dividers: Vec::new(),
+            dock_slots_geom: Vec::new(),
+            dock_drag: None,
+            hover_dock_divider: None,
             ws_rename: None,
             pane_rename: None,
             modal_commit_rect: None,
@@ -2035,6 +2077,10 @@ impl App {
             pane_menu: None,
             agent_menu: None,
             pinned_agents: std::collections::HashSet::new(),
+            dock_dividers: Vec::new(),
+            dock_slots_geom: Vec::new(),
+            dock_drag: None,
+            hover_dock_divider: None,
             ws_rename: None,
             pane_rename: None,
             modal_commit_rect: None,
@@ -4200,6 +4246,11 @@ impl App {
     /// highlight (mirrors `update_hover_divider`).
     pub fn update_hover_sidebar(&mut self, c: u16, r: u16) {
         self.hover_sidebar = self.sidebar_seam_at(c, r);
+        self.hover_dock_divider = self
+            .dock_dividers
+            .iter()
+            .find(|(_, _, rect)| r == rect.y && c >= rect.x && c < rect.right())
+            .map(|(side, i, _)| (*side, *i));
     }
 
     /// Enter keyboard resize mode (RESIZE-3) — a no-op with nothing to resize.
@@ -8555,12 +8606,9 @@ mod tests {
                     "files".into(),
                     "mod:y".into(),
                 ],
+                ..crate::config::SideConfig::left_default()
             },
-            right: crate::config::SideConfig {
-                visible: false,
-                width: 26,
-                docks: Vec::new(),
-            },
+            right: crate::config::SideConfig::right_default(),
         };
         let sidebars = Sidebars::from_config(&cfg);
         assert_eq!(

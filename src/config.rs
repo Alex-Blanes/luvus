@@ -186,6 +186,15 @@ pub struct SideConfig {
     pub width: u16,
     #[serde(default)]
     pub docks: Vec<String>,
+    /// Rows each dock asked for, by dock id (docs/29): the heights left by the
+    /// last divider drag. Keyed rather than positional so mounting, unmounting or
+    /// reordering a dock can't silently shift everyone's height. A dock with no
+    /// entry takes an equal share.
+    #[serde(default)]
+    pub dock_rows: std::collections::HashMap<String, u16>,
+    /// Docks folded to their header row, by dock id.
+    #[serde(default)]
+    pub collapsed: Vec<String>,
 }
 
 impl SideConfig {
@@ -195,6 +204,8 @@ impl SideConfig {
             visible: true,
             width: SIDEBAR_WIDTH_DEFAULT,
             docks: vec!["workspaces".into(), "agents".into()],
+            dock_rows: std::collections::HashMap::new(),
+            collapsed: Vec::new(),
         }
     }
     /// The default right sidebar: off and empty.
@@ -203,6 +214,8 @@ impl SideConfig {
             visible: false,
             width: SIDEBAR_WIDTH_DEFAULT,
             docks: Vec::new(),
+            dock_rows: std::collections::HashMap::new(),
+            collapsed: Vec::new(),
         }
     }
 }
