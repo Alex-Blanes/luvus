@@ -141,6 +141,8 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     let file_tree_rects = std::mem::take(&mut app.file_tree_rects);
     let module_dock_rects = std::mem::take(&mut app.module_dock_rects);
     let sidebar_bars = std::mem::take(&mut app.sidebar_bars);
+    let dock_dividers = std::mem::take(&mut app.dock_dividers);
+    let dock_slots_geom = std::mem::take(&mut app.dock_slots_geom);
     let picker_rects = std::mem::take(&mut app.picker_rects);
     let settings_tab_rects = std::mem::take(&mut app.settings_tab_rects);
     let settings_ctl_rects = std::mem::take(&mut app.settings_ctl_rects);
@@ -241,6 +243,8 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     app.file_tree_rects = file_tree_rects;
     app.module_dock_rects = module_dock_rects;
     app.sidebar_bars = sidebar_bars;
+    app.dock_dividers = dock_dividers;
+    app.dock_slots_geom = dock_slots_geom;
     app.picker_rects = picker_rects;
     app.settings_tab_rects = settings_tab_rects;
     app.settings_ctl_rects = settings_ctl_rects;
@@ -442,6 +446,8 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     app.workspaces_area = Rect::ZERO;
     app.agents_area = Rect::ZERO;
     app.sidebar_bars.clear();
+    app.dock_dividers.clear();
+    app.dock_slots_geom.clear();
     app.agents_filter_rects.clear();
     app.workspace_branch_rects.clear();
     app.module_dock_rects.clear();
