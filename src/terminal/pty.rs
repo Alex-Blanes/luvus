@@ -4,18 +4,145 @@
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::Result;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
 use crate::event::AppEvent;
 use crate::ids::PaneId;
+use crate::terminal::backend::TerminalRuntime;
 use crate::terminal::vt::alacritty::AlacrittyEngine;
 use crate::terminal::vt::VtEngine;
+
+const CHILD_REAPER_INTERVAL: Duration = Duration::from_millis(50);
+
+struct ReaperEntry {
+    id: PaneId,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    child_exited: Arc<AtomicBool>,
+    app_tx: Sender<AppEvent>,
+}
+
+static CHILD_REAPER: OnceLock<Sender<ReaperEntry>> = OnceLock::new();
+
+#[cfg(test)]
+static CHILD_REAPER_STARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Hand a child to the process-wide reaper. A pane still owns dedicated reader
+/// and writer threads so one blocked PTY cannot stall another pane, but waiting
+/// for child exit needs no per-pane thread: `try_wait` is non-blocking on every
+/// portable-pty backend.
+fn register_child_reaper(
+    id: PaneId,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    child_exited: Arc<AtomicBool>,
+    app_tx: Sender<AppEvent>,
+) {
+    let reaper = CHILD_REAPER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel();
+        thread::Builder::new()
+            .name("luvus-pty-reaper".to_string())
+            .spawn(move || child_reaper_loop(rx))
+            .expect("failed to start the PTY child reaper");
+        #[cfg(test)]
+        CHILD_REAPER_STARTS.fetch_add(1, Ordering::SeqCst);
+        tx
+    });
+    let entry = ReaperEntry {
+        id,
+        child,
+        child_exited,
+        app_tx,
+    };
+    if let Err(error) = reaper.send(entry) {
+        // A panic in the shared reaper must not leave an unreaped child. This
+        // fallback is deliberately exceptional; the normal path stays at one
+        // waiter thread for the whole server.
+        let mut entry = error.0;
+        let _ = thread::Builder::new()
+            .name("luvus-pty-reaper-fallback".to_string())
+            .spawn(move || {
+                let _ = entry.child.wait();
+                finish_child(entry);
+            });
+    }
+}
+
+fn child_reaper_loop(rx: Receiver<ReaperEntry>) {
+    let mut children = Vec::<ReaperEntry>::new();
+    loop {
+        let received = if children.is_empty() {
+            rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+        } else {
+            rx.recv_timeout(CHILD_REAPER_INTERVAL)
+        };
+        match received {
+            Ok(entry) => children.push(entry),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        children.extend(rx.try_iter());
+
+        let mut index = 0;
+        while index < children.len() {
+            if child_poll_finished(children[index].child.try_wait()) {
+                let entry = children.swap_remove(index);
+                finish_child(entry);
+            } else {
+                index += 1;
+            }
+        }
+    }
+}
+
+#[inline]
+fn child_poll_finished(result: std::io::Result<Option<portable_pty::ExitStatus>>) -> bool {
+    matches!(result, Ok(Some(_)))
+}
+
+fn terminate_spawned_child(child: &mut (dyn portable_pty::Child + Send + Sync)) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn finish_child(entry: ReaperEntry) {
+    // Publish exit before notifying the app. If the app immediately drops the
+    // pane, `Drop` must not signal a PID that the operating system may reuse.
+    entry.child_exited.store(true, Ordering::SeqCst);
+    let _ = entry.app_tx.send(AppEvent::PtyExit(entry.id));
+}
+
+pub(crate) enum InputAction {
+    Bytes(Vec<u8>),
+    /// One protocol-visible submit operation. The paste and its Enter are one
+    /// queue item, so accepting the action cannot report half a submission.
+    Submit {
+        paste: Vec<u8>,
+        settle: std::time::Duration,
+    },
+}
+
+fn write_input_action(writer: &mut dyn Write, action: InputAction) -> std::io::Result<()> {
+    match action {
+        InputAction::Bytes(bytes) => writer.write_all(&bytes)?,
+        InputAction::Submit { paste, settle } => {
+            if !paste.is_empty() {
+                writer.write_all(&paste)?;
+                writer.flush()?;
+                if !settle.is_zero() {
+                    std::thread::sleep(settle);
+                }
+            }
+            writer.write_all(b"\r")?;
+        }
+    }
+    writer.flush()
+}
 
 /// A pane app's mouse-tracking state (all four DECSET-derived flags in one
 /// read): whether it reports at all, whether it wants press-and-move (1002) or
@@ -33,13 +160,21 @@ pub struct Pane {
     pub engine: Arc<Mutex<dyn VtEngine>>,
     /// `None` until a deferred spawn's worker stores it (docs/82).
     master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
-    input_tx: Sender<Vec<u8>>,
+    input_tx: Sender<InputAction>,
     pub cwd: PathBuf,
     pub command: String,
     /// The shell's pid, for reading its live working directory and process
     /// tree. 0 means a deferred spawn has not finished yet — callers must
     /// treat that as "no process" rather than a real pid.
     pub child_pid: Arc<AtomicU32>,
+    /// Stable metadata for this exact PTY lifetime. `None` while a deferred
+    /// spawn is pending; assigned once after the PTY writer and root process are
+    /// both ready, and never changed for moves or tab reordering.
+    terminal_runtime: Arc<Mutex<Option<TerminalRuntime>>>,
+    /// Monotonic content generation for this PTY lifetime. The reader advances
+    /// it while holding the VT lock, so capture can return a revision that
+    /// exactly matches the screen snapshot it serialized.
+    content_revision: Arc<AtomicU64>,
     /// `PtyData` coalescing: set by the reader when it announces new output,
     /// cleared by the app loop when it consumes the event. While set, further
     /// reads skip the send — a saturated PTY (thousands of 8 KB reads/s) wakes
@@ -255,15 +390,22 @@ impl Pane {
         })?;
 
         apply_pane_env(&mut cmd, id, &cwd, extra_env);
-        let child = pair.slave.spawn_command(cmd)?;
+        let mut child = pair.slave.spawn_command(cmd)?;
         let child_pid = child
             .process_id()
             .expect("a spawned child always has a pid");
+        let terminal_runtime = match TerminalRuntime::new(child_pid) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                terminate_spawned_child(child.as_mut());
+                return Err(anyhow::Error::msg(error));
+            }
+        };
         drop(pair.slave);
 
         // All bytes (user input + terminal responses) funnel through one channel
         // to a single writer thread — keeps ordering correct, needs no mutex.
-        let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
+        let (input_tx, input_rx) = mpsc::channel::<InputAction>();
         let engine: Arc<Mutex<dyn VtEngine>> = Arc::new(Mutex::new(AlacrittyEngine::new(
             cols,
             rows,
@@ -279,11 +421,10 @@ impl Pane {
 
         let mut writer = pair.master.take_writer()?;
         thread::spawn(move || {
-            while let Ok(bytes) = input_rx.recv() {
-                if writer.write_all(&bytes).is_err() {
+            while let Ok(action) = input_rx.recv() {
+                if write_input_action(writer.as_mut(), action).is_err() {
                     break;
                 }
-                let _ = writer.flush();
             }
         });
 
@@ -292,23 +433,22 @@ impl Pane {
         let tx = app_tx.clone();
         let data_pending = Arc::new(AtomicBool::new(false));
         let pending = data_pending.clone();
-        thread::spawn(move || read_loop(id, reader, eng, tx, pending));
+        let content_revision = Arc::new(AtomicU64::new(0));
+        let revision = content_revision.clone();
+        thread::spawn(move || read_loop(id, reader, eng, tx, pending, revision));
 
-        // Reap the child so we notice it exiting. The exit flag is set *before*
-        // the event goes out, so by the time the loop closes the pane (and drops
-        // it) `Drop` already knows not to signal a possibly-recycled pid.
+        // Reap the child so we notice it exiting. The shared reaper sets the
+        // exit flag *before* the event goes out, so by the time the loop closes
+        // the pane (and drops it) `Drop` already knows not to signal a
+        // possibly-recycled pid.
         let child_exited = Arc::new(AtomicBool::new(false));
-        let exited = child_exited.clone();
-        thread::spawn(move || {
-            let mut child = child;
-            let _ = child.wait();
-            exited.store(true, Ordering::SeqCst);
-            let _ = app_tx.send(AppEvent::PtyExit(id));
-        });
+        register_child_reaper(id, child, child_exited.clone(), app_tx);
 
         Ok(Pane {
             engine,
             child_pid: Arc::new(AtomicU32::new(child_pid)),
+            terminal_runtime: Arc::new(Mutex::new(Some(terminal_runtime))),
+            content_revision,
             master: Arc::new(Mutex::new(Some(pair.master))),
             input_tx,
             cwd,
@@ -338,7 +478,7 @@ impl Pane {
     ) -> Pane {
         // Everything a caller can observe before the child exists: the engine
         // (pane.read, detection, rendering) and the input queue.
-        let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
+        let (input_tx, input_rx) = mpsc::channel::<InputAction>();
         let engine: Arc<Mutex<dyn VtEngine>> = Arc::new(Mutex::new(AlacrittyEngine::new(
             cols,
             rows,
@@ -355,27 +495,40 @@ impl Pane {
             let Ok(mut writer) = master_rx.recv() else {
                 return;
             };
-            while let Ok(bytes) = input_rx.recv() {
-                if writer.write_all(&bytes).is_err() {
+            while let Ok(action) = input_rx.recv() {
+                if write_input_action(writer.as_mut(), action).is_err() {
                     break;
                 }
-                let _ = writer.flush();
             }
         });
 
         let child_pid = Arc::new(AtomicU32::new(0));
+        let terminal_runtime: Arc<Mutex<Option<TerminalRuntime>>> = Arc::new(Mutex::new(None));
         let master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>> = Arc::new(Mutex::new(None));
         let data_pending = Arc::new(AtomicBool::new(false));
+        let content_revision = Arc::new(AtomicU64::new(0));
         let child_exited = Arc::new(AtomicBool::new(false));
         let size = Arc::new(Mutex::new((cols, rows)));
         let cancelled = Arc::new(AtomicBool::new(false));
 
         let worker = {
-            let (engine, child_pid, master, data_pending, child_exited, size, cancelled) = (
+            let (
+                engine,
+                child_pid,
+                terminal_runtime,
+                master,
+                data_pending,
+                content_revision,
+                child_exited,
+                size,
+                cancelled,
+            ) = (
                 engine.clone(),
                 child_pid.clone(),
+                terminal_runtime.clone(),
                 master.clone(),
                 data_pending.clone(),
+                content_revision.clone(),
                 child_exited.clone(),
                 size.clone(),
                 cancelled.clone(),
@@ -405,12 +558,20 @@ impl Pane {
                 if cancelled.load(Ordering::SeqCst) {
                     return;
                 }
-                let child = match pair.slave.spawn_command(cmd) {
+                let mut child = match pair.slave.spawn_command(cmd) {
                     Ok(child) => child,
                     Err(_) => return fail(),
                 };
                 let Some(pid) = child.process_id() else {
+                    terminate_spawned_child(child.as_mut());
                     return fail();
+                };
+                let runtime = match TerminalRuntime::new(pid) {
+                    Ok(runtime) => runtime,
+                    Err(_) => {
+                        terminate_spawned_child(child.as_mut());
+                        return fail();
+                    }
                 };
                 drop(pair.slave);
                 // Publish the pid *before* the cancellation check: a concurrent
@@ -465,16 +626,20 @@ impl Pane {
                     Err(_) => return fail(),
                 };
                 *master.lock().unwrap_or_else(|p| p.into_inner()) = Some(pair.master);
-                let reaper_tx = tx.clone();
-                thread::spawn(move || read_loop(id, reader, engine, tx, data_pending));
+                let read_tx = tx.clone();
+                let ready_tx = tx.clone();
                 thread::spawn(move || {
-                    let mut child = child;
-                    let _ = child.wait();
-                    child_exited.store(true, Ordering::SeqCst);
-                    let _ = reaper_tx.send(AppEvent::PtyExit(id));
+                    read_loop(id, reader, engine, read_tx, data_pending, content_revision)
                 });
+                register_child_reaper(id, child, child_exited, tx.clone());
 
-                let _ = master_tx.send(writer);
+                if master_tx.send(writer).is_err() {
+                    return fail();
+                }
+                *terminal_runtime
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime);
+                let _ = ready_tx.send(AppEvent::PtyReady(id));
             })
         };
         drop(worker);
@@ -482,6 +647,8 @@ impl Pane {
         Pane {
             engine,
             child_pid,
+            terminal_runtime,
+            content_revision,
             master,
             input_tx,
             cwd,
@@ -497,8 +664,15 @@ impl Pane {
     /// whether it was set — i.e. output arrived since the last re-arm, so the
     /// caller may owe one more render for the tail of a burst.
     pub fn take_data_pending(&self) -> bool {
-        self.data_pending
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        let pending = self
+            .data_pending
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
+        if pending {
+            if let Ok(mut engine) = self.engine.lock() {
+                engine.finish_output_batch();
+            }
+        }
+        pending
     }
 
     /// Clear the pending-output coalescing flag so the reader's next
@@ -511,7 +685,58 @@ impl Pane {
 
     pub fn send(&self, bytes: &[u8]) {
         self.rearm_pty_notify();
-        let _ = self.input_tx.send(bytes.to_vec());
+        let _ = self.input_tx.send(InputAction::Bytes(bytes.to_vec()));
+    }
+
+    /// Enqueue input and report a closed PTY writer instead of silently
+    /// treating it as delivery. Review-note handoff uses this before recording
+    /// delivery metadata; ordinary interactive input keeps the infallible API.
+    pub fn try_send(&self, bytes: &[u8]) -> Result<(), String> {
+        self.rearm_pty_notify();
+        self.input_tx
+            .send(InputAction::Bytes(bytes.to_vec()))
+            .map_err(|_| "target pane closed before input was delivered".to_string())
+    }
+
+    /// Enqueue one atomic submitted-text action for protocol consumers. Queue
+    /// success is dispatch evidence only; it does not claim the child consumed
+    /// or acted on the bytes.
+    pub fn try_submit_text(&self, text: &str) -> Result<(), String> {
+        let bracketed = self
+            .engine
+            .lock()
+            .map(|engine| engine.bracketed_paste())
+            .unwrap_or(false);
+        self.rearm_pty_notify();
+        self.input_tx
+            .send(InputAction::Submit {
+                paste: if text.is_empty() {
+                    Vec::new()
+                } else {
+                    wrap_paste(text, bracketed)
+                },
+                settle: std::time::Duration::from_millis(30),
+            })
+            .map_err(|_| "target pane closed before input was queued".to_string())
+    }
+
+    pub fn terminal_runtime(&self) -> Option<TerminalRuntime> {
+        self.terminal_runtime
+            .lock()
+            .ok()
+            .and_then(|runtime| runtime.clone())
+    }
+
+    pub fn content_revision(&self) -> u64 {
+        self.content_revision.load(Ordering::Acquire)
+    }
+
+    pub fn content_revision_handle(&self) -> Arc<AtomicU64> {
+        self.content_revision.clone()
+    }
+
+    pub fn child_exited(&self) -> bool {
+        self.child_exited.load(Ordering::SeqCst)
     }
 
     /// Enqueue `bytes` after `delay`, off-thread. Used to follow a pasted prompt
@@ -523,7 +748,7 @@ impl Pane {
         let tx = self.input_tx.clone();
         std::thread::spawn(move || {
             std::thread::sleep(delay);
-            let _ = tx.send(bytes);
+            let _ = tx.send(InputAction::Bytes(bytes));
         });
     }
 
@@ -621,6 +846,16 @@ impl Pane {
         self.engine.lock().map(|e| e.alt_screen()).unwrap_or(false)
     }
 
+    /// Whether the child enabled application cursor mode (DECCKM). When it has,
+    /// the key encoder sends SS3 (`ESC O` + letter) cursor-key codes so apps
+    /// like `less` that are strict about the mode recognize the keys.
+    pub fn application_cursor(&self) -> bool {
+        self.engine
+            .lock()
+            .map(|e| e.application_cursor())
+            .unwrap_or(false)
+    }
+
     /// `(mouse_report, sgr)` — whether the child tracks the mouse, and whether
     /// it wants SGR-encoded reports. Read together under one lock.
     /// The app's mouse-tracking state, read under **one** engine lock — callers
@@ -645,11 +880,7 @@ impl Pane {
     pub fn host_page_keys(&self) -> bool {
         self.engine
             .lock()
-            .map(|e| {
-                !e.alt_screen()
-                    && !e.mouse_report()
-                    && (!e.application_cursor() || e.bracketed_paste())
-            })
+            .map(|e| !e.alt_screen() && !e.mouse_report() && !e.application_cursor())
             .unwrap_or(false)
     }
 
@@ -669,6 +900,15 @@ impl Pane {
             .map(|e| e.bracketed_paste())
             .unwrap_or(false);
         self.send(&wrap_paste(text, bracketed));
+    }
+
+    pub fn try_send_paste(&self, text: &str) -> Result<(), String> {
+        let bracketed = self
+            .engine
+            .lock()
+            .map(|engine| engine.bracketed_paste())
+            .unwrap_or(false);
+        self.try_send(&wrap_paste(text, bracketed))
     }
 
     /// Resize the PTY + engine. Returns whether the size actually changed (so the
@@ -773,6 +1013,7 @@ fn read_loop(
     engine: Arc<Mutex<dyn VtEngine>>,
     tx: Sender<AppEvent>,
     data_pending: Arc<AtomicBool>,
+    content_revision: Arc<AtomicU64>,
 ) {
     let mut buf = [0u8; 8192];
     loop {
@@ -784,6 +1025,7 @@ fn read_loop(
             Ok(n) => {
                 if let Ok(mut e) = engine.lock() {
                     e.advance(&buf[..n]);
+                    content_revision.fetch_add(1, Ordering::Release);
                 }
                 // Announce new output only when no announcement is already in
                 // flight — the loop reads the engine's *latest* state anyway,
@@ -831,6 +1073,15 @@ mod reap_tests {
             500,
         )
         .expect("spawn")
+    }
+
+    #[test]
+    fn panes_share_one_child_reaper_thread() {
+        let first = spawn_sh();
+        let second = spawn_sh();
+        assert_eq!(CHILD_REAPER_STARTS.load(Ordering::SeqCst), 1);
+        drop(first);
+        drop(second);
     }
 
     /// A deferred pane (docs/82) is fully usable before its shell exists:
@@ -955,7 +1206,22 @@ mod reap_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::wrap_paste;
+    use super::{child_poll_finished, wrap_paste, write_input_action, InputAction};
+    use std::time::Duration;
+
+    #[test]
+    fn submit_action_writes_one_paste_then_exactly_one_enter() {
+        let mut output = Vec::new();
+        write_input_action(
+            &mut output,
+            InputAction::Submit {
+                paste: b"review this".to_vec(),
+                settle: Duration::ZERO,
+            },
+        )
+        .unwrap();
+        assert_eq!(output, b"review this\r");
+    }
 
     /// A dropped file path must reach the child as a *paste*, not as typing.
     /// luvus receives it with the markers already stripped by crossterm, so it
@@ -974,5 +1240,16 @@ mod tests {
             path.as_bytes(),
             "sent bare when it did not, so a plain shell is unaffected"
         );
+    }
+
+    #[test]
+    fn reaper_retries_child_poll_errors() {
+        assert!(!child_poll_finished(Ok(None)));
+        assert!(!child_poll_finished(Err(std::io::Error::other(
+            "temporary poll failure"
+        ))));
+        assert!(child_poll_finished(Ok(Some(
+            portable_pty::ExitStatus::with_exit_code(0)
+        ))));
     }
 }

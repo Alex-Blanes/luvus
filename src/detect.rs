@@ -123,6 +123,14 @@ const KNOWN_AGENTS: &[KnownAgent] = &[
         distinct: &["pi-coding-agent"],
         ambiguous: &["pi"],
     },
+    // `fx` is a short, common token in filenames and prose, so never infer it
+    // from arbitrary screen output. Its process name and OSC title are
+    // deliberate identity signals and therefore safe.
+    KnownAgent {
+        name: "fx",
+        distinct: &[],
+        ambiguous: &["fx"],
+    },
 ];
 
 /// The runtime form of [`KnownAgent`]: owned, so `~/.luvus/manifests/*.toml` can
@@ -319,6 +327,11 @@ impl Manifests {
         self.rules.len()
     }
 
+    /// Stable, bounded discovery data for Socket API administration.
+    pub fn agent_names(&self) -> Vec<String> {
+        self.agents.iter().map(|agent| agent.name.clone()).collect()
+    }
+
     /// True if `name` is a recognised agent (not a plain shell). Drives whether
     /// a pane appears in the AGENTS list.
     pub fn is_agent(&self, name: &str) -> bool {
@@ -326,19 +339,33 @@ impl Manifests {
         self.agents.iter().any(|a| a.name == low)
     }
 
-    fn evaluate(&self, agent: &str, regions: &Regions) -> Option<State> {
-        let mut best: Option<(i32, State)> = None;
+    fn evaluate(&self, agent: &str, regions: &Regions) -> Option<RuleMatch> {
+        let mut best: Option<RuleMatch> = None;
         for r in &self.rules {
             if !(r.agent.is_empty() || r.agent == agent) {
                 continue;
             }
             let text = regions.get(r.region);
-            if r.conds.iter().all(|c| c.holds(text)) && best.is_none_or(|(p, _)| r.priority > p) {
-                best = Some((r.priority, r.state));
+            if r.conds.iter().all(|c| c.holds(text))
+                && best
+                    .as_ref()
+                    .is_none_or(|matched| r.priority >= matched.priority)
+            {
+                best = Some(RuleMatch {
+                    state: r.state,
+                    priority: r.priority,
+                    region: r.region,
+                });
             }
         }
-        best.map(|(_, s)| s)
+        best
     }
+}
+
+struct RuleMatch {
+    state: State,
+    priority: i32,
+    region: Region,
 }
 
 fn any(subs: &[&str]) -> Cond {
@@ -346,6 +373,18 @@ fn any(subs: &[&str]) -> Cond {
 }
 fn all(subs: &[&str]) -> Cond {
     Cond::All(subs.iter().map(|s| s.to_lowercase()).collect())
+}
+
+/// How much of the live terminal grid must reach the rule engine. Most agents
+/// keep state beside their bottom prompt, but fx can pin its transient activity
+/// above a tall blank footer area. Expand only a confirmed fx pane so every
+/// other pane retains the existing extraction cost and false-positive surface.
+pub(crate) fn screen_rows(known_agent: &str, running: &[String], manifests: &Manifests) -> u16 {
+    if known_agent.eq_ignore_ascii_case("fx") || manifests.process_has_agent(running, "fx") {
+        40
+    } else {
+        14
+    }
 }
 
 /// The compiled-in default rules (generic first, then per-agent).
@@ -426,6 +465,73 @@ fn builtin_rules() -> Vec<Rule> {
             105,
             Region::Screen,
             vec![any(&["ctrl+c to stop"])],
+        ),
+        // fx suppresses its activity row while it needs user input. Its
+        // narrowest approval and question hints retain these paired controls,
+        // so they remain reliable even in a small pane.
+        per(
+            "fx",
+            State::Blocked,
+            325,
+            Region::Screen,
+            vec![all(&["enter confirm", "esc cancel"])],
+        ),
+        per(
+            "fx",
+            State::Blocked,
+            325,
+            Region::Screen,
+            vec![all(&["enter answer", "esc cancel"])],
+        ),
+        per(
+            "fx",
+            State::Blocked,
+            325,
+            Region::Screen,
+            vec![any(&["permission needed ·", "needs permission"])],
+        ),
+        // Native fx activity rows. Match stable UI copy rather than raw PTY
+        // traffic: fx probes terminal capabilities while idle, so recent bytes
+        // alone are not evidence that the model is working.
+        per(
+            "fx",
+            State::Working,
+            125,
+            Region::Screen,
+            vec![any(&["• thinking", "retrying request in"])],
+        ),
+        per(
+            "fx",
+            State::Working,
+            120,
+            Region::Screen,
+            vec![any(&[
+                "listing |",
+                "reading |",
+                "writing |",
+                "editing |",
+                "running |",
+                "delegating |",
+                "opening |",
+            ])],
+        ),
+        per(
+            "fx",
+            State::Working,
+            120,
+            Region::Screen,
+            vec![all(&["• (", "↑", "↓"])],
+        ),
+        // Streamed response rows intentionally have no bullet or verb. The
+        // live token counter is active only while the idle input rail is absent;
+        // requiring both prevents a completed turn's retained counter from
+        // pinning fx to Working at its prompt.
+        per(
+            "fx",
+            State::Working,
+            115,
+            Region::Screen,
+            vec![all(&["(↑", "↓"]), Cond::Not(vec!["┃".to_string()])],
         ),
         // Newer Claude Code dropped the "esc to interrupt" hint and animates a
         // non-braille spinner (✢/✻/✳), so the generic working rules miss it and
@@ -682,6 +788,14 @@ impl RuleSpec {
 pub struct Detection {
     pub state: State,
     pub agent: String,
+    /// Where identity came from. Stable, machine-readable values are exposed by
+    /// `agent.explain`; no consumer needs to reverse-engineer detection order.
+    pub identity_source: &'static str,
+    /// Why the state was chosen. A manifest match includes its region/priority;
+    /// otherwise this names the deliberately conservative fallback.
+    pub state_source: &'static str,
+    pub rule_priority: Option<i32>,
+    pub rule_region: Option<&'static str>,
 }
 
 /// The recent-screen and title regions, lowercased once for matching.
@@ -734,19 +848,20 @@ pub fn classify(
     // agent's UI does not print its own name (Claude Code's bottom rows are a
     // prompt box and a model label, so a repaint would otherwise resolve to the
     // bare shell and read its own redraw as work).
-    let agent = if running.is_empty() {
+    let (agent, identity_source) = if running.is_empty() {
         manifests
             .detect_agent(title, &regions.screen, base_command)
             .or_else(|| {
                 manifests
                     .is_agent(known_agent)
-                    .then(|| known_agent.to_string())
+                    .then(|| (known_agent.to_string(), "prior_identity"))
             })
-            .unwrap_or_else(|| base_command.to_string())
+            .unwrap_or_else(|| (base_command.to_string(), "command_fallback"))
     } else {
         manifests
             .agent_in_processes(running)
-            .unwrap_or_else(|| base_command.to_string())
+            .map(|agent| (agent, "process_tree"))
+            .unwrap_or_else(|| (base_command.to_string(), "command_fallback"))
     };
 
     // A recognised agent is *working* only on positive evidence — a spinner or
@@ -760,9 +875,29 @@ pub fn classify(
     } else {
         State::Idle
     };
-    let state = manifests.evaluate(&agent, &regions).unwrap_or(fallback);
+    let matched = manifests.evaluate(&agent, &regions);
+    let (state, state_source, rule_priority, rule_region) = match matched {
+        Some(rule) => (
+            rule.state,
+            "manifest_rule",
+            Some(rule.priority),
+            Some(match rule.region {
+                Region::Title => "title",
+                Region::Screen => "screen",
+            }),
+        ),
+        None if fallback == State::Working => (fallback, "shell_activity", None, None),
+        None => (fallback, "no_positive_state_evidence", None, None),
+    };
 
-    Detection { state, agent }
+    Detection {
+        state,
+        agent,
+        identity_source,
+        state_source,
+        rule_priority,
+        rule_region,
+    }
 }
 
 /// Name the agent running in a pane, in decreasing order of how deliberate the
@@ -867,18 +1002,18 @@ impl Manifests {
         title: Option<&str>,
         low_bottom: &str,
         base_command: &str,
-    ) -> Option<String> {
+    ) -> Option<(String, &'static str)> {
         let cmd = base_command.to_lowercase();
         let title = title.map(|t| t.to_lowercase()).unwrap_or_default();
 
         // Deliberate signals: somebody typed this, or the agent published it.
-        for region in [&cmd, &title] {
+        for (region, source) in [(&cmd, "launch_command"), (&title, "osc_title")] {
             if let Some(a) = self
                 .agents
                 .iter()
                 .find(|a| a.all().any(|p| contains_agent_word(region, p)))
             {
-                return Some(a.name.clone());
+                return Some((a.name.clone(), source));
             }
         }
         // Incidental signal: pane output. Only names that can't be ordinary words.
@@ -889,13 +1024,13 @@ impl Manifests {
                     .iter()
                     .any(|p| contains_agent_word(low_bottom, p))
             })
-            .map(|a| a.name.clone())
+            .map(|a| (a.name.clone(), "screen_text"))
     }
 }
 
 /// The bare binary name of an argv token: no directory, no `.exe`, and no
 /// leading `-` (login shells appear as `-zsh`).
-fn binary_name(token: &str) -> &str {
+pub(crate) fn binary_name(token: &str) -> &str {
     token
         .rsplit(['/', '\\'])
         .next()
@@ -906,7 +1041,7 @@ fn binary_name(token: &str) -> &str {
 
 /// Runtimes that execute an agent as a script, so the name to look for is the
 /// argument rather than argv[0].
-fn is_interpreter(base: &str) -> bool {
+pub(crate) fn is_interpreter(base: &str) -> bool {
     matches!(
         base,
         "node"
@@ -966,6 +1101,135 @@ mod tests {
             &Manifests::builtin(),
         )
         .state
+    }
+
+    fn fx_state(bottom: &str, activity: bool, input: bool) -> State {
+        classify(
+            Some("fx · zai/glm-5.2"),
+            bottom,
+            activity,
+            input,
+            "zsh",
+            "fx",
+            &["/opt/homebrew/bin/fx".to_string()],
+            &Manifests::builtin(),
+        )
+        .state
+    }
+
+    #[test]
+    fn fx_identity_uses_process_or_title_not_incidental_output() {
+        let m = Manifests::builtin();
+        assert_eq!(screen_rows("", &["fx".to_string()], &m), 40);
+        assert_eq!(screen_rows("claude", &["claude".to_string()], &m), 14);
+        let running = classify(
+            Some("zsh"),
+            "generated file: effects/fx.rs",
+            true,
+            false,
+            "zsh",
+            "",
+            &["/opt/homebrew/bin/fx".to_string()],
+            &m,
+        );
+        assert_eq!(running.agent, "fx", "the running binary names the agent");
+
+        let titled = classify(
+            Some("fx · zai/glm-5.2"),
+            "",
+            false,
+            false,
+            "zsh",
+            "",
+            &[],
+            &m,
+        );
+        assert_eq!(titled.agent, "fx", "fx's OSC title is deliberate evidence");
+
+        let incidental = classify(
+            Some("zsh"),
+            "generated file: effects/fx.rs",
+            true,
+            false,
+            "zsh",
+            "",
+            &[],
+            &m,
+        );
+        assert_eq!(incidental.agent, "zsh", "screen prose must not name fx");
+    }
+
+    #[test]
+    fn fx_native_activity_rows_report_working() {
+        assert_eq!(fx_state("• Thinking (5s)", false, false), State::Working);
+        assert_eq!(
+            fx_state(
+                "Provider unavailable · HTTP 503 · retrying request in 4s · attempt 4/10",
+                false,
+                false,
+            ),
+            State::Working
+        );
+        assert_eq!(
+            fx_state("running | 1 command started", false, false),
+            State::Working
+        );
+        assert_eq!(
+            fx_state("• (12s) (↑169 ↓5.1k)", false, false),
+            State::Working
+        );
+        assert_eq!(
+            fx_state("streamed response\n  (↑1.5k ↓20)", true, false),
+            State::Working
+        );
+    }
+
+    #[test]
+    fn fx_idle_prompt_ignores_terminal_probe_activity() {
+        assert_eq!(
+            fx_state("𝒇x\n┃\nauto · zai/glm-5.2", true, false),
+            State::Idle,
+            "PTY capability traffic alone must not make an idle fx pane Working"
+        );
+        assert_eq!(
+            fx_state(
+                "last response (↑10 ↓20)\n┃\nauto · zai/glm-5.2",
+                true,
+                false
+            ),
+            State::Idle,
+            "a retained token counter above the input rail is still idle"
+        );
+    }
+
+    #[test]
+    fn fx_native_interactions_report_blocked() {
+        assert_eq!(
+            fx_state(
+                "• Thinking (4s)\nPermission needed · Choose one\nEnter Confirm    Esc Cancel",
+                true,
+                false,
+            ),
+            State::Blocked,
+            "approval must outrank a lingering activity row"
+        );
+        assert_eq!(
+            fx_state(
+                "Should we proceed?\n1) Yes\n2) No\nEnter Answer · Esc Cancel",
+                false,
+                false,
+            ),
+            State::Blocked,
+            "question prompts wait for the user"
+        );
+        assert_eq!(
+            fx_state(
+                "Subagent worker needs permission\nEnter Confirm    Esc Cancel",
+                false,
+                false,
+            ),
+            State::Blocked
+        );
     }
 
     #[test]
@@ -1328,11 +1592,59 @@ mod tests {
         assert_eq!(d2.state, State::Idle, "user rule is scoped to its agent");
     }
 
+    #[test]
+    fn later_equal_priority_rule_overrides_managed_rule() {
+        let rules = r#"
+            agent = "claude"
+            [[rule]]
+            state = "working"
+            priority = 250
+            region = "screen"
+            any = ["same marker"]
+            [[rule]]
+            state = "blocked"
+            priority = 250
+            region = "screen"
+            any = ["same marker"]
+        "#;
+        let mut manifests = Manifests::builtin();
+        manifests
+            .rules
+            .extend(toml::from_str::<ManifestFile>(rules).unwrap().into_rules());
+        let detection = classify(
+            Some("claude"),
+            "same marker",
+            true,
+            false,
+            "claude",
+            "claude",
+            &[],
+            &manifests,
+        );
+        assert_eq!(detection.state, State::Blocked);
+    }
+
+    #[test]
+    fn successful_process_scan_without_agent_is_command_fallback() {
+        let detection = classify(
+            Some("claude"),
+            "claude welcome",
+            true,
+            false,
+            "zsh",
+            "claude",
+            &["cargo test".to_string()],
+            &Manifests::builtin(),
+        );
+        assert_eq!(detection.agent, "zsh");
+        assert_eq!(detection.identity_source, "command_fallback");
+    }
+
     /// A pane is named after the agent *running in it*, never after a word that
     /// happens to be on screen. `amp` is a substring of "example", "sample",
     /// "stamped" and "implementation", so a Claude pane printing ordinary prose
     /// renamed itself to the amp agent; listing `~/.kiro` renamed a shell to
-    /// kiro. Both then propagated to the sidebar, the AGENTS list and the notch.
+    /// kiro. Both then propagated to the sidebar, the AGENTS list, and API clients.
     #[test]
     fn ordinary_words_do_not_name_an_agent() {
         let m = Manifests::builtin();

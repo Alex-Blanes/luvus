@@ -1139,11 +1139,17 @@ mod tests {
         }
     }
 
+    /// Test manifests must remain compatible with the package being built so
+    /// release verification does not depend on a hand-updated minor-version cap.
+    fn compatible_requires_luvus() -> String {
+        format!(">={}", env!("CARGO_PKG_VERSION"))
+    }
+
     fn manifest(release: &str) -> SkillManifest {
         SkillManifest {
             schema: MANIFEST_SCHEMA,
             release: release.to_string(),
-            requires_luvus: ">=0.11.0, <0.12.0".into(),
+            requires_luvus: compatible_requires_luvus(),
             artifacts: BTreeMap::new(),
         }
     }
@@ -1155,7 +1161,7 @@ mod tests {
         let signed = serde_json::to_vec(&serde_json::json!({
             "schema": 1,
             "release": "0.4.0",
-            "requires_luvus": ">=0.11.0, <0.12.0",
+            "requires_luvus": compatible_requires_luvus(),
             "artifacts": {}
         }))
         .unwrap();
@@ -1167,6 +1173,13 @@ mod tests {
         let parsed = parse_signed_manifest(&envelope, &signing.verifying_key()).unwrap();
         assert_eq!(parsed.release, "0.4.0");
         assert!(parse_signed_manifest(&envelope, &other.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_an_incompatible_luvus_version() {
+        let mut manifest = manifest("0.4.0");
+        manifest.requires_luvus = format!("<{}", env!("CARGO_PKG_VERSION"));
+        assert!(validate_manifest(&manifest).is_err());
     }
 
     #[test]

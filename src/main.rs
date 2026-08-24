@@ -3,12 +3,15 @@
 //! See docs/12-execution-plan.md.
 
 mod agent;
+mod api;
 mod app;
+mod bar;
 mod changelog;
 mod cli;
 mod compat;
 mod config;
 mod detect;
+mod diff;
 mod event;
 mod files;
 mod git;
@@ -24,9 +27,12 @@ mod orch;
 mod paste;
 mod persist;
 mod platform;
+mod runtime_api;
+mod search;
 mod session;
 mod skill;
 mod terminal;
+mod theme;
 mod ui;
 mod update;
 
@@ -71,6 +77,13 @@ fn main() -> Result<()> {
         _ => {}
     }
 
+    // Protocol discovery is a deliberately narrow, read-only startup route.
+    // Keep it ahead of every migration and setup hook so an adapter can list
+    // endpoints without changing the selected Luvus home in any way.
+    if is_backend_discovery_request(&args) {
+        std::process::exit(cli::run(&args)?);
+    }
+
     // Migration belongs to commands that use the runtime, not informational
     // output. In particular, `luvus --version` must stay side-effect-free and
     // must never contaminate stdout/stderr used by installers and scripts.
@@ -100,6 +113,14 @@ fn main() -> Result<()> {
     }
     // Default: attach to the session server, spawning it if needed.
     autodetect_and_attach()
+}
+
+fn is_backend_discovery_request(args: &[String]) -> bool {
+    matches!(
+        args,
+        [_, session, list, json]
+            if session == "session" && list == "list" && json == "--json"
+    ) || matches!(args, [_, api, schema] if api == "api" && matches!(schema.as_str(), "schema" | "runtime-schema" | "socket-schema"))
 }
 
 /// After `ratatui::init()` (which restores raw mode + alt-screen on panic), also
@@ -765,7 +786,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
 
     // `--local` still exposes the control API, so it must obey the same
     // single-server ownership rules as the headless server.
-    let state_dir = persist::ensure_session_dir();
+    let state_dir = persist::ensure_server_session_dir()?;
     let startup_lock = ipc::transport::acquire_server_startup_lock(&state_dir)?;
     let sock = persist::socket_path();
     let client_sock = persist::client_socket_path();
@@ -842,6 +863,9 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         }
         // Parked `wait.output` deadlines lapse on the tick (docs/81).
         app.tick_output_waits(Instant::now());
+        app.tick_agent_waits(Instant::now());
+        app.tick_agent_workflows(Instant::now());
+        app.tick_backend_revision_waits(Instant::now());
         if app.should_quit || app.detach_requested {
             break;
         }
@@ -867,7 +891,9 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
             emit_sound();
         }
         // Advance the working spinner ~10x/s (the loop redraws every frame).
-        if last_spin.elapsed() >= Duration::from_millis(100) && app.any_working() {
+        if last_spin.elapsed() >= Duration::from_millis(100)
+            && (app.any_working() || app.bar.has_visible_working(&app.config.bars, app.compact))
+        {
             app.spinner = app.spinner.wrapping_add(1);
             last_spin = Instant::now();
         }
@@ -879,6 +905,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         }
         app.tick_toast(Instant::now());
         app.tick_search_flash(Instant::now());
+        app.tick_bar_notifications(Instant::now());
         // A forced redraw (resize / regained focus) wipes the terminal so the next
         // draw repaints every cell, healing damage ratatui's own diff can't see.
         if std::mem::take(&mut app.force_redraw) {
@@ -953,6 +980,38 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    #[test]
+    fn only_exact_json_session_list_uses_discovery_route() {
+        let strings = |items: &[&str]| {
+            items
+                .iter()
+                .map(|item| item.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(is_backend_discovery_request(&strings(&[
+            "luvus", "session", "list", "--json"
+        ])));
+        assert!(!is_backend_discovery_request(&strings(&[
+            "luvus", "session", "list"
+        ])));
+        assert!(!is_backend_discovery_request(&strings(&[
+            "luvus", "session", "list", "--json", "extra"
+        ])));
+        assert!(is_backend_discovery_request(&strings(&[
+            "luvus", "api", "schema"
+        ])));
+        assert!(is_backend_discovery_request(&strings(&[
+            "luvus",
+            "api",
+            "runtime-schema"
+        ])));
+        assert!(is_backend_discovery_request(&strings(&[
+            "luvus",
+            "api",
+            "socket-schema"
+        ])));
+    }
 
     // The synthesized "done" jingle is a well-formed 16-bit mono WAV.
     #[test]
@@ -1070,6 +1129,56 @@ mod tests {
             &mut term,
             &mut last,
             b"the quick brown fox jumps over the lazy dog 0123 abcdefghij\r\n",
+        );
+
+        // Luvus Bar feature cost: ten bounded widgets exercise both regions,
+        // compact selection, and overflow without adding IO to the draw path.
+        for index in 0..10 {
+            let region = if index % 2 == 0 {
+                crate::bar::BarRegion::TopRight
+            } else {
+                crate::bar::BarRegion::BottomRight
+            };
+            let widget = crate::bar::BarWidget::new(
+                crate::bar::BarWidgetKey::new("bench", format!("job-{index}")),
+                region,
+                vec![crate::bar::BarSegment::text(
+                    format!("job {index} ready"),
+                    crate::bar::BarTone::Success,
+                )],
+                vec![crate::bar::BarSegment::text(
+                    format!("j{index}"),
+                    crate::bar::BarTone::Success,
+                )],
+                index as u8,
+            )
+            .unwrap();
+            app.bar.push_widget(widget).unwrap();
+        }
+        bench("10 widgets", &mut app, &mut term, &mut last, b"x");
+
+        // Exercise the update path separately so render cost and update cost
+        // remain distinguishable in manual performance runs.
+        let updates = 2_000u32;
+        let started = std::time::Instant::now();
+        for index in 0..updates {
+            let widget = crate::bar::BarWidget::new(
+                crate::bar::BarWidgetKey::new("bench", "live"),
+                crate::bar::BarRegion::BottomRight,
+                vec![crate::bar::BarSegment::text(
+                    format!("build {}", index % 100),
+                    crate::bar::BarTone::Accent,
+                )],
+                Vec::new(),
+                50,
+            )
+            .unwrap();
+            app.bar.push_widget(widget).unwrap();
+            term.draw(|frame| ui::render(frame, &mut app)).unwrap();
+        }
+        println!(
+            "bar update @ {w}x{h}: {:>10?}/update+frame",
+            started.elapsed() / updates
         );
 
         // Breakdown of one frame (where the ~126µs goes).

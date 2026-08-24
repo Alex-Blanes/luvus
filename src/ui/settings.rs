@@ -12,7 +12,9 @@ pub(super) struct SettingsHits {
     pub close: Rect,
     pub tabs: Vec<(SettingsTab, Rect)>,
     pub ctls: Vec<(usize, Rect)>,
+    pub theme_remove: Vec<(String, Rect)>,
     pub arrows: Vec<(usize, i32, Rect)>,
+    pub layout_scroll: usize,
 }
 
 fn format_history_budget(bytes: usize) -> String {
@@ -35,14 +37,15 @@ pub(super) fn draw_settings(
     // Width must fit the whole tab bar — translated labels (esp. CJK) can be much
     // wider than English, so size to the tabs instead of a fixed cap. The tabs
     // are ` {icon} {label} ` pills; the loop starts at inner.x+1 (1 left margin),
-    // and the modal adds 2 border columns → need = tabs + 3. Floor 46 for content,
-    // capped at the terminal width.
+    // and the modal adds 2 border columns. Keep a little breathing room beyond
+    // the toolbar so wide controls (notably Luvus Bar placement) do not crowd
+    // the border. Both dimensions remain capped to the current viewport.
     let tabs_w: u16 = SettingsTab::ALL
         .iter()
         .map(|st| display_width(&format!(" {} {} ", st.icon(), st.label(app.catalog))) as u16)
         .sum();
-    let w = (tabs_w + 4).max(46).min(area.width);
-    let h = area.height.saturating_sub(4).clamp(14, 24).min(area.height);
+    let w = (tabs_w + 12).max(54).min(area.width);
+    let h = area.height.saturating_sub(2).clamp(16, 30).min(area.height);
     let modal = centered_rect(area, w, h);
 
     f.render_widget(Clear, modal);
@@ -53,11 +56,11 @@ pub(super) fn draw_settings(
     let inner = block.inner(modal);
     f.render_widget(block, modal);
 
-    let (tab, cursor) = app
+    let (tab, cursor, layout_scroll) = app
         .settings
         .as_ref()
-        .map(|u| (u.tab, u.cursor))
-        .unwrap_or((SettingsTab::Theme, 0));
+        .map(|u| (u.tab, u.cursor, u.layout_scroll))
+        .unwrap_or((SettingsTab::Theme, 0, 0));
 
     // ── title bar ──
     f.render_widget(
@@ -103,7 +106,8 @@ pub(super) fn draw_settings(
         inner.width,
         inner.height.saturating_sub(6),
     );
-    let (ctls, arrows) = draw_content(f, content, tab, cursor, app, t);
+    let (ctls, theme_remove, arrows, layout_scroll) =
+        draw_content(f, content, tab, cursor, layout_scroll, app, t);
 
     // ── footer hint (Keys tab gets its own rebind/reset hints) ──
     let footer_y = inner.bottom().saturating_sub(1);
@@ -157,42 +161,54 @@ pub(super) fn draw_settings(
         close,
         tabs,
         ctls,
+        theme_remove,
         arrows,
+        layout_scroll,
     }
 }
 
-type Content = (Vec<(usize, Rect)>, Vec<(usize, i32, Rect)>);
+type Content = (
+    Vec<(usize, Rect)>,
+    Vec<(String, Rect)>,
+    Vec<(usize, i32, Rect)>,
+    usize,
+);
 
 fn draw_content(
     f: &mut RenderTarget,
     area: Rect,
     tab: SettingsTab,
     cursor: usize,
+    layout_scroll: usize,
     app: &App,
     t: &Theme,
 ) -> Content {
     let mut ctls = Vec::new();
+    let mut theme_remove = Vec::new();
     let mut arrows = Vec::new();
+    let mut resolved_layout_scroll = layout_scroll;
     let cat = app.catalog;
     match tab {
         SettingsTab::Theme => {
             // Scroll the list so the selected theme is always visible (there are
             // more palettes than fit a short modal).
             let avail = area.height.max(1) as usize;
-            let total = theme::THEMES.len();
+            let themes = app.theme_registry.entries();
+            let total = themes.len();
             let scroll = cursor
                 .saturating_sub(avail.saturating_sub(1))
                 .min(total.saturating_sub(avail));
             // Size the name column to the longest registered name, so the swatches
             // and descriptions stay in one straight column however long a palette
             // is called. A fixed width mis-aligned every row once a name outgrew it.
-            let name_w = theme::THEMES
+            let name_w = themes
                 .iter()
-                .map(|n| display_width(n))
+                .map(|entry| display_width(&entry.id))
                 .max()
                 .unwrap_or(9);
             for (vi, i) in (scroll..total).take(avail).enumerate() {
-                let name = theme::THEMES[i];
+                let entry = &themes[i];
+                let name = entry.id.as_str();
                 let row = Rect::new(area.x, area.y + vi as u16, area.width, 1);
                 let sel = i == cursor;
                 if sel {
@@ -205,12 +221,45 @@ fn draw_content(
                 // full RGB; downsample when the active theme is (i.e. on
                 // non-truecolor terminals) so it renders the right color instead of
                 // a mangled truecolor escape.
-                let pal = theme::by_name(name);
+                let pal = &entry.theme;
                 let (mut bg, mut accent) = (pal.base, pal.accent);
                 if app.downsample {
                     bg = crate::ipc::protocol::to_256(bg);
                     accent = crate::ipc::protocol::to_256(accent);
                 }
+                // Local files get the same right-aligned installed/remove affordance
+                // as agent integrations. Bundled and virtual themes never expose a
+                // destructive action. Reserve its cells so descriptions cannot draw
+                // underneath the button.
+                let remove = (matches!(
+                    entry.source,
+                    crate::theme::registry::ThemeSource::Local { .. }
+                ) && !app.theme_uninstall_pending(&entry.id))
+                .then(|| {
+                    let installed = format!("✓ {} ", cat.act_installed);
+                    let action = "· ⏎ remove";
+                    let width = (display_width(&installed) + display_width(action)) as u16;
+                    let width = width.min(row.width.saturating_sub(1));
+                    let rect = Rect::new(
+                        row.right().saturating_sub(width.saturating_add(1)),
+                        row.y,
+                        width,
+                        1,
+                    );
+                    f.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::styled(installed, Style::new().fg(t.mint)),
+                            Span::styled(action, Style::new().fg(t.overlay0)),
+                        ]))
+                        .alignment(Alignment::Right),
+                        rect,
+                    );
+                    theme_remove.push((entry.id.clone(), rect));
+                    rect
+                });
+                let content_width = remove
+                    .map(|rect| rect.x.saturating_sub(row.x + 1))
+                    .unwrap_or(row.width);
                 f.render_widget(
                     Paragraph::new(Line::from(vec![
                         Span::styled(if sel { " ▸ " } else { "   " }, Style::new().fg(t.accent)),
@@ -222,9 +271,16 @@ fn draw_content(
                         Span::styled("   ", Style::new().bg(bg)),
                         Span::styled("   ", Style::new().bg(accent)),
                         Span::raw("  "),
-                        Span::styled(theme::describe(name), Style::new().fg(t.overlay0)),
+                        Span::styled(
+                            if entry.description.is_empty() {
+                                entry.display_name.as_str()
+                            } else {
+                                entry.description.as_str()
+                            },
+                            Style::new().fg(t.overlay0),
+                        ),
                     ])),
-                    row,
+                    Rect::new(row.x, row.y, content_width, 1),
                 );
                 ctls.push((i, row));
             }
@@ -267,18 +323,28 @@ fn draw_content(
             // visible (docs/29), so a long registry of plugin docks stays reachable.
             let rows = app.layout_rows();
             let dock_start = app.dock_section_start();
+            let diff_start = app.diff_section_start();
+            let bar_start = app.bar_section_start();
             let l = &app.config.layout;
             // Visual sequence: control rows plus a blank + divider before the docks.
             enum V {
                 Ctl(usize),
                 Blank,
-                Divider,
+                Divider(&'static str),
             }
             let mut vis = Vec::new();
             for i in 0..rows.len() {
+                if i == diff_start {
+                    vis.push(V::Blank);
+                    vis.push(V::Divider(cat.tab_diff));
+                }
                 if i == dock_start {
                     vis.push(V::Blank);
-                    vis.push(V::Divider);
+                    vis.push(V::Divider(cat.tab_docks));
+                }
+                if i == bar_start {
+                    vis.push(V::Blank);
+                    vis.push(V::Divider(cat.tab_luvus_bar));
                 }
                 vis.push(V::Ctl(i));
             }
@@ -287,21 +353,25 @@ fn draw_content(
                 .iter()
                 .position(|v| matches!(v, V::Ctl(i) if *i == cursor))
                 .unwrap_or(0);
-            let scroll = cur_vis
-                .saturating_sub(avail.saturating_sub(1))
-                .min(vis.len().saturating_sub(avail));
+            let scroll = keep_visible_scroll(layout_scroll, cur_vis, avail, vis.len());
+            resolved_layout_scroll = scroll;
             for (row_i, v) in vis.iter().enumerate().skip(scroll).take(avail) {
                 let y = area.y + (row_i - scroll) as u16;
                 let i = match v {
                     V::Blank => continue,
-                    V::Divider => {
+                    V::Divider(label) => {
                         hline(f, area.x, y, area.width, t);
                         f.render_widget(
                             Paragraph::new(Span::styled(
-                                format!(" {} ", cat.tab_docks),
+                                format!(" {label} "),
                                 Style::new().fg(t.subtext0).bg(t.surface0),
                             )),
-                            Rect::new(area.x + 2, y, 12.min(area.width), 1),
+                            Rect::new(
+                                area.x + 2,
+                                y,
+                                (display_width(label) as u16 + 2).min(area.width),
+                                1,
+                            ),
                         );
                         continue;
                     }
@@ -396,6 +466,92 @@ fn draw_content(
                             t,
                         ));
                     }
+                    LayoutRow::DiffLayout => {
+                        ctls.push(ctl_row(
+                            f,
+                            area,
+                            y,
+                            i,
+                            cursor,
+                            cat.set_diff_layout,
+                            picker(app.config.layout.diff_layout.as_str(), t),
+                            t,
+                        ));
+                    }
+                    LayoutRow::DiffWrap => {
+                        ctls.push(ctl_row(
+                            f,
+                            area,
+                            y,
+                            i,
+                            cursor,
+                            cat.set_diff_wrap,
+                            toggle(app.config.layout.diff_wrap, t),
+                            t,
+                        ));
+                    }
+                    LayoutRow::DiffContext => {
+                        let row = slider_row(
+                            f,
+                            area,
+                            y,
+                            i,
+                            cursor == i,
+                            cat.set_diff_context,
+                            app.config.layout.diff_context_lines.to_string(),
+                            t,
+                            &mut arrows,
+                        );
+                        ctls.push((i, row));
+                    }
+                    LayoutRow::DiffLineNumbers => {
+                        ctls.push(ctl_row(
+                            f,
+                            area,
+                            y,
+                            i,
+                            cursor,
+                            cat.set_diff_line_numbers,
+                            toggle(app.config.layout.diff_show_line_numbers, t),
+                            t,
+                        ));
+                    }
+                    LayoutRow::DiffMarkers => {
+                        ctls.push(ctl_row(
+                            f,
+                            area,
+                            y,
+                            i,
+                            cursor,
+                            cat.set_diff_markers,
+                            picker(app.config.layout.diff_marker_style.as_str(), t),
+                            t,
+                        ));
+                    }
+                    LayoutRow::DiffColors => {
+                        ctls.push(ctl_row(
+                            f,
+                            area,
+                            y,
+                            i,
+                            cursor,
+                            cat.set_diff_colors,
+                            picker(app.config.layout.diff_color_mode.as_str(), t),
+                            t,
+                        ));
+                    }
+                    LayoutRow::DiffLiveRefresh => {
+                        ctls.push(ctl_row(
+                            f,
+                            area,
+                            y,
+                            i,
+                            cursor,
+                            cat.set_diff_live_refresh,
+                            toggle(app.config.layout.diff_live_refresh, t),
+                            t,
+                        ));
+                    }
                     #[cfg(windows)]
                     LayoutRow::Shell => {
                         let shell = crate::platform::shell_label(&app.config.shell);
@@ -441,6 +597,9 @@ fn draw_content(
                     }
                     LayoutRow::Dock(kind) => {
                         ctls.push(dock_row(f, area, y, i, cursor, app, kind, t, &mut arrows));
+                    }
+                    LayoutRow::Bar(key) => {
+                        ctls.push(bar_row(f, area, y, i, cursor, app, key, t, &mut arrows));
                     }
                 }
             }
@@ -614,6 +773,12 @@ fn draw_content(
             // so pressing Down eventually reaches every block; notes and headings
             // scroll along but aren't landed on.
             let capturing = app.settings.as_ref().is_some_and(|u| u.capturing);
+            let prefix_candidate = app
+                .settings
+                .as_ref()
+                .and_then(|ui| ui.prefix_candidate.as_deref())
+                .and_then(crate::app::PrefixSpec::parse)
+                .map(|prefix| prefix.label());
             let all = crate::app::Cmd::ALL;
             let dim = |s: &'static str| Span::styled(s, Style::new().fg(t.overlay0));
             let acc = |s: &'static str| Span::styled(s, Style::new().fg(t.accent).bold());
@@ -653,13 +818,16 @@ fn draw_content(
                 KV::Note(vec![
                     dim("Press the prefix ("),
                     Span::styled(prefix_label.clone(), Style::new().fg(t.accent).bold()),
-                    dim("), then a key below. Hold or release Ctrl, both work."),
+                    dim("), then a key below. Command-key modifiers are optional."),
                 ]),
                 KV::Note(vec![
                     dim("Move with arrows or "),
                     acc("h j k l"),
                     dim(".  "),
-                    acc("Ctrl+Space ?"),
+                    Span::styled(
+                        format!("{prefix_label} ?"),
+                        Style::new().fg(t.accent).bold(),
+                    ),
                     dim(" shows the cheat-sheet."),
                 ]),
                 KV::Note(vec![
@@ -760,7 +928,10 @@ fn draw_content(
                         // The prefix row shows a capture prompt while capturing;
                         // the preset row shows `‹ value ›`.
                         let txt = if is_sel && capturing {
-                            "press a chord…".to_string()
+                            prefix_candidate
+                                .as_ref()
+                                .map(|candidate| format!("press {candidate} again…"))
+                                .unwrap_or_else(|| "press F1-F12 or a Ctrl/Alt chord…".to_string())
                         } else if *chooser {
                             format!("‹ {value} ›")
                         } else {
@@ -968,7 +1139,20 @@ fn draw_content(
             }
         }
     }
-    (ctls, arrows)
+    (ctls, theme_remove, arrows, resolved_layout_scroll)
+}
+
+/// Preserve the current viewport whenever the selected row is already visible;
+/// move it only far enough to reveal keyboard navigation beyond either edge.
+fn keep_visible_scroll(scroll: usize, cursor: usize, viewport: usize, total: usize) -> usize {
+    let viewport = viewport.max(1);
+    let mut scroll = scroll.min(total.saturating_sub(viewport));
+    if cursor < scroll {
+        scroll = cursor;
+    } else if cursor >= scroll.saturating_add(viewport) {
+        scroll = cursor.saturating_add(1).saturating_sub(viewport);
+    }
+    scroll.min(total.saturating_sub(viewport))
 }
 
 /// The one-line summary of what a module contributes, e.g. `· 2 actions · 1 dock`.
@@ -1182,8 +1366,72 @@ fn dock_row(
     (idx, row)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn bar_row(
+    f: &mut RenderTarget,
+    area: Rect,
+    y: u16,
+    idx: usize,
+    cursor: usize,
+    app: &App,
+    key: &str,
+    t: &Theme,
+    arrows: &mut Vec<(usize, i32, Rect)>,
+) -> (usize, Rect) {
+    let row = Rect::new(area.x, y, area.width, 1);
+    let selected = idx == cursor;
+    if selected {
+        fill_bg(f, row, t.sel_bg);
+    }
+    let declaration = app.bar.declaration(key);
+    let title = declaration.map_or(key, |declaration| declaration.title.as_str());
+    let fallback = declaration.map_or(crate::bar::BarRegion::BottomRight, |declaration| {
+        declaration.region
+    });
+    let region = app.config.bars.region_for(key, fallback);
+    let cat = app.catalog;
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            format!("  {title}"),
+            Style::new().fg(if selected { t.text } else { t.subtext1 }),
+        )),
+        row,
+    );
+    let buttons = [
+        (
+            format!(" {} ", cat.side_top),
+            -1,
+            region == Some(crate::bar::BarRegion::TopRight),
+        ),
+        (
+            format!(" {} ", cat.side_bottom),
+            1,
+            region == Some(crate::bar::BarRegion::BottomRight),
+        ),
+        (format!(" {} ", cat.side_off), 2, region.is_none()),
+    ];
+    let total = buttons
+        .iter()
+        .map(|(label, _, _)| display_width(label) as u16 + 1)
+        .sum::<u16>()
+        .saturating_sub(1);
+    let mut x = row.right().saturating_sub(total + 2);
+    for (label, delta, active) in buttons {
+        let width = display_width(&label) as u16;
+        let rect = Rect::new(x, y, width, 1);
+        let style = if active {
+            Style::new().fg(t.crust).bg(t.accent).bold()
+        } else {
+            Style::new().fg(t.subtext0).bg(t.surface1)
+        };
+        f.render_widget(Paragraph::new(Span::styled(label, style)), rect);
+        arrows.push((idx, delta, rect));
+        x = x.saturating_add(width + 1);
+    }
+    (idx, row)
+}
+
 /// A `‹ value ›` picker display (cycled by click / keys; no arrow hit-rects).
-#[cfg(windows)]
 fn picker(value: &str, t: &Theme) -> Line<'static> {
     Line::from(vec![
         Span::styled("‹ ", Style::new().fg(t.overlay1)),
@@ -1238,5 +1486,19 @@ fn fill_bg(f: &mut RenderTarget, rect: Rect, color: ratatui::style::Color) {
         for x in rect.x..rect.right() {
             buf[(x, y)].set_bg(color);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::keep_visible_scroll;
+
+    #[test]
+    fn layout_scroll_moves_only_when_selection_leaves_the_viewport() {
+        assert_eq!(keep_visible_scroll(10, 15, 12, 40), 10);
+        assert_eq!(keep_visible_scroll(10, 10, 12, 40), 10);
+        assert_eq!(keep_visible_scroll(10, 9, 12, 40), 9);
+        assert_eq!(keep_visible_scroll(10, 22, 12, 40), 11);
+        assert_eq!(keep_visible_scroll(30, 15, 12, 20), 8);
     }
 }
