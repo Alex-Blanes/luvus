@@ -56,55 +56,58 @@ thread_local! {
     static PARKED: std::cell::RefCell<Option<Event>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Read one terminal event, turning a Windows paste burst into `Event::Paste`.
-/// Everywhere else this is `crossterm::event::read` unchanged.
+/// Read one terminal event. On every platform but Windows this is
+/// `crossterm::event::read` unchanged — the terminal already brackets its pastes.
+#[cfg(not(windows))]
 pub fn read() -> io::Result<Event> {
-    #[cfg(windows)]
-    {
-        if let Some(parked) = PARKED.with(|p| p.borrow_mut().take()) {
-            return Ok(parked);
-        }
-        let first = event::read()?;
-        let Event::Key(k) = &first else {
-            return Ok(first);
-        };
-        let Some(c) = paste_char(k) else {
-            return Ok(first);
-        };
-        // Nothing queued behind it → someone is typing. This is the check that
-        // keeps ordinary input ordinary, so it comes before anything else.
-        if !event::poll(std::time::Duration::ZERO)? {
-            return Ok(first);
-        }
-        let mut text = String::from(c);
-        while event::poll(std::time::Duration::ZERO)? {
-            let ev = event::read()?;
-            match &ev {
-                // Key-ups are interleaved through the burst and mean nothing to
-                // luvus (`handle_key` drops them), so they don't end the run.
-                Event::Key(k) if k.kind == KeyEventKind::Release => continue,
-                Event::Key(k) => match paste_char(k) {
-                    Some(c) => text.push(c),
-                    None => {
-                        PARKED.with(|p| *p.borrow_mut() = Some(ev));
-                        break;
-                    }
-                },
-                _ => {
+    event::read()
+}
+
+/// Read one terminal event, rebuilding a paste from the key burst the Windows
+/// console delivers instead of one.
+#[cfg(windows)]
+pub fn read() -> io::Result<Event> {
+    if let Some(parked) = PARKED.with(|p| p.borrow_mut().take()) {
+        return Ok(parked);
+    }
+    let first = event::read()?;
+    let Event::Key(k) = &first else {
+        return Ok(first);
+    };
+    let Some(c) = paste_char(k) else {
+        return Ok(first);
+    };
+    // Nothing queued behind it → someone is typing. This is the check that keeps
+    // ordinary input ordinary, so it comes before anything else.
+    if !event::poll(std::time::Duration::ZERO)? {
+        return Ok(first);
+    }
+    let mut text = String::from(c);
+    while event::poll(std::time::Duration::ZERO)? {
+        let ev = event::read()?;
+        match &ev {
+            // Key-ups are interleaved through the burst and mean nothing to luvus
+            // (`handle_key` drops them), so they don't end the run.
+            Event::Key(k) if k.kind == KeyEventKind::Release => continue,
+            Event::Key(k) => match paste_char(k) {
+                Some(c) => text.push(c),
+                None => {
                     PARKED.with(|p| *p.borrow_mut() = Some(ev));
                     break;
                 }
+            },
+            _ => {
+                PARKED.with(|p| *p.borrow_mut() = Some(ev));
+                break;
             }
         }
-        // One character after all — whatever was queued wasn't text. It stays
-        // parked for the next call and the key goes through as itself.
-        if text.chars().nth(1).is_none() {
-            return Ok(first);
-        }
-        return Ok(Event::Paste(text));
     }
-    #[cfg(not(windows))]
-    event::read()
+    // One character after all — whatever was queued wasn't text. It stays parked
+    // for the next call and the key goes through as itself.
+    match text.chars().nth(1) {
+        Some(_) => Ok(Event::Paste(text)),
+        None => Ok(first),
+    }
 }
 
 #[cfg(all(test, windows))]
