@@ -657,8 +657,107 @@ pub fn open_url(url: &str) {
     }
 }
 
+/// Spawn sites that deliberately do **not** carry [`no_window`], by
+/// `file:function` — the exception list for [`tests::every_background_spawn_hides_its_window`].
+///
+/// Two kinds live here. Some spawns need a *real* console because a person is
+/// looking at them: `ssh` for remote attach, the TUI this process relaunches
+/// into, the server's own launch (which sets its own creation flags). The rest
+/// only ever run from a CLI invocation that already owns a console, where the
+/// flag would change nothing.
+#[cfg(test)]
+const SPAWNS_WITHOUT_NO_WINDOW: &[&str] = &[
+    "cli.rs:doctor",                 // `luvus doctor`, in the user's terminal
+    "ipc/client.rs:spawn_successor", // becomes the TUI; needs the console
+    "main.rs:remote_ssh_command",    // interactive ssh
+    "main.rs:spawn_server",          // sets DETACHED_PROCESS itself
+    "module/install.rs:run_build",   // `module install`, in the user's terminal
+    "module/install.rs:git",         // same
+    "module/install.rs:git_capture", // same
+    "platform.rs:ps_command_table",  // unix-only
+    "update.rs:replace_executable",  // the `sudo` fallbacks, unix-only
+];
+
 #[cfg(test)]
 mod tests {
+    /// Windows hands a console child of a process that has no console of its own
+    /// a fresh `conhost.exe` **with a visible window**, and `luvus server` runs
+    /// detached precisely so it has none. So every spawn the server can reach
+    /// needs [`super::no_window`], not just the poller someone noticed first — a
+    /// single unflagged grandchild is enough to strobe windows over the desktop,
+    /// and that is how this bug came back after it was fixed once.
+    ///
+    /// Scanning the source is blunt, but it is the only check that fails for a
+    /// spawn site nobody has written yet. Deliberate exceptions are listed in
+    /// [`super::SPAWNS_WITHOUT_NO_WINDOW`], so adding one is a decision someone
+    /// has to write down.
+    #[test]
+    fn every_background_spawn_hides_its_window() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut unflagged = Vec::new();
+        let mut files = Vec::new();
+        collect_rs(&root, &mut files);
+        files.sort();
+
+        for path in files {
+            let text = std::fs::read_to_string(&path).expect("read source");
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let lines: Vec<&str> = text.lines().collect();
+            // Everything from the first test module down is test scaffolding,
+            // which never runs inside the server.
+            let end = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("mod tests") || l.trim() == "mod tests {")
+                .unwrap_or(lines.len());
+            let mut function = String::new();
+            for (i, line) in lines[..end].iter().enumerate() {
+                if let Some(name) = line.trim_start().strip_prefix("fn ").or_else(|| {
+                    line.trim_start()
+                        .strip_prefix("pub fn ")
+                        .or_else(|| line.trim_start().strip_prefix("pub(crate) fn "))
+                }) {
+                    function = name.split(['(', '<']).next().unwrap_or("").to_string();
+                }
+                if !line.contains("Command::new(") {
+                    continue;
+                }
+                // The flag is applied either around the constructor or on the
+                // builder a few lines down, so look at the whole statement.
+                let window = lines[i.saturating_sub(2)..(i + 18).min(lines.len())].join("\n");
+                if window.contains("no_window") || window.contains("creation_flags") {
+                    continue;
+                }
+                let site = format!("{rel}:{function}");
+                if !super::SPAWNS_WITHOUT_NO_WINDOW.contains(&site.as_str()) {
+                    unflagged.push(format!("{site} (line {})", i + 1));
+                }
+            }
+        }
+
+        assert!(
+            unflagged.is_empty(),
+            "these spawns would flash a console window on Windows; wrap them in \
+             `platform::no_window`, or add them to `SPAWNS_WITHOUT_NO_WINDOW` with a \
+             reason:\n  {}",
+            unflagged.join("\n  ")
+        );
+    }
+
+    fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read src").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
     /// The hidden-window flag must not break output capture: a command routed
     /// through [`no_window`] still runs and still reports its exit code. On
     /// Windows that is the whole contract (no window, same result); elsewhere
