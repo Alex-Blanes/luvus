@@ -10564,13 +10564,12 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+/// Unix only: `platform::process_cwd` has no Windows implementation, so a pane
+/// there never follows a `cd` and there is nothing to assert.
+#[cfg(all(test, unix))]
 mod cwd_test {
     use super::*;
 
-    /// Unix only: `platform::process_cwd` has no Windows implementation, so a
-    /// pane there never follows a `cd` and there is nothing to assert.
-    #[cfg(unix)]
     #[test]
     fn pane_cwd_follows_cd_without_moving_its_workspace() {
         let _env = crate::persist::test_env("pane-cwd-follows-cd");

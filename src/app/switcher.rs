@@ -270,10 +270,8 @@ impl App {
             KeyCode::Up => {
                 self.switcher_cursor = self.switcher_cursor.saturating_sub(1);
             }
-            KeyCode::Down => {
-                if n > 0 {
-                    self.switcher_cursor = (self.switcher_cursor + 1).min(n - 1);
-                }
+            KeyCode::Down if n > 0 => {
+                self.switcher_cursor = (self.switcher_cursor + 1).min(n - 1);
             }
             KeyCode::Tab => {
                 let next = self.switcher_scope.next();

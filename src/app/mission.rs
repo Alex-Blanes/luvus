@@ -220,10 +220,8 @@ impl App {
         }
         let n = self.mission_rows.len();
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                if n > 0 {
-                    self.mission_cursor = (self.mission_cursor + 1).min(n - 1);
-                }
+            KeyCode::Char('j') | KeyCode::Down if n > 0 => {
+                self.mission_cursor = (self.mission_cursor + 1).min(n - 1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.mission_cursor = self.mission_cursor.saturating_sub(1);
