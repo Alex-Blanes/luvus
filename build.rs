@@ -68,7 +68,16 @@ fn main() {
 fn emit_fork_build() {
     let git = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join(".git");
     // Rebuild when HEAD moves — a new commit or a merge is a new build number.
-    println!("cargo:rerun-if-changed={}", git.join("HEAD").display());
+    // On a branch, `.git/HEAD` only holds `ref: refs/heads/<branch>` and never
+    // changes as you commit, so the ref it points at has to be watched too or
+    // the number silently goes stale until something else forces a rebuild.
+    let head = git.join("HEAD");
+    println!("cargo:rerun-if-changed={}", head.display());
+    if let Ok(text) = fs::read_to_string(&head) {
+        if let Some(reference) = text.trim().strip_prefix("ref: ") {
+            println!("cargo:rerun-if-changed={}", git.join(reference).display());
+        }
+    }
     let tag = format!("v{}", env::var("CARGO_PKG_VERSION").unwrap());
     let count = std::process::Command::new("git")
         .args(["rev-list", "--count", &format!("{tag}..HEAD")])
