@@ -19,10 +19,14 @@ pub fn is_cli(args: &[String]) -> bool {
                 | "workspace"
                 | "tab"
                 | "agent"
+                | "bar"
                 | "ui"
                 | "events"
+                | "api"
                 | "module"
+                | "theme"
                 | "git"
+                | "diff"
                 | "files"
                 | "worktree"
                 | "task"
@@ -31,6 +35,7 @@ pub fn is_cli(args: &[String]) -> bool {
                 | "search"
                 | "help"
                 | "doctor"
+                | "update"
                 | "skill"
                 | "session"
         )
@@ -53,10 +58,13 @@ Commands:
   agent        Start, fork, message, inspect, and resume coding agents
   files        Browse and open workspace files
   git          Inspect repository state and open the Git UI
+  diff         Review Git diffs, notes, and agent feedback
   worktree     Create, open, list, and remove Git worktrees
   task         Coordinate work across multiple coding agents
   lease        Reserve file paths for active tasks
   module       Find, install, configure, and run extensions
+  theme        List, create, validate, install, and select themes
+  bar          Publish and arrange top and bottom status widgets
   ui           Configure sidebars, docks, and notifications
   session      List, attach, stop, and delete server sessions
   server       Inspect and manage the selected background server
@@ -65,8 +73,10 @@ Commands:
   wait         Wait for pane output or an agent state
   search       Search across pane scrollback
   events       Stream live status changes
+  api          Inspect the automation protocol and live capabilities
   attach       Open the TUI focused on one pane
   doctor       Check optional external tools
+  update       Check for and install a newer Luvus release
   ping         Check whether the selected server responds
 
 Examples:
@@ -99,6 +109,7 @@ usage: luvus <command> [args]
   --help, -h           show compact help
   help [all|<topic> [command]]  show compact, complete, or focused help
   doctor               check optional external tools (git, gh, …)
+  update               check for and install a newer Luvus release
   ping                 check the server
 
 workspaces:
@@ -115,7 +126,9 @@ tabs:
   tab list                   list tabs in the current workspace
   tab new                    new tab
   tab focus <n>              focus tab n (1-based)
-  tab move <from> <to>       reorder tabs in the current workspace (1-based)
+  tab move <from> <to>       move a tab to an exact position (1-based)
+  tab move left|right        move the active tab one position (--tab N targets one)
+  tab swap <first> <second>  exchange two tab positions (1-based)
   tab rename <name>          name a tab (--tab N to target one; empty clears it)
   tab close [<n>]            close a tab (default: active)
 
@@ -128,6 +141,7 @@ panes / agents:
   pane send [<id>] <text>    send raw text to a pane
   pane read [<id>]           print a pane's recent output
   pane status [<id>]         print a pane's agent status and history metrics (any workspace)
+  pane processes [<id>]      list cached executable identities without exposing arguments
   pane name <name>           name a pane so you can mention it (--pane <id>; --clear)
   pane close [<id>]          close a pane
   agent list                 list every agent across all workspaces/tabs
@@ -136,11 +150,17 @@ panes / agents:
   agent fork <target> [--name <alias>] [--no-focus]
                              fork a supported agent's session into a sibling pane
   agent name <name>          alias the current agent, same as pane name (--clear to drop)
+  agent prompt <target> <text> [--wait] [--until STATE] [--timeout <s>]
+                             atomically prompt and optionally wait (send is an alias)
   agent send <target> <text> [--wait] [--until STATE] [--timeout <s>]
-                             prompt an agent (target = a name, pane id, or kind)
+                             compatibility alias for agent prompt
   agent keys <target> <key>...   send control keys (enter, esc, ctrl+c, up, …)
   agent read <target> [--lines N] [--source visible|recent]   print an agent's output
   agent get <target>         one agent's live info (pane, name, kind, status, cwd)
+  agent explain <target>     show identity/state evidence and active authority
+  agent report [<pane>] --source <id> --kind <agent> --status <state>
+                             publish a leased authoritative state (integration API)
+  agent release [<pane>] --source <id>   release that integration authority
   agent sessions             list resumable sessions found on disk
   agent resume <id>          reopen a resumable session into a pane
   skill status [<agent>]      show enabled state, release, path, and integrity
@@ -156,6 +176,28 @@ panes / agents:
 search:
   search <text...> [--case]  find text across every pane's scrollback (docs/63);
                              --case is case-sensitive; returns matches as JSON
+  search --fuzzy <query...> [--scope all|navigate|files|output] [--all-sessions]
+                           [--limit <1-200>] [--case] [--json]
+                             rank navigation, file paths, and retained output;
+                             legacy search stays exact unless --fuzzy is passed
+
+themes:
+  theme list [--json]       list built-in, installed, and virtual themes
+  theme path                print/create the shared themes directory
+  theme init <id> [--extends <id>]   write an editable TOML starter
+  theme validate <path> [--strict] [--json]   validate without installing
+  theme install <source> [--yes]     install a local file, HTTPS URL, GitHub repo, or community/<id>
+  theme use <id>            select and persist a registered theme
+  theme uninstall <id>      remove an inactive local theme
+  theme reload              rescan installed themes in the selected server
+
+bars:
+  bar list                   list declared Luvus Bar widgets and live content
+  bar push --id <id> [--region top-right|bottom-right] --content <json>
+                             publish validated live widget segments;
+                             --content-file, --compact-content, --text and --state supported
+  bar move --id <id> --region top-right|bottom-right|off
+  bar remove --id <id>       clear live widget content, preserving placement
 
 appearance:
   ui sidebar [--side left|right] --width <n>     set a sidebar's width (columns)
@@ -165,6 +207,8 @@ appearance:
   ui dock push --id <id> [--title <t>] [--side left|right] [--rows <json>]
                              feed a module's sidebar dock its rows (JSON array,
                              or piped on stdin). See docs/29 + the website
+  ui notification push --text <text> [--level info|success|warning|error]
+  ui notification clear [--dedupe-key <key>]
   ui toast <text>            flash a one-line message in the UI
 
 modules (extensions):
@@ -196,6 +240,20 @@ git:
   files reveal <path>        expand the tree to a path
   files refresh              re-read the tree from disk
 
+diff review:
+  diff list [--layer staged|worktree|untracked|conflict]   list exact diff layers
+  diff open [<path>] [--layer <layer>] [--view auto|split|stack]
+                             [--placement preview|pane|tab]
+  diff get <path> [--layer <layer>] [--include-patch]   inspect a bounded semantic diff
+  diff refresh               refresh the shared FILES and DIFF index
+  diff note add --file <path> (--old-line N|--new-line N) --body <text>
+                             [--end-line N] [--kind question|issue|suggestion|praise]
+  diff note list [--file <path>] [--state open|resolved|outdated|orphaned]
+  diff note edit <id> --body <text>
+  diff note resolve|reopen <id>
+  diff note remove <id> --yes
+  diff note send --to <agent> [<id>...] [--all-open]
+
 worktrees:
   worktree list              list the current repo's worktrees
   worktree create <branch>   create a worktree + workspace for <branch>
@@ -225,6 +283,18 @@ orchestration (multiple agents on one project, docs/22):
 events:
   events                     stream live status changes
 
+api:
+  api schema                 print the installed UHP Terminal JSON Schema bundle
+  api runtime-schema         print the installed UHP Runtime JSON Schema bundle
+  api socket-schema          print the complete installed Socket API schema bundle
+  api capabilities           negotiate and print UHP Terminal capabilities
+  api snapshot               print a fenced UHP Terminal inventory
+  api events                 stream sequenced UHP Terminal events
+  api runtime                print UHP Runtime capabilities and limits
+  api session                print a fenced UHP Runtime session snapshot
+  api socket-capabilities    print live Socket API methods and limits
+  api proxy                  forward one JSON request from stdin to the local server
+
 sessions:
   session list [--json]      list default and named server sessions
   session attach <name>      start or attach the named session
@@ -250,11 +320,11 @@ pub fn run(args: &[String]) -> Result<i32> {
     if args.get(1).map(String::as_str) == Some("help") {
         return match args.get(2).map(String::as_str) {
             None => {
-                print!("{USAGE}");
+                print!("{USAGE}{HELP_BUG}");
                 Ok(0)
             }
             Some("all") if args.len() == 3 => {
-                print!("{DETAILED_USAGE}");
+                print!("{DETAILED_USAGE}{HELP_BUG}");
                 Ok(0)
             }
             Some(topic) if matches!(args.len(), 3 | 4) => {
@@ -282,6 +352,57 @@ pub fn run(args: &[String]) -> Result<i32> {
     if args.get(1).map(String::as_str) == Some("session") {
         return session_cmd(&args[2.min(args.len())..]);
     }
+    if args.get(1).map(String::as_str) == Some("theme") {
+        return theme_cmd(&args[2.min(args.len())..]);
+    }
+    if args.get(1).map(String::as_str) == Some("api")
+        && args.get(2).map(String::as_str) == Some("schema")
+    {
+        if args.len() != 3 {
+            return Err(anyhow!("usage: luvus api schema"));
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&crate::terminal::backend::schema_bundle())?
+        );
+        return Ok(0);
+    }
+    if args.get(1).map(String::as_str) == Some("api")
+        && args.get(2).map(String::as_str) == Some("runtime-schema")
+    {
+        if args.len() != 3 {
+            return Err(anyhow!("usage: luvus api runtime-schema"));
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&crate::runtime_api::schema_bundle())?
+        );
+        return Ok(0);
+    }
+    if args.get(1).map(String::as_str) == Some("api")
+        && args.get(2).map(String::as_str) == Some("socket-schema")
+    {
+        if args.len() != 3 {
+            return Err(anyhow!("usage: luvus api socket-schema"));
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&crate::api::schema_bundle())?
+        );
+        return Ok(0);
+    }
+    if args.get(1).map(String::as_str) == Some("api")
+        && args.get(2).map(String::as_str) == Some("proxy")
+    {
+        if args.len() != 3 {
+            return Err(anyhow!("usage: luvus api proxy"));
+        }
+        return api_proxy();
+    }
+    // Explicit update requests are local and never require a running server.
+    if args.get(1).map(String::as_str) == Some("update") {
+        return crate::update::run_cli(&args[2.min(args.len())..]);
+    }
     // `doctor` is a local environment check — no server needed.
     if args.get(1).map(String::as_str) == Some("doctor") {
         return Ok(doctor());
@@ -304,13 +425,13 @@ pub fn run(args: &[String]) -> Result<i32> {
     if args.get(1).map(String::as_str) == Some("wait") {
         return wait_cmd(args);
     }
-    // `agent send` is a submit-then-optionally-wait flow, not a one-shot request.
+    // Agent prompt/send and start are server-owned workflows, not plain
+    // dispatch calls; their one connection stays parked for the optional wait.
     if args.get(1).map(String::as_str) == Some("agent")
-        && args.get(2).map(String::as_str) == Some("send")
+        && matches!(args.get(2).map(String::as_str), Some("prompt" | "send"))
     {
         return agent_send_cmd(args);
     }
-    // `agent start` orchestrates split + run + wait-ready + name, not one request.
     if args.get(1).map(String::as_str) == Some("agent")
         && args.get(2).map(String::as_str) == Some("start")
     {
@@ -325,19 +446,18 @@ pub fn run(args: &[String]) -> Result<i32> {
     writeln!(stream, "{req}")?;
 
     let mut reader = BufReader::new(stream);
-    if method == "events.subscribe" {
-        // Stream events until the connection closes.
-        for line in reader.lines() {
-            match line {
-                Ok(l) => println!("{l}"),
-                Err(_) => break,
-            }
+    if matches!(
+        method.as_str(),
+        "events.subscribe" | "terminal.backend.events.subscribe"
+    ) {
+        // Stream bounded events until the connection closes cleanly.
+        while let Some(line) = crate::ipc::api::read_stream_frame(&mut reader)? {
+            println!("{line}");
         }
         return Ok(0);
     }
 
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
+    let line = crate::ipc::api::read_response_frame(&mut reader)?;
     let line = line.trim();
     // Pretty-print and set exit code on error.
     match serde_json::from_str::<Value>(line) {
@@ -385,7 +505,10 @@ fn command_help_request(args: &[String]) -> Option<(&str, Option<&str>)> {
 fn trailing_help_is_pass_through_payload(args: &[String], topic: &str) -> bool {
     match topic {
         "pane" => matches!(args.get(2).map(String::as_str), Some("run" | "send")),
-        "agent" => matches!(args.get(2).map(String::as_str), Some("send" | "keys")),
+        "agent" => matches!(
+            args.get(2).map(String::as_str),
+            Some("prompt" | "send" | "keys")
+        ),
         // `--remote <host> [ssh args]` forwards everything after the host to SSH.
         "remote" => args.len() > 3,
         _ => false,
@@ -401,29 +524,41 @@ fn help_topic_has_subcommands(topic: &str) -> bool {
             | "agent"
             | "files"
             | "git"
+            | "diff"
             | "worktree"
             | "task"
             | "lease"
             | "module"
+            | "theme"
+            | "bar"
             | "ui"
             | "session"
             | "server"
             | "integration"
             | "skill"
             | "wait"
+            | "api"
     )
 }
 
 fn normalize_help_topic(topic: &str) -> Option<&str> {
     match topic {
         "workspace" | "tab" | "pane" | "agent" | "files" | "git" | "worktree" | "task"
-        | "lease" | "module" | "ui" | "session" | "server" | "integration" | "skill" | "wait"
-        | "search" | "events" | "ping" | "doctor" | "attach" => Some(topic),
+        | "lease" | "module" | "theme" | "bar" | "ui" | "session" | "server" | "integration"
+        | "diff" | "skill" | "wait" | "search" | "events" | "api" | "ping" | "doctor"
+        | "update" | "attach" => Some(topic),
         "node" => Some("pane"),
         "remote" | "--remote" => Some("remote"),
         _ => None,
     }
 }
+
+const HELP_BUG: &str = r#"
+\   /
+ \_/
+(o_o)
+/|_|\
+"#;
 
 fn write_topic_help(
     mut output: impl Write,
@@ -436,12 +571,13 @@ fn write_topic_help(
     if topic == "session" {
         if let Some(command) = command {
             writeln!(output, "Usage: luvus session <command>\n")?;
-            if !write_command_rows(&mut output, SESSION_USAGE, topic, command)? {
+            if !write_topic_rows(&mut output, SESSION_USAGE, topic, Some(command))? {
                 output.write_all(SESSION_USAGE.as_bytes())?;
             }
         } else {
             output.write_all(SESSION_USAGE.as_bytes())?;
         }
+        output.write_all(HELP_BUG.as_bytes())?;
         return Ok(true);
     }
 
@@ -475,11 +611,19 @@ fn write_topic_help(
             detailed_section("panes / agents:\n", "\nsearch:\n"),
         ),
         "search" => (
-            "luvus search <text...> [--case]",
-            detailed_section("search:\n", "\nappearance:\n"),
+            "luvus search <text...> [--case]\n       luvus search --fuzzy <query...> [--scope all|navigate|files|output] [--all-sessions] [--limit 1-200] [--case] [--json]",
+            detailed_section("search:\n", "\nthemes:\n"),
+        ),
+        "theme" => (
+            "luvus theme <list|path|init|validate|install|use|uninstall|reload> [args]",
+            detailed_section("themes:\n", "\nbars:\n"),
+        ),
+        "bar" => (
+            "luvus bar <list|push|move|remove> [args]",
+            detailed_section("bars:\n", "\nappearance:\n"),
         ),
         "ui" => (
-            "luvus ui <sidebar|dock|toast> [args]",
+            "luvus ui <sidebar|dock|notification|toast> [args]",
             detailed_section("appearance:\n", "\nmodules (extensions):\n"),
         ),
         "module" => (
@@ -488,11 +632,15 @@ fn write_topic_help(
         ),
         "git" => (
             "luvus git <status|branches|log|open> [args]",
-            detailed_section("git:\n", "\nworktrees:\n"),
+            detailed_section("git:\n", "\ndiff review:\n"),
         ),
         "files" => (
             "luvus files <tree|open|reveal|refresh> [args]",
-            detailed_section("git:\n", "\nworktrees:\n"),
+            detailed_section("git:\n", "\ndiff review:\n"),
+        ),
+        "diff" => (
+            "luvus diff <list|open|get|refresh|note> [args]",
+            detailed_section("diff review:\n", "\nworktrees:\n"),
         ),
         "worktree" => (
             "luvus worktree <command> [args]",
@@ -517,7 +665,11 @@ fn write_topic_help(
         ),
         "events" => (
             "luvus events",
-            detailed_section("events:\n", "\nsessions:\n"),
+            detailed_section("events:\n", "\napi:\n"),
+        ),
+        "api" => (
+            "luvus api <schema|runtime-schema|socket-schema|capabilities|snapshot|events|runtime|session|socket-capabilities|proxy>",
+            detailed_section("api:\n", "\nsessions:\n"),
         ),
         "remote" => (
             "luvus [--session <name>] --remote <host> [ssh args]",
@@ -539,27 +691,32 @@ fn write_topic_help(
             "luvus doctor",
             "Check optional external tools used by Luvus.\n",
         ),
+        "update" => (
+            "luvus update",
+            "Check for a newer release and install it through the detected safe update channel.\n",
+        ),
         _ => unreachable!("normalized help topic"),
     };
 
     writeln!(output, "Usage: {usage}\n")?;
-    if let Some(command) = command {
-        if !write_command_rows(&mut output, section, topic, command)? {
-            output.write_all(section.as_bytes())?;
-        }
-    } else {
+    if !write_topic_rows(&mut output, section, topic, command)? {
         output.write_all(section.as_bytes())?;
     }
+    output.write_all(HELP_BUG.as_bytes())?;
     Ok(true)
 }
 
-fn write_command_rows(
+fn write_topic_rows(
     output: &mut impl Write,
     section: &str,
     topic: &str,
-    command: &str,
+    command: Option<&str>,
 ) -> std::io::Result<bool> {
-    let noun = if topic == "session" { "" } else { topic };
+    let noun = match topic {
+        "session" => "",
+        "remote" | "--remote" => "--remote",
+        _ => topic,
+    };
     let mut matched = false;
     let mut include_continuation = false;
 
@@ -583,9 +740,11 @@ fn write_command_rows(
                 continue;
             };
             let syntax = rest.split("  ").next().unwrap_or(rest);
-            include_continuation = syntax
-                .split(|character: char| character.is_whitespace() || character == '|')
-                .any(|token| token == command);
+            include_continuation = command.is_none_or(|command| {
+                syntax
+                    .split(|character: char| character.is_whitespace() || character == '|')
+                    .any(|token| token == command)
+            });
             if include_continuation {
                 matched = true;
                 writeln!(output, "{line}")?;
@@ -653,7 +812,8 @@ Commands:
 ";
 
 fn write_session_help(mut output: impl Write) -> std::io::Result<()> {
-    output.write_all(SESSION_USAGE.as_bytes())
+    output.write_all(SESSION_USAGE.as_bytes())?;
+    output.write_all(HELP_BUG.as_bytes())
 }
 
 fn session_list(args: &[String]) -> Result<i32> {
@@ -744,6 +904,268 @@ fn session_error(code: &str, message: &str, json_output: bool) -> Result<i32> {
         eprintln!("{message}");
     }
     Ok(1)
+}
+
+fn theme_cmd(args: &[String]) -> Result<i32> {
+    let subcommand = args.first().map(String::as_str).unwrap_or("list");
+    let json_output = args.iter().any(|arg| arg == "--json");
+    match subcommand {
+        "list" => {
+            if args.iter().skip(1).any(|arg| arg != "--json") {
+                return Err(anyhow!("usage: luvus theme list [--json]"));
+            }
+            let registry = crate::theme::ThemeRegistry::load();
+            let active = crate::config::load().theme;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&registry.list_json(&active))?
+                );
+            } else {
+                for entry in registry.entries() {
+                    let marker = if crate::ui::theme::canonical(&active) == entry.id {
+                        '*'
+                    } else {
+                        ' '
+                    };
+                    let source = match &entry.source {
+                        crate::theme::registry::ThemeSource::BuiltIn => "built-in",
+                        crate::theme::registry::ThemeSource::Local { .. } => "local",
+                        crate::theme::registry::ThemeSource::Virtual => "virtual",
+                    };
+                    println!(
+                        "{marker} {:<28} {:<9} {}",
+                        entry.id, source, entry.description
+                    );
+                    for warning in &entry.warnings {
+                        println!("    warning: {warning}");
+                    }
+                }
+                for problem in registry.problems() {
+                    eprintln!("invalid {}: {}", problem.path, problem.message);
+                }
+            }
+            Ok(if registry.problems().is_empty() { 0 } else { 1 })
+        }
+        "path" => {
+            reject_theme_extras(args, 1, "usage: luvus theme path")?;
+            println!("{}", crate::theme::ensure_themes_dir()?.display());
+            Ok(0)
+        }
+        "init" => {
+            let id = args
+                .get(1)
+                .filter(|arg| !arg.starts_with('-'))
+                .ok_or_else(|| anyhow!("usage: luvus theme init <id> [--extends <id>]"))?;
+            if !matches!(args.len(), 2 | 4)
+                || (args.len() == 4 && args.get(2).map(String::as_str) != Some("--extends"))
+            {
+                return Err(anyhow!("usage: luvus theme init <id> [--extends <id>]"));
+            }
+            let parent = flag(args, "--extends");
+            let path = std::path::PathBuf::from(format!("{id}.toml"));
+            crate::theme::install::init(&path, id, parent.as_deref())?;
+            println!("created {}", path.display());
+            Ok(0)
+        }
+        "validate" => {
+            let path = args
+                .get(1)
+                .filter(|arg| !arg.starts_with('-'))
+                .ok_or_else(|| anyhow!("usage: luvus theme validate <path> [--strict] [--json]"))?;
+            if args
+                .iter()
+                .skip(2)
+                .any(|arg| !matches!(arg.as_str(), "--strict" | "--json"))
+            {
+                return Err(anyhow!(
+                    "usage: luvus theme validate <path> [--strict] [--json]"
+                ));
+            }
+            let strict = args.iter().any(|arg| arg == "--strict");
+            let (file, warnings) =
+                match crate::theme::install::validate_path(std::path::Path::new(path), strict) {
+                    Ok(validated) => validated,
+                    Err(error) if json_output => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({
+                                "valid": false,
+                                "error": format!("{error:#}"),
+                            }))?
+                        );
+                        return Ok(1);
+                    }
+                    Err(error) => return Err(error),
+                };
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "valid": true,
+                        "id": file.id,
+                        "display_name": file.display_name,
+                        "warnings": warnings,
+                    }))?
+                );
+            } else {
+                println!("valid theme: {} ({})", file.display_name, file.id);
+                for warning in warnings {
+                    println!("warning: {warning}");
+                }
+            }
+            Ok(0)
+        }
+        "install" => {
+            let source = args
+                .get(1)
+                .filter(|arg| !arg.starts_with('-'))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "usage: luvus theme install <path|https-url|github-repo|community/id> [--yes]"
+                    )
+                })?;
+            if args
+                .iter()
+                .skip(2)
+                .any(|arg| !matches!(arg.as_str(), "--yes" | "-y"))
+            {
+                return Err(anyhow!(
+                    "usage: luvus theme install <path|https-url|github-repo|community/id> [--yes]"
+                ));
+            }
+            let yes = args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--yes" | "-y"));
+            let installed = crate::theme::install::install(source, yes)?;
+            let reloaded = reload_theme_server()?;
+            println!(
+                "installed {} ({}) from {} to {}{}",
+                installed.display_name,
+                installed.id,
+                installed.source,
+                installed.path.display(),
+                if reloaded {
+                    " and reloaded the selected server"
+                } else {
+                    " — start or reload Luvus to use it"
+                }
+            );
+            for warning in installed.warnings {
+                println!("warning: {warning}");
+            }
+            Ok(0)
+        }
+        "use" => {
+            let id = args
+                .get(1)
+                .filter(|arg| !arg.starts_with('-'))
+                .ok_or_else(|| anyhow!("usage: luvus theme use <id>"))?;
+            reject_theme_extras(args, 2, "usage: luvus theme use <id>")?;
+            let registry = crate::theme::ThemeRegistry::load();
+            let entry = registry
+                .get(id)
+                .ok_or_else(|| anyhow!("theme `{id}` is not installed"))?;
+            let selected = entry.id.clone();
+            match send_request("theme.use", json!({"id": selected})) {
+                Ok(response) if !is_unknown_method(&response, "theme.use") => {
+                    ensure_api_success(&response)?;
+                    println!("using theme {}", entry.id);
+                }
+                Ok(_) | Err(_) => {
+                    let mut config = crate::config::load();
+                    config.theme = selected;
+                    crate::config::save(&config);
+                    println!("using theme {} — applies when Luvus starts", entry.id);
+                }
+            }
+            Ok(0)
+        }
+        "uninstall" => {
+            let id = args
+                .get(1)
+                .filter(|arg| !arg.starts_with('-'))
+                .ok_or_else(|| anyhow!("usage: luvus theme uninstall <id>"))?;
+            reject_theme_extras(args, 2, "usage: luvus theme uninstall <id>")?;
+            let path = crate::theme::install::uninstall(id)?;
+            let reloaded = reload_theme_server()?;
+            println!(
+                "uninstalled {id} ({}){}",
+                path.display(),
+                if reloaded {
+                    " and reloaded the selected server"
+                } else {
+                    ""
+                }
+            );
+            Ok(0)
+        }
+        "reload" => {
+            reject_theme_extras(args, 1, "usage: luvus theme reload")?;
+            let registry = crate::theme::ThemeRegistry::load();
+            if !registry.problems().is_empty() {
+                for problem in registry.problems() {
+                    eprintln!("invalid {}: {}", problem.path, problem.message);
+                }
+            }
+            if reload_theme_server()? {
+                println!("reloaded {} themes", registry.entries().len());
+            } else {
+                println!(
+                    "validated {} themes — start Luvus to load them",
+                    registry.entries().len()
+                );
+            }
+            Ok(if registry.problems().is_empty() { 0 } else { 1 })
+        }
+        "help" | "--help" | "-h" => {
+            write_topic_help(std::io::stdout().lock(), "theme", None)?;
+            Ok(0)
+        }
+        _ => Err(anyhow!(
+            "usage: luvus theme <list|path|init|validate|install|use|uninstall|reload>"
+        )),
+    }
+}
+
+fn reject_theme_extras(args: &[String], expected: usize, usage: &str) -> Result<()> {
+    if args.len() != expected {
+        return Err(anyhow!(usage.to_string()));
+    }
+    Ok(())
+}
+
+fn is_unknown_method(response: &Value, method: &str) -> bool {
+    response
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .and_then(|message| message.strip_prefix("unknown method: "))
+        == Some(method)
+}
+
+fn ensure_api_success(response: &Value) -> Result<()> {
+    if let Some(error) = response.get("error") {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("theme request failed");
+        return Err(anyhow!(message.to_string()));
+    }
+    Ok(())
+}
+
+fn reload_theme_server() -> Result<bool> {
+    match send_request("theme.reload", json!({})) {
+        Ok(response) => {
+            if is_unknown_method(&response, "theme.reload") {
+                return Ok(false);
+            }
+            ensure_api_success(&response)?;
+            Ok(true)
+        }
+        Err(_) => Ok(false),
+    }
 }
 
 /// `luvus module install owner/repo[/sub] [--ref REF] [--yes]` — clone + build
@@ -876,9 +1298,13 @@ fn doctor() -> i32 {
             println!("  ✓ keys    Shift+Enter works (terminal reports modified keys)");
         }
         KeyProto::Unsupported => {
-            println!("  ✗ keys    Shift+Enter can't be distinguished from Enter here");
-            println!("           ↳ use Option+Enter instead, or switch to a terminal with");
-            println!("             the keyboard protocol (Ghostty · Kitty · WezTerm · iTerm2)");
+            let is_wsl = std::env::var_os("WSL_DISTRO_NAME").is_some()
+                || std::env::var_os("WSL_INTEROP").is_some();
+            let in_windows_terminal = std::env::var_os("WT_SESSION").is_some();
+            let (detail, action) = unsupported_key_guidance(is_wsl, in_windows_terminal);
+            println!("  ! keys    Shift+Enter isn't distinguishable here · optional");
+            println!("           ↳ {detail}");
+            println!("             {action}");
         }
     }
 
@@ -902,6 +1328,30 @@ enum KeyProto {
     InsidePane,
 }
 
+/// Reassure users that a missing modified-key protocol is not a Luvus failure,
+/// then provide the repair that matches the terminal path they are actually
+/// using. Windows Terminal gained the protocol in 1.25; older releases can
+/// send Luvus's existing newline sequence with a `sendInput` binding.
+fn unsupported_key_guidance(
+    is_wsl: bool,
+    in_windows_terminal: bool,
+) -> (&'static str, &'static str) {
+    match (is_wsl, in_windows_terminal) {
+        (true, true) => (
+            "WSL in Windows Terminal detected; all other features still work",
+            "update Windows Terminal to 1.25+, or bind Shift+Enter to ESC CR",
+        ),
+        (true, false) => (
+            "WSL detected; all other features still work",
+            "use Windows Terminal 1.25+ or bind Shift+Enter to ESC CR",
+        ),
+        (false, _) => (
+            "Luvus still works; only the modified-Enter shortcut is affected",
+            "use Alt/Option+Enter or a terminal with the keyboard protocol",
+        ),
+    }
+}
+
 /// Ask the terminal whether it supports progressive keyboard enhancement. The
 /// query needs raw mode (crossterm writes a request and reads the reply), so it
 /// is enabled just for the probe and always restored.
@@ -915,7 +1365,7 @@ fn keyboard_protocol_status() -> KeyProto {
     // regardless. Reporting on the protocol would wrongly say it isn't.
     #[cfg(windows)]
     {
-        return KeyProto::Supported;
+        KeyProto::Supported
     }
     #[cfg(not(windows))]
     {
@@ -994,7 +1444,18 @@ fn parse_wait(args: &[String]) -> Result<WaitSpec> {
         .cloned()
         .or_else(|| std::env::var("LUVUS_PANE_ID").ok())
         .ok_or_else(|| anyhow!("wait needs a pane id (or $LUVUS_PANE_ID)"))?;
-    let timeout = flag(args, "--timeout").and_then(|s| s.parse::<f64>().ok());
+    let timeout = match flag(args, "--timeout") {
+        Some(raw) => {
+            let seconds = raw
+                .parse::<f64>()
+                .map_err(|_| anyhow!("--timeout must be a non-negative number of seconds"))?;
+            if std::time::Duration::try_from_secs_f64(seconds).is_err() || seconds > 3600.0 {
+                return Err(anyhow!("--timeout must be between 0 and 3600 seconds"));
+            }
+            Some(seconds)
+        }
+        None => None,
+    };
     let condition = match kind {
         "output" => WaitFor::Output {
             needle: flag(args, "--match").ok_or_else(|| {
@@ -1079,7 +1540,39 @@ fn wait_cmd(args: &[String]) -> Result<i32> {
             }
             Ok(2)
         }
-        WaitFor::AgentStatus { status } => wait_status_stream(&spec.pane, &status, deadline),
+        WaitFor::AgentStatus { status } => {
+            let mut params = json!({"pane":spec.pane, "status":status});
+            if let Some(timeout) = spec.timeout {
+                params["timeout_s"] = json!(timeout);
+            }
+            let response = send_request("agent.wait", params)?;
+            if response
+                .get("result")
+                .and_then(|result| result.get("matched"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                return Ok(0);
+            }
+            let unknown = response
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.starts_with("unknown method"));
+            if unknown {
+                return wait_status_stream(&spec.pane, &status, deadline);
+            }
+            if let Some(error) = response.get("error") {
+                eprintln!(
+                    "wait agent-status: {}",
+                    error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("agent.wait failed")
+                );
+            }
+            Ok(2)
+        }
     }
 }
 
@@ -1114,78 +1607,66 @@ fn agent_start_cmd(args: &[String]) -> Result<i32> {
     let name = args.get(3).cloned().ok_or_else(|| {
         anyhow!("usage: luvus agent start <name> --kind <kind> [--pane <id> | --anchor <id>] [--down] [--timeout S] [-- <extra>]")
     })?;
-    let kind = flag(args, "--kind").ok_or_else(|| anyhow!("agent start requires --kind <kind>"))?;
-    // Native agent args after `--` are appended to the launch command.
-    let extra = args
-        .iter()
-        .position(|a| a == "--")
-        .map(|i| args[i + 1..].join(" "))
+    let separator = args.iter().position(|arg| arg == "--");
+    let options = &args[..separator.unwrap_or(args.len())];
+    validate_agent_start_options(options)?;
+    let kind =
+        flag(options, "--kind").ok_or_else(|| anyhow!("agent start requires --kind <kind>"))?;
+    let extra = separator
+        .map(|index| args[index + 1..].to_vec())
         .unwrap_or_default();
-    let cmd = if extra.is_empty() {
-        kind.clone()
-    } else {
-        format!("{kind} {extra}")
-    };
-
-    // `--pane` reuses an existing pane. `--anchor` creates a background sibling
-    // beside an explicit pane. Without either, a managed caller pane is the anchor.
-    let target = parse_agent_start_target(args, std::env::var("LUVUS_PANE_ID").ok())?;
-    let pane = match target {
-        AgentStartTarget::Existing(pane) => pane,
+    let target = parse_agent_start_target(options, std::env::var("LUVUS_PANE_ID").ok())?;
+    let mut params = serde_json::Map::new();
+    params.insert("name".into(), json!(name));
+    params.insert("kind".into(), json!(kind));
+    params.insert("args".into(), json!(extra));
+    match target {
+        AgentStartTarget::Existing(pane) => {
+            params.insert("pane".into(), json!(pane));
+        }
         AgentStartTarget::Split { anchor, down } => {
-            let mut split = serde_json::Map::new();
             if let Some(anchor) = anchor {
-                split.insert("pane".to_string(), json!(anchor));
+                params.insert("anchor".into(), json!(anchor));
             }
-            if down {
-                split.insert("direction".to_string(), json!("down"));
-            }
-            split.insert("focus".to_string(), json!(false));
-            let v = send_request("pane.split", Value::Object(split))?;
-            v.get("result")
-                .and_then(|r| r.get("pane"))
-                .and_then(|x| x.as_str())
-                .ok_or_else(|| anyhow!("agent start: could not create a pane"))?
-                .to_string()
+            params.insert(
+                "direction".into(),
+                json!(if down { "down" } else { "right" }),
+            );
         }
-    };
-
-    // Launch the agent in the pane.
-    send_request("pane.run", json!({ "pane": pane, "command": cmd }))?;
-
-    // Wait until detection recognizes the kind as the pane's foreground agent.
-    let secs = flag(args, "--timeout")
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(30.0);
-    let deadline = Instant::now() + Duration::from_secs_f64(secs);
-    let mut ready = false;
-    loop {
-        let v = send_request("pane.status", json!({ "pane": pane }))?;
-        let agent = v
-            .get("result")
-            .and_then(|r| r.get("agent"))
-            .and_then(|x| x.as_str())
-            .unwrap_or("");
-        if agent.eq_ignore_ascii_case(&kind) {
-            ready = true;
-            break;
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(300));
     }
-
-    // Name it either way, so it is addressable even if readiness was not confirmed.
-    send_request("agent.name", json!({ "pane": pane, "name": name }))?;
+    if let Some(timeout) = flag(options, "--timeout") {
+        let timeout = timeout
+            .parse::<f64>()
+            .map_err(|_| anyhow!("--timeout must be seconds between 0 and 3600"))?;
+        params.insert("timeout_s".into(), json!(timeout));
+    }
+    let response = send_request("agent.start", Value::Object(params))?;
+    let ready = response["result"]["ready"].as_bool().unwrap_or(false);
     println!(
         "{}",
-        serde_json::to_string_pretty(&json!({
-            "result": {"name": name, "pane": pane, "kind": kind, "ready": ready}
-        }))
-        .unwrap_or_default()
+        serde_json::to_string_pretty(&response).unwrap_or_default()
     );
     Ok(if ready { 0 } else { 2 })
+}
+
+fn validate_agent_start_options(args: &[String]) -> Result<()> {
+    let mut index = 4;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--kind" | "--pane" | "--anchor" | "--timeout" => {
+                if args.get(index + 1).is_none() {
+                    return Err(anyhow!("{} requires a value", args[index]));
+                }
+                index += 2;
+            }
+            "--down" => index += 1,
+            option if option.starts_with("--") => {
+                return Err(anyhow!("unknown agent start option: {option}"));
+            }
+            value => return Err(anyhow!("unexpected agent start argument: {value}")),
+        }
+    }
+    Ok(())
 }
 
 fn confirm_legacy_all_from(
@@ -1406,84 +1887,89 @@ fn skill_cmd(rest: &[String]) -> Result<i32> {
     }
 }
 
-/// `luvus agent send <target> <text…> [--wait] [--until STATE] [--timeout S]` —
-/// submit a prompt to a target agent, then optionally block until it reaches a
-/// state (default `idle`). Exit 0 on the state, 2 on timeout, like `wait`.
+/// `luvus agent prompt <target> <text…> [--wait] [--until STATE] [--timeout S]`
+/// submits and waits as one server-owned operation. `agent send` remains a
+/// compatibility alias.
 fn agent_send_cmd(args: &[String]) -> Result<i32> {
     let target = args.get(3).cloned().ok_or_else(|| {
-        anyhow!("usage: luvus agent send <target> <text> [--wait] [--until STATE] [--timeout S]")
+        anyhow!("usage: luvus agent prompt <target> <text> [--wait] [--until STATE] [--timeout S]")
     })?;
-    // Text is every positional before the first flag, so `--wait` and friends can
-    // follow an unquoted multi-word prompt.
-    let text = args[4.min(args.len())..]
-        .iter()
-        .take_while(|a| !a.starts_with("--"))
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let mut text_parts = Vec::new();
+    let mut wait = false;
+    let mut until = Vec::new();
+    let mut timeout = None;
+    let mut positional_only = false;
+    let mut index = 4;
+    while index < args.len() {
+        let arg = &args[index];
+        if positional_only {
+            text_parts.push(arg.clone());
+            index += 1;
+            continue;
+        }
+        match arg.as_str() {
+            "--" => {
+                positional_only = true;
+                index += 1;
+            }
+            "--wait" => {
+                wait = true;
+                index += 1;
+            }
+            "--until" => {
+                until.push(
+                    args.get(index + 1)
+                        .ok_or_else(|| anyhow!("--until requires a state"))?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--timeout" => {
+                timeout = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| anyhow!("--timeout requires seconds"))?
+                        .parse::<f64>()
+                        .map_err(|_| anyhow!("--timeout must be seconds between 0 and 3600"))?,
+                );
+                index += 2;
+            }
+            option if option.starts_with("--") => {
+                return Err(anyhow!("unknown agent prompt option: {option}"));
+            }
+            _ => {
+                text_parts.push(arg.clone());
+                index += 1;
+            }
+        }
+    }
+    let text = text_parts.join(" ");
     if text.is_empty() {
-        return Err(anyhow!("agent send requires text"));
+        return Err(anyhow!("agent prompt requires text"));
     }
-    let v = send_request("agent.send", json!({ "target": target, "text": text }))?;
-    if v.get("error").is_some() {
-        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
-        return Ok(1);
+    let mut params = serde_json::Map::new();
+    params.insert("target".into(), json!(target));
+    params.insert("text".into(), json!(text));
+    params.insert("wait".into(), json!(wait));
+    if !until.is_empty() {
+        params.insert("until".into(), json!(until));
     }
-    if !args.iter().any(|a| a == "--wait") {
-        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
-        return Ok(0);
+    if let Some(timeout) = timeout {
+        params.insert("timeout_s".into(), json!(timeout));
     }
-    let pane = v
-        .get("result")
-        .and_then(|r| r.get("pane"))
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| anyhow!("agent send: server did not return a pane"))?
-        .to_string();
-    // Default timeout 300s (bounded so a stuck worker never hangs forever).
-    let deadline = Instant::now()
-        + Duration::from_secs_f64(
-            flag(args, "--timeout")
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(300.0),
-        );
-    // An explicit `--until STATE` waits for exactly that state. Otherwise wait for
-    // the agent to settle, with a stall guard so a prompt that lands on nothing
-    // (or a broken/idle worker) returns fast instead of blocking to the timeout.
-    match flag(args, "--until") {
-        Some(until) => wait_status_stream(&pane, &until, Some(deadline)),
-        None => agent_wait_settled(&pane, deadline),
-    }
-}
-
-/// Wait for a just-prompted agent to finish, like prompt-and-wait tools do:
-/// the prompt must produce a lifecycle change within a few seconds or we
-/// call it **stalled** (exit 3) rather than hang; then we wait until the agent
-/// settles at `idle`/`done`/`blocked` (exit 0), or the deadline passes (exit 2).
-fn agent_wait_settled(pane: &str, deadline: Instant) -> Result<i32> {
-    const STALL: Duration = Duration::from_secs(5);
-    let stall_by = Instant::now() + STALL;
-    let mut ever_worked = false;
-    loop {
-        match pane_status(pane)?.as_deref() {
-            Some("working") => ever_worked = true,
-            // Settled — but only count it once the prompt actually started work,
-            // so a target that was already idle when we sent isn't read as "done".
-            Some("idle") | Some("done") | Some("blocked") if ever_worked => return Ok(0),
-            _ => {}
-        }
-        let now = Instant::now();
-        if !ever_worked && now >= stall_by {
-            eprintln!(
-                "agent send: no response within 5s — the prompt may not have landed (stalled)"
-            );
-            return Ok(3);
-        }
-        if now >= deadline {
-            eprintln!("agent send: timed out waiting for the agent to settle");
-            return Ok(2);
-        }
-        std::thread::sleep(Duration::from_millis(300));
-    }
+    let response = send_request("agent.prompt", Value::Object(params))?;
+    let ok = response.get("error").is_none();
+    let matched = response["result"]["matched"].as_bool().unwrap_or(!wait);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+    Ok(if !ok {
+        1
+    } else if wait && !matched {
+        2
+    } else {
+        0
+    })
 }
 
 /// Current agent status of `pane` (global lookup via `pane.status`).
@@ -1509,13 +1995,12 @@ fn wait_status_stream(pane: &str, target: &str, deadline: Option<Instant>) -> Re
         "{}",
         json!({"id":"1","method":"events.subscribe","params":{}})
     )?;
-    let reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream);
 
     let (tx, rx) = std::sync::mpsc::channel();
     let (pane_s, target_s) = (pane.to_string(), target.to_string());
     std::thread::spawn(move || {
-        for line in reader.lines() {
-            let Ok(l) = line else { break };
+        while let Ok(Some(l)) = crate::ipc::api::read_stream_frame(&mut reader) {
             if let Ok(v) = serde_json::from_str::<Value>(&l) {
                 let is_status =
                     v.get("event").and_then(|e| e.as_str()) == Some("pane.agent_status_changed");
@@ -1566,9 +2051,58 @@ pub(crate) fn send_request(method: &str, params: Value) -> Result<Value> {
     let req = json!({ "id": "1", "method": method, "params": params });
     writeln!(stream, "{req}")?;
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    serde_json::from_str(line.trim()).map_err(|e| anyhow!("bad reply: {e}"))
+    let line = crate::ipc::api::read_response_frame(&mut reader)?;
+    serde_json::from_str(&line).map_err(|e| anyhow!("bad reply: {e}"))
+}
+
+/// Transport-neutral one-frame bridge for harnesses that cannot use Unix
+/// sockets or Windows named pipes directly. This is intentionally not a shell
+/// wrapper: it forwards one bounded protocol frame to the selected session and
+/// writes one bounded response. It composes over SSH as
+/// `ssh host luvus api proxy` without opening a network listener.
+fn api_proxy() -> Result<i32> {
+    let mut input = std::io::BufReader::new(std::io::stdin().lock());
+    let request = crate::ipc::api::read_request_frame(&mut input)
+        .map_err(|error| anyhow!("invalid request frame: {error}"))?;
+    let path = crate::persist::cli_socket_path();
+    let mut stream = crate::ipc::transport::connect(&path)
+        .map_err(|_| anyhow!("no luvus server running (socket: {})", path.display()))?;
+    writeln!(stream, "{request}")?;
+    let mut reader = BufReader::new(stream);
+    let response = crate::ipc::api::read_response_frame(&mut reader)?;
+    validate_response_id(&request, &response)?;
+    println!("{response}");
+    Ok(api_response_exit_code(&response))
+}
+
+fn validate_response_id(request: &str, response: &str) -> Result<()> {
+    let request: Value = serde_json::from_str(request)
+        .map_err(|error| anyhow!("invalid request envelope: {error}"))?;
+    let response: Value = serde_json::from_str(response)
+        .map_err(|error| anyhow!("invalid response envelope: {error}"))?;
+    let request_id = request
+        .get("id")
+        .ok_or_else(|| anyhow!("request envelope is missing id"))?;
+    let response_id = response
+        .get("id")
+        .ok_or_else(|| anyhow!("response envelope is missing id"))?;
+    if response_id != request_id {
+        return Err(anyhow!(
+            "response id does not match request id: expected {request_id}, received {response_id}"
+        ));
+    }
+    Ok(())
+}
+
+fn api_response_exit_code(response: &str) -> i32 {
+    if serde_json::from_str::<Value>(response)
+        .ok()
+        .is_some_and(|value| value.get("error").is_some())
+    {
+        1
+    } else {
+        0
+    }
 }
 
 /// Register an installed module by writing the registry file directly (used when
@@ -1595,6 +2129,15 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
     let noun = args.get(1).map(String::as_str).unwrap_or("");
     let verb = args.get(2).map(String::as_str).unwrap_or("");
     let rest = &args[3.min(args.len())..];
+    if noun == "api"
+        && matches!(
+            verb,
+            "capabilities" | "snapshot" | "events" | "runtime" | "session" | "socket-capabilities"
+        )
+        && !rest.is_empty()
+    {
+        return Err(anyhow!("luvus api {verb} does not accept arguments"));
+    }
 
     // The pane id is the first numeric positional, else $LUVUS_PANE_ID.
     let pane = || -> Value {
@@ -1657,21 +2200,107 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
     Ok(match (noun, verb) {
         ("ping", _) => ("ping".into(), json!({})),
         ("events", _) => ("events.subscribe".into(), json!({})),
-        // `luvus search <text...> [--case]` — scan every pane's scrollback
-        // (docs/63). Everything after `search`, minus flags, is the query.
+        ("api", "capabilities") => (
+            "terminal.backend.capabilities".into(),
+            json!({"protocol":{
+                "name":crate::terminal::backend::PROTOCOL_NAME,
+                "major":crate::terminal::backend::PROTOCOL_MAJOR,
+                "minor":crate::terminal::backend::PROTOCOL_MINOR,
+            }}),
+        ),
+        ("api", "snapshot") => ("terminal.backend.snapshot".into(), json!({})),
+        ("api", "events") => ("terminal.backend.events.subscribe".into(), json!({})),
+        ("api", "runtime") => ("runtime.capabilities".into(), json!({})),
+        ("api", "session") => ("session.snapshot".into(), json!({})),
+        ("api", "socket-capabilities") => ("socket.capabilities".into(), json!({})),
+        ("api", _) => {
+            return Err(anyhow!(
+                "usage: luvus api schema|runtime-schema|socket-schema|capabilities|snapshot|events|runtime|session|socket-capabilities|proxy"
+            ));
+        }
+        // Exact scrollback search remains the default for script compatibility.
+        // The universal finder is deliberately opt-in through `--fuzzy`.
         ("search", _) => {
-            let case = args
+            let search_args = &args[2.min(args.len())..];
+            let fuzzy = search_args
                 .iter()
-                .any(|a| a == "--case" || a == "--case-sensitive");
-            let query: Vec<&str> = args[2.min(args.len())..]
-                .iter()
-                .filter(|a| !a.starts_with("--"))
-                .map(String::as_str)
-                .collect();
-            (
-                "search".into(),
-                json!({ "query": query.join(" "), "case_sensitive": case }),
-            )
+                .take_while(|arg| arg.as_str() != "--")
+                .any(|arg| arg == "--fuzzy");
+            let mut query: Vec<String> = Vec::new();
+            let mut case_sensitive = false;
+            let mut scope = "all".to_string();
+            let mut all_sessions = false;
+            let mut limit = crate::search::RESULT_CAP as u64;
+            let mut index = 0;
+            while index < search_args.len() {
+                match search_args[index].as_str() {
+                    "--" => {
+                        query.extend_from_slice(&search_args[index + 1..]);
+                        break;
+                    }
+                    "--fuzzy" | "--json" => index += 1,
+                    "--case" | "--case-sensitive" => {
+                        case_sensitive = true;
+                        index += 1;
+                    }
+                    "--all-sessions" if fuzzy => {
+                        all_sessions = true;
+                        index += 1;
+                    }
+                    "--scope" if fuzzy => {
+                        let value = search_args
+                            .get(index + 1)
+                            .ok_or_else(|| anyhow!("--scope requires a value"))?;
+                        if !matches!(value.as_str(), "all" | "navigate" | "files" | "output") {
+                            return Err(anyhow!("--scope must be all, navigate, files, or output"));
+                        }
+                        scope = value.clone();
+                        index += 2;
+                    }
+                    "--limit" if fuzzy => {
+                        let value = search_args
+                            .get(index + 1)
+                            .ok_or_else(|| anyhow!("--limit requires a value"))?;
+                        limit = value
+                            .parse::<u64>()
+                            .ok()
+                            .filter(|value| (1..=crate::search::RESULT_CAP as u64).contains(value))
+                            .ok_or_else(|| anyhow!("--limit must be between 1 and 200"))?;
+                        index += 2;
+                    }
+                    flag if flag.starts_with("--") => {
+                        return Err(anyhow!("unknown search option: {flag}"));
+                    }
+                    value => {
+                        query.push(value.to_string());
+                        index += 1;
+                    }
+                }
+            }
+            if query.is_empty() {
+                return Err(anyhow!(if fuzzy {
+                    "usage: luvus search --fuzzy <query...> [--scope all|navigate|files|output] [--all-sessions] [--limit 1-200] [--case] [--json]"
+                } else {
+                    "usage: luvus search <text...> [--case]"
+                }));
+            }
+            if fuzzy {
+                (
+                    "search.query".into(),
+                    json!({
+                        "query": query.join(" "),
+                        "scope": scope,
+                        "all_sessions": all_sessions,
+                        "limit": limit,
+                        "case_sensitive": case_sensitive,
+                    }),
+                )
+            } else {
+                (
+                    "search".into(),
+                    json!({ "query": query.join(" "), "case_sensitive": case_sensitive }),
+                )
+            }
         }
         ("agent", "sessions") => ("agent.sessions".into(), json!({})),
         ("agent", "resume") => ("agent.resume".into(), one("session_id", arg0())),
@@ -1751,6 +2380,69 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
         ("agent", "get") => {
             // `agent get <target>` — one agent's live info
             ("agent.get".into(), one("target", rest.first().cloned()))
+        }
+        ("agent", "explain") => ("agent.explain".into(), one("target", rest.first().cloned())),
+        ("agent", "report") => {
+            let usage = "usage: luvus agent report [<pane>] --source <id> --kind <agent> --status idle|working|blocked|done [--message <text>] [--session <id>] [--sequence N] [--ttl S]";
+            let mut obj = serde_json::Map::new();
+            let pane_id = rest
+                .first()
+                .filter(|value| value.parse::<u32>().is_ok())
+                .cloned()
+                .or_else(|| std::env::var("LUVUS_PANE_ID").ok())
+                .ok_or_else(|| anyhow!(usage))?;
+            obj.insert("pane".into(), json!(pane_id));
+            obj.insert(
+                "source".into(),
+                json!(flag(args, "--source").ok_or_else(|| anyhow!(usage))?),
+            );
+            obj.insert(
+                "agent".into(),
+                json!(flag(args, "--kind").ok_or_else(|| anyhow!(usage))?),
+            );
+            obj.insert(
+                "status".into(),
+                json!(flag(args, "--status").ok_or_else(|| anyhow!(usage))?),
+            );
+            if let Some(value) = flag(args, "--message") {
+                obj.insert("message".into(), json!(value));
+            }
+            if let Some(value) = flag(args, "--session") {
+                obj.insert("session_id".into(), json!(value));
+            }
+            if let Some(value) = flag(args, "--sequence") {
+                obj.insert(
+                    "sequence".into(),
+                    json!(value
+                        .parse::<u64>()
+                        .map_err(|_| anyhow!("--sequence must be a non-negative integer"))?),
+                );
+            }
+            if let Some(value) = flag(args, "--ttl") {
+                obj.insert(
+                    "ttl_s".into(),
+                    json!(value
+                        .parse::<u64>()
+                        .map_err(|_| anyhow!("--ttl must be whole seconds"))?),
+                );
+            }
+            ("agent.report".into(), Value::Object(obj))
+        }
+        ("agent", "release") => {
+            let usage = "usage: luvus agent release [<pane>] --source <id>";
+            let mut obj = serde_json::Map::new();
+            let pane_id = rest
+                .first()
+                .filter(|value| value.parse::<u32>().is_ok())
+                .cloned()
+                .or_else(|| std::env::var("LUVUS_PANE_ID").ok())
+                .ok_or_else(|| anyhow!(usage))?;
+            obj.insert("pane".into(), json!(pane_id));
+            obj.insert(
+                "source".into(),
+                json!(flag(args, "--source").ok_or_else(|| anyhow!(usage))?),
+            );
+            ("agent.release".into(), Value::Object(obj))
         }
         ("agent", "read") => {
             // `agent read <target> [--lines N] [--source visible|recent]`
@@ -1832,6 +2524,156 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
                 _ => ("ui.dock.list".into(), json!({})),
             }
         }
+        ("bar", sub) => {
+            let mut obj = serde_json::Map::new();
+            if let Ok(owner) = std::env::var("LUVUS_MODULE_ID") {
+                obj.insert("owner".into(), json!(owner));
+            }
+            match sub {
+                "push" => {
+                    let usage = "usage: luvus bar push --id <id> [--region top-right|bottom-right] (--content <json>|--content-file <path>|--text <text>|--state <state>)";
+                    let id = flag(args, "--id").ok_or_else(|| anyhow!(usage))?;
+                    obj.insert("id".into(), json!(id));
+                    if let Some(region) = flag(args, "--region") {
+                        if !matches!(
+                            region.as_str(),
+                            "top" | "top-right" | "bottom" | "bottom-right"
+                        ) {
+                            return Err(anyhow!("--region must be top-right or bottom-right"));
+                        }
+                        obj.insert("region".into(), json!(region));
+                    }
+                    if let Some(priority) = flag(args, "--priority") {
+                        let priority = priority
+                            .parse::<u8>()
+                            .map_err(|_| anyhow!("--priority must be 0..255"))?;
+                        obj.insert("priority".into(), json!(priority));
+                    }
+                    let inline = flag(args, "--content");
+                    let file = flag(args, "--content-file");
+                    if inline.is_some() && file.is_some() {
+                        return Err(anyhow!("use only one of --content and --content-file"));
+                    }
+                    let content = if let Some(raw) = inline {
+                        serde_json::from_str(&raw).map_err(|error| {
+                            anyhow!("--content must be a JSON segment array: {error}")
+                        })?
+                    } else if let Some(path) = file {
+                        let raw = std::fs::read_to_string(&path)
+                            .map_err(|error| anyhow!("cannot read {path}: {error}"))?;
+                        serde_json::from_str(&raw).map_err(|error| {
+                            anyhow!("{path} must contain a JSON segment array: {error}")
+                        })?
+                    } else {
+                        let mut segments = Vec::new();
+                        if let Some(text) = flag(args, "--text") {
+                            segments.push(json!({"type":"text","text":text}));
+                        }
+                        if let Some(state) = flag(args, "--state") {
+                            segments.push(json!({"type":"state","state":state}));
+                        }
+                        if segments.is_empty() {
+                            return Err(anyhow!(usage));
+                        }
+                        if let Some(last) = segments.last_mut().and_then(Value::as_object_mut) {
+                            if let Some(action) = flag(args, "--action") {
+                                last.insert("action".into(), json!(action));
+                            }
+                            if let Some(value) = flag(args, "--value") {
+                                last.insert("value".into(), json!(value));
+                            }
+                        }
+                        Value::Array(segments)
+                    };
+                    if !content.is_array() {
+                        return Err(anyhow!("bar content must be a JSON segment array"));
+                    }
+                    obj.insert("content".into(), content);
+                    if let Some(raw) = flag(args, "--compact-content") {
+                        let compact: Value = serde_json::from_str(&raw).map_err(|error| {
+                            anyhow!("--compact-content must be a JSON segment array: {error}")
+                        })?;
+                        if !compact.is_array() {
+                            return Err(anyhow!(
+                                "compact bar content must be a JSON segment array"
+                            ));
+                        }
+                        obj.insert("compact_content".into(), compact);
+                    }
+                    ("ui.bar.push".into(), Value::Object(obj))
+                }
+                "move" => {
+                    let id = flag(args, "--id").ok_or_else(|| {
+                        anyhow!(
+                            "usage: luvus bar move --id <id> --region top-right|bottom-right|off"
+                        )
+                    })?;
+                    let region =
+                        flag(args, "--region").ok_or_else(|| anyhow!("--region is required"))?;
+                    if !matches!(
+                        region.as_str(),
+                        "top" | "top-right" | "bottom" | "bottom-right" | "off"
+                    ) {
+                        return Err(anyhow!("--region must be top-right, bottom-right, or off"));
+                    }
+                    obj.insert("id".into(), json!(id));
+                    obj.insert("region".into(), json!(region));
+                    ("ui.bar.move".into(), Value::Object(obj))
+                }
+                "remove" => {
+                    let id = flag(args, "--id")
+                        .ok_or_else(|| anyhow!("usage: luvus bar remove --id <id>"))?;
+                    obj.insert("id".into(), json!(id));
+                    ("ui.bar.remove".into(), Value::Object(obj))
+                }
+                "" | "list" => ("ui.bar.list".into(), Value::Object(obj)),
+                _ => return Err(anyhow!("usage: luvus bar list|push|move|remove")),
+            }
+        }
+        ("ui", "notification") => {
+            let sub = rest.first().map(String::as_str).unwrap_or("push");
+            let mut obj = serde_json::Map::new();
+            if let Ok(owner) = std::env::var("LUVUS_MODULE_ID") {
+                obj.insert("owner".into(), json!(owner));
+            }
+            match sub {
+                "push" => {
+                    let text = flag(args, "--text").ok_or_else(|| anyhow!("usage: luvus ui notification push --text <text> [--level info|success|warning|error] [--ttl-ms <n>]"))?;
+                    obj.insert("text".into(), json!(text));
+                    if let Some(level) = flag(args, "--level") {
+                        if !matches!(level.as_str(), "info" | "success" | "warning" | "error") {
+                            return Err(anyhow!("unknown notification level {level}"));
+                        }
+                        obj.insert("level".into(), json!(level));
+                    }
+                    if let Some(ttl) = flag(args, "--ttl-ms") {
+                        obj.insert(
+                            "ttl_ms".into(),
+                            json!(ttl
+                                .parse::<u64>()
+                                .map_err(|_| anyhow!("--ttl-ms must be a positive integer"))?),
+                        );
+                    }
+                    for (flag_name, key) in [
+                        ("--action", "action"),
+                        ("--value", "value"),
+                        ("--dedupe-key", "dedupe_key"),
+                    ] {
+                        if let Some(value) = flag(args, flag_name) {
+                            obj.insert(key.into(), json!(value));
+                        }
+                    }
+                    ("ui.notification.push".into(), Value::Object(obj))
+                }
+                "clear" => {
+                    if let Some(key) = flag(args, "--dedupe-key") {
+                        obj.insert("dedupe_key".into(), json!(key));
+                    }
+                    ("ui.notification.clear".into(), Value::Object(obj))
+                }
+                _ => return Err(anyhow!("usage: luvus ui notification push|clear")),
+            }
+        }
 
         ("workspace" | "node", "new") => ("workspace.new".into(), json!({})),
         ("workspace" | "node", "open") => ("workspace.open".into(), one("path", arg0())),
@@ -1882,10 +2724,53 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
         }
 
         ("tab", "new") => ("tab.new".into(), json!({})),
-        ("tab", "focus") => ("tab.focus".into(), one("tab", arg0())),
+        ("tab", "focus") => {
+            if rest.len() != 1 {
+                return Err(anyhow!("usage: luvus tab focus <n>"));
+            }
+            let tab = rest[0]
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| anyhow!("tab position must be a positive 1-based number"))?;
+            ("tab.focus".into(), json!({"tab": tab.to_string()}))
+        }
         ("tab", "move") => {
+            let parse_position = |raw: &str| -> Result<String> {
+                raw.parse::<usize>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .map(|n| n.to_string())
+                    .ok_or_else(|| anyhow!("tab positions must be positive 1-based numbers"))
+            };
+            let usage = "usage: luvus tab move <from> <to> | left|right [--tab N]";
+            if rest
+                .first()
+                .is_some_and(|arg| matches!(arg.as_str(), "left" | "right"))
+            {
+                let valid_shape = rest.len() == 1 || (rest.len() == 3 && rest[1] == "--tab");
+                if !valid_shape {
+                    return Err(anyhow!(usage));
+                }
+                let mut params = serde_json::Map::new();
+                params.insert("direction".to_string(), json!(rest[0]));
+                if rest.len() == 3 {
+                    params.insert("tab".to_string(), json!(parse_position(&rest[2])?));
+                }
+                ("tab.move".into(), Value::Object(params))
+            } else {
+                if rest.len() != 2 {
+                    return Err(anyhow!(usage));
+                }
+                let from = parse_position(&rest[0])?;
+                let to = parse_position(&rest[1])?;
+                ("tab.move".into(), json!({"tab": from, "to": to}))
+            }
+        }
+        ("tab", "swap") => {
+            let usage = "usage: luvus tab swap <first> <second>";
             if rest.len() != 2 {
-                return Err(anyhow!("usage: luvus tab move <from> <to>"));
+                return Err(anyhow!(usage));
             }
             let parse_position = |raw: &str| -> Result<String> {
                 raw.parse::<usize>()
@@ -1894,16 +2779,54 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
                     .map(|n| n.to_string())
                     .ok_or_else(|| anyhow!("tab positions must be positive 1-based numbers"))
             };
-            let from = parse_position(&rest[0])?;
-            let to = parse_position(&rest[1])?;
-            ("tab.move".into(), json!({"tab": from, "to": to}))
+            let first = parse_position(&rest[0])?;
+            let second = parse_position(&rest[1])?;
+            if first == second {
+                return Err(anyhow!("tab positions must differ"));
+            }
+            ("tab.swap".into(), json!({"tab": first, "with": second}))
         }
         ("tab", "close") => ("tab.close".into(), one("tab", arg0())),
         // `tab rename <name>` names the active tab; `--tab N` targets another.
         ("tab", "rename") => {
+            let mut words = Vec::new();
+            let mut tab = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--tab" => {
+                        if tab.is_some() || i + 1 >= rest.len() {
+                            return Err(anyhow!("usage: luvus tab rename <name> [--tab N]"));
+                        }
+                        let position = rest[i + 1]
+                            .parse::<usize>()
+                            .ok()
+                            .filter(|n| *n > 0)
+                            .ok_or_else(|| {
+                                anyhow!("tab position must be a positive 1-based number")
+                            })?;
+                        tab = Some(position.to_string());
+                        i += 2;
+                    }
+                    arg if arg.starts_with("--") => {
+                        return Err(anyhow!("unknown tab rename option `{arg}`"));
+                    }
+                    _ => {
+                        words.push(rest[i].as_str());
+                        i += 1;
+                    }
+                }
+            }
+            let name = words.join(" ");
+            if name.chars().count() > crate::app::TAB_NAME_MAX {
+                return Err(anyhow!(
+                    "tab name must be at most {} characters",
+                    crate::app::TAB_NAME_MAX
+                ));
+            }
             let mut obj = serde_json::Map::new();
-            obj.insert("name".to_string(), json!(rest_text()));
-            if let Some(n) = flag(args, "--tab") {
+            obj.insert("name".to_string(), json!(name));
+            if let Some(n) = tab {
                 obj.insert("tab".to_string(), json!(n));
             }
             ("tab.rename".into(), Value::Object(obj))
@@ -2000,6 +2923,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
         }
         ("pane", "read") => ("pane.read".into(), with_pane(serde_json::Map::new())),
         ("pane", "status") => ("pane.status".into(), with_pane(serde_json::Map::new())),
+        ("pane", "processes") => ("pane.processes".into(), with_pane(serde_json::Map::new())),
         ("pane", "close") => ("pane.close".into(), with_pane(serde_json::Map::new())),
         // `pane name <name>` is a synonym for `agent name`: it aliases the pane so
         // you can mention it by name. The name never doubles as a pane id.
@@ -2147,6 +3071,207 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             }
         }
         ("module", _) => ("module.list".into(), json!({})),
+
+        ("diff", "refresh") => {
+            if !rest.is_empty() {
+                return Err(anyhow!("usage: luvus diff refresh"));
+            }
+            ("diff.refresh".into(), json!({}))
+        }
+        ("diff", "" | "list") => {
+            let mut obj = serde_json::Map::new();
+            if let Some(layer) = flag(args, "--layer") {
+                obj.insert("layer".into(), json!(layer));
+            }
+            ("diff.list".into(), Value::Object(obj))
+        }
+        ("diff", "open") => {
+            let mut obj = serde_json::Map::new();
+            if let Some(path) = rest.first().filter(|value| !value.starts_with("--")) {
+                obj.insert("path".into(), json!(path));
+            }
+            if let Some(layer) = flag(args, "--layer") {
+                obj.insert("layer".into(), json!(layer));
+            }
+            if let Some(view) = flag(args, "--view") {
+                if !matches!(view.as_str(), "auto" | "split" | "stack") {
+                    return Err(anyhow!("--view must be auto, split, or stack"));
+                }
+                obj.insert("view".into(), json!(view));
+            }
+            if let Some(placement) = flag(args, "--placement") {
+                if !matches!(placement.as_str(), "preview" | "pane" | "tab") {
+                    return Err(anyhow!("--placement must be preview, pane, or tab"));
+                }
+                obj.insert("placement".into(), json!(placement));
+            }
+            ("diff.open".into(), Value::Object(obj))
+        }
+        ("diff", "get") => {
+            let path = rest
+                .first()
+                .filter(|value| !value.starts_with("--"))
+                .ok_or_else(|| {
+                    anyhow!("usage: luvus diff get <path> [--layer <layer>] [--include-patch]")
+                })?;
+            let mut obj = serde_json::Map::new();
+            obj.insert("path".into(), json!(path));
+            if let Some(layer) = flag(args, "--layer") {
+                obj.insert("layer".into(), json!(layer));
+            }
+            if args.iter().any(|arg| arg == "--include-patch") {
+                obj.insert("include_patch".into(), json!(true));
+            }
+            ("diff.get".into(), Value::Object(obj))
+        }
+        ("diff", "note") => {
+            let sub = rest.first().map(String::as_str).unwrap_or("list");
+            let positionals: Vec<&String> = {
+                let mut values = Vec::new();
+                let mut index = 1;
+                while index < rest.len() {
+                    match rest[index].as_str() {
+                        "--yes" if sub == "remove" => index += 1,
+                        "--all-open" if sub == "send" => index += 1,
+                        flag if matches!(
+                            (sub, flag),
+                            ("list", "--file" | "--state")
+                                | (
+                                    "add",
+                                    "--file"
+                                        | "--body"
+                                        | "--old-line"
+                                        | "--new-line"
+                                        | "--end-line"
+                                        | "--layer"
+                                        | "--kind"
+                                )
+                                | ("edit", "--body")
+                                | ("send", "--to")
+                        ) =>
+                        {
+                            if rest.get(index + 1).is_none() {
+                                return Err(anyhow!("{} requires a value", rest[index]));
+                            }
+                            index += 2;
+                        }
+                        flag if flag.starts_with("--") => {
+                            return Err(anyhow!("unknown diff note option `{flag}`"));
+                        }
+                        _ => {
+                            values.push(&rest[index]);
+                            index += 1;
+                        }
+                    }
+                }
+                values
+            };
+            let line_flag = |name: &str| -> Result<Option<u64>> {
+                flag(args, name)
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .ok()
+                            .filter(|line| *line > 0 && *line <= u32::MAX as u64)
+                            .ok_or_else(|| anyhow!("{name} must be a positive line number"))
+                    })
+                    .transpose()
+            };
+            let mut obj = serde_json::Map::new();
+            match sub {
+                "list" => {
+                    if let Some(path) = flag(args, "--file") {
+                        obj.insert("file".into(), json!(path));
+                    }
+                    if let Some(state) = flag(args, "--state") {
+                        if !matches!(
+                            state.as_str(),
+                            "open" | "resolved" | "outdated" | "orphaned"
+                        ) {
+                            return Err(anyhow!(
+                                "--state must be open, resolved, outdated, or orphaned"
+                            ));
+                        }
+                        obj.insert("state".into(), json!(state));
+                    }
+                    ("diff.note.list".into(), Value::Object(obj))
+                }
+                "add" => {
+                    let file = flag(args, "--file").ok_or_else(|| anyhow!("--file is required"))?;
+                    let body = flag(args, "--body").ok_or_else(|| anyhow!("--body is required"))?;
+                    obj.insert("file".into(), json!(file));
+                    obj.insert("body".into(), json!(body));
+                    if let Some(line) = line_flag("--old-line")? {
+                        obj.insert("old_line".into(), json!(line));
+                    }
+                    if let Some(line) = line_flag("--new-line")? {
+                        obj.insert("new_line".into(), json!(line));
+                    }
+                    if let Some(line) = line_flag("--end-line")? {
+                        obj.insert("end_line".into(), json!(line));
+                    }
+                    if let Some(layer) = flag(args, "--layer") {
+                        obj.insert("layer".into(), json!(layer));
+                    }
+                    if let Some(kind) = flag(args, "--kind") {
+                        obj.insert("kind".into(), json!(kind));
+                    }
+                    ("diff.note.add".into(), Value::Object(obj))
+                }
+                "edit" => {
+                    let id = positionals
+                        .first()
+                        .ok_or_else(|| anyhow!("note id is required"))?;
+                    let body = flag(args, "--body").ok_or_else(|| anyhow!("--body is required"))?;
+                    obj.insert("id".into(), json!(id));
+                    obj.insert("body".into(), json!(body));
+                    ("diff.note.edit".into(), Value::Object(obj))
+                }
+                "resolve" | "reopen" => {
+                    let id = positionals
+                        .first()
+                        .ok_or_else(|| anyhow!("note id is required"))?;
+                    obj.insert("id".into(), json!(id));
+                    (format!("diff.note.{sub}"), Value::Object(obj))
+                }
+                "remove" => {
+                    if !args.iter().any(|arg| arg == "--yes") {
+                        return Err(anyhow!("diff note remove requires --yes"));
+                    }
+                    let id = positionals
+                        .first()
+                        .ok_or_else(|| anyhow!("note id is required"))?;
+                    obj.insert("id".into(), json!(id));
+                    ("diff.note.remove".into(), Value::Object(obj))
+                }
+                "send" => {
+                    let target = flag(args, "--to").ok_or_else(|| anyhow!("--to is required"))?;
+                    obj.insert("to".into(), json!(target));
+                    let all_open = args.iter().any(|arg| arg == "--all-open");
+                    if all_open {
+                        obj.insert("all_open".into(), json!(true));
+                    }
+                    let ids: Vec<_> = positionals.into_iter().cloned().collect();
+                    if ids.is_empty() && !all_open {
+                        return Err(anyhow!(
+                            "diff note send needs at least one note id or --all-open"
+                        ));
+                    }
+                    obj.insert("ids".into(), json!(ids));
+                    ("diff.note.send".into(), Value::Object(obj))
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "usage: luvus diff note add|list|edit|resolve|reopen|remove|send"
+                    ))
+                }
+            }
+        }
+        ("diff", other) => {
+            return Err(anyhow!(
+                "unknown diff command `{other}`. Try `luvus help diff`."
+            ))
+        }
 
         ("git", "branches") => ("git.branches".into(), json!({})),
         ("git", "log") => {
@@ -2334,6 +3459,71 @@ mod tests {
         s.split_whitespace().map(String::from).collect()
     }
 
+    fn rendered_topic_help(topic: &str, command: Option<&str>) -> String {
+        let mut output = Vec::new();
+        assert!(write_topic_help(&mut output, topic, command).unwrap());
+        String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn family_help_lists_only_commands_owned_by_that_family() {
+        for (topic, noun) in [
+            ("workspace", "workspace"),
+            ("tab", "tab"),
+            ("pane", "pane"),
+            ("agent", "agent"),
+            ("skill", "skill"),
+            ("wait", "wait"),
+            ("attach", "attach"),
+            ("search", "search"),
+            ("theme", "theme"),
+            ("bar", "bar"),
+            ("ui", "ui"),
+            ("module", "module"),
+            ("git", "git"),
+            ("files", "files"),
+            ("diff", "diff"),
+            ("worktree", "worktree"),
+            ("task", "task"),
+            ("lease", "lease"),
+            ("events", "events"),
+            ("api", "api"),
+            ("remote", "--remote"),
+            ("server", "server"),
+            ("integration", "integration"),
+        ] {
+            let output = rendered_topic_help(topic, None);
+            assert!(output.ends_with(HELP_BUG), "{topic} help lost the bug");
+            let rows: Vec<_> = output
+                .lines()
+                .filter(|line| {
+                    line.starts_with("  ")
+                        && line
+                            .as_bytes()
+                            .get(2)
+                            .is_some_and(|character| *character != b' ')
+                })
+                .collect();
+            assert!(!rows.is_empty(), "{topic} help has no command rows");
+            assert!(
+                rows.iter().all(|line| {
+                    line.trim_start()
+                        .strip_prefix(noun)
+                        .is_some_and(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+                }),
+                "{topic} help contains another family: {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn leaf_help_still_selects_only_the_requested_command() {
+        let output = rendered_topic_help("pane", Some("split"));
+        assert!(output.contains("pane split [<id>]"));
+        assert!(!output.contains("pane list"));
+        assert!(!output.contains("agent start"));
+    }
+
     #[test]
     fn pass_through_commands_preserve_trailing_help_payloads() {
         for raw in [
@@ -2343,6 +3533,8 @@ mod tests {
             "luvus pane send 9 -h",
             "luvus agent send reviewer --help",
             "luvus agent send reviewer -h",
+            "luvus agent prompt reviewer --help",
+            "luvus agent prompt reviewer -h",
             "luvus agent keys reviewer --help",
             "luvus agent keys reviewer -h",
             "luvus --remote devbox --help",
@@ -2354,15 +3546,116 @@ mod tests {
     }
 
     #[test]
+    fn terminal_backend_api_commands_are_first_class_cli_routes() {
+        assert!(is_cli(&argv("luvus api schema")));
+        let (method, params) = parse(&argv("luvus api capabilities")).unwrap();
+        assert_eq!(method, "terminal.backend.capabilities");
+        assert_eq!(params["protocol"]["major"], 1);
+        assert_eq!(params["protocol"]["minor"], 0);
+        let (method, params) = parse(&argv("luvus api snapshot")).unwrap();
+        assert_eq!(method, "terminal.backend.snapshot");
+        assert_eq!(params, json!({}));
+        let (method, _) = parse(&argv("luvus api events")).unwrap();
+        assert_eq!(method, "terminal.backend.events.subscribe");
+        assert_eq!(
+            parse(&argv("luvus api runtime")).unwrap().0,
+            "runtime.capabilities"
+        );
+        assert_eq!(
+            parse(&argv("luvus api session")).unwrap().0,
+            "session.snapshot"
+        );
+        assert_eq!(
+            parse(&argv("luvus api socket-capabilities")).unwrap().0,
+            "socket.capabilities"
+        );
+        for command in [
+            "capabilities",
+            "snapshot",
+            "events",
+            "runtime",
+            "session",
+            "socket-capabilities",
+        ] {
+            assert!(
+                parse(&argv(&format!("luvus api {command} unexpected"))).is_err(),
+                "api {command} must reject trailing arguments"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_authority_and_process_commands_map_to_structured_api() {
+        let (method, params) = parse(&argv(
+            "luvus agent report 7 --source fx/plugin --kind fx --status working --message busy --sequence 4 --ttl 30",
+        ))
+        .unwrap();
+        assert_eq!(method, "agent.report");
+        assert_eq!(params["pane"], "7");
+        assert_eq!(params["source"], "fx/plugin");
+        assert_eq!(params["agent"], "fx");
+        assert_eq!(params["status"], "working");
+        assert_eq!(params["sequence"], 4);
+        assert_eq!(params["ttl_s"], 30);
+        assert_eq!(
+            parse(&argv("luvus agent explain 7")).unwrap().0,
+            "agent.explain"
+        );
+        assert_eq!(
+            parse(&argv("luvus agent release 7 --source fx/plugin"))
+                .unwrap()
+                .0,
+            "agent.release"
+        );
+        assert_eq!(
+            parse(&argv("luvus pane processes 7")).unwrap().0,
+            "pane.processes"
+        );
+    }
+
+    #[test]
     fn normal_and_group_help_detection_remains_intact() {
         for (raw, expected) in [
             ("luvus pane --help", Some(("pane", None))),
             ("luvus --remote --help", Some(("--remote", None))),
             ("luvus pane split --help", Some(("pane", Some("split")))),
             ("luvus module install -h", Some(("module", Some("install")))),
+            ("luvus update --help", Some(("update", None))),
         ] {
             let args = argv(raw);
             assert_eq!(command_help_request(&args), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn update_is_a_top_level_local_cli_command() {
+        assert!(is_cli(&argv("luvus update")));
+        assert!(!help_topic_has_subcommands("update"));
+    }
+
+    #[test]
+    fn theme_cli_is_recognized_and_validates_command_shapes() {
+        assert!(is_cli(&argv("luvus theme list")));
+        assert_eq!(
+            command_help_request(&argv("luvus theme install --help")),
+            Some(("theme", Some("install")))
+        );
+        for invalid in [
+            vec!["list".into(), "extra".into()],
+            vec!["path".into(), "extra".into()],
+            vec![
+                "init".into(),
+                "new-theme".into(),
+                "--bad".into(),
+                "noir".into(),
+            ],
+            vec!["validate".into(), "x.toml".into(), "--bad".into()],
+            vec!["install".into(), "x.toml".into(), "--bad".into()],
+            vec!["use".into(), "noir".into(), "extra".into()],
+            vec!["uninstall".into(), "x".into(), "extra".into()],
+            vec!["reload".into(), "extra".into()],
+        ] {
+            assert!(theme_cmd(&invalid).is_err(), "{invalid:?}");
         }
     }
 
@@ -2393,6 +3686,64 @@ mod tests {
         assert_eq!(m, "tab.new");
         let (m, _) = parse(&argv("luvus agent list")).unwrap();
         assert_eq!(m, "agent.list");
+    }
+
+    #[test]
+    fn search_keeps_exact_contract_and_fuzzy_is_explicit() {
+        let (method, params) = parse(&argv("luvus search build failed --case")).unwrap();
+        assert_eq!(method, "search");
+        assert_eq!(
+            params,
+            json!({"query": "build failed", "case_sensitive": true})
+        );
+
+        let (method, params) =
+            parse(&argv("luvus search --fuzzy -- --case --scope output")).unwrap();
+        assert_eq!(method, "search.query");
+        assert_eq!(
+            params,
+            json!({
+                "query": "--case --scope output",
+                "scope": "all",
+                "all_sessions": false,
+                "limit": 200,
+                "case_sensitive": false,
+            })
+        );
+
+        let (method, params) = parse(&argv("luvus search -- --fuzzy --case")).unwrap();
+        assert_eq!(method, "search");
+        assert_eq!(
+            params,
+            json!({"query": "--fuzzy --case", "case_sensitive": false})
+        );
+
+        let (method, params) = parse(&argv(
+            "luvus search --fuzzy api auth --scope files --all-sessions --limit 25 --case --json",
+        ))
+        .unwrap();
+        assert_eq!(method, "search.query");
+        assert_eq!(
+            params,
+            json!({
+                "query": "api auth",
+                "scope": "files",
+                "all_sessions": true,
+                "limit": 25,
+                "case_sensitive": true,
+            })
+        );
+
+        for bad in [
+            "luvus search --fuzzy",
+            "luvus search --fuzzy api --scope unknown",
+            "luvus search --fuzzy api --limit 0",
+            "luvus search --fuzzy api --limit 201",
+            "luvus search api --all-sessions",
+            "luvus search api --unknown",
+        ] {
+            assert!(parse(&argv(bad)).is_err(), "{bad} must be rejected");
+        }
     }
 
     #[test]
@@ -2447,6 +3798,22 @@ mod tests {
         assert_eq!(m, "tab.move");
         assert_eq!(p, json!({"tab": "3", "to": "1"}));
 
+        let (m, p) = parse(&argv("luvus tab move left")).unwrap();
+        assert_eq!(m, "tab.move");
+        assert_eq!(p, json!({"direction": "left"}));
+
+        let (m, p) = parse(&argv("luvus tab move right --tab 3")).unwrap();
+        assert_eq!(m, "tab.move");
+        assert_eq!(p, json!({"direction": "right", "tab": "3"}));
+
+        let (m, p) = parse(&argv("luvus tab focus 2")).unwrap();
+        assert_eq!(m, "tab.focus");
+        assert_eq!(p, json!({"tab": "2"}));
+
+        let (m, p) = parse(&argv("luvus tab swap 1 3")).unwrap();
+        assert_eq!(m, "tab.swap");
+        assert_eq!(p, json!({"tab": "1", "with": "3"}));
+
         for bad in [
             "luvus pane move 7",
             "luvus pane move 7 --tab 0",
@@ -2458,11 +3825,51 @@ mod tests {
             "luvus tab move 1",
             "luvus tab move 0 1",
             "luvus tab move 1 two",
+            "luvus tab move left --tab 0",
+            "luvus tab move right --tab",
+            "luvus tab move left right",
+            "luvus tab move up",
+            "luvus tab swap 1",
+            "luvus tab swap 0 1",
+            "luvus tab swap 1 two",
+            "luvus tab swap 2 2",
+            "luvus tab swap 1 2 extra",
+            "luvus tab focus",
+            "luvus tab focus 0",
+            "luvus tab focus two",
+            "luvus tab focus 1 extra",
             "luvus pane teleport 7",
             "luvus tab reorder 2 1",
         ] {
             assert!(parse(&argv(bad)).is_err(), "{bad} must be rejected");
         }
+    }
+
+    #[test]
+    fn tab_rename_validates_optional_target_and_name_length() {
+        let (method, params) = parse(&argv("luvus tab rename review notes --tab 2")).unwrap();
+        assert_eq!(method, "tab.rename");
+        assert_eq!(params, json!({"name": "review notes", "tab": "2"}));
+
+        let (method, params) = parse(&argv("luvus tab rename")).unwrap();
+        assert_eq!(method, "tab.rename");
+        assert_eq!(params, json!({"name": ""}));
+
+        for bad in [
+            "luvus tab rename review --tab 0",
+            "luvus tab rename review --tab nope",
+            "luvus tab rename review --tab",
+            "luvus tab rename review --tab 1 --tab 2",
+            "luvus tab rename review --unknown value",
+        ] {
+            assert!(parse(&argv(bad)).is_err(), "{bad} must be rejected");
+        }
+
+        let long = format!("luvus tab rename {}", "x".repeat(41));
+        assert!(
+            parse(&argv(&long)).is_err(),
+            "41-character name is rejected"
+        );
     }
 
     #[test]
@@ -2489,6 +3896,73 @@ mod tests {
             "luvus agent fork 7 --name one --name two",
             "luvus agent fork 7 --no-focus --no-focus",
             "luvus agent fork 7 --down",
+        ] {
+            assert!(parse(&argv(bad)).is_err(), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn maps_diff_review_commands() {
+        assert!(is_cli(&argv("luvus diff list")));
+        let (method, params) = parse(&argv("luvus diff list --layer staged")).unwrap();
+        assert_eq!(method, "diff.list");
+        assert_eq!(params, json!({"layer":"staged"}));
+
+        let (method, params) = parse(&argv(
+            "luvus diff open src/lib.rs --layer worktree --view split --placement pane",
+        ))
+        .unwrap();
+        assert_eq!(method, "diff.open");
+        assert_eq!(params["path"], "src/lib.rs");
+        assert_eq!(params["view"], "split");
+        assert_eq!(params["placement"], "pane");
+
+        let (method, params) = parse(&argv("luvus diff get src/lib.rs --include-patch")).unwrap();
+        assert_eq!(method, "diff.get");
+        assert_eq!(params, json!({"path":"src/lib.rs","include_patch":true}));
+
+        let (method, params) = parse(&argv(
+            "luvus diff note add --file src/lib.rs --new-line 12 --end-line 14 --body check",
+        ))
+        .unwrap();
+        assert_eq!(method, "diff.note.add");
+        assert_eq!(params["new_line"], 12);
+        assert_eq!(params["end_line"], 14);
+
+        let (method, params) = parse(&argv("luvus diff note edit --body updated n1")).unwrap();
+        assert_eq!(method, "diff.note.edit");
+        assert_eq!(params, json!({"id":"n1","body":"updated"}));
+
+        let (method, params) = parse(&argv("luvus diff note remove --yes n1")).unwrap();
+        assert_eq!(method, "diff.note.remove");
+        assert_eq!(params, json!({"id":"n1"}));
+
+        let (method, params) = parse(&argv("luvus diff note send --to reviewer n1 n2")).unwrap();
+        assert_eq!(method, "diff.note.send");
+        assert_eq!(params["to"], "reviewer");
+        assert_eq!(params["ids"], json!(["n1", "n2"]));
+
+        let (method, params) = parse(&argv("luvus diff note send same --to same")).unwrap();
+        assert_eq!(method, "diff.note.send");
+        assert_eq!(params["to"], "same");
+        assert_eq!(params["ids"], json!(["same"]));
+
+        let (method, params) =
+            parse(&argv("luvus diff note send --to reviewer --all-open")).unwrap();
+        assert_eq!(method, "diff.note.send");
+        assert_eq!(params["all_open"], true);
+        assert_eq!(params["ids"], json!([]));
+
+        for bad in [
+            "luvus diff open src/lib.rs --view columns",
+            "luvus diff open src/lib.rs --placement replace",
+            "luvus diff note add --file src/lib.rs --new-line zero --body check",
+            "luvus diff note list --state unknown",
+            "luvus diff note remove n1",
+            "luvus diff note send n1",
+            "luvus diff note send --to reviewer",
+            "luvus diff note edit n1 --state open --body check",
+            "luvus diff note edit n1 --body",
         ] {
             assert!(parse(&argv(bad)).is_err(), "{bad} must be rejected");
         }
@@ -2539,6 +4013,50 @@ mod tests {
         let (m, p) = parse(&argv("luvus ui sidebar --side right --width 30")).unwrap();
         assert_eq!(m, "ui.sidebar");
         assert_eq!(p.get("side").and_then(|v| v.as_str()), Some("right"));
+    }
+
+    #[test]
+    fn maps_luvus_bar_and_notification_commands() {
+        let _env = crate::persist::test_env("cli-bar");
+        std::env::set_var("LUVUS_MODULE_ID", "you.ci");
+        let args = vec![
+            "luvus".into(),
+            "bar".into(),
+            "push".into(),
+            "--id".into(),
+            "status".into(),
+            "--region".into(),
+            "top-right".into(),
+            "--content".into(),
+            r#"[{"type":"text","text":"CI"},{"type":"state","state":"done"}]"#.into(),
+        ];
+        let (method, params) = parse(&args).unwrap();
+        assert_eq!(method, "ui.bar.push");
+        assert_eq!(params["owner"], "you.ci");
+        assert_eq!(params["content"].as_array().unwrap().len(), 2);
+
+        let (method, params) =
+            parse(&argv("luvus bar move --id status --region bottom-right")).unwrap();
+        assert_eq!(method, "ui.bar.move");
+        assert_eq!(params["region"], "bottom-right");
+
+        let (method, params) = parse(&argv(
+            "luvus ui notification push --text failed --level error --ttl-ms 6000",
+        ))
+        .unwrap();
+        assert_eq!(method, "ui.notification.push");
+        assert_eq!(params["ttl_ms"], 6000);
+        assert_eq!(params["owner"], "you.ci");
+        std::env::remove_var("LUVUS_MODULE_ID");
+
+        for bad in [
+            "luvus bar push --id status",
+            "luvus bar move --id status --region middle",
+            "luvus ui bar list",
+            "luvus ui notification push --text bad --level urgent",
+        ] {
+            assert!(parse(&argv(bad)).is_err(), "{bad} must be rejected");
+        }
     }
 
     #[test]
@@ -2723,10 +4241,66 @@ mod tests {
         assert_eq!(p.get("path").and_then(|v| v.as_str()), Some("/tmp/wt"));
     }
 
+    #[test]
+    fn unsupported_keys_explain_wsl_repairs_without_calling_luvus_broken() {
+        let (detail, action) = unsupported_key_guidance(true, true);
+        assert!(detail.contains("all other features still work"));
+        assert!(action.contains("Windows Terminal to 1.25+"));
+        assert!(action.contains("ESC CR"));
+
+        let (detail, action) = unsupported_key_guidance(true, false);
+        assert!(detail.starts_with("WSL detected"));
+        assert!(action.contains("Windows Terminal 1.25+"));
+
+        let (detail, action) = unsupported_key_guidance(false, false);
+        assert!(detail.contains("only the modified-Enter shortcut is affected"));
+        assert!(action.contains("Alt/Option+Enter"));
+    }
+
     // The docs site's CLI reference (website/…/reference/cli.mdx) carries the
     // `luvus help all` text VERBATIM — this guard fails CI if a command changes
     // without the docs page being regenerated, so the two can never drift.
     // Regenerate with:  luvus help all  →  the page's ```txt block.
+    #[test]
+    fn unknown_method_detection_is_method_specific() {
+        let response = json!({"error": {
+            "code": "invalid_request",
+            "message": "unknown method: theme.use"
+        }});
+        assert!(is_unknown_method(&response, "theme.use"));
+        assert!(!is_unknown_method(&response, "theme.reload"));
+        assert!(!is_unknown_method(
+            &json!({"error": {"message": "theme.use failed"}}),
+            "theme.use"
+        ));
+    }
+
+    #[test]
+    fn api_proxy_exit_code_distinguishes_protocol_errors() {
+        assert_eq!(api_response_exit_code(r#"{"id":"1","result":{}}"#), 0);
+        assert_eq!(
+            api_response_exit_code(
+                r#"{"id":"1","error":{"code":"invalid_request","message":"bad"}}"#
+            ),
+            1
+        );
+        assert_eq!(api_response_exit_code("not json"), 0);
+    }
+
+    #[test]
+    fn api_proxy_rejects_mismatched_response_ids() {
+        assert!(validate_response_id(
+            r#"{"id":"request-1","method":"ping","params":{}}"#,
+            r#"{"id":"request-1","result":{}}"#,
+        )
+        .is_ok());
+        assert!(validate_response_id(
+            r#"{"id":"request-1","method":"ping","params":{}}"#,
+            r#"{"id":"request-2","result":{}}"#,
+        )
+        .is_err());
+    }
+
     #[test]
     fn docs_cli_reference_matches_help() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2742,9 +4316,9 @@ mod tests {
         // DETAILED_USAGE ends with a newline the split consumes; compare trimmed.
         assert_eq!(
             block.trim_end(),
-            DETAILED_USAGE.trim_end(),
+            format!("{DETAILED_USAGE}{HELP_BUG}").trim_end(),
             "website/…/reference/cli.mdx has drifted from `luvus help all` — \
-             regenerate the page's txt block from the DETAILED_USAGE text"
+             regenerate the page's txt block from DETAILED_USAGE plus HELP_BUG"
         );
     }
 

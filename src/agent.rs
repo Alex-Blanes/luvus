@@ -115,7 +115,8 @@ static SOURCES: &[SessionSource] = &[
             list: None,
         }),
         resume: |q| format!("grok --resume {q}\r"),
-        fork: None,
+        // Same flag pair as Claude: resume the source transcript into a new id.
+        fork: Some(|q| format!("grok --resume {q} --fork-session\r")),
     },
     SessionSource {
         name: "pi",
@@ -369,6 +370,22 @@ pub fn resume_for(
         Some(flags) => resume_command_with_flags(agent, session_id, flags),
         None => resume_command(agent, session_id),
     }
+}
+
+/// Resolve the source session for a native fork.
+///
+/// A hook-reported or explicitly resumed identity always wins. Codex must have
+/// that exact binding because several live rollouts commonly share one cwd;
+/// guessing its newest file can fork a different pane's conversation. Agents
+/// without a precise integration retain the historical newest-session fallback.
+pub fn fork_session_id(agent: &str, bound: Option<&str>, cwd: &Path) -> Option<String> {
+    if let Some(id) = bound {
+        return Some(id.to_string());
+    }
+    if agent == "codex" {
+        return None;
+    }
+    latest_session(agent, cwd)
 }
 
 /// The command that **forks** an agent's session: continue from the original's
@@ -837,12 +854,17 @@ fn codex_latest(base: &Path, cwd: &Path) -> Option<String> {
     None
 }
 
-/// Every Codex session for `cwd`, newest first. Forked Codex panes share a
-/// working directory, so persistence needs the ranked list to keep the parent
-/// and fork attached to different rollouts after a server restart.
+/// Every Codex session for `cwd`, newest **creation** first. Forked Codex panes
+/// share a working directory, so persistence needs the ranked list to keep the
+/// parent and fork attached to different rollouts after a server restart.
+///
+/// Rollout mtimes cannot provide that order: they change throughout a live
+/// conversation and would make two panes trade sessions according to whichever
+/// agent wrote last. Codex's `sessions/YYYY/MM/DD/rollout-<ISO timestamp>-...`
+/// path is creation-ordered and remains stable for the life of the session.
 fn codex_list(base: &Path, cwd: &Path) -> Vec<String> {
     let mut files = codex_rollout_files(base);
-    files.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
+    files.sort_by(|(_, a), (_, b)| b.cmp(a));
     files
         .into_iter()
         .filter_map(|(_, path)| read_codex_session(&path))
@@ -1311,8 +1333,9 @@ mod tests {
         let base = tmp("codex");
         let day = base.join("sessions").join("2025").join("01").join("22");
         fs::create_dir_all(&day).unwrap();
+        let older = day.join("rollout-2025-01-22T10-00-00-aaa.jsonl");
         fs::write(
-            day.join("rollout-2025-01-22T10-00-00-aaa.jsonl"),
+            &older,
             "{\"session_id\":\"aaa\",\"cwd\":\"/work/app\"}\n{\"type\":\"message\"}\n",
         )
         .unwrap();
@@ -1338,6 +1361,21 @@ mod tests {
             codex_latest(&base, Path::new("/work/app")).as_deref(),
             Some("ccc")
         );
+
+        // Rollout mtimes track activity, not session creation. The older pane
+        // can keep working after the newer pane starts, but restart pairing
+        // must still keep the newer session attached to the newer pane.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(
+            &older,
+            "{\"session_id\":\"aaa\",\"cwd\":\"/work/app\"}\n{\"type\":\"message\",\"updated\":true}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            codex_latest(&base, Path::new("/work/app")).as_deref(),
+            Some("aaa"),
+            "latest remains activity-based for the resumable-session list"
+        );
         assert_eq!(
             codex_latest(&base, Path::new("/work/api")).as_deref(),
             Some("bbb")
@@ -1349,7 +1387,7 @@ mod tests {
         assert_eq!(
             codex_list(&base, Path::new("/work/app")),
             vec!["ccc", "aaa"],
-            "fork and parent are both available, newest first"
+            "restart pairing follows stable creation order, not changing mtimes"
         );
     }
 
@@ -1472,6 +1510,11 @@ mod tests {
             ),
             vec!["--verbose"]
         );
+        // Grok uses the same `--fork-session` resume pair; restore must not re-fork.
+        assert_eq!(
+            f("grok", &["--resume", "old-id", "--fork-session", "--yolo"]),
+            vec!["--yolo"]
+        );
         // Codex selects a session with positional resume/fork subcommands.
         assert_eq!(
             f("codex", &["resume", "sess_9", "--model", "o3"]),
@@ -1551,6 +1594,20 @@ mod tests {
     }
 
     #[test]
+    fn codex_fork_requires_the_selected_session_identity() {
+        let cwd = Path::new("/work/project");
+        assert_eq!(
+            fork_session_id("codex", Some("selected-rollout"), cwd).as_deref(),
+            Some("selected-rollout")
+        );
+        assert_eq!(
+            fork_session_id("codex", None, cwd),
+            None,
+            "Codex must not guess another active rollout from the shared cwd"
+        );
+    }
+
+    #[test]
     fn fork_commands() {
         // Native-fork agents produce a diverging-session command; the id is
         // shell-quoted like resume, and unsafe ids are refused.
@@ -1563,10 +1620,11 @@ mod tests {
         assert!(fork_command("pi", "0198abcd-uuid")
             .unwrap()
             .contains("pi --fork"));
-        assert!(can_fork("claude") && can_fork("codex") && can_fork("pi"));
+        let grok = fork_command("grok", "g1").unwrap();
+        assert!(grok.contains("grok --resume") && grok.contains("--fork-session"));
+        assert!(can_fork("claude") && can_fork("codex") && can_fork("pi") && can_fork("grok"));
         // Resume-capable, but no native fork (the copy-then-resume tier is future).
-        assert!(fork_command("grok", "g1").is_none());
-        assert!(!can_fork("copilot") && !can_fork("grok"));
+        assert!(!can_fork("copilot"));
         assert!(!can_fork("cursor"));
         // Unknown agent / unsafe / empty id all refuse.
         assert!(fork_command("unknown", "x").is_none());

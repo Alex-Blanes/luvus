@@ -2,7 +2,17 @@
 //! per-pane agent-detection tick. Methods on [`App`](super::App).
 
 use super::*;
-use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc::Sender, Arc};
+
+pub(crate) const MAX_AGENT_WAIT: Duration = Duration::from_secs(3600);
+pub(crate) const MAX_AGENT_WAITS_TOTAL: usize = 1024;
+pub(crate) const MAX_AGENT_WAITS_PER_PANE: usize = 64;
+pub(crate) const MAX_AGENT_REPORT_TTL_S: u64 = 86400;
+pub(crate) const MAX_AGENT_REPORT_MESSAGE_CHARS: usize = 4096;
+pub(crate) const MAX_AGENT_PROMPT_CHARS: usize = 262_144;
+pub(crate) const MAX_AGENT_START_ARGS: usize = 64;
+const AGENT_PROMPT_QUIET: Duration = Duration::from_millis(1200);
 
 /// A parked `wait.output` request (docs/81): reply when the pane's recent
 /// output contains `needle`, or the optional deadline passes.
@@ -11,6 +21,269 @@ pub struct OutputWait {
     pub needle: String,
     pub reply: Sender<String>,
     pub deadline: Option<Instant>,
+    pub cancelled: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+mod socket_api_tests {
+    use super::*;
+
+    fn app(name: &str) -> (crate::persist::TestEnv, App) {
+        let env = crate::persist::test_env(name);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let app = App::new(100, 40, tx).unwrap();
+        (env, app)
+    }
+
+    #[test]
+    fn topology_queries_and_mutations_share_the_live_layout() {
+        let (_env, mut app) = app("socket-topology");
+        let first = app.layout().focus;
+        let split = app.dispatch("pane.split", &json!({})).unwrap();
+        let second = PaneId(split["pane"].as_str().unwrap().parse().unwrap());
+
+        let current = app.dispatch("pane.current", &json!({})).unwrap();
+        assert_eq!(current["pane"], second.0.to_string());
+        let neighbor = app
+            .dispatch(
+                "pane.neighbor",
+                &json!({
+                    "pane":second.0.to_string(), "direction":"left"
+                }),
+            )
+            .unwrap();
+        assert_eq!(neighbor["neighbor"], first.0.to_string());
+
+        app.dispatch(
+            "pane.swap",
+            &json!({
+                "pane":first.0, "with":second.0
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            app.layout().focus,
+            second,
+            "swap preserves focused PTY identity"
+        );
+
+        let exported = app.dispatch("layout.export", &json!({})).unwrap();
+        app.dispatch(
+            "layout.apply",
+            &json!({
+                "tree":exported["tree"].clone(), "focus":first.0.to_string()
+            }),
+        )
+        .unwrap();
+        assert_eq!(app.layout().focus, first);
+        assert_eq!(app.layout().leaves().len(), 2);
+        assert!(app.panes.contains_key(&first) && app.panes.contains_key(&second));
+    }
+
+    #[test]
+    fn workspace_block_move_is_atomic_and_keeps_active_workspace() {
+        let (_env, mut app) = app("socket-workspace-move");
+        app.dispatch("workspace.new", &json!({})).unwrap();
+        app.dispatch("workspace.new", &json!({})).unwrap();
+        assert_eq!(app.workspaces.len(), 3);
+        let active_name = app.workspaces[app.active_ws].name.clone();
+
+        let before: Vec<_> = app
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.cwd.clone())
+            .collect();
+        assert!(app
+            .dispatch(
+                "workspace.move_block",
+                &json!({
+                    "workspaces":[0,0], "to":1
+                })
+            )
+            .is_err());
+        assert_eq!(
+            app.workspaces
+                .iter()
+                .map(|workspace| workspace.cwd.clone())
+                .collect::<Vec<_>>(),
+            before
+        );
+
+        assert!(app
+            .dispatch(
+                "workspace.move_block",
+                &json!({
+                    "workspaces":[0,1], "to":2
+                })
+            )
+            .is_err());
+        assert_eq!(
+            app.workspaces
+                .iter()
+                .map(|workspace| workspace.cwd.clone())
+                .collect::<Vec<_>>(),
+            before,
+            "an impossible final block position is rejected atomically"
+        );
+
+        app.dispatch(
+            "workspace.move_block",
+            &json!({
+                "workspaces":[0,1], "to":1
+            }),
+        )
+        .unwrap();
+        assert_eq!(app.workspaces[app.active_ws].name, active_name);
+    }
+
+    #[test]
+    fn config_patch_rejects_unknown_fields_without_mutation() {
+        let (_env, mut app) = app("socket-config");
+        let before = serde_json::to_value(&app.config).unwrap();
+        let error = app.dispatch(
+            "config.patch",
+            &json!({"patch":{"layout":{"unknown":true}}}),
+        );
+        assert!(error.is_err());
+        assert_eq!(serde_json::to_value(&app.config).unwrap(), before);
+
+        let result = app
+            .dispatch("config.patch", &json!({"patch":{"check_updates":false}}))
+            .unwrap();
+        assert_eq!(result["config"]["check_updates"], false);
+        assert!(!app.config.check_updates);
+
+        app.dispatch(
+            "config.patch",
+            &json!({"patch":{"keybindings":{"new-command":"ctrl+n"}}}),
+        )
+        .unwrap();
+        assert_eq!(
+            app.config
+                .keybindings
+                .get("new-command")
+                .map(String::as_str),
+            Some("ctrl+n")
+        );
+        app.dispatch(
+            "config.patch",
+            &json!({"patch":{"mission_pricing":{"new-model":[1.0,2.0,0.5]}}}),
+        )
+        .unwrap();
+        assert_eq!(
+            app.config.mission_pricing.get("new-model"),
+            Some(&[1.0, 2.0, 0.5])
+        );
+    }
+
+    #[test]
+    fn workspace_metadata_partial_updates_preserve_the_other_counter() {
+        let (_env, mut app) = app("socket-workspace-metadata");
+        app.dispatch(
+            "workspace.report_metadata",
+            &json!({"workspace":0,"ahead":4,"behind":7}),
+        )
+        .unwrap();
+        app.dispatch(
+            "workspace.report_metadata",
+            &json!({"workspace":0,"ahead":9}),
+        )
+        .unwrap();
+        assert_eq!(app.workspaces[0].git_ahead_behind, Some((9, 7)));
+        app.dispatch(
+            "workspace.report_metadata",
+            &json!({"workspace":0,"behind":2}),
+        )
+        .unwrap();
+        assert_eq!(app.workspaces[0].git_ahead_behind, Some((9, 2)));
+    }
+
+    #[test]
+    fn stable_topology_ids_survive_reordering_and_address_mutations() {
+        let (_env, mut app) = app("socket-stable-ids");
+        let workspace_id = app.workspaces[0].id.clone();
+        let first_tab_id = app.workspaces[0].tabs[0].id.clone();
+        app.dispatch("tab.new", &json!({})).unwrap();
+        let second_tab_id = app.workspaces[0].tabs[1].id.clone();
+
+        app.dispatch(
+            "tab.swap",
+            &json!({"tab_id":first_tab_id,"with_id":second_tab_id}),
+        )
+        .unwrap();
+        assert_eq!(app.workspaces[0].tabs[1].id, first_tab_id);
+        let selected = app
+            .dispatch(
+                "tab.get",
+                &json!({"workspace_id":workspace_id,"tab_id":first_tab_id}),
+            )
+            .unwrap();
+        assert_eq!(selected["tab"], "2");
+        assert_eq!(selected["workspace_id"], workspace_id);
+        assert_eq!(selected["tab_id"], first_tab_id);
+    }
+
+    #[test]
+    fn socket_mutations_support_optimistic_revision_guards() {
+        let (_env, mut app) = app("socket-revision-guard");
+        let (reply, _) = std::sync::mpsc::channel();
+        let first: Value = serde_json::from_str(&app.handle_api(&ApiRequest {
+            id: "first".into(),
+            method: "tab.new".into(),
+            params: json!({"if_revision":0}),
+            reply: reply.clone(),
+        }))
+        .unwrap();
+        assert!(first["result"]["revision"].as_u64().unwrap() > 0);
+
+        let conflict: Value = serde_json::from_str(&app.handle_api(&ApiRequest {
+            id: "stale".into(),
+            method: "tab.new".into(),
+            params: json!({"if_revision":0}),
+            reply,
+        }))
+        .unwrap();
+        assert_eq!(conflict["error"]["code"], "revision_conflict");
+        assert_eq!(app.workspaces[0].tabs.len(), 2);
+    }
+}
+
+/// A parked `agent.wait` request. State transitions resolve these directly on
+/// the app loop; no client polling and no subscribe-then-snapshot race.
+pub struct AgentWait {
+    pub request_id: String,
+    pub state: State,
+    pub reply: Sender<String>,
+    pub deadline: Instant,
+    pub cancelled: Arc<AtomicBool>,
+}
+
+/// One launch whose pane and command have already been committed, waiting only
+/// for Luvus to recognize the requested agent as interactive.
+pub struct AgentStart {
+    request_id: String,
+    name: String,
+    kind: String,
+    reply: Sender<String>,
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+}
+
+/// A submitted prompt waiting for post-submission evidence. `saw_output`
+/// closes the fast-turn gap where an agent starts and settles between two
+/// semantic detection ticks; the quiet window prevents prompt echo alone from
+/// being reported as completion immediately.
+pub struct AgentPrompt {
+    request_id: String,
+    until: Vec<State>,
+    baseline_revision: u64,
+    last_revision: u64,
+    last_output_at: Instant,
+    saw_output: bool,
+    saw_working: bool,
+    reply: Sender<String>,
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
 }
 
 /// The canonical `wait.output` response: `matched` says whether the marker
@@ -21,6 +294,51 @@ fn wait_response(request_id: &str, matched: bool, pane: Option<PaneId>) -> Strin
         None => json!({ "type": "wait", "matched": matched }),
     };
     json!({ "id": request_id, "result": result }).to_string()
+}
+
+fn agent_wait_response(
+    request_id: &str,
+    matched: bool,
+    pane: Option<PaneId>,
+    state: Option<State>,
+) -> String {
+    json!({
+        "id": request_id,
+        "result": {
+            "type": "agent_wait",
+            "matched": matched,
+            "pane": pane.map(|id| id.0.to_string()),
+            "status": state.map(state_str),
+        }
+    })
+    .to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agent_prompt_response(
+    request_id: &str,
+    pane: PaneId,
+    submitted: bool,
+    matched: bool,
+    state: Option<State>,
+    baseline_revision: u64,
+    content_revision: u64,
+    evidence: &str,
+) -> String {
+    json!({
+        "id":request_id,
+        "result":{
+            "type":"agent_prompt",
+            "pane":pane.0.to_string(),
+            "submitted":submitted,
+            "matched":matched,
+            "status":state.map(state_str),
+            "baseline_revision":baseline_revision,
+            "content_revision":content_revision,
+            "evidence":evidence,
+        }
+    })
+    .to_string()
 }
 
 /// Debounce dwell for committing a newly-desired agent state (hysteresis).
@@ -201,29 +519,63 @@ impl App {
         // the state remains Idle. Keep this separate from `agent_appeared`:
         // non-resumable agents still need a repaint, but not a persisted session.
         let mut visible_identity_changed = false;
+        let mut expired_reports: Vec<(PaneId, String)> = Vec::new();
         for id in ids {
             let Some(pane) = self.panes.get(&id) else {
                 continue;
             };
+            if let Some(status) = self.status.get_mut(&id) {
+                if status
+                    .agent_report
+                    .as_ref()
+                    .is_some_and(|report| now >= report.expires_at)
+                {
+                    if let Some(report) = status.agent_report.take() {
+                        expired_reports.push((id, report.source));
+                    }
+                    status.force_detect = true;
+                }
+            }
+            let report = self
+                .status
+                .get(&id)
+                .and_then(|status| status.agent_report.clone());
+            let detection_rows = detect::screen_rows(
+                self.status
+                    .get(&id)
+                    .map(|status| status.agent.as_str())
+                    .unwrap_or(""),
+                self.proc_commands
+                    .get(&id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                &self.manifests,
+            );
             let (last_generation, force_detect) = self
                 .status
                 .get(&id)
                 .map(|s| (s.last_detect_generation, s.force_detect))
                 .unwrap_or((None, true));
-            let inspected = match pane.engine.lock() {
-                Ok(engine) => {
-                    let generation = engine.output_generation();
-                    if force_detect || last_generation != Some(generation) {
-                        Some((
-                            generation,
-                            engine.title().map(Arc::<str>::from),
-                            Arc::<str>::from(engine.detection_text(14)),
-                        ))
-                    } else {
-                        None
+            let inspected = if report.is_some() {
+                // An explicit lease is the state authority. Keep the cached
+                // screen untouched and avoid a needless VT lock/extraction.
+                None
+            } else {
+                match pane.engine.lock() {
+                    Ok(engine) => {
+                        let generation = engine.output_generation();
+                        if force_detect || last_generation != Some(generation) {
+                            Some((
+                                generation,
+                                engine.title().map(Arc::<str>::from),
+                                Arc::<str>::from(engine.detection_text(detection_rows)),
+                            ))
+                        } else {
+                            None
+                        }
                     }
+                    Err(_) => None,
                 }
-                Err(_) => None,
             };
             if let Some(s) = self.status.get_mut(&id) {
                 if let Some((generation, title, bottom)) = inspected {
@@ -277,18 +629,32 @@ impl App {
                 .get(&id)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let det = detect::classify(
-                title.as_deref(),
-                &bottom,
-                recent,
-                recent_input,
-                base,
-                &known,
-                running,
-                &self.manifests,
-            );
+            let det = match report.as_ref() {
+                Some(report) => detect::Detection {
+                    state: report.state,
+                    agent: report.agent.clone(),
+                    identity_source: "integration_report",
+                    state_source: "integration_report",
+                    rule_priority: None,
+                    rule_region: None,
+                },
+                None => detect::classify(
+                    title.as_deref(),
+                    &bottom,
+                    recent,
+                    recent_input,
+                    base,
+                    &known,
+                    running,
+                    &self.manifests,
+                ),
+            };
 
             if let Some(s) = self.status.get_mut(&id) {
+                s.identity_source = det.identity_source;
+                s.state_source = det.state_source;
+                s.rule_priority = det.rule_priority;
+                s.rule_region = det.rule_region;
                 let focused = id == focus;
                 if focused {
                     s.seen = true;
@@ -316,8 +682,8 @@ impl App {
                 // The screen-scraped name wins only when it's a *known* agent. If
                 // the banner text doesn't currently show one (so classify fell back
                 // to the bare shell name), don't downgrade a pane that already has a
-                // resolved agent_session: keep its disk/hook identity so the brand —
-                // and the notch logo keyed off it — stays stable across an agent's
+                // resolved agent_session: keep its disk/hook identity so the brand
+                // shown to UI and API consumers stays stable across an agent's
                 // quiet moments (Claude showing "Opus 4.8" but not "claude", etc.).
                 let detected = if self.manifests.is_agent(&det.agent) {
                     det.agent
@@ -327,11 +693,13 @@ impl App {
                         _ => det.agent,
                     }
                 };
-                let was_visible_agent =
-                    self.manifests.is_agent(&s.agent) || s.agent_session.is_some();
+                let was_visible_agent = self.manifests.is_agent(&s.agent)
+                    || s.agent_session.is_some()
+                    || s.agent_report.is_some();
                 let agent_changed = s.agent != detected;
-                let is_visible_agent =
-                    self.manifests.is_agent(&detected) || s.agent_session.is_some();
+                let is_visible_agent = self.manifests.is_agent(&detected)
+                    || s.agent_session.is_some()
+                    || s.agent_report.is_some();
                 s.agent = detected;
                 if agent_changed {
                     visible_identity_changed |= was_visible_agent || is_visible_agent;
@@ -355,7 +723,11 @@ impl App {
                     s.candidate = desired;
                     s.candidate_since = now;
                 }
-                let dwell = commit_dwell(desired);
+                let dwell = if report.is_some() {
+                    Duration::ZERO
+                } else {
+                    commit_dwell(desired)
+                };
                 if s.state != desired && now.duration_since(s.candidate_since) >= dwell {
                     let was_working = s.state == State::Working;
                     s.state = desired;
@@ -387,8 +759,8 @@ impl App {
         };
         for (id, st, agent) in changes {
             // Publishes to subscribers and fires any module `[[events]]` hooks.
-            // Carry the pane's cwd + its node's label/branch so consumers (e.g. the
-            // notch companion, docs/24) can label the row without a second call.
+            // Carry the pane's cwd + its node's label/branch so API consumers can
+            // label the row without a second call.
             // `project` is the **node label**, matching `agent.list` exactly — a
             // consumer that patches rows from both must not see the name change
             // shape (it used to be the cwd basename here, so renaming a node made
@@ -404,15 +776,21 @@ impl App {
                 .unwrap_or_default();
             self.emit_event(
                 "pane.agent_status_changed",
-                json!({ "pane": id.0.to_string(), "status": state_str(st), "agent": agent, "cwd": cwd, "project": project, "branch": branch }),
+                json!({
+                    "pane": id.0.to_string(), "status": state_str(st), "agent": agent,
+                    "cwd": cwd, "project": project, "branch": branch,
+                    "authority":self.status.get(&id).map(|status| status.identity_source),
+                    "state_source":self.status.get(&id).map(|status| status.state_source),
+                }),
             );
+            self.check_agent_waits(id);
             // The optional retro chime (off by default). A plain shell going
             // quiet or blocking is not an agent, so it stays silent either way.
             let is_agent_pane = self.manifests.is_agent(&agent)
                 || self
                     .status
                     .get(&id)
-                    .is_some_and(|s| s.agent_session.is_some());
+                    .is_some_and(|s| s.agent_session.is_some() || s.agent_report.is_some());
             // *Done*: one chime per real finish of a working stretch — the
             // debounce already absorbs mid-turn pauses, and it rings whether or
             // not the pane is focused (that's the point: you looked away).
@@ -430,12 +808,21 @@ impl App {
                 }
             }
         }
+        for (id, source) in expired_reports {
+            self.emit_event(
+                "agent.authority_released",
+                json!({"pane":id.0.to_string(), "source":source, "reason":"expired"}),
+            );
+        }
         changed
     }
 
     // ── api dispatch ──────────────────────────────────────────────────────────
 
     pub fn handle_api(&mut self, req: &ApiRequest) -> String {
+        if Self::is_terminal_backend_method(&req.method) {
+            return self.handle_terminal_backend(req);
+        }
         // No node open: most methods reach `layout()`, which would index an empty
         // `workspaces`. This was written when an empty session only ever existed
         // for the moment before the app quit; since docs/43 §3.3 a server *stays*
@@ -448,18 +835,73 @@ impl App {
         // *server's* cwd — the very thing §3.3 removed.
         const WITHOUT_NODE: &[&str] = &[
             "ping",
+            "socket.capabilities",
+            "runtime.capabilities",
+            "session.snapshot",
+            "search.capabilities",
             "server.stop",
+            "server.reload_config",
+            "server.agent_manifests",
+            "server.reload_agent_manifests",
+            "config.get",
+            "config.patch",
             "workspace.open",
             "node.open",
             "workspace.list",
             "node.list",
             "worktree.open",
+            "ui.bar.list",
+            "ui.bar.push",
+            "ui.bar.move",
+            "ui.bar.remove",
+            "ui.notification.push",
+            "ui.notification.clear",
+            "theme.list",
+            "theme.use",
+            "theme.path",
         ];
         if self.workspaces.is_empty() && !WITHOUT_NODE.contains(&req.method.as_str()) {
             return json!({ "id": req.id, "error": { "code": "no_session", "message": "no active session" } }).to_string();
         }
-        match self.dispatch(&req.method, &req.params) {
-            Ok(result) => json!({ "id": req.id, "result": result }).to_string(),
+        let read_only = crate::api::capabilities::is_read_only(&req.method);
+        let revisioned = !matches!(
+            req.method.as_str(),
+            "runtime.capabilities" | "session.snapshot"
+        );
+        let mut params = req.params.clone();
+        let expected_revision = revisioned
+            .then(|| {
+                params
+                    .as_object_mut()
+                    .and_then(|object| object.remove("if_revision"))
+            })
+            .flatten();
+        if read_only && expected_revision.is_some() {
+            return json!({ "id": req.id, "error": { "code": "invalid_request",
+                "message": "if_revision is only valid for mutations" } })
+            .to_string();
+        }
+        if let Some(expected) = expected_revision {
+            let actual = crate::ipc::api::current_sequence(&self.events);
+            if expected.as_u64() != Some(actual) {
+                return json!({ "id": req.id, "error": { "code": "revision_conflict",
+                    "message": "socket state changed before this mutation",
+                    "expected": expected, "actual": actual } })
+                .to_string();
+            }
+        }
+        match self.dispatch(&req.method, &params) {
+            Ok(mut result) => {
+                if revisioned {
+                    if let Some(object) = result.as_object_mut() {
+                        object.insert(
+                            "revision".to_string(),
+                            json!(crate::ipc::api::current_sequence(&self.events)),
+                        );
+                    }
+                }
+                json!({ "id": req.id, "result": result }).to_string()
+            }
             Err((code, message)) => {
                 json!({ "id": req.id, "error": { "code": code, "message": message } }).to_string()
             }
@@ -474,20 +916,153 @@ impl App {
                 "protocol":1,
                 "session": crate::session::display_name()
             })),
-            // Re-read `~/.luvus/manifests/` (built-in + managed OTA + user) into
-            // the live engine, so `server update-manifest` applies without a
-            // restart. Detection uses the new rules on the next tick.
-            "manifest.reload" => {
-                self.manifests =
+            "socket.capabilities" => {
+                reject_api_fields(p, &[])?;
+                Ok(crate::api::capabilities(crate::ipc::api::current_sequence(
+                    &self.events,
+                )))
+            }
+            "config.get" => {
+                reject_api_fields(p, &[])?;
+                Ok(json!({"type":"config", "config":self.config}))
+            }
+            "config.patch" => {
+                reject_api_fields(p, &["patch"])?;
+                let patch = p.get("patch").ok_or_else(|| {
+                    (
+                        "invalid_request".to_string(),
+                        "config.patch needs a patch object".to_string(),
+                    )
+                })?;
+                let next = patched_config(&self.config, patch)?;
+                self.apply_socket_config(next)?;
+                Ok(json!({"type":"config", "config":self.config}))
+            }
+            "server.reload_config" => {
+                reject_api_fields(p, &[])?;
+                let next = crate::config::load();
+                self.apply_socket_config(next)?;
+                Ok(json!({"type":"config_reloaded", "config":self.config}))
+            }
+            "server.agent_manifests" => {
+                reject_api_fields(p, &[])?;
+                Ok(json!({
+                    "type":"agent_manifests",
+                    "rules":self.manifests.rule_count(),
+                    "agents":self.manifests.agent_names(),
+                }))
+            }
+            "server.reload_agent_manifests" | "manifest.reload" => {
+                reject_api_fields(p, &[])?;
+                let manifests =
                     crate::detect::Manifests::load(&crate::persist::ensure_manifests_dir());
-                for status in self.status.values_mut() {
-                    status.force_detect = true;
+                self.apply_socket_manifests(manifests);
+                let rules = self.manifests.rule_count();
+                Ok(json!({"type":"agent_manifests_reloaded","rules":rules}))
+            }
+            "runtime.capabilities" => {
+                reject_api_fields(p, &[])?;
+                Ok(json!({
+                "type":"runtime_capabilities",
+                "protocol":{
+                    "name":crate::runtime_api::PROTOCOL_NAME,
+                    "major":crate::runtime_api::PROTOCOL_MAJOR,
+                    "minor":crate::runtime_api::PROTOCOL_MINOR,
+                },
+                "session":crate::session::display_name(),
+                "event_sequence":crate::ipc::api::current_sequence(&self.events),
+                "methods":crate::runtime_api::METHODS,
+                "agent_authorities":["integration_report", "process_tree", "launch_command", "osc_title", "screen_text", "prior_identity", "command_fallback"],
+                "agent_states":["idle", "working", "blocked", "done"],
+                "limits":{
+                    "agent_wait_timeout_s":MAX_AGENT_WAIT.as_secs(),
+                    "agent_prompt_characters":MAX_AGENT_PROMPT_CHARS,
+                    "agent_prompt_quiet_ms":AGENT_PROMPT_QUIET.as_millis(),
+                    "agent_start_arguments":MAX_AGENT_START_ARGS,
+                    "agent_report_ttl_s":MAX_AGENT_REPORT_TTL_S,
+                    "agent_report_message_characters":MAX_AGENT_REPORT_MESSAGE_CHARS,
+                    "agent_waits_per_pane":MAX_AGENT_WAITS_PER_PANE,
+                    "agent_waits_total":MAX_AGENT_WAITS_TOTAL,
                 }
-                Ok(json!({"type":"ok","rules": self.manifests.rule_count()}))
+                }))
+            }
+            "session.snapshot" => {
+                reject_api_fields(p, &[])?;
+                Ok(self.runtime_snapshot())
+            }
+            "search.capabilities" => Ok(json!({
+                "type": "search_capabilities",
+                "version": 1,
+                "methods": ["search.query", "search.activate"],
+                "scopes": ["all", "navigate", "files", "output"],
+                "max_results": crate::search::RESULT_CAP,
+                "max_response_bytes": crate::search::federation::MAX_SESSION_RESPONSE_BYTES,
+            })),
+            "theme.list" => Ok(self.theme_registry.list_json(&self.config.theme)),
+            "theme.path" => Ok(json!({
+                "type": "theme_path",
+                "path": crate::theme::themes_dir().display().to_string(),
+            })),
+            "theme.use" => {
+                let id = p.get("id").and_then(Value::as_str).ok_or_else(|| {
+                    (
+                        "invalid_request".to_string(),
+                        "theme.use needs an id".to_string(),
+                    )
+                })?;
+                if self.theme_registry.get(id).is_none() {
+                    return Err((
+                        "not_found".to_string(),
+                        format!("theme `{id}` is not installed"),
+                    ));
+                }
+                self.apply_theme(id);
+                Ok(json!({"type": "theme_selected", "id": self.config.theme}))
             }
             "server.stop" => {
                 self.should_quit = true;
                 Ok(json!({"type":"ok"}))
+            }
+            "pane.get" => {
+                reject_api_fields(p, &["pane"])?;
+                let pane = self.resolve_pane(p).ok_or_else(not_found)?;
+                self.socket_pane(pane)
+            }
+            "pane.current" => {
+                reject_api_fields(p, &[])?;
+                self.socket_pane(self.layout().focus)
+            }
+            "pane.layout" => {
+                reject_api_fields(p, &["pane"])?;
+                let pane = self.resolve_pane(p).unwrap_or_else(|| self.layout().focus);
+                self.socket_pane_layout(pane)
+            }
+            "pane.neighbor" => {
+                reject_api_fields(p, &["pane", "direction"])?;
+                let pane = self.resolve_pane(p).unwrap_or_else(|| self.layout().focus);
+                let direction = crate::api::topology::direction(p)?;
+                let (workspace, tab) = self.pane_location(pane).ok_or_else(not_found)?;
+                let layout = &self.workspaces[workspace].tabs[tab].layout;
+                let neighbor =
+                    layout.neighbor(crate::api::topology::logical_area(), pane, direction);
+                Ok(json!({"type":"pane_neighbor","pane":pane.0.to_string(),
+                    "neighbor":neighbor.map(|id| id.0.to_string())}))
+            }
+            "pane.edges" => {
+                reject_api_fields(p, &["pane"])?;
+                let pane = self.resolve_pane(p).unwrap_or_else(|| self.layout().focus);
+                let (workspace, tab) = self.pane_location(pane).ok_or_else(not_found)?;
+                let area = crate::api::topology::logical_area();
+                let rect = self.workspaces[workspace].tabs[tab]
+                    .layout
+                    .pane_rect(area, pane)
+                    .ok_or_else(not_found)?;
+                Ok(
+                    json!({"type":"pane_edges","pane":pane.0.to_string(),"edges":{
+                        "left":rect.x == area.x, "right":rect.right() == area.right(),
+                        "top":rect.y == area.y, "bottom":rect.bottom() == area.bottom(),
+                    }}),
+                )
             }
             "pane.list" => {
                 let focus = self.layout().focus;
@@ -662,14 +1237,22 @@ impl App {
             // scoped to the active workspace, so `luvus wait agent-status` polls this.
             "pane.status" => {
                 let id = self.resolve_pane(p).ok_or_else(not_found)?;
-                let (agent, status) = self
+                let (agent, status, authority, state_source) = self
                     .status
                     .get(&id)
-                    .map(|s| (s.agent.clone(), state_str(s.state).to_string()))
-                    .unwrap_or_else(|| (String::new(), "unknown".to_string()));
+                    .map(|s| {
+                        (
+                            s.agent.clone(),
+                            state_str(s.state).to_string(),
+                            s.identity_source,
+                            s.state_source,
+                        )
+                    })
+                    .unwrap_or_else(|| (String::new(), "unknown".to_string(), "none", "none"));
                 let history = self.panes.get(&id).map(|p| p.history_metrics());
                 Ok(json!({
                     "type":"pane_status","pane": id.0.to_string(), "agent": agent, "status": status,
+                    "authority":authority, "state_source":state_source,
                     "scroll_offset": history.map(|m| m.offset).unwrap_or(0),
                     "history_rows": history.map(|m| m.retained_rows).unwrap_or(0),
                     "history_budget_bytes": history.map(|m| m.budget_bytes).unwrap_or(0),
@@ -681,6 +1264,11 @@ impl App {
                     "history_exact": history.map(|m| m.exact_bytes).unwrap_or(false),
                     "history_bytes_kind": if history.is_some_and(|m| m.exact_bytes) { "exact" } else { "estimated" },
                 }))
+            }
+            "pane.processes" => {
+                reject_api_fields(p, &["pane"])?;
+                let id = self.resolve_pane(p).ok_or_else(not_found)?;
+                Ok(self.pane_processes(id))
             }
             "pane.report_session" => {
                 let id = self.resolve_pane(p).ok_or_else(not_found)?;
@@ -704,9 +1292,9 @@ impl App {
                 self.session_dirty = true;
                 Ok(json!({"type":"ok"}))
             }
-            // A precise agent lifecycle event from an integration hook (docs/24
-            // NOTCH-6): permission prompt, question, turn end. Forwarded verbatim
-            // onto the event bus as `agent.hook` for the notch companion.
+            // A precise agent lifecycle event from an integration hook:
+            // permission prompt, question, turn end. Forwarded verbatim onto the
+            // event bus as `agent.hook` for modules and API clients.
             "pane.report_event" => {
                 let id = self.resolve_pane(p).ok_or_else(not_found)?;
                 let agent = p.get("agent").and_then(|v| v.as_str()).unwrap_or("");
@@ -735,6 +1323,7 @@ impl App {
                     .map(|(i, w)| {
                         json!({
                             "workspace": i.to_string(),
+                            "workspace_id": w.id,
                             "name": w.name,
                             "cwd": w.cwd.display().to_string(),
                             "pinned": w.pinned,
@@ -746,9 +1335,124 @@ impl App {
                     .collect();
                 Ok(json!({"type":"workspace_list","workspaces":arr}))
             }
+            "workspace.get" => {
+                reject_api_fields(p, &["workspace", "workspace_id"])?;
+                let index = self.optional_socket_workspace(p)?.unwrap_or(self.active_ws);
+                self.socket_workspace(index)
+            }
+            "workspace.move" => {
+                reject_api_fields(p, &["workspace", "workspace_id", "to"])?;
+                let workspace = self.required_socket_workspace(p)?;
+                let to = required_index_param(p, "to")?;
+                let positions = self.reorder_workspace_block(&[workspace], to)?;
+                self.emit_event(
+                    "workspace.moved",
+                    json!({"workspace":workspace.to_string(),"to":positions[0].to_string()}),
+                );
+                Ok(json!({
+                    "type":"workspace_move",
+                    "workspace":workspace.to_string(),
+                    "to":positions[0].to_string()
+                }))
+            }
+            "workspace.move_block" => {
+                reject_api_fields(p, &["workspaces", "workspace_ids", "to"])?;
+                if p.get("workspaces").is_some() && p.get("workspace_ids").is_some() {
+                    return Err((
+                        "invalid_request".to_string(),
+                        "workspaces and workspace_ids cannot be used together".to_string(),
+                    ));
+                }
+                let values = p
+                    .get("workspaces")
+                    .or_else(|| p.get("workspace_ids"))
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        (
+                            "invalid_request".to_string(),
+                            "workspaces or workspace_ids must be an array".to_string(),
+                        )
+                    })?;
+                if values.is_empty()
+                    || values.len() > crate::api::topology::MAX_WORKSPACE_MOVE_BLOCK
+                {
+                    return Err((
+                        "limit_exceeded".to_string(),
+                        "workspace block size is invalid".to_string(),
+                    ));
+                }
+                let workspaces: Vec<usize> = if p.get("workspace_ids").is_some() {
+                    values
+                        .iter()
+                        .map(|value| {
+                            let id = value.as_str().ok_or_else(|| {
+                                (
+                                    "invalid_request".to_string(),
+                                    "workspace_ids must contain strings".to_string(),
+                                )
+                            })?;
+                            self.workspaces
+                                .iter()
+                                .position(|workspace| workspace.id == id)
+                                .ok_or_else(|| {
+                                    (
+                                        "not_found".to_string(),
+                                        format!("workspace id {id} not found"),
+                                    )
+                                })
+                        })
+                        .collect::<Result<_, _>>()?
+                } else {
+                    values
+                        .iter()
+                        .map(parse_index_value)
+                        .collect::<Result<_, _>>()?
+                };
+                let to = required_index_param(p, "to")?;
+                let positions = self.reorder_workspace_block(&workspaces, to)?;
+                self.emit_event(
+                    "workspace.block_moved",
+                    json!({"workspaces":workspaces,"positions":positions}),
+                );
+                Ok(json!({
+                    "type":"workspace_move_block",
+                    "workspaces":workspaces,
+                    "positions":positions
+                }))
+            }
+            "workspace.report_metadata" => {
+                reject_api_fields(
+                    p,
+                    &["workspace", "workspace_id", "branch", "ahead", "behind"],
+                )?;
+                let index = self.required_socket_workspace(p)?;
+                let branch = optional_nullable_string(p, "branch", 512)?;
+                let ahead = optional_u32(p, "ahead")?;
+                let behind = optional_u32(p, "behind")?;
+                let workspace = self
+                    .workspaces
+                    .get_mut(index)
+                    .ok_or_else(|| workspace_update_error(index, WorkspaceUpdateError::NotFound))?;
+                if p.get("branch").is_some() {
+                    workspace.branch = branch;
+                }
+                if ahead.is_some() || behind.is_some() {
+                    let current = workspace.git_ahead_behind.unwrap_or_default();
+                    workspace.git_ahead_behind =
+                        Some((ahead.unwrap_or(current.0), behind.unwrap_or(current.1)));
+                }
+                self.emit_event(
+                    "workspace.metadata_reported",
+                    json!({"workspace":index.to_string()}),
+                );
+                self.socket_workspace(index)
+            }
             "workspace.new" | "node.new" => {
                 self.new_workspace();
-                Ok(json!({"type":"workspace","workspace": self.active_ws.to_string()}))
+                Ok(json!({
+                    "type":"workspace",
+                    "workspace": self.active_ws.to_string()
+                }))
             }
             "workspace.open" | "node.open" => {
                 // Open `path` as a workspace, or focus it if it's already one. Used
@@ -781,10 +1485,13 @@ impl App {
                 if !focus && self.workspaces.len() == before_len {
                     self.active_ws = was;
                 }
-                Ok(json!({"type":"workspace","workspace": self.active_ws.to_string()}))
+                Ok(json!({
+                    "type":"workspace",
+                    "workspace": self.active_ws.to_string()
+                }))
             }
             "workspace.focus" | "node.focus" => {
-                if let Some(i) = param_usize(p, "workspace").or_else(|| param_usize(p, "node")) {
+                if let Some(i) = self.optional_socket_workspace(p)? {
                     if i < self.workspaces.len() {
                         self.active_ws = i;
                     }
@@ -792,7 +1499,7 @@ impl App {
                 Ok(json!({"type":"ok"}))
             }
             "workspace.rename" | "node.rename" => {
-                let i = required_workspace_param(p)?;
+                let i = self.required_socket_workspace(p)?;
                 let name = p.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
                     (
                         "invalid_request".to_string(),
@@ -812,7 +1519,7 @@ impl App {
                 }))
             }
             "workspace.pin" | "node.pin" => {
-                let i = required_workspace_param(p)?;
+                let i = self.required_socket_workspace(p)?;
                 let pinned = p.get("pinned").and_then(|v| v.as_bool()).ok_or_else(|| {
                     (
                         "invalid_request".to_string(),
@@ -832,9 +1539,7 @@ impl App {
                 }))
             }
             "workspace.close" | "node.close" => {
-                let i = param_usize(p, "workspace")
-                    .or_else(|| param_usize(p, "node"))
-                    .unwrap_or(self.active_ws);
+                let i = self.optional_socket_workspace(p)?.unwrap_or(self.active_ws);
                 self.close_workspace(i);
                 Ok(json!({"type":"ok"}))
             }
@@ -857,6 +1562,7 @@ impl App {
                         };
                         json!({
                             "tab": (i + 1).to_string(),
+                            "tab_id": t.id,
                             "active": i == ws.active_tab,
                             "name": t.name.clone(),
                             "kind": kind,
@@ -865,20 +1571,60 @@ impl App {
                     .collect();
                 Ok(json!({"type":"tab_list","tabs":arr}))
             }
+            "tab.get" => {
+                reject_api_fields(p, &["workspace", "workspace_id", "tab", "tab_id"])?;
+                let workspace = self.optional_socket_workspace(p)?.unwrap_or(self.active_ws);
+                let tab = self
+                    .optional_socket_tab(workspace, p, "tab", "tab_id")?
+                    .unwrap_or_else(|| {
+                        self.workspaces
+                            .get(workspace)
+                            .map(|ws| ws.active_tab)
+                            .unwrap_or(usize::MAX)
+                    });
+                self.socket_tab(workspace, tab)
+            }
             "tab.new" => {
                 self.new_tab();
-                Ok(json!({"type":"tab","tab": (self.ws().active_tab + 1).to_string()}))
+                Ok(json!({
+                    "type":"tab",
+                    "tab": (self.ws().active_tab + 1).to_string()
+                }))
             }
             "tab.focus" => {
-                if let Some(i) = param_usize(p, "tab") {
-                    self.switch_tab(i.saturating_sub(1));
-                }
+                let index = self.required_socket_tab(self.active_ws, p, "tab", "tab_id")?;
+                self.focus_tab(index).map_err(tab_focus_error)?;
                 Ok(json!({"type":"ok"}))
             }
             "tab.move" => {
-                let from = required_one_based_param(p, "tab")?;
-                let to = required_one_based_param(p, "to")?;
-                let active = self.move_tab(from, to).map_err(tab_move_error)?;
+                let (from, to, active) = if let Some(raw_direction) =
+                    p.get("direction").filter(|direction| !direction.is_null())
+                {
+                    if p.get("to").is_some() {
+                        return Err((
+                            "invalid_request".to_string(),
+                            "direction and to cannot be used together".to_string(),
+                        ));
+                    }
+                    let direction = match raw_direction.as_str() {
+                        Some("left") => TabMoveDirection::Left,
+                        Some("right") => TabMoveDirection::Right,
+                        _ => {
+                            return Err((
+                                "invalid_request".to_string(),
+                                "direction must be left or right".to_string(),
+                            ))
+                        }
+                    };
+                    let from = self.optional_socket_tab(self.active_ws, p, "tab", "tab_id")?;
+                    self.move_tab_direction(from, direction)
+                        .map_err(tab_move_error)?
+                } else {
+                    let from = self.required_socket_tab(self.active_ws, p, "tab", "tab_id")?;
+                    let to = required_one_based_param(p, "to")?;
+                    let active = self.move_tab(from, to).map_err(tab_move_error)?;
+                    (from, to, active)
+                };
                 Ok(json!({
                     "type": "tab_move",
                     "from": (from + 1).to_string(),
@@ -886,40 +1632,318 @@ impl App {
                     "active": (active + 1).to_string(),
                 }))
             }
+            "tab.swap" => {
+                let first = self.required_socket_tab(self.active_ws, p, "tab", "tab_id")?;
+                let second = self.required_socket_tab(self.active_ws, p, "with", "with_id")?;
+                let active = self.swap_tabs(first, second).map_err(tab_move_error)?;
+                Ok(json!({
+                    "type": "tab_swap",
+                    "tab": (first + 1).to_string(),
+                    "with": (second + 1).to_string(),
+                    "active": (active + 1).to_string(),
+                }))
+            }
             // Name a tab from a module (docs/13 §3.9) — the same label the
             // tab-rename modal writes. An empty name clears it back to a number.
             "tab.rename" => {
-                let i = param_usize(p, "tab")
-                    .map(|i| i.saturating_sub(1))
+                let index = self
+                    .optional_socket_tab(self.active_ws, p, "tab", "tab_id")?
                     .unwrap_or(self.ws().active_tab);
-                let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
-                let active = self.active_ws;
-                let tab = self.workspaces[active]
-                    .tabs
-                    .get_mut(i)
-                    .ok_or_else(not_found)?;
-                // Git/orch tabs keep their fixed labels (docs/28).
-                if tab.git.is_some() || tab.orch {
-                    return Err(module_err(
-                        "git and orch tabs cannot be renamed".to_string(),
-                    ));
-                }
-                tab.name = (!name.is_empty()).then(|| name.chars().take(40).collect());
-                self.session_dirty = true;
+                let name = p.get("name").and_then(Value::as_str).ok_or_else(|| {
+                    (
+                        "invalid_request".to_string(),
+                        "name must be a string (empty clears the tab name)".to_string(),
+                    )
+                })?;
+                self.rename_tab(index, name).map_err(tab_rename_error)?;
                 Ok(json!({"type":"ok"}))
             }
             "tab.close" => {
-                let i = param_usize(p, "tab")
-                    .map(|i| i.saturating_sub(1))
+                let i = self
+                    .optional_socket_tab(self.active_ws, p, "tab", "tab_id")?
                     .unwrap_or(self.ws().active_tab);
                 self.close_tab(i);
                 Ok(json!({"type":"ok"}))
+            }
+            "layout.export" => {
+                reject_api_fields(p, &["workspace", "workspace_id", "tab", "tab_id"])?;
+                let workspace = self.optional_socket_workspace(p)?.unwrap_or(self.active_ws);
+                let tab = self
+                    .optional_socket_tab(workspace, p, "tab", "tab_id")?
+                    .unwrap_or_else(|| {
+                        self.workspaces
+                            .get(workspace)
+                            .map(|ws| ws.active_tab)
+                            .unwrap_or(usize::MAX)
+                    });
+                let tab_ref = self
+                    .workspaces
+                    .get(workspace)
+                    .and_then(|ws| ws.tabs.get(tab))
+                    .ok_or_else(not_found)?;
+                if !tab_ref.is_renameable() {
+                    return Err((
+                        "invalid_request".to_string(),
+                        "dashboard tabs do not have a mutable pane layout".to_string(),
+                    ));
+                }
+                Ok(
+                    json!({"type":"layout","workspace":workspace.to_string(),"tab":(tab+1).to_string(),
+                    "focus":tab_ref.layout.focus.0.to_string(),"tree":tab_ref.layout.to_tree()}),
+                )
+            }
+            "layout.apply" => {
+                reject_api_fields(
+                    p,
+                    &[
+                        "workspace",
+                        "workspace_id",
+                        "tab",
+                        "tab_id",
+                        "focus",
+                        "tree",
+                    ],
+                )?;
+                let workspace = self.optional_socket_workspace(p)?.unwrap_or(self.active_ws);
+                let tab = self
+                    .optional_socket_tab(workspace, p, "tab", "tab_id")?
+                    .unwrap_or_else(|| {
+                        self.workspaces
+                            .get(workspace)
+                            .map(|ws| ws.active_tab)
+                            .unwrap_or(usize::MAX)
+                    });
+                let tree = crate::api::topology::parse_tree(p.get("tree").ok_or_else(|| {
+                    (
+                        "invalid_request".to_string(),
+                        "layout.apply needs a tree".to_string(),
+                    )
+                })?)?;
+                let tab_ref = self
+                    .workspaces
+                    .get_mut(workspace)
+                    .and_then(|ws| ws.tabs.get_mut(tab))
+                    .ok_or_else(not_found)?;
+                if !tab_ref.is_renameable() {
+                    return Err((
+                        "invalid_request".to_string(),
+                        "dashboard tabs do not have a mutable pane layout".to_string(),
+                    ));
+                }
+                let focus = match p.get("focus") {
+                    None => tab_ref.layout.focus,
+                    Some(value) => PaneId(parse_u32_value(value, "focus")?),
+                };
+                tab_ref
+                    .layout
+                    .apply_tree(&tree, focus)
+                    .map_err(|message| ("invalid_request".to_string(), message.to_string()))?;
+                self.session_dirty = true;
+                self.emit_event(
+                    "layout.applied",
+                    json!({"workspace":workspace.to_string(),"tab":(tab+1).to_string()}),
+                );
+                Ok(
+                    json!({"type":"layout_applied","workspace":workspace.to_string(),"tab":(tab+1).to_string()}),
+                )
+            }
+            "layout.set_split_ratio" => {
+                reject_api_fields(
+                    p,
+                    &[
+                        "workspace",
+                        "workspace_id",
+                        "tab",
+                        "tab_id",
+                        "path",
+                        "ratio",
+                    ],
+                )?;
+                let workspace = self.optional_socket_workspace(p)?.unwrap_or(self.active_ws);
+                let tab = self
+                    .optional_socket_tab(workspace, p, "tab", "tab_id")?
+                    .unwrap_or_else(|| {
+                        self.workspaces
+                            .get(workspace)
+                            .map(|ws| ws.active_tab)
+                            .unwrap_or(usize::MAX)
+                    });
+                let path = crate::api::topology::split_path(p)?;
+                let ratio = p.get("ratio").and_then(Value::as_f64).ok_or_else(|| {
+                    (
+                        "invalid_request".to_string(),
+                        "ratio must be a finite number".to_string(),
+                    )
+                })?;
+                if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
+                    return Err((
+                        "invalid_request".to_string(),
+                        "ratio must be between 0 and 1".to_string(),
+                    ));
+                }
+                let tab_ref = self
+                    .workspaces
+                    .get_mut(workspace)
+                    .and_then(|ws| ws.tabs.get_mut(tab))
+                    .ok_or_else(not_found)?;
+                if !tab_ref.layout.try_set_ratio(
+                    crate::api::topology::logical_area(),
+                    &path,
+                    ratio as f32,
+                ) {
+                    return Err((
+                        "not_found".to_string(),
+                        "path does not identify a split".to_string(),
+                    ));
+                }
+                self.session_dirty = true;
+                self.emit_event("layout.ratio_changed", json!({"workspace":workspace.to_string(),"tab":(tab+1).to_string(),"path":p["path"],"ratio":ratio}));
+                Ok(
+                    json!({"type":"layout_split_ratio","workspace":workspace.to_string(),"tab":(tab+1).to_string(),"ratio":ratio}),
+                )
             }
             // ── panes / agents ──
             "pane.focus" => {
                 let id = self.resolve_pane(p).ok_or_else(not_found)?;
                 self.focus_pane_global(id);
                 Ok(json!({"type":"ok"}))
+            }
+            "pane.focus_direction" => {
+                reject_api_fields(p, &["pane", "direction"])?;
+                let pane = self.resolve_pane(p).unwrap_or_else(|| self.layout().focus);
+                let direction = crate::api::topology::direction(p)?;
+                let (workspace, tab) = self.pane_location(pane).ok_or_else(not_found)?;
+                let next = self.workspaces[workspace].tabs[tab]
+                    .layout
+                    .neighbor(crate::api::topology::logical_area(), pane, direction)
+                    .ok_or_else(|| {
+                        (
+                            "not_found".to_string(),
+                            "no pane exists in that direction".to_string(),
+                        )
+                    })?;
+                self.focus_pane_global(next);
+                self.emit_event("pane.focused", json!({"pane":next.0.to_string()}));
+                Ok(json!({"type":"pane_focus","pane":next.0.to_string()}))
+            }
+            "pane.resize" => {
+                reject_api_fields(p, &["pane", "direction", "cells"])?;
+                let pane = self.resolve_pane(p).unwrap_or_else(|| self.layout().focus);
+                let direction = crate::api::topology::direction(p)?;
+                let cells = p.get("cells").and_then(Value::as_i64).unwrap_or(1);
+                if !(1..=1000).contains(&cells) {
+                    return Err((
+                        "invalid_request".to_string(),
+                        "cells must be between 1 and 1000".to_string(),
+                    ));
+                }
+                let (workspace, tab) = self.pane_location(pane).ok_or_else(not_found)?;
+                let layout = &mut self.workspaces[workspace].tabs[tab].layout;
+                let previous = layout.focus;
+                layout.focus = pane;
+                let area = if self.last_pane_area.width > 1 && self.last_pane_area.height > 1 {
+                    self.last_pane_area
+                } else {
+                    crate::api::topology::logical_area()
+                };
+                let changed = layout.resize_focused(area, direction, cells as i16);
+                layout.focus = previous;
+                if !changed {
+                    return Err((
+                        "not_found".to_string(),
+                        "no matching divider can resize this pane".to_string(),
+                    ));
+                }
+                self.session_dirty = true;
+                self.emit_event(
+                    "pane.resized",
+                    json!({"pane":pane.0.to_string(),"cells":cells}),
+                );
+                Ok(json!({"type":"pane_resize","pane":pane.0.to_string()}))
+            }
+            "pane.zoom" => {
+                reject_api_fields(p, &["pane", "enabled"])?;
+                if let Some(pane) = self.resolve_pane(p) {
+                    self.focus_pane_global(pane);
+                }
+                let enabled = match p.get("enabled") {
+                    None => !self.zoomed,
+                    Some(Value::Bool(enabled)) => *enabled,
+                    Some(_) => {
+                        return Err((
+                            "invalid_request".to_string(),
+                            "enabled must be a boolean".to_string(),
+                        ))
+                    }
+                };
+                self.zoomed = enabled;
+                let pane = self.layout().focus;
+                self.emit_event(
+                    "pane.zoomed",
+                    json!({"pane":pane.0.to_string(),"enabled":enabled}),
+                );
+                Ok(json!({"type":"pane_zoom","pane":pane.0.to_string(),"enabled":enabled}))
+            }
+            "pane.rename" => {
+                reject_api_fields(p, &["pane", "name"])?;
+                let pane = self.resolve_pane(p).ok_or_else(not_found)?;
+                let name = p
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        (
+                            "invalid_request".to_string(),
+                            "name must be a string".to_string(),
+                        )
+                    })?
+                    .trim();
+                if !name.is_empty() && !valid_agent_name(name) {
+                    return Err((
+                        "invalid_request".to_string(),
+                        "name must match [a-z][a-z0-9_-]{0,31}".to_string(),
+                    ));
+                }
+                self.set_agent_name(pane, (!name.is_empty()).then_some(name));
+                self.emit_event("pane.renamed", json!({"pane":pane.0.to_string(),"name":if name.is_empty(){Value::Null}else{json!(name)}}));
+                Ok(
+                    json!({"type":"pane_rename","pane":pane.0.to_string(),"name":if name.is_empty(){Value::Null}else{json!(name)}}),
+                )
+            }
+            "pane.swap" => {
+                reject_api_fields(p, &["pane", "with"])?;
+                let first = self.resolve_pane(p).ok_or_else(not_found)?;
+                let second = PaneId(parse_u32_value(
+                    p.get("with").ok_or_else(|| {
+                        (
+                            "invalid_request".to_string(),
+                            "with must be a pane id".to_string(),
+                        )
+                    })?,
+                    "with",
+                )?);
+                let first_location = self.pane_location(first).ok_or_else(not_found)?;
+                let second_location = self.pane_location(second).ok_or_else(not_found)?;
+                if first_location != second_location {
+                    return Err((
+                        "invalid_request".to_string(),
+                        "panes must belong to the same tab".to_string(),
+                    ));
+                }
+                let layout = &mut self.workspaces[first_location.0].tabs[first_location.1].layout;
+                if !layout.swap_panes(first, second) {
+                    return Err((
+                        "invalid_request".to_string(),
+                        "panes could not be swapped".to_string(),
+                    ));
+                }
+                self.session_dirty = true;
+                self.emit_event(
+                    "pane.swapped",
+                    json!({"pane":first.0.to_string(),"with":second.0.to_string()}),
+                );
+                Ok(
+                    json!({"type":"pane_swap","pane":first.0.to_string(),"with":second.0.to_string()}),
+                )
             }
             // `attach.pane` (docs/18 WA-2): focus a pane and zoom it, so a client
             // attaching next opens straight into that fullscreen terminal.
@@ -952,7 +1976,10 @@ impl App {
                                 continue;
                             };
                             // Only real agent sessions, not the shells behind tabs.
-                            if !(self.manifests.is_agent(&s.agent) || s.agent_session.is_some()) {
+                            if !(self.manifests.is_agent(&s.agent)
+                                || s.agent_session.is_some()
+                                || s.agent_report.is_some())
+                            {
                                 continue;
                             }
                             let cwd = self
@@ -970,6 +1997,8 @@ impl App {
                                 "pane": id.0.to_string(), "agent": s.agent,
                                 "name": self.agent_name_for(id),
                                 "status": state_str(s.state),
+                                "authority":s.identity_source,
+                                "state_source":s.state_source,
                                 "session": session,
                                 "workspace": wi.to_string(), "workspace_name": ws.name,
                                 "project": ws.name, "cwd": cwd,
@@ -1135,15 +2164,221 @@ impl App {
                     .get(&id)
                     .map(|pn| pn.cwd.display().to_string())
                     .unwrap_or_default();
-                let (agent, status) = s
-                    .map(|s| (s.agent.clone(), state_str(s.state).to_string()))
+                let (agent, status, authority, state_source) = s
+                    .map(|s| {
+                        (
+                            s.agent.clone(),
+                            state_str(s.state).to_string(),
+                            s.identity_source,
+                            s.state_source,
+                        )
+                    })
                     .unwrap_or_default();
                 let session =
                     s.and_then(|s| s.agent_session.as_ref().map(|a| a.session_id.clone()));
                 Ok(json!({"type":"agent","pane": id.0.to_string(),
                           "name": self.agent_name_for(id), "agent": agent,
-                          "status": status, "session": session, "cwd": cwd}))
+                          "status": status, "authority":authority,
+                          "state_source":state_source, "session": session, "cwd": cwd}))
             }
+            "agent.explain" => {
+                reject_api_fields(p, &["target", "pane"])?;
+                if p.get("target").is_some() == p.get("pane").is_some() {
+                    return Err((
+                        "invalid_request".to_string(),
+                        "agent.explain needs exactly one of target or pane".to_string(),
+                    ));
+                }
+                if let Some(target) = p.get("target") {
+                    let valid = target
+                        .as_str()
+                        .is_some_and(|target| !target.is_empty() && target.chars().count() <= 128);
+                    if !valid {
+                        return Err((
+                            "invalid_request".to_string(),
+                            "target must be a non-empty string of at most 128 characters"
+                                .to_string(),
+                        ));
+                    }
+                }
+                let id = self
+                    .resolve_agent_pane(p)
+                    .or_else(|| self.resolve_pane(p))
+                    .ok_or_else(not_found)?;
+                Ok(self.agent_explanation(id))
+            }
+            "agent.report" => {
+                reject_api_fields(
+                    p,
+                    &[
+                        "pane",
+                        "source",
+                        "agent",
+                        "status",
+                        "message",
+                        "session_id",
+                        "sequence",
+                        "ttl_s",
+                    ],
+                )?;
+                let id = self
+                    .resolve_agent_pane(p)
+                    .or_else(|| self.resolve_pane(p))
+                    .ok_or_else(not_found)?;
+                let source = required_report_source(p)?;
+                let agent = p.get("agent").and_then(Value::as_str).ok_or_else(|| {
+                    (
+                        "invalid_request".to_string(),
+                        "agent.report needs an agent".to_string(),
+                    )
+                })?;
+                if !valid_agent_name(agent) {
+                    return Err((
+                        "invalid_request".to_string(),
+                        "agent must match [a-z][a-z0-9_-]{0,31}".to_string(),
+                    ));
+                }
+                let state = p
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .and_then(parse_agent_wait_state)
+                    .ok_or_else(|| {
+                        (
+                            "invalid_request".to_string(),
+                            "status must be idle, working, blocked, or done".to_string(),
+                        )
+                    })?;
+                let message =
+                    optional_bounded_string(p, "message", MAX_AGENT_REPORT_MESSAGE_CHARS)?;
+                let session_id = optional_bounded_string(p, "session_id", 512)?;
+                let ttl_s = p.get("ttl_s").and_then(Value::as_u64).unwrap_or(3600);
+                if !(1..=MAX_AGENT_REPORT_TTL_S).contains(&ttl_s) {
+                    return Err((
+                        "invalid_request".to_string(),
+                        "ttl_s must be between 1 and 86400".to_string(),
+                    ));
+                }
+                let now = Instant::now();
+                let current = self
+                    .status
+                    .get(&id)
+                    .and_then(|status| status.agent_report.as_ref());
+                if current.is_some_and(|report| report.source != source) {
+                    return Err((
+                        "authority_conflict".to_string(),
+                        "another integration owns this pane; release it first".to_string(),
+                    ));
+                }
+                let sequence = match p.get("sequence") {
+                    Some(Value::Number(number)) => number.as_u64().ok_or_else(|| {
+                        (
+                            "invalid_request".to_string(),
+                            "sequence must be a non-negative integer".to_string(),
+                        )
+                    })?,
+                    Some(_) => {
+                        return Err((
+                            "invalid_request".to_string(),
+                            "sequence must be a non-negative integer".to_string(),
+                        ))
+                    }
+                    None => current.map_or(1, |report| report.sequence.saturating_add(1)),
+                };
+                if current.is_some_and(|report| sequence <= report.sequence) {
+                    return Err((
+                        "stale_report".to_string(),
+                        "sequence must increase for this authority".to_string(),
+                    ));
+                }
+                let (changed, cwd, project, branch) = {
+                    let status = self.status.get_mut(&id).ok_or_else(not_found)?;
+                    let changed = status.state != state || status.agent != agent;
+                    status.agent = agent.to_string();
+                    status.state = state;
+                    status.candidate = state;
+                    status.candidate_since = now;
+                    status.prev_working = state == State::Working;
+                    status.done = state == State::Done;
+                    status.identity_source = "integration_report";
+                    status.state_source = "integration_report";
+                    status.rule_priority = None;
+                    status.rule_region = None;
+                    status.blocked_hint =
+                        (state == State::Blocked).then(|| message.clone()).flatten();
+                    status.agent_report = Some(AgentReport {
+                        source: source.clone(),
+                        agent: agent.to_string(),
+                        state,
+                        message: message.clone(),
+                        sequence,
+                        expires_at: now + Duration::from_secs(ttl_s),
+                    });
+                    if let Some(session_id) = session_id.as_ref() {
+                        status.agent_session = Some(AgentSession {
+                            agent: agent.to_string(),
+                            session_id: session_id.clone(),
+                        });
+                    }
+                    let cwd = self
+                        .panes
+                        .get(&id)
+                        .map(|pane| pane.cwd.display().to_string())
+                        .unwrap_or_default();
+                    let (project, branch) = self
+                        .workspace_of_pane(id)
+                        .map(|workspace| (workspace.name.clone(), workspace.branch.clone()))
+                        .unwrap_or_default();
+                    (changed, cwd, project, branch)
+                };
+                self.emit_event(
+                    "agent.authority_reported",
+                    json!({"pane":id.0.to_string(), "source":source, "agent":agent, "status":state_str(state), "sequence":sequence, "ttl_s":ttl_s}),
+                );
+                if changed {
+                    self.emit_event(
+                        "pane.agent_status_changed",
+                        json!({"pane":id.0.to_string(), "status":state_str(state), "agent":agent, "cwd":cwd, "project":project, "branch":branch, "authority":"integration_report"}),
+                    );
+                }
+                self.check_agent_waits(id);
+                Ok(json!({
+                    "type":"agent_report", "pane":id.0.to_string(),
+                    "agent":agent, "status":state_str(state), "source":source,
+                    "sequence":sequence, "ttl_s":ttl_s,
+                }))
+            }
+            "agent.release" => {
+                reject_api_fields(p, &["pane", "source"])?;
+                let id = self
+                    .resolve_agent_pane(p)
+                    .or_else(|| self.resolve_pane(p))
+                    .ok_or_else(not_found)?;
+                let source = required_report_source(p)?;
+                let status = self.status.get_mut(&id).ok_or_else(not_found)?;
+                let Some(report) = status.agent_report.as_ref() else {
+                    return Err((
+                        "not_found".to_string(),
+                        "pane has no integration authority".to_string(),
+                    ));
+                };
+                if report.source != source {
+                    return Err((
+                        "authority_conflict".to_string(),
+                        "source does not own this pane".to_string(),
+                    ));
+                }
+                status.agent_report = None;
+                status.force_detect = true;
+                self.emit_event(
+                    "agent.authority_released",
+                    json!({"pane":id.0.to_string(), "source":source, "reason":"released"}),
+                );
+                Ok(json!({"type":"agent_release", "pane":id.0.to_string()}))
+            }
+            "agent.wait" => Err((
+                "internal".to_string(),
+                "agent.wait must be dispatched through the event-driven waiter".to_string(),
+            )),
             // Resumable sessions discovered on disk (the AGENTS sidebar list).
             "agent.sessions" => {
                 self.refresh_resumable();
@@ -1304,6 +2539,205 @@ impl App {
                     Ok(json!({"type":"error","message":"sidebar is full (max 3 docks)"}))
                 }
             }
+            "ui.bar.list" => {
+                let widgets: Vec<Value> = self
+                    .bar
+                    .declarations
+                    .iter()
+                    .map(|(key, declaration)| {
+                        let live = self.bar.widgets.get(key);
+                        let region = self
+                            .config
+                            .bars
+                            .region_for(key, declaration.region)
+                            .map(crate::bar::BarRegion::as_str);
+                        json!({
+                            "id": declaration.key.id,
+                            "owner": declaration.key.owner,
+                            "key": key,
+                            "title": declaration.title,
+                            "region": region,
+                            "default_region": declaration.region.as_str(),
+                            "priority": live.map_or(declaration.priority, |widget| widget.priority),
+                            "live": live.is_some(),
+                            "content": live.map(|widget| &widget.content),
+                            "compact_content": live.map(|widget| &widget.compact_content),
+                        })
+                    })
+                    .collect();
+                Ok(json!({"type":"bar_list","widgets":widgets}))
+            }
+            "ui.bar.push" => {
+                let id = req_str(p, "id")?;
+                let owner = p.get("owner").and_then(Value::as_str);
+                let declaration = self
+                    .bar
+                    .resolve_declaration(owner, id)
+                    .map_err(module_err)?
+                    .clone();
+                if declaration.key.owner == "core" {
+                    return Err(module_err("core bar widgets cannot be updated".into()));
+                }
+                let content: Vec<crate::bar::BarSegment> = serde_json::from_value(
+                    p.get("content")
+                        .cloned()
+                        .ok_or_else(|| ("invalid_request".into(), "content is required".into()))?,
+                )
+                .map_err(|error| {
+                    (
+                        "invalid_request".into(),
+                        format!("invalid content: {error}"),
+                    )
+                })?;
+                let compact: Vec<crate::bar::BarSegment> = match p.get("compact_content") {
+                    Some(value) => serde_json::from_value(value.clone()).map_err(|error| {
+                        (
+                            "invalid_request".into(),
+                            format!("invalid compact_content: {error}"),
+                        )
+                    })?,
+                    None => Vec::new(),
+                };
+                validate_bar_actions(self, &declaration.key.owner, &content)?;
+                validate_bar_actions(self, &declaration.key.owner, &compact)?;
+                let region = match p.get("region").and_then(Value::as_str) {
+                    Some("top-right" | "top") => crate::bar::BarRegion::TopRight,
+                    Some("bottom-right" | "bottom") => crate::bar::BarRegion::BottomRight,
+                    Some(other) => {
+                        return Err((
+                            "invalid_request".into(),
+                            format!("unknown bar region {other}"),
+                        ))
+                    }
+                    None => declaration.region,
+                };
+                let priority = match p.get("priority") {
+                    None => declaration.priority,
+                    Some(value) => value
+                        .as_u64()
+                        .filter(|value| *value <= u8::MAX as u64)
+                        .map(|value| value as u8)
+                        .ok_or_else(|| {
+                            (
+                                "invalid_request".into(),
+                                "priority must be an integer from 0 to 255".into(),
+                            )
+                        })?,
+                };
+                let widget = crate::bar::BarWidget::new(
+                    declaration.key.clone(),
+                    region,
+                    content,
+                    compact,
+                    priority,
+                )
+                .map_err(|error| ("invalid_request".into(), error))?;
+                self.bar
+                    .allow_push(&declaration.key.owner, Instant::now())
+                    .map_err(|error| ("rate_limited".into(), error))?;
+                let changed = self
+                    .bar
+                    .push_widget(widget)
+                    .map_err(|error| ("limit_exceeded".into(), error))?;
+                Ok(json!({"type":"ok","changed":changed,"key":declaration.key.canonical()}))
+            }
+            "ui.bar.move" => {
+                let declaration = self
+                    .bar
+                    .resolve_declaration(p.get("owner").and_then(Value::as_str), req_str(p, "id")?)
+                    .map_err(module_err)?
+                    .clone();
+                let region = match req_str(p, "region")? {
+                    "top-right" | "top" => Some(crate::bar::BarRegion::TopRight),
+                    "bottom-right" | "bottom" => Some(crate::bar::BarRegion::BottomRight),
+                    "off" => None,
+                    other => {
+                        return Err((
+                            "invalid_request".into(),
+                            format!("unknown bar region {other}"),
+                        ))
+                    }
+                };
+                let key = declaration.key.canonical();
+                if !self.config.bars.is_explicitly_placed(&key, region) {
+                    self.config.bars.place(&key, region);
+                    crate::config::save(&self.config);
+                    self.bar.clear_geometry();
+                }
+                Ok(
+                    json!({"type":"ok","key":key,"region":region.map(crate::bar::BarRegion::as_str)}),
+                )
+            }
+            "ui.bar.remove" => {
+                let declaration = self
+                    .bar
+                    .resolve_declaration(p.get("owner").and_then(Value::as_str), req_str(p, "id")?)
+                    .map_err(module_err)?
+                    .clone();
+                if declaration.key.owner == "core" {
+                    return Err(module_err("core bar widgets cannot be removed".into()));
+                }
+                let removed = self.bar.remove_widget(&declaration.key.canonical());
+                Ok(json!({"type":"ok","removed":removed}))
+            }
+            "ui.notification.push" => {
+                let owner = p.get("owner").and_then(Value::as_str).map(String::from);
+                let text = req_str(p, "text")?.to_string();
+                let level: crate::bar::NotificationLevel = serde_json::from_value(
+                    p.get("level").cloned().unwrap_or_else(|| json!("info")),
+                )
+                .map_err(|error| ("invalid_request".into(), format!("invalid level: {error}")))?;
+                let action = opt_str(p, "action");
+                if let Some(owner) = owner.as_deref() {
+                    validate_bar_action(self, owner, action.as_deref())?;
+                } else if action.is_some() {
+                    return Err((
+                        "invalid_request".into(),
+                        "an actionable notification requires its module owner".into(),
+                    ));
+                }
+                let ttl_ms = match p.get("ttl_ms") {
+                    None => 4_000,
+                    Some(value) => value.as_u64().filter(|ttl| *ttl > 0).ok_or_else(|| {
+                        (
+                            "invalid_request".into(),
+                            "ttl_ms must be a positive integer".into(),
+                        )
+                    })?,
+                };
+                let notification = crate::bar::NotificationPush {
+                    owner,
+                    text,
+                    level,
+                    ttl_ms,
+                    action,
+                    value: opt_str(p, "value"),
+                    dedupe_key: opt_str(p, "dedupe_key"),
+                };
+                notification
+                    .validate()
+                    .map_err(|error| ("invalid_request".into(), error))?;
+                self.bar
+                    .allow_push(
+                        notification
+                            .owner
+                            .as_deref()
+                            .unwrap_or(crate::bar::UNOWNED_NOTIFICATION_OWNER),
+                        Instant::now(),
+                    )
+                    .map_err(|error| ("rate_limited".into(), error))?;
+                self.bar
+                    .push_notification(notification, Instant::now())
+                    .map_err(|error| ("invalid_request".into(), error))?;
+                Ok(json!({"type":"ok"}))
+            }
+            "ui.notification.clear" => {
+                let owner = p.get("owner").and_then(Value::as_str);
+                let removed = self
+                    .bar
+                    .clear_notifications(owner, p.get("dedupe_key").and_then(Value::as_str));
+                Ok(json!({"type":"ok","removed":removed}))
+            }
             // ── modules (docs/13) ──
             "module.list" => {
                 let arr: Vec<Value> = self.modules.modules.iter().map(module_json).collect();
@@ -1331,6 +2765,8 @@ impl App {
                         .map(|a| json!({"id": a.id, "title": a.title, "contexts": a.contexts})).collect::<Vec<_>>(),
                     "panes": m.manifest.panes.iter()
                         .map(|pe| json!({"id": pe.id, "title": pe.title, "placement": pe.placement})).collect::<Vec<_>>(),
+                    "bars": m.manifest.bars.iter()
+                        .map(|bar| json!({"id": bar.id, "title": bar.title, "region": bar.region.as_str(), "priority": bar.priority})).collect::<Vec<_>>(),
                     "events": m.manifest.events.iter().map(|e| e.on.clone()).collect::<Vec<_>>(),
                     "build_steps": m.manifest.build.len(),
                 }))
@@ -1501,6 +2937,424 @@ impl App {
                 self.close_pane(id);
                 Ok(json!({"type":"ok"}))
             }
+            // ── DIFF review (docs/88) ────────────────────────────────────
+            "diff.refresh" => {
+                self.ensure_diff_snapshot().map_err(diff_err)?;
+                let generation = self
+                    .diff
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.generation)
+                    .unwrap_or_default();
+                Ok(json!({"type":"ok","refresh":"complete","generation":generation}))
+            }
+            "diff.list" => {
+                self.ensure_diff_snapshot().map_err(diff_err)?;
+                let layer = p
+                    .get("layer")
+                    .and_then(|value| value.as_str())
+                    .map(parse_diff_layer)
+                    .transpose()?;
+                let snapshot = self
+                    .diff
+                    .snapshot
+                    .as_ref()
+                    .ok_or_else(|| diff_err("DIFF is not ready".to_string()))?;
+                let files: Vec<Value> = snapshot
+                    .files
+                    .iter()
+                    .filter(|file| layer.as_ref().is_none_or(|layer| &file.key.layer == layer))
+                    .map(diff_file_json)
+                    .collect();
+                Ok(json!({
+                    "type":"diff_list",
+                    "repo": snapshot.repo_root,
+                    "branch": snapshot.branch,
+                    "generation": snapshot.generation,
+                    "fingerprint": snapshot.fingerprint,
+                    "omitted": snapshot.omitted_files,
+                    "refreshing": self.diff.status_inflight,
+                    "files": files,
+                }))
+            }
+            "diff.open" => {
+                self.ensure_diff_snapshot().map_err(diff_err)?;
+                let target = match p
+                    .get("placement")
+                    .or_else(|| p.get("target"))
+                    .and_then(|v| v.as_str())
+                {
+                    Some("tab") => crate::app::files::OpenTarget::Tab,
+                    Some("pane") => crate::app::files::OpenTarget::Pane,
+                    Some("preview") | None => crate::app::files::OpenTarget::Preview,
+                    Some(_) => {
+                        return Err(diff_err(
+                            "placement must be preview, pane, or tab".to_string(),
+                        ))
+                    }
+                };
+                let preference = match p.get("view").and_then(Value::as_str) {
+                    None => None,
+                    Some("auto") => Some(crate::diff::DiffLayoutPreference::Auto),
+                    Some("split") => Some(crate::diff::DiffLayoutPreference::Split),
+                    Some("stack") => Some(crate::diff::DiffLayoutPreference::Stack),
+                    Some(_) => {
+                        return Err(diff_err("view must be auto, split, or stack".to_string()))
+                    }
+                };
+                let layer = p
+                    .get("layer")
+                    .and_then(|value| value.as_str())
+                    .map(parse_diff_layer)
+                    .transpose()?;
+                let raw = p.get("path").and_then(|value| value.as_str()).unwrap_or("");
+                let key = if raw.is_empty() {
+                    self.diff
+                        .selected_file()
+                        .or_else(|| {
+                            self.diff
+                                .snapshot
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.files.first())
+                        })
+                        .map(|file| file.key.clone())
+                        .ok_or_else(|| diff_err("there are no changed files".to_string()))?
+                } else {
+                    self.diff_file_for_path(raw, layer.as_ref())
+                        .map_err(diff_err)?
+                        .key
+                };
+                self.open_diff_view(key.clone(), target);
+                let id = self
+                    .diff_view_showing(&key)
+                    .ok_or_else(|| diff_err("failed to open diff".to_string()))?;
+                if let (Some(preference), Some(crate::app::ViewKind::Diff(view))) =
+                    (preference, self.views.get_mut(&id))
+                {
+                    view.preference = preference;
+                }
+                Ok(
+                    json!({"type":"diff_open","pane":id.0.to_string(),"path":key.display_path(),"layer":key.layer.label()}),
+                )
+            }
+            "diff.get" => {
+                self.ensure_diff_snapshot().map_err(diff_err)?;
+                let raw = req_str(p, "path")?;
+                let layer = p
+                    .get("layer")
+                    .and_then(|value| value.as_str())
+                    .map(parse_diff_layer)
+                    .transpose()?;
+                let file = self
+                    .diff_file_for_path(raw, layer.as_ref())
+                    .map_err(diff_err)?;
+                let diff = self.load_diff_file_sync(&file).map_err(diff_err)?;
+                let include_patch = p
+                    .get("include_patch")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let hunks: Vec<Value> = diff
+                    .hunks
+                    .iter()
+                    .map(|hunk| {
+                        json!({
+                            "id":hunk.id,
+                            "old_start":hunk.old_start,
+                            "new_start":hunk.new_start,
+                            "header":hunk.header,
+                            "lines": if include_patch {
+                                serde_json::to_value(&hunk.lines).unwrap_or(Value::Null)
+                            } else {
+                                Value::Null
+                            },
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "type":"diff",
+                    "file":diff_file_json(&file),
+                    "additions":diff.additions,
+                    "deletions":diff.deletions,
+                    "binary":diff.binary,
+                    "truncated":diff.truncated,
+                    "omitted_lines":diff.omitted_lines,
+                    "hunks":hunks,
+                }))
+            }
+            "diff.navigate" => {
+                let id = self.resolve_pane(p).unwrap_or_else(|| self.layout().focus);
+                let action = req_str(p, "action")?;
+                let key = match action {
+                    "next" | "next_line" => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                    "previous" | "previous_line" => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                    "next_file" => KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE),
+                    "previous_file" => KeyEvent::new(KeyCode::Char('K'), KeyModifiers::NONE),
+                    "next_hunk" => KeyEvent::new(KeyCode::Char('}'), KeyModifiers::NONE),
+                    "previous_hunk" => KeyEvent::new(KeyCode::Char('{'), KeyModifiers::NONE),
+                    "next_note" => KeyEvent::new(KeyCode::Char('N'), KeyModifiers::NONE),
+                    "previous_note" => KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE),
+                    "top" => KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+                    "bottom" => KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+                    _ => {
+                        return Err(diff_err(
+                            "action must target a line, file, hunk, note, top, or bottom"
+                                .to_string(),
+                        ))
+                    }
+                };
+                if !self.handle_diff_key(id, key) {
+                    return Err(diff_err("target is not an open DIFF view".to_string()));
+                }
+                Ok(json!({"type":"ok","pane":id.0.to_string()}))
+            }
+            "diff.note.list" => {
+                self.ensure_diff_snapshot().map_err(diff_err)?;
+                self.ensure_diff_notes_sync().map_err(diff_err)?;
+                let state = p
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .map(parse_note_state)
+                    .transpose()?;
+                let path = p
+                    .get("file")
+                    .or_else(|| p.get("path"))
+                    .and_then(Value::as_str);
+                let notes: Vec<Value> = self
+                    .diff
+                    .notes
+                    .iter()
+                    .filter(|note| state.is_none_or(|state| note.state == state))
+                    .filter(|note| {
+                        path.is_none_or(|path| note.anchor.diff_key.display_path() == path)
+                    })
+                    .map(note_json)
+                    .collect();
+                Ok(json!({"type":"diff_notes","notes":notes}))
+            }
+            "diff.note.apply" => {
+                self.ensure_diff_snapshot().map_err(diff_err)?;
+                self.ensure_diff_notes_sync().map_err(diff_err)?;
+                let items = p
+                    .get("notes")
+                    .and_then(Value::as_array)
+                    .filter(|items| !items.is_empty())
+                    .ok_or_else(|| diff_err("notes must be a non-empty array".to_string()))?;
+                if self.diff.notes.len().saturating_add(items.len()) > crate::diff::NOTE_CAP {
+                    return Err(diff_err(format!(
+                        "review note limit is {}",
+                        crate::diff::NOTE_CAP
+                    )));
+                }
+                let mut notes = Vec::with_capacity(items.len());
+                for item in items {
+                    let raw = item
+                        .get("file")
+                        .or_else(|| item.get("path"))
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| diff_err("every note needs a file".to_string()))?;
+                    let layer = item
+                        .get("layer")
+                        .and_then(Value::as_str)
+                        .map(parse_diff_layer)
+                        .transpose()?;
+                    let file = self
+                        .diff_file_for_path(raw, layer.as_ref())
+                        .map_err(diff_err)?;
+                    let old = diff_line_param(item, "old_line")?;
+                    let new = diff_line_param(item, "new_line")?;
+                    let (side, start) = match (old, new) {
+                        (Some(line), None) => (crate::diff::DiffSide::Old, line),
+                        (None, Some(line)) => (crate::diff::DiffSide::New, line),
+                        _ => {
+                            return Err(diff_err(
+                                "every note needs exactly one old_line or new_line".to_string(),
+                            ))
+                        }
+                    };
+                    let end = diff_line_param(item, "end_line")?.unwrap_or(start);
+                    let diff = self.load_diff_file_sync(&file).map_err(diff_err)?;
+                    let context = crate::diff::notes::anchor_context(&diff, side, start, end)
+                        .map_err(diff_err)?;
+                    let context_sha256 = crate::diff::notes::context_hash(&context);
+                    let context: String = context.chars().take(512).collect();
+                    let body = item
+                        .get("body")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| diff_err("every note needs a body".to_string()))?
+                        .to_string();
+                    let kind = parse_note_kind(
+                        item.get("kind").and_then(Value::as_str).unwrap_or("issue"),
+                    )?;
+                    let key = file.key;
+                    let now = crate::diff::notes::now_ms();
+                    notes.push(crate::diff::ReviewNote {
+                        id: crate::diff::notes::note_id(),
+                        review_id: crate::diff::notes::review_id(&key),
+                        author: "external".to_string(),
+                        kind,
+                        body,
+                        anchor: crate::diff::notes::NoteAnchor {
+                            diff_key: key,
+                            side,
+                            start_line: start,
+                            end_line: end,
+                            context_sha256,
+                            context,
+                        },
+                        state: crate::diff::NoteState::Open,
+                        deliveries: Vec::new(),
+                        revision: 1,
+                        created_at_ms: now,
+                        updated_at_ms: now,
+                    });
+                }
+                crate::diff::notes::save_batch_new(&notes).map_err(diff_err)?;
+                self.diff.notes.extend(notes.iter().cloned());
+                self.refresh_diff_note_counts();
+                Ok(json!({
+                    "type":"diff_notes_applied",
+                    "notes":notes.iter().map(note_json).collect::<Vec<_>>()
+                }))
+            }
+            "diff.note.add" => {
+                self.ensure_diff_snapshot().map_err(diff_err)?;
+                self.ensure_diff_notes_sync().map_err(diff_err)?;
+                let raw = p
+                    .get("file")
+                    .or_else(|| p.get("path"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| diff_err("file is required".to_string()))?;
+                let layer = p
+                    .get("layer")
+                    .and_then(Value::as_str)
+                    .map(parse_diff_layer)
+                    .transpose()?;
+                let file = self
+                    .diff_file_for_path(raw, layer.as_ref())
+                    .map_err(diff_err)?;
+                let (side, start) = match (
+                    diff_line_param(p, "old_line")?,
+                    diff_line_param(p, "new_line")?,
+                ) {
+                    (Some(line), None) => (crate::diff::DiffSide::Old, line),
+                    (None, Some(line)) => (crate::diff::DiffSide::New, line),
+                    _ => {
+                        return Err(diff_err(
+                            "pass exactly one of old_line or new_line".to_string(),
+                        ))
+                    }
+                };
+                let end = diff_line_param(p, "end_line")?.unwrap_or(start);
+                let diff = self.load_diff_file_sync(&file).map_err(diff_err)?;
+                let context = crate::diff::notes::anchor_context(&diff, side, start, end)
+                    .map_err(diff_err)?;
+                let context_sha256 = crate::diff::notes::context_hash(&context);
+                let context: String = context.chars().take(512).collect();
+                let body = req_str(p, "body")?.to_string();
+                let kind =
+                    parse_note_kind(p.get("kind").and_then(Value::as_str).unwrap_or("issue"))?;
+                let key = file.key;
+                let now = crate::diff::notes::now_ms();
+                let note = crate::diff::ReviewNote {
+                    id: crate::diff::notes::note_id(),
+                    review_id: crate::diff::notes::review_id(&key),
+                    author: "external".to_string(),
+                    kind,
+                    body,
+                    anchor: crate::diff::notes::NoteAnchor {
+                        diff_key: key,
+                        side,
+                        start_line: start,
+                        end_line: end,
+                        context_sha256,
+                        context,
+                    },
+                    state: crate::diff::NoteState::Open,
+                    deliveries: Vec::new(),
+                    revision: 1,
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                };
+                crate::diff::notes::save(&note, None).map_err(diff_err)?;
+                self.apply_diff_note_saved(note.clone(), Ok(()));
+                Ok(json!({"type":"diff_note","note":note_json(&note)}))
+            }
+            "diff.note.edit" | "diff.note.resolve" | "diff.note.reopen" => {
+                self.ensure_diff_snapshot().map_err(diff_err)?;
+                self.ensure_diff_notes_sync().map_err(diff_err)?;
+                let id = req_str(p, "id")?;
+                let note = self
+                    .diff
+                    .notes
+                    .iter()
+                    .find(|note| note.id == id)
+                    .cloned()
+                    .ok_or_else(|| diff_err("review note not found".to_string()))?;
+                let mut updated = note.clone();
+                match method {
+                    "diff.note.edit" => updated.body = req_str(p, "body")?.to_string(),
+                    "diff.note.resolve" => updated.state = crate::diff::NoteState::Resolved,
+                    "diff.note.reopen" => updated.state = crate::diff::NoteState::Open,
+                    _ => unreachable!(),
+                }
+                updated.revision = updated.revision.saturating_add(1);
+                updated.updated_at_ms = crate::diff::notes::now_ms();
+                crate::diff::notes::save(&updated, Some(note.revision)).map_err(diff_err)?;
+                self.apply_diff_note_saved(updated.clone(), Ok(()));
+                Ok(json!({"type":"diff_note","note":note_json(&updated)}))
+            }
+            "diff.note.remove" => {
+                self.ensure_diff_snapshot().map_err(diff_err)?;
+                self.ensure_diff_notes_sync().map_err(diff_err)?;
+                let id = req_str(p, "id")?;
+                let note = self
+                    .diff
+                    .notes
+                    .iter()
+                    .find(|note| note.id == id)
+                    .cloned()
+                    .ok_or_else(|| diff_err("review note not found".to_string()))?;
+                crate::diff::notes::remove(&note, Some(note.revision)).map_err(diff_err)?;
+                self.apply_diff_note_removed(id.to_string(), Ok(()));
+                Ok(json!({"type":"ok","removed":id}))
+            }
+            "diff.note.send" => {
+                self.ensure_diff_snapshot().map_err(diff_err)?;
+                self.ensure_diff_notes_sync().map_err(diff_err)?;
+                let target = req_str(p, "to")?;
+                let all_open = p.get("all_open").and_then(Value::as_bool).unwrap_or(false);
+                let ids: Vec<&str> = p
+                    .get("ids")
+                    .and_then(Value::as_array)
+                    .map(|items| items.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let selected: Vec<crate::diff::ReviewNote> = self
+                    .diff
+                    .notes
+                    .iter()
+                    .filter(|note| {
+                        if all_open {
+                            note.state == crate::diff::NoteState::Open
+                        } else {
+                            ids.contains(&note.id.as_str())
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                if selected.is_empty() {
+                    return Err(diff_err("select at least one review note".to_string()));
+                }
+                let params = json!({"target":target});
+                let pane_id = self.resolve_agent_target(&params)?;
+                let selected_ids: Vec<String> =
+                    selected.iter().map(|note| note.id.clone()).collect();
+                let count = self
+                    .deliver_diff_notes(pane_id, target, &selected_ids)
+                    .map_err(diff_err)?;
+                Ok(
+                    json!({"type":"diff_note_send","pane":pane_id.0.to_string(),"target":target,"count":count}),
+                )
+            }
             // ── git (docs/17) — fast local-git reads + open the git tab ──
             "git.status" => {
                 let cwd = self.git_workspace_cwd(p);
@@ -1559,6 +3413,7 @@ impl App {
                 Ok(json!({"type":"ok"}))
             }
             "files.tree" => {
+                self.prepare_file_tree_api(false);
                 let rows: Vec<Value> = self
                     .file_tree
                     .visible_rows()
@@ -1589,7 +3444,7 @@ impl App {
                 Ok(json!({"type":"ok"}))
             }
             "files.refresh" => {
-                self.file_tree.invalidate();
+                self.prepare_file_tree_api(true);
                 Ok(json!({"type":"ok"}))
             }
             // ── worktrees (docs/18 WT-3) ──
@@ -1853,6 +3708,164 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// One coherent, sequence-fenced model for orchestrators. Unlike the
+    /// presentation-oriented list methods this spans every workspace and tab,
+    /// includes non-terminal views explicitly, and never reads terminal text.
+    pub(crate) fn runtime_snapshot(&self) -> Value {
+        let mut workspaces = Vec::with_capacity(self.workspaces.len());
+        for (workspace_index, workspace) in self.workspaces.iter().enumerate() {
+            let mut tabs = Vec::with_capacity(workspace.tabs.len());
+            for (tab_index, tab) in workspace.tabs.iter().enumerate() {
+                let kind = if tab.is_git() {
+                    "git"
+                } else if tab.is_orch() {
+                    "orchestration"
+                } else if tab.is_mission() {
+                    "mission_control"
+                } else {
+                    "panes"
+                };
+                let panes: Vec<Value> = tab
+                    .layout
+                    .leaves()
+                    .into_iter()
+                    .map(|pane_id| {
+                        if let Some(pane) = self.panes.get(&pane_id) {
+                            let runtime = pane.terminal_runtime();
+                            let status = self.status.get(&pane_id);
+                            json!({
+                                "pane_id":pane_id.0.to_string(),
+                                "kind":"terminal",
+                                "focused":workspace_index == self.active_ws
+                                    && tab_index == workspace.active_tab
+                                    && tab.layout.focus == pane_id,
+                                "cwd":pane.cwd.display().to_string(),
+                                "terminal_id":runtime.as_ref().map(|runtime| runtime.terminal_id.clone()),
+                                "root_process":runtime.as_ref().map(|runtime| json!({
+                                    "pid":runtime.pid,
+                                    "start_marker":runtime.start_marker,
+                                })),
+                                "content_revision":pane.content_revision(),
+                                "agent":status.map(|status| status.agent.clone()),
+                                "agent_status":status.map(|status| state_str(status.state)),
+                                "agent_authority":status.map(|status| status.identity_source),
+                                "agent_session":status.and_then(|status| status.agent_session.as_ref().map(|session| session.session_id.clone())),
+                            })
+                        } else {
+                            json!({
+                                "pane_id":pane_id.0.to_string(),
+                                "kind":"view",
+                                "focused":workspace_index == self.active_ws
+                                    && tab_index == workspace.active_tab
+                                    && tab.layout.focus == pane_id,
+                            })
+                        }
+                    })
+                    .collect();
+                tabs.push(json!({
+                    "index":tab_index + 1,
+                    "name":tab.name,
+                    "kind":kind,
+                    "active":tab_index == workspace.active_tab,
+                    "panes":panes,
+                }));
+            }
+            workspaces.push(json!({
+                "index":workspace_index + 1,
+                "name":workspace.name,
+                "cwd":workspace.cwd.display().to_string(),
+                "branch":workspace.branch,
+                "pinned":workspace.pinned,
+                "active":workspace_index == self.active_ws,
+                "tabs":tabs,
+            }));
+        }
+        json!({
+            "type":"session_snapshot",
+            "protocol":{
+                "name":crate::runtime_api::PROTOCOL_NAME,
+                "major":crate::runtime_api::PROTOCOL_MAJOR,
+                "minor":crate::runtime_api::PROTOCOL_MINOR,
+            },
+            "session":crate::session::display_name(),
+            "server_generation":self.backend_server_generation,
+            "event_sequence":crate::ipc::api::current_sequence(&self.events),
+            "workspaces":workspaces,
+        })
+    }
+
+    /// Cached process identity for a pane. The process scan already runs once
+    /// for all panes off-loop; this endpoint does no spawn or filesystem IO and
+    /// deliberately returns executable names rather than full argv, which may
+    /// contain credentials or prompts.
+    pub(crate) fn pane_processes(&self, id: PaneId) -> Value {
+        let runtime = self
+            .panes
+            .get(&id)
+            .and_then(crate::terminal::pty::Pane::terminal_runtime);
+        let observed = self.proc_commands.get(&id);
+        let executables = observed
+            .map(|commands| process_executables(commands))
+            .unwrap_or_default();
+        json!({
+            "type":"pane_processes",
+            "pane":id.0.to_string(),
+            "terminal_id":runtime.as_ref().map(|runtime| runtime.terminal_id.clone()),
+            "root_process":runtime.as_ref().map(|runtime| json!({
+                "pid":runtime.pid,
+                "start_marker":runtime.start_marker,
+            })),
+            "scan":if observed.is_some() { "observed" } else { "unavailable" },
+            "executables":executables,
+            "arguments_exposed":false,
+        })
+    }
+
+    pub(crate) fn agent_explanation(&self, id: PaneId) -> Value {
+        let Some(status) = self.status.get(&id) else {
+            return json!({"type":"agent_explanation", "pane":id.0.to_string(), "available":false});
+        };
+        let now = Instant::now();
+        let report = status.agent_report.as_ref();
+        let identity_confidence = match status.identity_source {
+            "integration_report" | "process_tree" => "authoritative",
+            "launch_command" | "osc_title" => "high",
+            "screen_text" | "prior_identity" => "heuristic",
+            _ => "none",
+        };
+        let state_confidence = match status.state_source {
+            "integration_report" => "authoritative",
+            "manifest_rule" => "high",
+            "shell_activity" => "heuristic",
+            _ => "none",
+        };
+        json!({
+            "type":"agent_explanation",
+            "pane":id.0.to_string(),
+            "available":true,
+            "agent":status.agent,
+            "status":state_str(status.state),
+            "identity":{"source":status.identity_source, "confidence":identity_confidence},
+            "state_evidence":{
+                "source":status.state_source,
+                "confidence":state_confidence,
+                "rule_priority":status.rule_priority,
+                "rule_region":status.rule_region,
+                "blocked_hint":status.blocked_hint,
+            },
+            "authority":report.map(|report| json!({
+                "source":report.source,
+                "sequence":report.sequence,
+                "message":report.message,
+                "expires_in_ms":report.expires_at.saturating_duration_since(now).as_millis().min(u64::MAX as u128) as u64,
+            })),
+            "session":status.agent_session.as_ref().map(|session| json!({
+                "agent":session.agent,
+                "id":session.session_id,
+            })),
+        })
+    }
+
     /// Register a server-side `wait.output` (docs/81). An already-visible
     /// marker replies immediately; otherwise the waiter is parked and answered
     /// by the pane's next output event — no polling on either side.
@@ -1863,16 +3876,19 @@ impl App {
         needle: String,
         reply: Sender<String>,
         timeout: Option<Duration>,
+        cancelled: Arc<AtomicBool>,
     ) {
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
         let recent = self.pane_recent_text(id);
         if recent.contains(&needle) {
             let _ = reply.send(wait_response(&request_id, true, Some(id)));
             return;
         }
-        // Always bound the wait: a client that disconnects cannot be detected on
-        // the reply channel, so an uncapped waiter would be re-scanned forever.
-        // A shorter caller-specified timeout still wins; a longer one (or none)
-        // is capped so an abandoned waiter is reclaimed within an hour.
+        // Always bound the wait as a second line of defence. Socket workers mark
+        // disconnected clients immediately; this cap also protects against a
+        // worker failure or a client that stays connected but never consumes.
         const MAX_WAIT: Duration = Duration::from_secs(3600);
         let deadline = Some(Instant::now() + timeout.unwrap_or(MAX_WAIT).min(MAX_WAIT));
         self.output_waits.entry(id).or_default().push(OutputWait {
@@ -1880,6 +3896,7 @@ impl App {
             needle,
             reply,
             deadline,
+            cancelled,
         });
     }
 
@@ -1895,7 +3912,9 @@ impl App {
         };
         let mut keep = Vec::with_capacity(waiters.len());
         for waiter in waiters.drain(..) {
-            if text.contains(&waiter.needle) {
+            if waiter.cancelled.load(Ordering::Acquire) {
+                continue;
+            } else if text.contains(&waiter.needle) {
                 let _ = waiter
                     .reply
                     .send(wait_response(&waiter.request_id, true, Some(id)));
@@ -1935,7 +3954,9 @@ impl App {
         }
         for waiters in self.output_waits.values_mut() {
             waiters.retain(|waiter| {
-                if waiter.deadline.is_some_and(|d| now >= d) {
+                if waiter.cancelled.load(Ordering::Acquire) {
+                    false
+                } else if waiter.deadline.is_some_and(|d| now >= d) {
                     let _ = waiter
                         .reply
                         .send(wait_response(&waiter.request_id, false, None));
@@ -1960,12 +3981,565 @@ impl App {
         }
     }
 
-    /// The live alias pointing at `pane`, if any (set by `agent.name`). Reverse of
-    /// the `agent_names` map; the map is small, so a linear scan is fine.
+    /// Begin one server-owned launch. Pane selection/creation, command queueing,
+    /// alias reservation, and readiness observation are committed on this app
+    /// loop turn, so no other client can target a half-configured workflow.
+    pub(crate) fn start_agent_launch(
+        &mut self,
+        request_id: String,
+        p: Value,
+        reply: Sender<String>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        let fail = |code: &str, message: String| {
+            let _ = reply
+                .send(json!({"id":request_id,"error":{"code":code,"message":message}}).to_string());
+        };
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        if let Err((code, message)) = reject_api_fields(
+            &p,
+            &[
+                "name",
+                "kind",
+                "pane",
+                "anchor",
+                "direction",
+                "args",
+                "timeout_s",
+            ],
+        ) {
+            fail(&code, message);
+            return;
+        }
+        let name = p.get("name").and_then(Value::as_str).unwrap_or("");
+        let kind = p.get("kind").and_then(Value::as_str).unwrap_or("");
+        if !valid_agent_name(name) || !valid_agent_name(kind) {
+            fail(
+                "invalid_request",
+                "name and kind must match [a-z][a-z0-9_-]{0,31}".to_string(),
+            );
+            return;
+        }
+        if !self.manifests.is_agent(kind) {
+            fail("unsupported_agent", format!("unknown agent kind: {kind}"));
+            return;
+        }
+        if self.agent_names.contains_key(name) {
+            fail("name_in_use", format!("agent name already exists: {name}"));
+            return;
+        }
+        let timeout = match agent_timeout(&p, 30.0) {
+            Ok(timeout) => timeout,
+            Err(message) => {
+                fail("invalid_request", message);
+                return;
+            }
+        };
+        let args = match agent_start_args(&p) {
+            Ok(args) => args,
+            Err(message) => {
+                fail("invalid_request", message);
+                return;
+            }
+        };
+        if !matches!(
+            p.get("direction").and_then(Value::as_str),
+            None | Some("right" | "down")
+        ) {
+            fail(
+                "invalid_request",
+                "direction must be right or down".to_string(),
+            );
+            return;
+        }
+        let (pane, created) = match (p.get("pane"), p.get("anchor")) {
+            (Some(_), Some(_)) => {
+                fail(
+                    "invalid_request",
+                    "agent.start accepts either pane or anchor, not both".to_string(),
+                );
+                return;
+            }
+            (Some(_), None) => match self.resolve_pane(&json!({"pane":p["pane"]})) {
+                Some(id) => (id, false),
+                None => {
+                    fail("not_found", "pane not found".to_string());
+                    return;
+                }
+            },
+            (_, _) => {
+                let mut split = serde_json::Map::new();
+                if let Some(anchor) = p.get("anchor") {
+                    let Some(anchor) = self.resolve_pane(&json!({"pane":anchor})) else {
+                        fail("not_found", "anchor pane not found".to_string());
+                        return;
+                    };
+                    split.insert("pane".into(), json!(anchor.0.to_string()));
+                }
+                split.insert("focus".into(), json!(false));
+                if let Some(direction) = p.get("direction") {
+                    split.insert("direction".into(), direction.clone());
+                }
+                match self.dispatch("pane.split", &Value::Object(split)) {
+                    Ok(value) => match value["pane"]
+                        .as_str()
+                        .and_then(|pane| pane.parse::<u32>().ok())
+                        .map(PaneId)
+                    {
+                        Some(id) => (id, true),
+                        None => {
+                            fail("spawn_failed", "agent pane was not created".to_string());
+                            return;
+                        }
+                    },
+                    Err((code, message)) => {
+                        fail(&code, message);
+                        return;
+                    }
+                }
+            }
+        };
+        if self.is_agent_pane(pane) || self.agent_starts.contains_key(&pane) {
+            fail(
+                "agent_pane_busy",
+                "target pane already hosts or is starting an agent".to_string(),
+            );
+            return;
+        }
+        let Some(target) = self.panes.get(&pane) else {
+            fail("not_found", "pane not found".to_string());
+            return;
+        };
+        let shell = target.command.clone();
+        let mut command = match shell_word(kind, &shell) {
+            Ok(word) => word,
+            Err(message) => {
+                if created {
+                    self.close_pane(pane);
+                }
+                fail("invalid_request", message);
+                return;
+            }
+        };
+        for arg in args {
+            command.push(' ');
+            let word = match shell_word(&arg, &shell) {
+                Ok(word) => word,
+                Err(message) => {
+                    if created {
+                        self.close_pane(pane);
+                    }
+                    fail("invalid_request", message);
+                    return;
+                }
+            };
+            command.push_str(&word);
+        }
+        if let Err(message) = target.try_submit_text(&command) {
+            if created {
+                self.close_pane(pane);
+            }
+            fail("send_failed", message);
+            return;
+        }
+        self.set_agent_name(pane, Some(name));
+        self.agent_starts.insert(
+            pane,
+            AgentStart {
+                request_id,
+                name: name.to_string(),
+                kind: kind.to_string(),
+                reply,
+                deadline: Instant::now() + timeout,
+                cancelled,
+            },
+        );
+    }
+
+    /// Atomically submit a prompt and, when requested, retain the response until
+    /// the post-submission lifecycle has settled. The single queued PTY action
+    /// guarantees that paste and Enter cannot be accepted independently.
+    pub(crate) fn start_agent_prompt(
+        &mut self,
+        request_id: String,
+        p: Value,
+        reply: Sender<String>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        let fail = |code: &str, message: String| {
+            let _ = reply
+                .send(json!({"id":request_id,"error":{"code":code,"message":message}}).to_string());
+        };
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        if let Err((code, message)) =
+            reject_api_fields(&p, &["target", "text", "wait", "until", "timeout_s"])
+        {
+            fail(&code, message);
+            return;
+        }
+        let pane = match self.resolve_agent_target(&p) {
+            Ok(pane) if self.is_agent_pane(pane) => pane,
+            Ok(_) => {
+                fail(
+                    "agent_not_ready",
+                    "target pane is not a running agent".to_string(),
+                );
+                return;
+            }
+            Err((code, message)) => {
+                fail(&code, message);
+                return;
+            }
+        };
+        let text = p.get("text").and_then(Value::as_str).unwrap_or("");
+        if text.is_empty() || text.chars().count() > MAX_AGENT_PROMPT_CHARS {
+            fail(
+                "invalid_request",
+                format!("text must contain 1 to {MAX_AGENT_PROMPT_CHARS} characters"),
+            );
+            return;
+        }
+        let wait = match p.get("wait") {
+            None => false,
+            Some(Value::Bool(wait)) => *wait,
+            Some(_) => {
+                fail("invalid_request", "wait must be a boolean".to_string());
+                return;
+            }
+        };
+        if !wait && (p.get("until").is_some() || p.get("timeout_s").is_some()) {
+            fail(
+                "invalid_request",
+                "until and timeout_s require wait=true".to_string(),
+            );
+            return;
+        }
+        let until = match prompt_states(&p) {
+            Ok(states) => states,
+            Err(message) => {
+                fail("invalid_request", message);
+                return;
+            }
+        };
+        let timeout = match agent_timeout(&p, 300.0) {
+            Ok(timeout) => timeout,
+            Err(message) => {
+                fail("invalid_request", message);
+                return;
+            }
+        };
+        if wait {
+            let total: usize = self.agent_prompts.values().map(Vec::len).sum();
+            if total >= MAX_AGENT_WAITS_TOTAL {
+                fail(
+                    "unavailable",
+                    "agent prompt wait capacity is full".to_string(),
+                );
+                return;
+            }
+            // A terminal stream has no turn identifier. Refuse a second
+            // server-owned turn instead of letting both callers claim the same
+            // state/output transition as their completion evidence.
+            if self.agent_prompts.contains_key(&pane) {
+                fail(
+                    "agent_prompt_busy",
+                    "target agent already has a prompt waiting for completion".to_string(),
+                );
+                return;
+            }
+        }
+        let Some(target) = self.panes.get(&pane) else {
+            fail("not_found", "pane not found".to_string());
+            return;
+        };
+        let baseline_revision = target.content_revision();
+        if let Err(message) = target.try_submit_text(text) {
+            fail("send_failed", message);
+            return;
+        }
+        let status = self.status.get(&pane).map(|status| status.state);
+        if !wait {
+            let _ = reply.send(agent_prompt_response(
+                &request_id,
+                pane,
+                true,
+                false,
+                status,
+                baseline_revision,
+                baseline_revision,
+                "queued",
+            ));
+            return;
+        }
+        let now = Instant::now();
+        self.agent_prompts
+            .entry(pane)
+            .or_default()
+            .push(AgentPrompt {
+                request_id,
+                until,
+                baseline_revision,
+                last_revision: baseline_revision,
+                last_output_at: now,
+                saw_output: false,
+                saw_working: status == Some(State::Working),
+                reply,
+                deadline: now + timeout,
+                cancelled,
+            });
+    }
+
+    /// Progress only active launch/prompt workflows. With no pending workflow
+    /// this is O(1) and allocates nothing; PTY/output work remains event driven.
+    pub(crate) fn tick_agent_workflows(&mut self, now: Instant) {
+        let starts: Vec<PaneId> = self.agent_starts.keys().copied().collect();
+        for pane in starts {
+            let outcome = self.agent_starts.get(&pane).and_then(|start| {
+                if start.cancelled.load(Ordering::Acquire) {
+                    return Some(None);
+                }
+                let status = self.status.get(&pane);
+                if status.is_some_and(|status| {
+                    status.agent.eq_ignore_ascii_case(&start.kind) && self.is_agent_pane(pane)
+                }) {
+                    return Some(Some((true, status.map(|status| status.state))));
+                }
+                if !self.panes.contains_key(&pane) || now >= start.deadline {
+                    return Some(Some((false, status.map(|status| status.state))));
+                }
+                None
+            });
+            if let Some(outcome) = outcome {
+                let start = self.agent_starts.remove(&pane).expect("start exists");
+                match outcome {
+                    None => {}
+                    Some((ready, status)) => {
+                        let _ = start.reply.send(
+                            json!({"id":start.request_id,"result":{
+                                "type":"agent_start","name":start.name,"kind":start.kind,
+                                "pane":pane.0.to_string(),"ready":ready,
+                                "status":status.map(state_str),
+                            }})
+                            .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+
+        let panes: Vec<PaneId> = self.agent_prompts.keys().copied().collect();
+        for pane in panes {
+            let revision = self
+                .panes
+                .get(&pane)
+                .map(crate::terminal::pty::Pane::content_revision);
+            let state = self.status.get(&pane).map(|status| status.state);
+            let Some(waiters) = self.agent_prompts.get_mut(&pane) else {
+                continue;
+            };
+            waiters.retain_mut(|waiter| {
+                if waiter.cancelled.load(Ordering::Acquire) {
+                    return false;
+                }
+                let Some(revision) = revision else {
+                    let _ = waiter.reply.send(agent_prompt_response(
+                        &waiter.request_id,
+                        pane,
+                        true,
+                        false,
+                        None,
+                        waiter.baseline_revision,
+                        waiter.last_revision,
+                        "pane_closed",
+                    ));
+                    return false;
+                };
+                if revision != waiter.last_revision {
+                    waiter.last_revision = revision;
+                    waiter.last_output_at = now;
+                    waiter.saw_output = revision > waiter.baseline_revision;
+                }
+                if state == Some(State::Working) {
+                    waiter.saw_working = true;
+                }
+                let target = state.is_some_and(|state| waiter.until.contains(&state));
+                let quiet = waiter.saw_output
+                    && now.saturating_duration_since(waiter.last_output_at) >= AGENT_PROMPT_QUIET;
+                if target && (waiter.saw_working || quiet) {
+                    let evidence = if waiter.saw_working {
+                        "state_transition"
+                    } else {
+                        "output_settled"
+                    };
+                    let _ = waiter.reply.send(agent_prompt_response(
+                        &waiter.request_id,
+                        pane,
+                        true,
+                        true,
+                        state,
+                        waiter.baseline_revision,
+                        revision,
+                        evidence,
+                    ));
+                    return false;
+                }
+                if now >= waiter.deadline {
+                    let _ = waiter.reply.send(agent_prompt_response(
+                        &waiter.request_id,
+                        pane,
+                        true,
+                        false,
+                        state,
+                        waiter.baseline_revision,
+                        revision,
+                        "timeout",
+                    ));
+                    return false;
+                }
+                true
+            });
+            if waiters.is_empty() {
+                self.agent_prompts.remove(&pane);
+            }
+        }
+    }
+
+    pub(crate) fn register_agent_wait(
+        &mut self,
+        id: PaneId,
+        request_id: String,
+        state: State,
+        reply: Sender<String>,
+        timeout: Option<Duration>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let current = self.status.get(&id).map(|status| status.state);
+        if current == Some(state) {
+            let _ = reply.send(agent_wait_response(&request_id, true, Some(id), current));
+            return;
+        }
+        let total: usize = self.agent_waits.values().map(Vec::len).sum();
+        if total >= MAX_AGENT_WAITS_TOTAL
+            || self
+                .agent_waits
+                .get(&id)
+                .is_some_and(|waits| waits.len() >= MAX_AGENT_WAITS_PER_PANE)
+        {
+            let _ = reply.send(
+                json!({"id":request_id,"error":{"code":"unavailable","message":"agent wait capacity is full"}})
+                    .to_string(),
+            );
+            return;
+        }
+        self.agent_waits.entry(id).or_default().push(AgentWait {
+            request_id,
+            state,
+            reply,
+            deadline: Instant::now() + timeout.unwrap_or(MAX_AGENT_WAIT).min(MAX_AGENT_WAIT),
+            cancelled,
+        });
+    }
+
+    pub(crate) fn check_agent_waits(&mut self, id: PaneId) {
+        let Some(current) = self.status.get(&id).map(|status| status.state) else {
+            return;
+        };
+        let Some(waiters) = self.agent_waits.get_mut(&id) else {
+            return;
+        };
+        waiters.retain(|waiter| {
+            if waiter.cancelled.load(Ordering::Acquire) {
+                false
+            } else if waiter.state == current {
+                let _ = waiter.reply.send(agent_wait_response(
+                    &waiter.request_id,
+                    true,
+                    Some(id),
+                    Some(current),
+                ));
+                false
+            } else {
+                true
+            }
+        });
+        if waiters.is_empty() {
+            self.agent_waits.remove(&id);
+        }
+    }
+
+    pub(crate) fn tick_agent_waits(&mut self, now: Instant) {
+        for (id, waiters) in self.agent_waits.iter_mut() {
+            let current = self.status.get(id).map(|status| status.state);
+            waiters.retain(|waiter| {
+                if waiter.cancelled.load(Ordering::Acquire) {
+                    false
+                } else if now >= waiter.deadline {
+                    let _ = waiter.reply.send(agent_wait_response(
+                        &waiter.request_id,
+                        false,
+                        Some(*id),
+                        current,
+                    ));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        self.agent_waits.retain(|_, waits| !waits.is_empty());
+    }
+
+    pub(crate) fn cancel_agent_waits(&mut self, id: PaneId) {
+        if let Some(waiters) = self.agent_waits.remove(&id) {
+            for waiter in waiters {
+                let _ =
+                    waiter
+                        .reply
+                        .send(agent_wait_response(&waiter.request_id, false, None, None));
+            }
+        }
+        if let Some(start) = self.agent_starts.remove(&id) {
+            let _ = start.reply.send(
+                json!({"id":start.request_id,"error":{
+                    "code":"agent_not_running","message":"agent pane closed during startup"
+                }})
+                .to_string(),
+            );
+        }
+        if let Some(prompts) = self.agent_prompts.remove(&id) {
+            for prompt in prompts {
+                let _ = prompt.reply.send(agent_prompt_response(
+                    &prompt.request_id,
+                    id,
+                    true,
+                    false,
+                    None,
+                    prompt.baseline_revision,
+                    prompt.last_revision,
+                    "pane_closed",
+                ));
+            }
+        }
+    }
+
+    /// The display label for `pane`: a terminal-backend title when present,
+    /// otherwise the live alias set by `agent.name`.
     pub(crate) fn agent_name_for(&self, pane: PaneId) -> Option<&str> {
-        self.agent_names
-            .iter()
-            .find_map(|(name, p)| (*p == pane).then_some(name.as_str()))
+        self.backend_labels
+            .get(&pane)
+            .map(String::as_str)
+            .or_else(|| {
+                self.agent_names
+                    .iter()
+                    .find_map(|(name, p)| (*p == pane).then_some(name.as_str()))
+            })
     }
 
     /// Record every live agent session's current title, so the session keeps a
@@ -1995,10 +4569,12 @@ impl App {
 
     /// Whether `pane` currently hosts a recognised agent (detection) or a bound
     /// agent session — the same test `agent.list` uses to decide what is an agent.
-    fn is_agent_pane(&self, pane: PaneId) -> bool {
-        self.status
-            .get(&pane)
-            .is_some_and(|s| self.manifests.is_agent(&s.agent) || s.agent_session.is_some())
+    pub(crate) fn is_agent_pane(&self, pane: PaneId) -> bool {
+        self.status.get(&pane).is_some_and(|s| {
+            self.manifests.is_agent(&s.agent)
+                || s.agent_session.is_some()
+                || s.agent_report.is_some()
+        })
     }
 
     /// Resolve an `agent.*` `target` param (a live alias or a numeric pane id) to a
@@ -2062,6 +4638,284 @@ impl App {
         }
     }
 
+    fn optional_socket_workspace(&self, p: &Value) -> Result<Option<usize>, (String, String)> {
+        let indexed = optional_workspace_param(p)?;
+        let by_id = match p.get("workspace_id") {
+            None => None,
+            Some(Value::String(id)) if !id.is_empty() => Some(
+                self.workspaces
+                    .iter()
+                    .position(|workspace| workspace.id == *id)
+                    .ok_or_else(|| {
+                        (
+                            "not_found".to_string(),
+                            format!("workspace id {id} not found"),
+                        )
+                    })?,
+            ),
+            Some(_) => {
+                return Err((
+                    "invalid_request".to_string(),
+                    "workspace_id must be a non-empty string".to_string(),
+                ))
+            }
+        };
+        if indexed.is_some() && by_id.is_some() {
+            return Err((
+                "invalid_request".to_string(),
+                "workspace and workspace_id cannot be used together".to_string(),
+            ));
+        }
+        Ok(indexed.or(by_id))
+    }
+
+    fn required_socket_workspace(&self, p: &Value) -> Result<usize, (String, String)> {
+        self.optional_socket_workspace(p)?.ok_or_else(|| {
+            (
+                "invalid_request".to_string(),
+                "workspace or workspace_id is required".to_string(),
+            )
+        })
+    }
+
+    fn optional_socket_tab(
+        &self,
+        workspace: usize,
+        p: &Value,
+        position_key: &str,
+        id_key: &str,
+    ) -> Result<Option<usize>, (String, String)> {
+        let positioned = p
+            .get(position_key)
+            .map(|_| required_one_based_param(p, position_key))
+            .transpose()?;
+        let by_id = match p.get(id_key) {
+            None => None,
+            Some(Value::String(id)) if !id.is_empty() => Some(
+                self.workspaces
+                    .get(workspace)
+                    .and_then(|workspace| workspace.tabs.iter().position(|tab| tab.id == *id))
+                    .ok_or_else(|| ("not_found".to_string(), format!("tab id {id} not found")))?,
+            ),
+            Some(_) => {
+                return Err((
+                    "invalid_request".to_string(),
+                    format!("{id_key} must be a non-empty string"),
+                ))
+            }
+        };
+        if positioned.is_some() && by_id.is_some() {
+            return Err((
+                "invalid_request".to_string(),
+                format!("{position_key} and {id_key} cannot be used together"),
+            ));
+        }
+        Ok(positioned.or(by_id))
+    }
+
+    fn required_socket_tab(
+        &self,
+        workspace: usize,
+        p: &Value,
+        position_key: &str,
+        id_key: &str,
+    ) -> Result<usize, (String, String)> {
+        self.optional_socket_tab(workspace, p, position_key, id_key)?
+            .ok_or_else(|| {
+                (
+                    "invalid_request".to_string(),
+                    format!("{position_key} or {id_key} is required"),
+                )
+            })
+    }
+
+    fn socket_workspace(&self, index: usize) -> Result<Value, (String, String)> {
+        let workspace = self
+            .workspaces
+            .get(index)
+            .ok_or_else(|| workspace_update_error(index, WorkspaceUpdateError::NotFound))?;
+        Ok(json!({
+            "type":"workspace", "workspace":index.to_string(), "workspace_id":workspace.id,
+            "name":workspace.name,
+            "cwd":workspace.cwd.display().to_string(), "branch":workspace.branch,
+            "ahead":workspace.git_ahead_behind.map(|value| value.0),
+            "behind":workspace.git_ahead_behind.map(|value| value.1),
+            "pinned":workspace.pinned, "active":index == self.active_ws,
+            "display_position":self.workspace_display_position(index).unwrap_or(index).to_string(),
+            "active_tab":(workspace.active_tab + 1).to_string(), "tabs":workspace.tabs.len(),
+        }))
+    }
+
+    fn socket_tab(&self, workspace: usize, tab: usize) -> Result<Value, (String, String)> {
+        let ws = self
+            .workspaces
+            .get(workspace)
+            .ok_or_else(|| workspace_update_error(workspace, WorkspaceUpdateError::NotFound))?;
+        let value = ws.tabs.get(tab).ok_or_else(|| {
+            (
+                "not_found".to_string(),
+                format!("tab {} not found", tab + 1),
+            )
+        })?;
+        let kind = if value.is_git() {
+            "git"
+        } else if value.is_orch() {
+            "orch"
+        } else if value.is_mission() {
+            "mission"
+        } else {
+            "panes"
+        };
+        Ok(json!({
+            "type":"tab", "workspace":workspace.to_string(), "workspace_id":ws.id,
+            "tab":(tab+1).to_string(), "tab_id":value.id,
+            "active":workspace == self.active_ws && tab == ws.active_tab,
+            "name":value.name, "kind":kind, "focus":value.layout.focus.0.to_string(),
+            "panes":value.layout.leaves().into_iter().map(|id| id.0.to_string()).collect::<Vec<_>>(),
+        }))
+    }
+
+    fn socket_pane(&self, pane: PaneId) -> Result<Value, (String, String)> {
+        let (workspace, tab) = self.pane_location(pane).ok_or_else(not_found)?;
+        let terminal = self.panes.get(&pane);
+        let status = self.status.get(&pane);
+        let history = terminal.map(|pane| pane.history_metrics());
+        Ok(json!({
+            "type":"pane", "pane":pane.0.to_string(), "workspace":workspace.to_string(),
+            "workspace_id":self.workspaces[workspace].id,
+            "tab":(tab+1).to_string(), "tab_id":self.workspaces[workspace].tabs[tab].id,
+            "terminal_id":terminal.and_then(|pane| pane.terminal_runtime()).map(|runtime| runtime.terminal_id),
+            "focused":workspace == self.active_ws
+                && tab == self.workspaces[workspace].active_tab
+                && self.workspaces[workspace].tabs[tab].layout.focus == pane,
+            "name":self.agent_name_for(pane),
+            "cwd":terminal.map(|pane| pane.cwd.display().to_string()),
+            "command":terminal.map(|pane| pane.command.as_str()),
+            "agent":status.map(|status| status.agent.as_str()),
+            "status":status.map(|status| state_str(status.state)).unwrap_or("unknown"),
+            "history_budget_bytes":history.map(|metrics| metrics.budget_bytes),
+            "history_bytes":history.map(|metrics| metrics.retained_bytes),
+            "module":self.module_panes.get(&pane).map(|module| json!({"id":module.module_id,"entrypoint":module.entrypoint})),
+        }))
+    }
+
+    fn socket_pane_layout(&self, pane: PaneId) -> Result<Value, (String, String)> {
+        let (workspace, tab) = self.pane_location(pane).ok_or_else(not_found)?;
+        let area = crate::api::topology::logical_area();
+        let layout = &self.workspaces[workspace].tabs[tab].layout;
+        let rect = layout.pane_rect(area, pane).ok_or_else(not_found)?;
+        Ok(json!({
+            "type":"pane_layout", "pane":pane.0.to_string(), "workspace":workspace.to_string(),
+            "tab":(tab+1).to_string(), "logical_size":{"width":area.width,"height":area.height},
+            "rect":{"x":rect.x,"y":rect.y,"width":rect.width,"height":rect.height},
+            "tree":layout.to_tree(),
+        }))
+    }
+
+    fn reorder_workspace_block(
+        &mut self,
+        block: &[usize],
+        to: usize,
+    ) -> Result<Vec<usize>, (String, String)> {
+        let len = self.workspaces.len();
+        if block.is_empty() || to > len.saturating_sub(block.len()) {
+            return Err((
+                "invalid_request".to_string(),
+                "destination workspace position is out of range".to_string(),
+            ));
+        }
+        let selected: std::collections::HashSet<_> = block.iter().copied().collect();
+        if selected.len() != block.len() || block.iter().any(|index| *index >= len) {
+            return Err((
+                "invalid_request".to_string(),
+                "workspace block contains an invalid or duplicate index".to_string(),
+            ));
+        }
+        let mut order: Vec<usize> = (0..len).filter(|index| !selected.contains(index)).collect();
+        let insertion = to;
+        for (offset, index) in block.iter().copied().enumerate() {
+            order.insert(insertion + offset, index);
+        }
+        if !order.iter().copied().eq(0..len) {
+            let old_active = self.active_ws;
+            let mut old: Vec<Option<Workspace>> = std::mem::take(&mut self.workspaces)
+                .into_iter()
+                .map(Some)
+                .collect();
+            self.workspaces = order
+                .iter()
+                .map(|index| old[*index].take().unwrap())
+                .collect();
+            self.active_ws = order
+                .iter()
+                .position(|index| *index == old_active)
+                .unwrap_or(0);
+            self.session_dirty = true;
+        }
+        Ok(block
+            .iter()
+            .map(|index| {
+                order
+                    .iter()
+                    .position(|candidate| candidate == index)
+                    .unwrap()
+            })
+            .collect())
+    }
+
+    pub(super) fn apply_socket_config(
+        &mut self,
+        next: crate::config::Config,
+    ) -> Result<(), (String, String)> {
+        let prefix = keys::PrefixSpec::parse(&next.prefix).ok_or_else(|| {
+            (
+                "invalid_request".to_string(),
+                "config prefix must be F1-F12 or a valid Ctrl/Alt chord".to_string(),
+            )
+        })?;
+        if self.theme_registry.get(&next.theme).is_none() && next.theme != "terminal" {
+            return Err((
+                "invalid_request".to_string(),
+                format!("theme `{}` is not installed", next.theme),
+            ));
+        }
+        let mut theme = self.theme_registry.theme_or_default(&next.theme);
+        if self.downsample {
+            theme = theme.to_256();
+        }
+        let sidebars = Sidebars::from_config(&next.sidebars());
+        let keymap = keys::build_keymap(&next.keybindings);
+        let history_budget = next.scrollback_bytes();
+        self.theme = theme;
+        self.catalog = crate::i18n::by_code(&next.language);
+        self.prefix = prefix;
+        self.keymap = keymap;
+        self.sidebars = sidebars;
+        self.file_tree.show_hidden = next.layout.files_show_hidden;
+        self.file_tree.scroll = 0;
+        crate::layout::set_gaps(next.layout.col_gap, next.layout.row_gap);
+        for pane in self.panes.values() {
+            pane.set_history_budget(history_budget);
+        }
+        self.config = next;
+        self.changelog_rows = None;
+        let persisted = self.config.clone();
+        std::thread::spawn(move || crate::config::save(&persisted));
+        self.emit_event("config.changed", json!({}));
+        Ok(())
+    }
+
+    pub(super) fn apply_socket_manifests(&mut self, manifests: crate::detect::Manifests) {
+        self.manifests = manifests;
+        for status in self.status.values_mut() {
+            status.force_detect = true;
+        }
+        self.emit_event(
+            "server.agent_manifests_reloaded",
+            json!({"rules":self.manifests.rule_count()}),
+        );
+    }
+
     /// The cwd of the `workspace` param (else the active workspace) for git.* methods.
     fn git_workspace_cwd(&self, p: &Value) -> PathBuf {
         let i = param_usize(p, "workspace")
@@ -2100,6 +4954,24 @@ fn tab_move_error(err: TabMoveError) -> (String, String) {
     let message = match err {
         TabMoveError::PositionOutOfRange => "tab position is out of range",
         TabMoveError::SamePosition => "source and destination tab positions must differ",
+        TabMoveError::AlreadyFirst => "tab is already at the left edge",
+        TabMoveError::AlreadyLast => "tab is already at the right edge",
+    };
+    ("invalid_request".to_string(), message.to_string())
+}
+
+fn tab_focus_error(err: TabFocusError) -> (String, String) {
+    let message = match err {
+        TabFocusError::PositionOutOfRange => "tab position is out of range",
+    };
+    ("invalid_request".to_string(), message.to_string())
+}
+
+fn tab_rename_error(err: TabRenameError) -> (String, String) {
+    let message = match err {
+        TabRenameError::PositionOutOfRange => "tab position is out of range",
+        TabRenameError::Dashboard => "dashboard tabs cannot be renamed",
+        TabRenameError::NameTooLong => "tab name must be at most 40 characters",
     };
     ("invalid_request".to_string(), message.to_string())
 }
@@ -2215,6 +5087,104 @@ fn git_err(e: String) -> (String, String) {
     ("git_error".to_string(), e)
 }
 
+fn diff_err(e: String) -> (String, String) {
+    ("diff_error".to_string(), e)
+}
+
+fn parse_diff_layer(value: &str) -> Result<crate::diff::DiffLayer, (String, String)> {
+    match value {
+        "staged" => Ok(crate::diff::DiffLayer::Staged),
+        "worktree" | "unstaged" => Ok(crate::diff::DiffLayer::Worktree),
+        "untracked" => Ok(crate::diff::DiffLayer::Untracked),
+        "conflict" => Ok(crate::diff::DiffLayer::Conflict),
+        _ => Err(diff_err(
+            "layer must be staged, worktree, untracked, or conflict".to_string(),
+        )),
+    }
+}
+
+fn diff_file_json(file: &crate::diff::DiffFile) -> Value {
+    json!({
+        "path":file.key.display_path(),
+        "path_raw_hex":file.key.new_path.as_ref().or(file.key.old_path.as_ref()).map(|path| path.raw_hex.as_str()),
+        "old_path":file.key.old_path.as_ref().map(|path| path.display.as_str()),
+        "old_path_raw_hex":file.key.old_path.as_ref().map(|path| path.raw_hex.as_str()),
+        "layer":file.key.layer.label(),
+        "status":file.status.badge(),
+        "additions":file.additions,
+        "deletions":file.deletions,
+        "binary":file.binary,
+        "notes":file.unresolved_notes,
+        "viewed":file.viewed(),
+        "modified_since_review":file.modified_since_review(),
+        "fingerprint":file.fingerprint,
+    })
+}
+
+fn parse_note_kind(value: &str) -> Result<crate::diff::NoteKind, (String, String)> {
+    match value {
+        "question" => Ok(crate::diff::NoteKind::Question),
+        "issue" => Ok(crate::diff::NoteKind::Issue),
+        "suggestion" => Ok(crate::diff::NoteKind::Suggestion),
+        "praise" => Ok(crate::diff::NoteKind::Praise),
+        _ => Err(diff_err(
+            "note kind must be question, issue, suggestion, or praise".to_string(),
+        )),
+    }
+}
+
+fn parse_note_state(value: &str) -> Result<crate::diff::NoteState, (String, String)> {
+    match value {
+        "open" => Ok(crate::diff::NoteState::Open),
+        "resolved" => Ok(crate::diff::NoteState::Resolved),
+        "outdated" => Ok(crate::diff::NoteState::Outdated),
+        "orphaned" => Ok(crate::diff::NoteState::Orphaned),
+        _ => Err(diff_err(
+            "note state must be open, resolved, outdated, or orphaned".to_string(),
+        )),
+    }
+}
+
+fn diff_line_param(value: &Value, key: &str) -> Result<Option<u32>, (String, String)> {
+    let Some(raw) = value.get(key) else {
+        return Ok(None);
+    };
+    let number = raw
+        .as_u64()
+        .filter(|number| *number > 0 && *number <= u32::MAX as u64)
+        .ok_or_else(|| diff_err(format!("{key} must be a positive line number")))?;
+    Ok(Some(number as u32))
+}
+
+fn note_state_label(state: crate::diff::NoteState) -> &'static str {
+    match state {
+        crate::diff::NoteState::Open => "open",
+        crate::diff::NoteState::Resolved => "resolved",
+        crate::diff::NoteState::Outdated => "outdated",
+        crate::diff::NoteState::Orphaned => "orphaned",
+    }
+}
+
+fn note_json(note: &crate::diff::ReviewNote) -> Value {
+    json!({
+        "id":note.id,
+        "review":note.review_id,
+        "author":note.author,
+        "kind":note.kind.label(),
+        "body":note.body,
+        "state":note_state_label(note.state),
+        "path":note.anchor.diff_key.display_path(),
+        "layer":note.anchor.diff_key.layer.label(),
+        "side":note.anchor.side.label(),
+        "start_line":note.anchor.start_line,
+        "end_line":note.anchor.end_line,
+        "revision":note.revision,
+        "deliveries":note.deliveries,
+        "created_at_ms":note.created_at_ms,
+        "updated_at_ms":note.updated_at_ms,
+    })
+}
+
 /// Required `path` string param → a `PathBuf`.
 fn param_path(p: &Value) -> Result<PathBuf, (String, String)> {
     p.get("path")
@@ -2225,6 +5195,35 @@ fn param_path(p: &Value) -> Result<PathBuf, (String, String)> {
 
 fn module_err(e: String) -> (String, String) {
     ("module_error".to_string(), e)
+}
+
+fn validate_bar_actions(
+    app: &App,
+    owner: &str,
+    segments: &[crate::bar::BarSegment],
+) -> Result<(), (String, String)> {
+    for segment in segments {
+        validate_bar_action(app, owner, segment.action.as_deref())?;
+    }
+    Ok(())
+}
+
+fn validate_bar_action(
+    app: &App,
+    owner: &str,
+    action: Option<&str>,
+) -> Result<(), (String, String)> {
+    let module = app
+        .modules
+        .find(owner)
+        .filter(|module| module.is_runnable())
+        .ok_or_else(|| module_err(format!("module {owner} is unavailable")))?;
+    if let Some(action) = action {
+        if module.manifest.action(action).is_none() {
+            return Err(module_err(format!("module {owner} has no action {action}")));
+        }
+    }
+    Ok(())
 }
 
 /// Require a non-empty string param.
@@ -2274,6 +5273,7 @@ fn module_json(m: &crate::module::InstalledModule) -> Value {
         "source": m.source,
         "actions": m.manifest.actions.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
         "panes": m.manifest.panes.iter().map(|pe| pe.id.clone()).collect::<Vec<_>>(),
+        "bars": m.manifest.bars.iter().map(|bar| bar.id.clone()).collect::<Vec<_>>(),
         "warning": m.warning,
     })
 }
@@ -2286,17 +5286,137 @@ fn param_usize(p: &Value, key: &str) -> Option<usize> {
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
-/// Required public workspace index. Workspace indices are deliberately
-/// 0-based and stay in storage/API order even when pins change sidebar order.
-fn required_workspace_param(p: &Value) -> Result<usize, (String, String)> {
-    param_usize(p, "workspace")
-        .or_else(|| param_usize(p, "node"))
+fn parse_index_value(value: &Value) -> Result<usize, (String, String)> {
+    value
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
         .ok_or_else(|| {
             (
                 "invalid_request".to_string(),
-                "workspace must be a 0-based number".to_string(),
+                "workspace indices must be non-negative integers".to_string(),
             )
         })
+}
+
+fn required_index_param(p: &Value, key: &str) -> Result<usize, (String, String)> {
+    p.get(key)
+        .map(parse_index_value)
+        .transpose()?
+        .ok_or_else(|| ("invalid_request".to_string(), format!("{key} is required")))
+}
+
+fn parse_u32_value(value: &Value, key: &str) -> Result<u32, (String, String)> {
+    value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        .ok_or_else(|| {
+            (
+                "invalid_request".to_string(),
+                format!("{key} must be a pane id"),
+            )
+        })
+}
+
+fn optional_workspace_param(p: &Value) -> Result<Option<usize>, (String, String)> {
+    if p.get("workspace").is_some() && p.get("node").is_some() {
+        return Err((
+            "invalid_request".to_string(),
+            "workspace and node cannot be used together".to_string(),
+        ));
+    }
+    match p.get("workspace").or_else(|| p.get("node")) {
+        None => Ok(None),
+        Some(value) => parse_index_value(value).map(Some),
+    }
+}
+
+fn optional_nullable_string(
+    p: &Value,
+    key: &str,
+    max_chars: usize,
+) -> Result<Option<String>, (String, String)> {
+    match p.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value.chars().count() <= max_chars => Ok(Some(value.clone())),
+        Some(_) => Err((
+            "invalid_request".to_string(),
+            format!("{key} must be null or a string of at most {max_chars} characters"),
+        )),
+    }
+}
+
+fn optional_u32(p: &Value, key: &str) -> Result<Option<u32>, (String, String)> {
+    match p.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => parse_u32_value(value, key).map(Some),
+    }
+}
+
+fn patched_config(
+    current: &crate::config::Config,
+    patch: &Value,
+) -> Result<crate::config::Config, (String, String)> {
+    if !patch.is_object() {
+        return Err((
+            "invalid_request".to_string(),
+            "patch must be an object".to_string(),
+        ));
+    }
+    let mut merged = serde_json::to_value(current).map_err(|error| {
+        (
+            "internal".to_string(),
+            format!("could not serialize config: {error}"),
+        )
+    })?;
+    merge_known_fields(&mut merged, patch, "config")?;
+    serde_json::from_value(merged)
+        .map(crate::config::normalize_config)
+        .map_err(|error| {
+            (
+                "invalid_request".to_string(),
+                format!("invalid config patch: {error}"),
+            )
+        })
+}
+
+fn merge_known_fields(
+    target: &mut Value,
+    patch: &Value,
+    path: &str,
+) -> Result<(), (String, String)> {
+    let patch = patch.as_object().ok_or_else(|| {
+        (
+            "invalid_request".to_string(),
+            format!("{path} patch must be an object"),
+        )
+    })?;
+    let target = target.as_object_mut().ok_or_else(|| {
+        (
+            "invalid_request".to_string(),
+            format!("{path} cannot be patched as an object"),
+        )
+    })?;
+    let dynamic_map = matches!(path, "config.keybindings" | "config.mission_pricing");
+    for (key, value) in patch {
+        let Some(existing) = target.get_mut(key) else {
+            if dynamic_map {
+                target.insert(key.clone(), value.clone());
+                continue;
+            }
+            return Err((
+                "invalid_request".to_string(),
+                format!("unknown config field {path}.{key}"),
+            ));
+        };
+        if existing.is_object() && value.is_object() {
+            merge_known_fields(existing, value, &format!("{path}.{key}"))?;
+        } else {
+            *existing = value.clone();
+        }
+    }
+    Ok(())
 }
 
 /// Required public tab position: accepts a JSON integer or numeric string and
@@ -2314,6 +5434,199 @@ fn required_one_based_param(p: &Value, key: &str) -> Result<usize, (String, Stri
             format!("{key} must be a positive 1-based tab number"),
         )
     })
+}
+
+pub(crate) fn parse_agent_wait_state(value: &str) -> Option<State> {
+    match value {
+        "idle" => Some(State::Idle),
+        "working" => Some(State::Working),
+        "blocked" => Some(State::Blocked),
+        "done" => Some(State::Done),
+        _ => None,
+    }
+}
+
+fn agent_timeout(p: &Value, default_s: f64) -> Result<Duration, String> {
+    let seconds = p
+        .get("timeout_s")
+        .map(|value| {
+            value
+                .as_f64()
+                .filter(|seconds| seconds.is_finite())
+                .ok_or_else(|| "timeout_s must be a finite number".to_string())
+        })
+        .transpose()?
+        .unwrap_or(default_s);
+    if !(0.0..=MAX_AGENT_WAIT.as_secs_f64()).contains(&seconds) {
+        return Err(format!(
+            "timeout_s must be between 0 and {}",
+            MAX_AGENT_WAIT.as_secs()
+        ));
+    }
+    Duration::try_from_secs_f64(seconds)
+        .map_err(|_| "timeout_s is outside the supported range".to_string())
+}
+
+fn prompt_states(p: &Value) -> Result<Vec<State>, String> {
+    let Some(until) = p.get("until") else {
+        return Ok(vec![State::Idle, State::Done, State::Blocked]);
+    };
+    let values = until
+        .as_array()
+        .filter(|values| !values.is_empty() && values.len() <= 4)
+        .ok_or_else(|| "until must contain 1 to 4 agent states".to_string())?;
+    let mut states = Vec::with_capacity(values.len());
+    for value in values {
+        let state = value
+            .as_str()
+            .and_then(parse_agent_wait_state)
+            .ok_or_else(|| "until states must be idle, working, blocked, or done".to_string())?;
+        if !states.contains(&state) {
+            states.push(state);
+        }
+    }
+    Ok(states)
+}
+
+fn agent_start_args(p: &Value) -> Result<Vec<String>, String> {
+    let Some(args) = p.get("args") else {
+        return Ok(Vec::new());
+    };
+    let args = args
+        .as_array()
+        .filter(|args| args.len() <= MAX_AGENT_START_ARGS)
+        .ok_or_else(|| format!("args must contain at most {MAX_AGENT_START_ARGS} strings"))?;
+    args.iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|arg| arg.chars().count() <= 4096 && !arg.contains(['\n', '\r', '\0']))
+                .map(String::from)
+                .ok_or_else(|| {
+                    "each agent argument must be a string of at most 4096 characters without control lines"
+                        .to_string()
+                })
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn shell_word(value: &str, _shell: &str) -> Result<String, String> {
+    Ok(format!("'{}'", value.replace('\'', "'\"'\"'")))
+}
+
+#[cfg(windows)]
+fn shell_word(value: &str, shell: &str) -> Result<String, String> {
+    let base = std::path::Path::new(shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(shell)
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase();
+    match base.as_str() {
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" => {
+            Ok(format!("'{}'", value.replace('\'', "'\"'\"'")))
+        }
+        "cmd" => {
+            // cmd.exe expands percent/bang variables and treats these glyphs as
+            // syntax even inside some quoting contexts. Refuse ambiguous input
+            // instead of turning an argument into an injected shell command.
+            if value.chars().any(|ch| {
+                ch.is_control()
+                    || matches!(
+                        ch,
+                        '"' | '%' | '!' | '^' | '&' | '|' | '<' | '>' | '(' | ')'
+                    )
+            }) {
+                Err("agent arguments for cmd.exe cannot contain shell metacharacters".to_string())
+            } else {
+                Ok(format!("\"{value}\""))
+            }
+        }
+        _ => Ok(format!("'{}'", value.replace('\'', "''"))),
+    }
+}
+
+fn required_report_source(p: &Value) -> Result<String, (String, String)> {
+    let source = p.get("source").and_then(Value::as_str).unwrap_or("");
+    let valid = !source.is_empty()
+        && source.len() <= 64
+        && source.as_bytes()[0].is_ascii_alphabetic()
+        && source.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+        });
+    if valid {
+        Ok(source.to_string())
+    } else {
+        Err((
+            "invalid_request".to_string(),
+            "source must be 1-64 safe ASCII characters and start with a letter".to_string(),
+        ))
+    }
+}
+
+fn reject_api_fields(p: &Value, allowed: &[&str]) -> Result<(), (String, String)> {
+    let object = p.as_object().ok_or_else(|| {
+        (
+            "invalid_request".to_string(),
+            "params must be an object".to_string(),
+        )
+    })?;
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err((
+            "invalid_request".to_string(),
+            format!("unknown parameter: {field}"),
+        ));
+    }
+    Ok(())
+}
+
+fn optional_bounded_string(
+    p: &Value,
+    key: &str,
+    max_characters: usize,
+) -> Result<Option<String>, (String, String)> {
+    match p.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value.chars().count() <= max_characters => {
+            Ok(Some(value.clone()))
+        }
+        Some(Value::String(_)) => Err((
+            "invalid_request".to_string(),
+            format!("{key} exceeds {max_characters} characters"),
+        )),
+        Some(_) => Err((
+            "invalid_request".to_string(),
+            format!("{key} must be a string"),
+        )),
+    }
+}
+
+/// Privacy-preserving executable inventory from cached process command lines.
+/// Keep only argv[0], plus an interpreter's first non-flag script name, and
+/// de-duplicate in scan order. Full argv commonly contains prompts or secrets.
+fn process_executables(commands: &[String]) -> Vec<String> {
+    let mut result = Vec::new();
+    for command in commands.iter().take(128) {
+        let mut words = command.split_whitespace();
+        let Some(first) = words.next() else { continue };
+        let first = crate::detect::binary_name(first);
+        if !first.is_empty() && !result.iter().any(|item| item == first) {
+            result.push(first.to_string());
+        }
+        if crate::detect::is_interpreter(first) {
+            if let Some(script) = words.find(|word| !word.starts_with('-')) {
+                let script = crate::detect::binary_name(script);
+                if !script.is_empty() && !result.iter().any(|item| item == script) {
+                    result.push(script.to_string());
+                }
+            }
+        }
+    }
+    result
 }
 
 fn state_str(s: State) -> &'static str {
@@ -2379,6 +5692,274 @@ mod tests {
                 "Wire up the sidebar filter".to_string()
             )]
         );
+    }
+
+    fn run_git(repo: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn diff_api_validates_anchors_and_preserves_atomic_note_lifecycle() {
+        let _env = crate::persist::test_env("diff-api");
+        let repo = std::path::PathBuf::from(std::env::var_os("LUVUS_HOME").unwrap()).join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["config", "user.name", "Luvus Test"]);
+        run_git(&repo, &["config", "user.email", "luvus@example.invalid"]);
+        std::fs::write(repo.join("file.txt"), "old line\nstable\n").unwrap();
+        run_git(&repo, &["add", "file.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "base"]);
+        std::fs::write(repo.join("file.txt"), "new line\nstable\n").unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        app.workspaces[0].cwd = repo;
+
+        let token = 1;
+        app.diff.status_generation = token;
+        let snapshot = crate::diff::git::scan(&app.workspaces[0].cwd, token).unwrap();
+        assert!(app.apply_diff_status(token, app.workspaces[0].cwd.clone(), Ok(snapshot)));
+        let refreshed = app.dispatch("diff.refresh", &json!({})).unwrap();
+        assert_eq!(refreshed["refresh"], "complete");
+        let listed = app
+            .dispatch("diff.list", &json!({"layer":"worktree"}))
+            .unwrap();
+        assert_eq!(listed["files"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["files"][0]["path"], "file.txt");
+
+        let loaded = app
+            .dispatch(
+                "diff.get",
+                &json!({"path":"file.txt","layer":"worktree","include_patch":true}),
+            )
+            .unwrap();
+        assert_eq!(loaded["additions"], 1);
+        assert_eq!(loaded["deletions"], 1);
+        assert!(loaded["hunks"][0]["lines"].is_array());
+
+        let opened = app
+            .dispatch(
+                "diff.open",
+                &json!({"path":"file.txt","layer":"worktree","placement":"tab","view":"stack"}),
+            )
+            .unwrap();
+        let pane = opened["pane"].as_str().unwrap();
+        assert!(app
+            .dispatch("diff.navigate", &json!({"pane":pane,"action":"next_line"}))
+            .is_ok());
+
+        let invalid_state = app
+            .dispatch("diff.note.list", &json!({"state":"unknown"}))
+            .expect_err("unknown note states must not silently produce an empty list");
+        assert_eq!(invalid_state.0, "diff_error");
+
+        let empty_send = app
+            .dispatch("diff.note.send", &json!({"to":"missing-agent","ids":[]}))
+            .expect_err("empty review selection must fail before target resolution");
+        assert_eq!(empty_send.0, "diff_error");
+        assert_eq!(empty_send.1, "select at least one review note");
+
+        let invalid_anchor = app
+            .dispatch(
+                "diff.note.add",
+                &json!({"file":"file.txt","layer":"worktree","new_line":99,"body":"missing"}),
+            )
+            .expect_err("a note must reference a source line in the loaded diff");
+        assert_eq!(invalid_anchor.0, "diff_error");
+        assert!(app.diff.notes.is_empty());
+
+        let added = app
+            .dispatch(
+                "diff.note.add",
+                &json!({"file":"file.txt","layer":"worktree","new_line":1,"body":"check this"}),
+            )
+            .unwrap();
+        let note_id = added["note"]["id"].as_str().unwrap().to_string();
+        assert_eq!(app.diff.notes[0].anchor.context, "new line");
+        assert_ne!(
+            app.diff.notes[0].anchor.context_sha256,
+            crate::diff::notes::context_hash("")
+        );
+        let open = app
+            .dispatch("diff.note.list", &json!({"state":"open"}))
+            .unwrap();
+        assert_eq!(open["notes"].as_array().unwrap().len(), 1);
+
+        let edited = app
+            .dispatch("diff.note.edit", &json!({"id":note_id,"body":"updated"}))
+            .unwrap();
+        assert_eq!(edited["note"]["body"], "updated");
+        let resolved = app
+            .dispatch("diff.note.resolve", &json!({"id":note_id}))
+            .unwrap();
+        assert_eq!(resolved["note"]["state"], "resolved");
+        let reopened = app
+            .dispatch("diff.note.reopen", &json!({"id":note_id}))
+            .unwrap();
+        assert_eq!(reopened["note"]["state"], "open");
+        app.dispatch("diff.note.remove", &json!({"id":note_id}))
+            .unwrap();
+        assert!(app.diff.notes.is_empty());
+
+        let batch = app
+            .dispatch(
+                "diff.note.apply",
+                &json!({"notes":[
+                    {"file":"file.txt","layer":"worktree","new_line":1,"body":"valid"},
+                    {"file":"file.txt","layer":"worktree","new_line":99,"body":"invalid"}
+                ]}),
+            )
+            .expect_err("one invalid anchor must reject the whole batch");
+        assert_eq!(batch.0, "diff_error");
+        assert!(app.diff.notes.is_empty());
+        assert!(crate::diff::notes::load(
+            &app.diff.snapshot.as_ref().unwrap().repo_id,
+            app.diff.loaded_review.as_ref().unwrap()
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    #[test]
+    fn theme_api_lists_validates_and_applies_registry_entries() {
+        let _env = crate::persist::test_env("theme-api");
+        let source = crate::persist::ensure_config_dir().join("api-theme.toml");
+        crate::theme::install::init(&source, "api-theme", Some("noir")).unwrap();
+        crate::theme::install::install(source.to_str().unwrap(), true).unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+
+        let listed = app.dispatch("theme.list", &json!({})).unwrap();
+        assert!(listed["themes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["id"] == "api-theme"));
+        assert!(app
+            .dispatch("theme.use", &json!({"id": "missing"}))
+            .is_err());
+        let selected = app
+            .dispatch("theme.use", &json!({"id": "api-theme"}))
+            .unwrap();
+        assert_eq!(selected["id"], "api-theme");
+        assert_eq!(app.config.theme, "api-theme");
+    }
+
+    #[test]
+    fn bar_api_validates_ownership_and_preserves_the_last_valid_widget() {
+        let _env = crate::persist::test_env("bar-api");
+        let module =
+            std::path::PathBuf::from(std::env::var_os("LUVUS_HOME").unwrap()).join("bar-module");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(
+            module.join("luvus-module.toml"),
+            r#"
+id = "you.ci"
+name = "CI"
+version = "0.1.0"
+min_luvus_version = "0.1.0"
+
+[[bars]]
+id = "status"
+title = "CI status"
+region = "top-right"
+priority = 60
+
+[[actions]]
+id = "details"
+title = "Details"
+command = ["true"]
+"#,
+        )
+        .unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.module_link_with(&module, true, None).unwrap();
+
+        let valid = json!({
+            "owner": "you.ci",
+            "id": "status",
+            "content": [
+                {"type":"text","text":"CI"},
+                {"type":"state","state":"done","action":"details","value":"run-1"}
+            ],
+            "compact_content": [{"type":"state","state":"done"}]
+        });
+        let result = app.dispatch("ui.bar.push", &valid).unwrap();
+        assert_eq!(result["changed"], true);
+        let before = app.bar.widgets["you.ci:status"].clone();
+
+        let mut invalid = valid;
+        invalid["content"] = json!([{"type":"text","text":"\u{1b}[31mraw"}]);
+        assert!(app.dispatch("ui.bar.push", &invalid).is_err());
+        assert_eq!(app.bar.widgets["you.ci:status"], before);
+
+        let mut wrong_action = invalid;
+        wrong_action["content"] =
+            json!([{"type":"text","text":"bad","action":"other-module-action"}]);
+        assert!(app.dispatch("ui.bar.push", &wrong_action).is_err());
+        assert_eq!(app.bar.widgets["you.ci:status"], before);
+
+        app.dispatch(
+            "ui.bar.move",
+            &json!({"owner":"you.ci","id":"status","region":"bottom-right"}),
+        )
+        .unwrap();
+        assert_eq!(
+            app.config
+                .bars
+                .region_for("you.ci:status", crate::bar::BarRegion::TopRight),
+            Some(crate::bar::BarRegion::BottomRight)
+        );
+        app.config.bars.bottom_right.push("other:widget".into());
+        let order = app.config.bars.bottom_right.clone();
+        app.dispatch(
+            "ui.bar.move",
+            &json!({"owner":"you.ci","id":"status","region":"bottom-right"}),
+        )
+        .unwrap();
+        assert_eq!(
+            app.config.bars.bottom_right, order,
+            "an identical move must not rewrite or reorder persisted placement"
+        );
+        app.module_set_enabled("you.ci", false).unwrap();
+        assert!(!app.bar.widgets.contains_key("you.ci:status"));
+    }
+
+    #[test]
+    fn unowned_notifications_share_the_same_rate_limit() {
+        let _env = crate::persist::test_env("anonymous-notification-rate");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let request = json!({"text":"build finished"});
+
+        for invalid in [
+            json!({"text":"build finished","ttl_ms":0}),
+            json!({"text":"bad\u{1b}content"}),
+        ] {
+            for _ in 0..40 {
+                let error = app
+                    .dispatch("ui.notification.push", &invalid)
+                    .expect_err("invalid payloads must be rejected before rate limiting");
+                assert_eq!(error.0, "invalid_request");
+            }
+        }
+        for _ in 0..30 {
+            app.dispatch("ui.notification.push", &request).unwrap();
+        }
+        let error = app
+            .dispatch("ui.notification.push", &request)
+            .expect_err("the shared anonymous bucket must be bounded");
+        assert_eq!(error.0, "rate_limited");
     }
 
     #[test]
@@ -2475,7 +6056,7 @@ mod tests {
         // `dock_menu_click_spawns_the_action_with_the_clicked_rows_env`.
     }
 
-    /// The notch companion (docs/24) patches its rows from **both** `agent.list`
+    /// External clients patch their rows from **both** `agent.list`
     /// and `pane.agent_status_changed`. If the two disagree about what `project`
     /// means, a renamed node visibly alternates between its label and its folder
     /// basename as snapshots and events interleave. Pin the contract: both carry
@@ -2500,7 +6081,7 @@ mod tests {
         let row = &out["agents"][0];
         assert_eq!(row["agent"], "claude");
         assert_eq!(row["status"], "working");
-        // The label the notch renders, and the legacy field it falls back to.
+        // The label an API client renders, and the legacy field it falls back to.
         assert_eq!(row["project"], "renamed-node");
         assert_eq!(row["workspace_name"], "renamed-node");
         assert_eq!(row["branch"], "feat/x");
@@ -2686,6 +6267,215 @@ mod tests {
     }
 
     #[test]
+    fn atomic_agent_prompt_uses_output_evidence_for_a_fast_settled_turn() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).unwrap().agent = "codex".into();
+        let (reply, response) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        app.start_agent_prompt(
+            "prompt-1".into(),
+            json!({
+                "target":pane.0.to_string(), "text":"review this", "wait":true,
+                "until":["idle", "done", "blocked"], "timeout_s":10,
+            }),
+            reply,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(
+            response.try_recv().is_err(),
+            "idle before evidence is not completion"
+        );
+
+        let revision = app.panes[&pane].content_revision_handle();
+        revision.fetch_add(1, Ordering::Release);
+        app.tick_agent_workflows(started + Duration::from_millis(10));
+        app.tick_agent_workflows(started + AGENT_PROMPT_QUIET + Duration::from_millis(20));
+        let value: Value = serde_json::from_str(&response.recv().unwrap()).unwrap();
+        assert_eq!(value["result"]["type"], "agent_prompt");
+        assert_eq!(value["result"]["submitted"], true);
+        assert_eq!(value["result"]["matched"], true);
+        assert_eq!(value["result"]["evidence"], "output_settled");
+        assert!(app.agent_prompts.is_empty());
+    }
+
+    #[test]
+    fn atomic_agent_prompt_reports_queued_timeout_without_resubmitting() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).unwrap().agent = "codex".into();
+        let (reply, response) = std::sync::mpsc::channel();
+        app.start_agent_prompt(
+            "prompt-timeout".into(),
+            json!({"target":pane.0.to_string(), "text":"review", "wait":true, "timeout_s":0}),
+            reply,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.tick_agent_workflows(Instant::now());
+        let value: Value = serde_json::from_str(&response.recv().unwrap()).unwrap();
+        assert_eq!(value["result"]["submitted"], true);
+        assert_eq!(value["result"]["matched"], false);
+        assert_eq!(value["result"]["evidence"], "timeout");
+    }
+
+    #[test]
+    fn atomic_agent_prompt_rejects_an_overlapping_wait_before_queueing() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).unwrap().agent = "codex".into();
+        let (first_reply, _first_response) = std::sync::mpsc::channel();
+        app.start_agent_prompt(
+            "prompt-first".into(),
+            json!({"target":pane.0.to_string(), "text":"first", "wait":true}),
+            first_reply,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let (second_reply, second_response) = std::sync::mpsc::channel();
+        app.start_agent_prompt(
+            "prompt-second".into(),
+            json!({"target":pane.0.to_string(), "text":"second", "wait":true}),
+            second_reply,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let value: Value = serde_json::from_str(&second_response.recv().unwrap()).unwrap();
+        assert_eq!(value["error"]["code"], "agent_prompt_busy");
+        assert_eq!(app.agent_prompts[&pane].len(), 1);
+    }
+
+    #[test]
+    fn server_owned_agent_start_reserves_name_and_waits_for_detection() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let (reply, response) = std::sync::mpsc::channel();
+        app.start_agent_launch(
+            "start-1".into(),
+            json!({
+                "name":"reviewer", "kind":"codex", "pane":pane.0.to_string(),
+                "args":[], "timeout_s":10,
+            }),
+            reply,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(app.agent_names.get("reviewer"), Some(&pane));
+        assert!(response.try_recv().is_err());
+
+        let status = app.status.get_mut(&pane).unwrap();
+        status.agent = "codex".into();
+        status.state = State::Working;
+        app.tick_agent_workflows(Instant::now());
+        let value: Value = serde_json::from_str(&response.recv().unwrap()).unwrap();
+        assert_eq!(value["result"]["type"], "agent_start");
+        assert_eq!(value["result"]["ready"], true);
+        assert_eq!(value["result"]["name"], "reviewer");
+        assert_eq!(value["result"]["status"], "working");
+    }
+
+    #[test]
+    fn integration_report_is_explainable_exclusive_and_resolves_waits() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let (reply, response) = std::sync::mpsc::channel();
+        app.register_agent_wait(
+            pane,
+            "wait-1".into(),
+            State::Blocked,
+            reply,
+            Some(Duration::from_secs(1)),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let reported = app
+            .dispatch(
+                "agent.report",
+                &json!({
+                    "pane":pane.0.to_string(), "source":"fx/plugin", "agent":"newagent",
+                    "status":"blocked", "message":"approval required", "sequence":7,
+                    "ttl_s":60,
+                }),
+            )
+            .unwrap();
+        assert_eq!(reported["status"], "blocked");
+        let waited: Value = serde_json::from_str(&response.recv().unwrap()).unwrap();
+        assert_eq!(waited["result"]["matched"], true);
+        assert_eq!(waited["result"]["status"], "blocked");
+
+        let explanation = app
+            .dispatch("agent.explain", &json!({"target":pane.0.to_string()}))
+            .unwrap();
+        assert_eq!(explanation["identity"]["source"], "integration_report");
+        assert_eq!(explanation["identity"]["confidence"], "authoritative");
+        assert_eq!(
+            explanation["state_evidence"]["blocked_hint"],
+            "approval required"
+        );
+        assert!(
+            app.is_agent_pane(pane),
+            "a reported new agent is immediately live"
+        );
+
+        assert_eq!(
+            app.dispatch(
+                "agent.report",
+                &json!({"pane":pane.0.to_string(), "source":"other", "agent":"newagent", "status":"idle"}),
+            )
+            .unwrap_err()
+            .0,
+            "authority_conflict"
+        );
+        assert_eq!(
+            app.dispatch(
+                "agent.report",
+                &json!({"pane":pane.0.to_string(), "source":"fx/plugin", "agent":"newagent", "status":"idle", "sequence":7}),
+            )
+            .unwrap_err()
+            .0,
+            "stale_report"
+        );
+        app.dispatch(
+            "agent.release",
+            &json!({"pane":pane.0.to_string(), "source":"fx/plugin"}),
+        )
+        .unwrap();
+        assert!(app.status[&pane].agent_report.is_none());
+        assert!(app.status[&pane].force_detect);
+    }
+
+    #[test]
+    fn runtime_snapshot_is_global_fenced_and_processes_hide_arguments() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.proc_commands.insert(
+            pane,
+            vec![
+                "/bin/zsh -l".into(),
+                "/usr/bin/node /tools/codex.js --token secret-value".into(),
+            ],
+        );
+        let processes = app
+            .dispatch("pane.processes", &json!({"pane":pane.0}))
+            .unwrap();
+        assert_eq!(processes["executables"], json!(["zsh", "node", "codex.js"]));
+        assert_eq!(processes["arguments_exposed"], false);
+        assert!(!processes.to_string().contains("secret-value"));
+
+        let snapshot = app.dispatch("session.snapshot", &json!({})).unwrap();
+        assert_eq!(snapshot["type"], "session_snapshot");
+        assert_eq!(snapshot["protocol"]["name"], "luvus-runtime");
+        assert_eq!(
+            snapshot["workspaces"][0]["tabs"][0]["panes"][0]["pane_id"],
+            pane.0.to_string()
+        );
+        assert!(snapshot["event_sequence"].is_u64());
+    }
+
+    #[test]
     fn a_target_resolves_by_kind_when_unique_and_is_ambiguous_when_not() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
@@ -2777,6 +6567,19 @@ mod tests {
         }
         app.handle_pane_rename_key(KeyEvent::from(KeyCode::Enter));
         assert_eq!(app.agent_name_for(pane), None);
+    }
+
+    #[test]
+    fn pane_rename_does_not_turn_backend_label_into_alias() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.backend_labels.insert(pane, "harness-shell".into());
+
+        app.open_pane_rename(pane);
+        assert_eq!(app.pane_rename.as_ref().unwrap().buffer, "");
+        assert!(app.agent_names.values().all(|target| *target != pane));
+        assert_eq!(app.agent_name_for(pane), Some("harness-shell"));
     }
 
     #[test]
@@ -3003,6 +6806,30 @@ mod tests {
             Some("c")
         );
 
+        let out = app
+            .dispatch("tab.move", &json!({"tab": 3, "to": 1, "direction": null}))
+            .expect("null direction uses explicit tab positions");
+        assert_eq!(
+            out,
+            json!({
+                "type": "tab_move",
+                "from": "3",
+                "to": "1",
+                "active": "3",
+            })
+        );
+        let names = app
+            .ws()
+            .tabs
+            .iter()
+            .map(|tab| tab.name.as_deref().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["a", "b", "c"]);
+        assert_eq!(
+            app.ws().tabs[app.ws().active_tab].name.as_deref(),
+            Some("c")
+        );
+
         for params in [
             json!({"tab": 0, "to": 1}),
             json!({"tab": 1, "to": 1}),
@@ -3014,6 +6841,183 @@ mod tests {
                 .expect_err("invalid tab move must fail");
             assert_eq!(err.0, "invalid_request", "params: {params}");
         }
+    }
+
+    #[test]
+    fn tab_move_api_supports_directional_active_and_explicit_targets() {
+        let _env = crate::persist::test_env("tab-move-direction-api");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.workspaces[0].tabs[0].name = Some("a".into());
+        app.run_cmd(crate::app::keys::Cmd::NewTab);
+        app.workspaces[0].tabs[1].name = Some("b".into());
+        app.run_cmd(crate::app::keys::Cmd::NewTab);
+        app.workspaces[0].tabs[2].name = Some("c".into());
+
+        let out = app
+            .dispatch("tab.move", &json!({"direction": "left"}))
+            .expect("active tab moves left");
+        assert_eq!(
+            out,
+            json!({"type":"tab_move", "from":"3", "to":"2", "active":"2"})
+        );
+        let names = |app: &App| {
+            app.ws()
+                .tabs
+                .iter()
+                .map(|tab| tab.name.clone().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&app), ["a", "c", "b"]);
+
+        let out = app
+            .dispatch("tab.move", &json!({"direction": "right", "tab": 1}))
+            .expect("explicit tab moves right");
+        assert_eq!(
+            out,
+            json!({"type":"tab_move", "from":"1", "to":"2", "active":"1"})
+        );
+        assert_eq!(names(&app), ["c", "a", "b"]);
+        assert_eq!(
+            app.ws().tabs[app.ws().active_tab].name.as_deref(),
+            Some("c"),
+            "active tab identity is preserved"
+        );
+
+        for params in [
+            json!({"direction": "left", "tab": 1}),
+            json!({"direction": "right", "tab": 3}),
+            json!({"direction": "up"}),
+            json!({"direction": "left", "to": 1}),
+            json!({"direction": "right", "tab": 0}),
+        ] {
+            let before = names(&app);
+            let err = app
+                .dispatch("tab.move", &params)
+                .expect_err("invalid directional move must fail");
+            assert_eq!(err.0, "invalid_request", "params: {params}");
+            assert_eq!(names(&app), before, "failure is atomic: {params}");
+        }
+    }
+
+    #[test]
+    fn tab_swap_api_exchanges_positions_and_preserves_active_identity() {
+        let _env = crate::persist::test_env("tab-swap-api");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.workspaces[0].tabs[0].name = Some("a".into());
+        app.run_cmd(crate::app::keys::Cmd::NewTab);
+        app.workspaces[0].tabs[1].name = Some("b".into());
+        app.run_cmd(crate::app::keys::Cmd::NewTab);
+        app.workspaces[0].tabs[2].name = Some("c".into());
+
+        let out = app
+            .dispatch("tab.swap", &json!({"tab": 1, "with": "3"}))
+            .expect("valid tab swap");
+        assert_eq!(
+            out,
+            json!({"type":"tab_swap", "tab":"1", "with":"3", "active":"1"})
+        );
+        let names = |app: &App| {
+            app.ws()
+                .tabs
+                .iter()
+                .map(|tab| tab.name.clone().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&app), ["c", "b", "a"]);
+        assert_eq!(
+            app.ws().tabs[app.ws().active_tab].name.as_deref(),
+            Some("c")
+        );
+
+        for params in [
+            json!({}),
+            json!({"tab": 0, "with": 1}),
+            json!({"tab": 1, "with": 1}),
+            json!({"tab": 1, "with": 9}),
+        ] {
+            let before = names(&app);
+            let err = app
+                .dispatch("tab.swap", &params)
+                .expect_err("invalid tab swap must fail");
+            assert_eq!(err.0, "invalid_request", "params: {params}");
+            let after = names(&app);
+            assert_eq!(after, before, "failure is atomic: {params}");
+        }
+    }
+
+    #[test]
+    fn tab_focus_api_requires_an_existing_one_based_position() {
+        let _env = crate::persist::test_env("tab-focus-api");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.run_cmd(crate::app::keys::Cmd::NewTab);
+
+        assert_eq!(
+            app.dispatch("tab.focus", &json!({"tab": "1"})),
+            Ok(json!({"type": "ok"}))
+        );
+        assert_eq!(app.ws().active_tab, 0);
+
+        for params in [json!({}), json!({"tab": 0}), json!({"tab": 3})] {
+            let before = app.ws().active_tab;
+            let err = app
+                .dispatch("tab.focus", &params)
+                .expect_err("invalid focus must fail");
+            assert_eq!(err.0, "invalid_request", "params: {params}");
+            assert_eq!(app.ws().active_tab, before, "failure is atomic");
+        }
+    }
+
+    #[test]
+    fn tab_rename_api_validates_target_name_and_dashboard_kind() {
+        let _env = crate::persist::test_env("tab-rename-api");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.run_cmd(crate::app::keys::Cmd::NewTab);
+
+        app.dispatch("tab.rename", &json!({"name": "active"}))
+            .expect("omitting tab targets the active tab");
+        assert_eq!(app.ws().tabs[1].name.as_deref(), Some("active"));
+
+        app.dispatch("tab.rename", &json!({"tab": 1, "name": " first "}))
+            .expect("explicit one-based tab is accepted");
+        assert_eq!(app.ws().tabs[0].name.as_deref(), Some("first"));
+        app.dispatch("tab.rename", &json!({"tab": 1, "name": ""}))
+            .expect("an explicit empty name clears the label");
+        assert_eq!(app.ws().tabs[0].name, None);
+
+        let names = |app: &App| {
+            app.ws()
+                .tabs
+                .iter()
+                .map(|tab| tab.name.clone())
+                .collect::<Vec<_>>()
+        };
+        for params in [
+            json!({"tab": 0, "name": "wrong"}),
+            json!({"tab": "nope", "name": "wrong"}),
+            json!({"tab": 9, "name": "wrong"}),
+            json!({"tab": 1}),
+            json!({"tab": 1, "name": 7}),
+            json!({"tab": 1, "name": "x".repeat(41)}),
+        ] {
+            let before = names(&app);
+            let err = app
+                .dispatch("tab.rename", &params)
+                .expect_err("invalid rename must fail");
+            assert_eq!(err.0, "invalid_request", "params: {params}");
+            assert_eq!(names(&app), before, "failure is atomic: {params}");
+        }
+
+        app.open_mission_control(0);
+        let mission = app.ws().active_tab + 1;
+        let err = app
+            .dispatch("tab.rename", &json!({"tab": mission, "name": "wrong"}))
+            .expect_err("dashboard rename must fail");
+        assert_eq!(err.0, "invalid_request");
+        assert!(app.ws().tabs[mission - 1].name.is_none());
     }
 
     #[test]
@@ -3116,6 +7120,21 @@ mod tests {
         assert!(!valid_agent_name(&"x".repeat(33))); // too long
     }
 
+    #[test]
+    fn runtime_string_limits_count_unicode_codepoints() {
+        let accepted = "é".repeat(MAX_AGENT_REPORT_MESSAGE_CHARS);
+        assert_eq!(
+            optional_bounded_string(&json!({"message":accepted}), "message", 4096)
+                .unwrap()
+                .unwrap()
+                .chars()
+                .count(),
+            4096
+        );
+        let rejected = "é".repeat(MAX_AGENT_REPORT_MESSAGE_CHARS + 1);
+        assert!(optional_bounded_string(&json!({"message":rejected}), "message", 4096).is_err());
+    }
+
     /// `wait.output` never polls: an already-visible marker resolves on
     /// registration, fresh output resolves on the next output event, and a
     /// deadline lapses on the loop tick (docs/81).
@@ -3136,7 +7155,14 @@ mod tests {
             .unwrap()
             .advance(b"ready NOW\r\n");
         let (reply, rx): (_, Receiver<String>) = std::sync::mpsc::channel();
-        app.register_output_wait(pane, "t1".into(), "NOW".into(), reply, None);
+        app.register_output_wait(
+            pane,
+            "t1".into(),
+            "NOW".into(),
+            reply,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
         assert!(rx
             .recv_timeout(Duration::from_secs(1))
             .unwrap()
@@ -3144,7 +7170,14 @@ mod tests {
 
         // Parked: resolves only when the pane produces matching output.
         let (reply, rx): (_, Receiver<String>) = std::sync::mpsc::channel();
-        app.register_output_wait(pane, "t2".into(), "LATER".into(), reply, None);
+        app.register_output_wait(
+            pane,
+            "t2".into(),
+            "LATER".into(),
+            reply,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
         assert_eq!(
             rx.recv_timeout(Duration::from_millis(50)),
             Err(RecvTimeoutError::Timeout)
@@ -3170,6 +7203,7 @@ mod tests {
             "NEVER".into(),
             reply,
             Some(Duration::from_millis(10)),
+            Arc::new(AtomicBool::new(false)),
         );
         app.tick_output_waits(Instant::now() + Duration::from_secs(1));
         assert!(rx
@@ -3179,7 +7213,14 @@ mod tests {
 
         // A closed pane fails its parked waiters.
         let (reply, rx): (_, Receiver<String>) = std::sync::mpsc::channel();
-        app.register_output_wait(pane, "t4".into(), "NEVER".into(), reply, None);
+        app.register_output_wait(
+            pane,
+            "t4".into(),
+            "NEVER".into(),
+            reply,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
         app.cancel_output_waits(pane);
         assert!(rx
             .recv_timeout(Duration::from_secs(1))
@@ -3197,9 +7238,59 @@ mod tests {
         let mut app = App::new(80, 24, tx).unwrap();
         let pane = app.layout().focus;
         let (reply, _rx): (_, std::sync::mpsc::Receiver<String>) = std::sync::mpsc::channel();
-        app.register_output_wait(pane, "t".into(), "NEVER".into(), reply, None);
+        app.register_output_wait(
+            pane,
+            "t".into(),
+            "NEVER".into(),
+            reply,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
         let waiter = &app.output_waits[&pane][0];
         assert!(waiter.deadline.is_some(), "an abandoned waiter must expire");
+    }
+
+    #[test]
+    fn disconnected_clients_reclaim_parked_waiters_without_replies() {
+        use std::sync::mpsc::TryRecvError;
+
+        let _env = crate::persist::test_env("wait-disconnect");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+
+        let output_cancelled = Arc::new(AtomicBool::new(false));
+        let (output_reply, output_rx) = std::sync::mpsc::channel();
+        app.register_output_wait(
+            pane,
+            "output-disconnect".into(),
+            "NEVER".into(),
+            output_reply,
+            None,
+            output_cancelled.clone(),
+        );
+
+        let agent_cancelled = Arc::new(AtomicBool::new(false));
+        let (agent_reply, agent_rx) = std::sync::mpsc::channel();
+        app.register_agent_wait(
+            pane,
+            "agent-disconnect".into(),
+            State::Blocked,
+            agent_reply,
+            None,
+            agent_cancelled.clone(),
+        );
+
+        output_cancelled.store(true, Ordering::Release);
+        agent_cancelled.store(true, Ordering::Release);
+        let now = Instant::now();
+        app.tick_output_waits(now);
+        app.tick_agent_waits(now);
+
+        assert!(app.output_waits.is_empty());
+        assert!(app.agent_waits.is_empty());
+        assert_eq!(output_rx.try_recv(), Err(TryRecvError::Disconnected));
+        assert_eq!(agent_rx.try_recv(), Err(TryRecvError::Disconnected));
     }
 
     /// Every pane-close path funnels through `drop_leaf_runtime`, so closing a
@@ -3211,7 +7302,14 @@ mod tests {
         let mut app = App::new(80, 24, tx).unwrap();
         let pane = app.layout().focus;
         let (reply, rx): (_, std::sync::mpsc::Receiver<String>) = std::sync::mpsc::channel();
-        app.register_output_wait(pane, "t".into(), "NEVER".into(), reply, None);
+        app.register_output_wait(
+            pane,
+            "t".into(),
+            "NEVER".into(),
+            reply,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
         app.close_workspace(0);
         assert!(
             rx.recv_timeout(Duration::from_secs(1))

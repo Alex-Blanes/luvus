@@ -918,6 +918,8 @@ fn draw_footer(f: &mut RenderTarget, area: Rect, g: &GitView, cat: &Catalog, t: 
         // The `x` email toggle is deliberately left off this line.
         Section::Status => vec![
             ("j/k", cat.act_scroll),
+            ("↑/↓", cat.act_select),
+            ("⏎", cat.act_diff),
             ("E", cat.st_show_more),
             ("r", cat.act_refresh),
             ("q", cat.act_close),
@@ -1061,7 +1063,7 @@ fn commit_row(
 fn draw_status(
     f: &mut RenderTarget,
     area: Rect,
-    g: &GitView,
+    g: &mut GitView,
     cat: &Catalog,
     t: &Theme,
 ) -> (usize, Option<Rect>) {
@@ -1189,22 +1191,36 @@ fn draw_status(
 
     // ── Working tree ──
     let clean = s.dirty_count() == 0 && s.stashes.is_empty();
-    group(
-        &mut rows,
-        format!("{} ({})", cat.st_staged, s.staged.len()),
-        s.staged
-            .iter()
-            .map(|c| file_line(c.code, &c.path, t.green, t))
-            .collect(),
-    );
-    group(
-        &mut rows,
-        format!("{} ({})", cat.st_changed, s.unstaged.len()),
-        s.unstaged
-            .iter()
-            .map(|c| file_line(c.code, &c.path, t.amber, t))
-            .collect(),
-    );
+    // Track staged/unstaged file row indices for Enter/d hit-testing.
+    if !s.staged.is_empty() {
+        header(&mut rows, format!("{} ({})", cat.st_staged, s.staged.len()));
+        let start = rows.len();
+        rows.extend(
+            s.staged
+                .iter()
+                .map(|c| file_line(c.code, &c.path, t.green, t)),
+        );
+        g.status_staged_rows = start..rows.len();
+        rows.push(Line::from(""));
+    } else {
+        g.status_staged_rows = 0..0;
+    }
+    if !s.unstaged.is_empty() {
+        header(
+            &mut rows,
+            format!("{} ({})", cat.st_changed, s.unstaged.len()),
+        );
+        let start = rows.len();
+        rows.extend(
+            s.unstaged
+                .iter()
+                .map(|c| file_line(c.code, &c.path, t.amber, t)),
+        );
+        g.status_unstaged_rows = start..rows.len();
+        rows.push(Line::from(""));
+    } else {
+        g.status_unstaged_rows = 0..0;
+    }
     group(
         &mut rows,
         format!("{} ({})", cat.st_untracked, s.untracked.len()),
@@ -1229,11 +1245,29 @@ fn draw_status(
         )));
     }
 
-    // Status isn't row-selectable; render from the top with the scroll offset.
+    // Status has an explicit file selection, while repository metadata remains
+    // independently scrollable with j/k.
     let avail = area.height as usize;
     let scroll = g.scroll.min(rows.len().saturating_sub(avail));
-    for (y, line) in (area.y..).zip(rows.into_iter().skip(scroll).take(avail)) {
-        f.render_widget(Paragraph::new(line), Rect::new(area.x, y, area.width, 1));
+    let selected_row = g.status_selected.as_ref().and_then(|(path, staged)| {
+        let changes = if *staged { &s.staged } else { &s.unstaged };
+        let rows = if *staged {
+            &g.status_staged_rows
+        } else {
+            &g.status_unstaged_rows
+        };
+        changes
+            .iter()
+            .position(|change| change.path == *path)
+            .map(|index| rows.start + index)
+    });
+    for (index, line) in rows.into_iter().enumerate().skip(scroll).take(avail) {
+        let y = area.y + (index - scroll) as u16;
+        let row = Rect::new(area.x, y, area.width, 1);
+        if selected_row == Some(index) {
+            fill_bg(f, row, t.sel_bg);
+        }
+        f.render_widget(Paragraph::new(line), row);
     }
     // Map the toggle row to a screen rect, but only while it is actually visible
     // in this frame's scroll window — a stale rect would fire from empty space.

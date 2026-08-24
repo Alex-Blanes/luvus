@@ -325,6 +325,10 @@ pub struct Term<T> {
     /// Information about damaged cells.
     damage: TermDamageState,
 
+    /// Alternate-screen rebalancing updates logical history for every row but
+    /// defers physical cache trimming until the frame leaves the parser path.
+    history_cache_dirty: bool,
+
     /// Config directly for the terminal.
     config: Config,
 }
@@ -427,6 +431,7 @@ impl<T> Term<T> {
             scroll_region,
             event_proxy,
             damage,
+            history_cache_dirty: false,
             config,
             grid,
             tabs,
@@ -487,7 +492,18 @@ impl<T> Term<T> {
 
     /// Resets the terminal damage information.
     pub fn reset_damage(&mut self) {
+        self.finish_output_batch();
         self.damage.reset(self.columns());
+    }
+
+    /// Complete deferred allocation maintenance after a parsed output batch.
+    /// Consumers which do not use damage tracking can call this at their own
+    /// frame boundary.
+    pub fn finish_output_batch(&mut self) {
+        if mem::take(&mut self.history_cache_dirty) {
+            self.grid.trim_history_cache();
+            self.inactive_grid.trim_history_cache();
+        }
     }
 
     #[inline]
@@ -510,9 +526,13 @@ impl<T> Term<T> {
         self.event_proxy.send_event(title_event);
 
         if self.mode.contains(TermMode::ALT_SCREEN) {
-            self.inactive_grid.update_history(self.config.scrolling_history);
+            self.rebalance_alt_history();
         } else {
             self.grid.update_history(self.config.scrolling_history);
+            // Alternate history belongs only to the active alternate-screen
+            // lifetime. Reclaim it once the primary screen is active.
+            self.inactive_grid.clear_history();
+            self.inactive_grid.update_history(0);
         }
 
         if self.config.kitty_keyboard != old_config.kitty_keyboard {
@@ -702,6 +722,9 @@ impl<T> Term<T> {
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
         self.grid.resize(!is_alt, num_lines, num_cols);
         self.inactive_grid.resize(is_alt, num_lines, num_cols);
+        if is_alt {
+            self.rebalance_alt_history();
+        }
 
         // Invalidate selection and tabs only when necessary.
         if old_cols != num_cols {
@@ -738,7 +761,8 @@ impl<T> Term<T> {
 
     /// Swap primary and alternate screen buffer.
     pub fn swap_alt(&mut self) {
-        if !self.mode.contains(TermMode::ALT_SCREEN) {
+        let entering = !self.mode.contains(TermMode::ALT_SCREEN);
+        if entering {
             // Set alt screen cursor to the current primary screen cursor.
             self.inactive_grid.cursor = self.grid.cursor.clone();
 
@@ -746,7 +770,17 @@ impl<T> Term<T> {
             self.grid.saved_cursor = self.grid.cursor.clone();
 
             // Reset alternate screen contents.
+            self.inactive_grid.clear_history();
             self.inactive_grid.reset_region(..);
+
+            // Standard alternate screens are not user-scrollable, but Luvus
+            // needs a passive, bounded transcript for automation reads. Let
+            // the empty alternate grid grow into the existing pane allowance;
+            // `rebalance_alt_history` evicts the oldest primary rows one for
+            // one as alternate rows arrive, rather than discarding half of the
+            // primary transcript merely because alternate mode was entered.
+            self.grid.update_history(self.config.scrolling_history);
+            self.inactive_grid.update_history(self.config.scrolling_history);
         }
 
         mem::swap(&mut self.keyboard_mode_stack, &mut self.inactive_keyboard_mode_stack);
@@ -756,6 +790,16 @@ impl<T> Term<T> {
 
         mem::swap(&mut self.grid, &mut self.inactive_grid);
         self.mode ^= TermMode::ALT_SCREEN;
+        if entering {
+            self.rebalance_alt_history();
+        } else {
+            // The alternate transcript is useful only while that application
+            // owns the screen. Drop it on return and restore the primary grid's
+            // full configured allowance.
+            self.inactive_grid.clear_history();
+            self.inactive_grid.update_history(0);
+            self.grid.update_history(self.config.scrolling_history);
+        }
         self.selection = None;
         self.mark_fully_damaged();
     }
@@ -804,6 +848,9 @@ impl<T> Term<T> {
         self.selection = self.selection.take().and_then(|s| s.rotate(self, &region, lines as i32));
 
         self.grid.scroll_up(&region, lines);
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            self.rebalance_alt_history();
+        }
 
         // Scroll vi mode cursor.
         let viewport_top = Line(-(self.grid.display_offset() as i32));
@@ -813,6 +860,19 @@ impl<T> Term<T> {
             *line = cmp::max(*line - lines, top);
         }
         self.mark_fully_damaged();
+    }
+
+    /// Keep the retained rows across primary and alternate grids within one
+    /// configured history allowance. The active alternate transcript takes
+    /// only the rows it has actually produced; older primary rows yield as it
+    /// grows. Both visible screens remain outside this history allowance.
+    fn rebalance_alt_history(&mut self) {
+        let limit = self.config.scrolling_history;
+        self.grid.update_history_deferred(limit);
+        let alternate_rows = self.grid.history_size().min(limit);
+        self.inactive_grid
+            .update_history_deferred(limit.saturating_sub(alternate_rows));
+        self.history_cache_dirty = true;
     }
 
     fn deccolm(&mut self)
@@ -3267,6 +3327,26 @@ mod tests {
         let size = TermSize::new(10, 10);
         term.resize(size);
         assert!(term.damage.full);
+    }
+
+    #[test]
+    fn alternate_history_trims_cache_once_at_frame_boundary() {
+        let size = TermSize::new(8, 4);
+        let config = Config { scrolling_history: 32, ..Config::default() };
+        let mut term = Term::new(config, &size, VoidListener);
+
+        for _ in 0..40 {
+            term.newline();
+        }
+        term.swap_alt();
+        for _ in 0..16 {
+            term.newline();
+        }
+
+        assert!(term.history_cache_dirty);
+        assert!(term.grid.history_size() + term.inactive_grid.history_size() <= 32);
+        term.reset_damage();
+        assert!(!term.history_cache_dirty);
     }
 
     #[test]

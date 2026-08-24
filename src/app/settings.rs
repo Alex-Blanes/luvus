@@ -36,12 +36,12 @@ impl SettingsTab {
 
     pub fn icon(self) -> &'static str {
         match self {
-            SettingsTab::General => "◈",
+            SettingsTab::General => "◆",
             SettingsTab::Theme => "◑",
-            SettingsTab::Layout => "▦",
+            SettingsTab::Layout => "▣",
             SettingsTab::Keys => "⌨",
             SettingsTab::Modules => "❏",
-            SettingsTab::Integrations => "⌁",
+            SettingsTab::Integrations => "☆",
             SettingsTab::Language => "⊕",
         }
     }
@@ -72,13 +72,20 @@ impl SettingsTab {
 pub struct SettingsUi {
     pub tab: SettingsTab,
     pub cursor: usize,
+    /// Candidate prefix captured once and waiting for the same chord again.
+    /// Nothing is persisted until confirmation succeeds.
+    pub prefix_candidate: Option<String>,
+    /// First visual row shown in the Layout tab. Persisting this while the modal
+    /// is open prevents a visible dock/bar button click from re-anchoring the
+    /// list around its newly selected row.
+    pub layout_scroll: usize,
     /// In the Keys tab: capturing the next key press to rebind `cursor`'s command.
     pub capturing: bool,
 }
 
-/// A selectable row in the Layout tab (docs/15 + docs/29). The pane-layout rows
-/// come first, then a `── Docks ──` divider, then the sidebar + dock controls.
-/// `Dock` rows carry `[Left] [Right]` place buttons.
+/// A selectable row in the Layout tab (docs/15 + docs/29). The pane-layout and
+/// DIFF rows come first, then a `── Docks ──` divider with sidebar and dock
+/// controls. `Dock` rows carry `[Left] [Right]` place buttons.
 #[derive(Clone)]
 pub enum LayoutRow {
     SidebarWidth,
@@ -88,12 +95,20 @@ pub enum LayoutRow {
     PaneTitles,
     PaneTitlePath,
     ResumeWs,
+    DiffLayout,
+    DiffWrap,
+    DiffContext,
+    DiffLineNumbers,
+    DiffMarkers,
+    DiffColors,
+    DiffLiveRefresh,
     #[cfg(windows)]
     Shell,
     LeftVisible,
     RightVisible,
     RightWidth,
     Dock(DockKind),
+    Bar(String),
 }
 
 /// A selectable row in the General tab: the app-wide preferences that are not
@@ -154,7 +169,6 @@ impl App {
     /// dock section (used to draw the `── Docks ──` divider) is `dock_section_start`.
     pub fn layout_rows(&self) -> Vec<LayoutRow> {
         let mut v = vec![
-            LayoutRow::SidebarWidth,
             LayoutRow::ColGap,
             LayoutRow::RowGap,
             LayoutRow::Scrollback,
@@ -164,27 +178,55 @@ impl App {
         ];
         #[cfg(windows)]
         v.push(LayoutRow::Shell);
+        v.push(LayoutRow::DiffLayout);
+        v.push(LayoutRow::DiffWrap);
+        v.push(LayoutRow::DiffContext);
+        v.push(LayoutRow::DiffLineNumbers);
+        v.push(LayoutRow::DiffMarkers);
+        v.push(LayoutRow::DiffColors);
+        v.push(LayoutRow::DiffLiveRefresh);
         v.push(LayoutRow::LeftVisible);
         v.push(LayoutRow::RightVisible);
+        v.push(LayoutRow::SidebarWidth);
         v.push(LayoutRow::RightWidth);
         for k in self.available_docks() {
             v.push(LayoutRow::Dock(k));
         }
+        for key in self.bar_setting_keys() {
+            v.push(LayoutRow::Bar(key));
+        }
         v
+    }
+
+    fn bar_setting_keys(&self) -> Vec<String> {
+        // Settings rows describe declarations, not their placement. Keeping
+        // this order stable prevents a Top/Bottom click from moving the row
+        // under the pointer while the user is arranging widgets.
+        self.bar.declarations.keys().cloned().collect()
+    }
+
+    pub fn bar_section_start(&self) -> usize {
+        self.layout_rows()
+            .iter()
+            .position(|row| matches!(row, LayoutRow::Bar(_)))
+            .unwrap_or(usize::MAX)
+    }
+
+    pub fn diff_section_start(&self) -> usize {
+        self.layout_rows()
+            .iter()
+            .position(|row| matches!(row, LayoutRow::DiffLayout))
+            .unwrap_or(usize::MAX)
     }
 
     /// Index of the first dock-section row (where the `── Docks ──` divider goes).
     pub fn dock_section_start(&self) -> usize {
-        // Keep in step with `layout_rows`: the pane-layout rows before the docks
-        // section (sidebar width, gaps, scrollback, titles, resume, +shell).
-        #[cfg(windows)]
-        {
-            7
-        }
-        #[cfg(not(windows))]
-        {
-            6
-        }
+        // Keep in step with `layout_rows`: the pane-layout and DIFF rows before
+        // the sidebar controls and dock-placement rows.
+        self.layout_rows()
+            .iter()
+            .position(|row| matches!(row, LayoutRow::LeftVisible))
+            .unwrap_or(usize::MAX)
     }
 
     /// Open Settings on the **first** tab (General). Switching to Theme still
@@ -193,6 +235,8 @@ impl App {
         self.settings = Some(SettingsUi {
             tab: SettingsTab::General,
             cursor: 0,
+            prefix_candidate: None,
+            layout_scroll: 0,
             capturing: false,
         });
     }
@@ -220,7 +264,7 @@ impl App {
     pub fn settings_rows(&self, tab: SettingsTab) -> usize {
         match tab {
             SettingsTab::General => self.general_rows().len(),
-            SettingsTab::Theme => theme::THEMES.len(),
+            SettingsTab::Theme => self.theme_registry.entries().len(),
             SettingsTab::Layout => self.layout_rows().len(),
             // Rebindable commands first, then the read-only reference rows — the
             // cursor steps through both so the whole reference is keyboard-reachable.
@@ -234,11 +278,10 @@ impl App {
     }
 
     pub fn handle_settings_key(&mut self, key: KeyEvent) {
-        let Some(&SettingsUi {
-            tab,
-            cursor,
-            capturing,
-        }) = self.settings.as_ref()
+        let Some((tab, cursor, capturing, prefix_candidate)) = self
+            .settings
+            .as_ref()
+            .map(|ui| (ui.tab, ui.cursor, ui.capturing, ui.prefix_candidate.clone()))
         else {
             return;
         };
@@ -246,22 +289,43 @@ impl App {
         // (Esc cancels). This must intercept before the normal handling so keys
         // like Tab / digits can themselves be bound.
         if capturing {
-            if key.code != KeyCode::Esc {
-                if cursor == KEYS_PREFIX_ROW {
-                    // Capturing the prefix chord needs the modifiers, not just the
-                    // key. Refuse anything without Ctrl and keep the old prefix.
-                    match Self::prefix_spec_from_key(&key) {
-                        Some(spec) if self.set_prefix(&spec) => {}
-                        _ => self.show_toast("Prefix must include Ctrl"),
+            if cursor == KEYS_PREFIX_ROW {
+                if key.code == KeyCode::Esc {
+                    if let Some(ui) = self.settings.as_mut() {
+                        ui.capturing = false;
+                        ui.prefix_candidate = None;
                     }
-                } else if let (Some(cmd), Some(s)) =
-                    (Self::keys_cmd_at(cursor), keys::key_string(&key))
-                {
+                    return;
+                }
+                let Some(spec) = Self::prefix_spec_from_key(&key) else {
+                    self.show_toast("Use F1-F12 or a Ctrl/Alt chord");
+                    return;
+                };
+                if prefix_candidate.as_deref() == Some(spec.as_str()) {
+                    self.set_prefix(&spec);
+                    if let Some(ui) = self.settings.as_mut() {
+                        ui.capturing = false;
+                        ui.prefix_candidate = None;
+                    }
+                } else {
+                    let label = keys::PrefixSpec::parse(&spec)
+                        .map(|prefix| prefix.label())
+                        .unwrap_or(spec.clone());
+                    if let Some(ui) = self.settings.as_mut() {
+                        ui.prefix_candidate = Some(spec);
+                    }
+                    self.show_toast(format!("Press {label} again to confirm"));
+                }
+                return;
+            }
+            if key.code != KeyCode::Esc {
+                if let (Some(cmd), Some(s)) = (Self::keys_cmd_at(cursor), keys::key_string(&key)) {
                     self.rebind(cmd, s);
                 }
             }
             if let Some(ui) = self.settings.as_mut() {
                 ui.capturing = false;
+                ui.prefix_candidate = None;
             }
             return;
         }
@@ -275,6 +339,7 @@ impl App {
             KeyCode::Down => self.settings_move(1),
             KeyCode::Left => self.settings_adjust(cursor, -1),
             KeyCode::Right => self.settings_adjust(cursor, 1),
+            KeyCode::Enter if tab == SettingsTab::Theme => self.settings_enter_theme(cursor),
             KeyCode::Enter | KeyCode::Char(' ') => self.settings_activate(cursor),
             // In the Keys tab, Backspace/Delete resets a binding to its default:
             // the prefix row back to Ctrl+Space, a command row to its default key
@@ -314,6 +379,23 @@ impl App {
             self.settings_set_tab(tab);
             return;
         }
+        // Installed themes expose a separate right-aligned remove action. Handle
+        // it before the row body so removal never previews/selects the target.
+        if self
+            .settings
+            .as_ref()
+            .is_some_and(|ui| ui.tab == SettingsTab::Theme)
+        {
+            if let Some(id) = self
+                .settings_theme_remove_rects
+                .iter()
+                .find(|(_, rect)| hit(*rect))
+                .map(|(id, _)| id.clone())
+            {
+                self.request_theme_uninstall(&id);
+                return;
+            }
+        }
         // A click on a slider arrow steps that control in its direction.
         if let Some((i, delta, _)) = self
             .settings_arrow_rects
@@ -347,7 +429,9 @@ impl App {
                     self.layout_rows().get(i),
                     Some(LayoutRow::SidebarWidth)
                         | Some(LayoutRow::RightWidth)
+                        | Some(LayoutRow::DiffContext)
                         | Some(LayoutRow::Dock(_))
+                        | Some(LayoutRow::Bar(_))
                 ),
                 // The file-open chooser only moves via its `‹ ›` arrows.
                 Some(SettingsTab::General) => {
@@ -365,13 +449,19 @@ impl App {
 
     fn settings_set_tab(&mut self, tab: SettingsTab) {
         let cursor = match tab {
-            SettingsTab::Theme => theme_cursor(&self.config.theme),
+            SettingsTab::Theme => self
+                .theme_registry
+                .index_of(&self.config.theme)
+                .unwrap_or(0),
             SettingsTab::Language => lang_cursor(&self.config.language),
             _ => 0,
         };
         if let Some(ui) = self.settings.as_mut() {
             ui.tab = tab;
             ui.cursor = cursor;
+            ui.prefix_candidate = None;
+            ui.layout_scroll = 0;
+            ui.capturing = false;
         }
     }
 
@@ -396,7 +486,14 @@ impl App {
         }
         // Theme / Language preview live as the selection moves.
         if tab == SettingsTab::Theme {
-            self.apply_theme(theme::THEMES[new]);
+            if let Some(id) = self
+                .theme_registry
+                .entries()
+                .get(new)
+                .map(|entry| entry.id.clone())
+            {
+                self.apply_theme(&id);
+            }
         } else if tab == SettingsTab::Language {
             self.apply_language(crate::i18n::LANGS[new]);
         }
@@ -424,9 +521,21 @@ impl App {
         let Some(tab) = self.settings.as_ref().map(|u| u.tab) else {
             return;
         };
+        if let Some(ui) = self.settings.as_mut() {
+            ui.capturing = false;
+            ui.prefix_candidate = None;
+        }
         match tab {
             SettingsTab::Theme => {
-                self.apply_theme(theme::THEMES[cursor.min(theme::THEMES.len() - 1)])
+                let index = cursor.min(self.theme_registry.entries().len().saturating_sub(1));
+                if let Some(id) = self
+                    .theme_registry
+                    .entries()
+                    .get(index)
+                    .map(|entry| entry.id.clone())
+                {
+                    self.apply_theme(&id);
+                }
             }
             SettingsTab::Language => {
                 self.apply_language(crate::i18n::LANGS[cursor.min(crate::i18n::LANGS.len() - 1)])
@@ -446,12 +555,14 @@ impl App {
                 KEYS_PREFIX_ROW => {
                     if let Some(ui) = self.settings.as_mut() {
                         ui.capturing = true;
+                        ui.prefix_candidate = None;
                     }
                 }
                 _ => {
                     if Self::keys_cmd_at(cursor).is_some() {
                         if let Some(ui) = self.settings.as_mut() {
                             ui.capturing = true;
+                            ui.prefix_candidate = None;
                         }
                     }
                 }
@@ -469,28 +580,52 @@ impl App {
             .and_then(|i| crate::app::Cmd::ALL.get(i).copied())
     }
 
-    /// Build a prefix spec string (e.g. `"ctrl+b"`) from a captured key event, or
-    /// `None` if it doesn't carry Ctrl. `Ctrl+Space` arrives as `Char(' ')`/`'@'`
-    /// with Ctrl or a bare `Null`; both normalize to `"ctrl+space"`.
+    /// Convert a captured event to one canonical safe prefix. Function keys can
+    /// stand alone; character and Space prefixes require Ctrl or Alt. Super,
+    /// Hyper, and Meta are rejected because desktop environments commonly keep
+    /// them before the terminal can report them consistently.
     fn prefix_spec_from_key(key: &KeyEvent) -> Option<String> {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let base = match key.code {
-            KeyCode::Null | KeyCode::Char(' ') | KeyCode::Char('@') => "space".to_string(),
-            KeyCode::Char(c) if c.is_ascii() => c.to_ascii_lowercase().to_string(),
-            _ => return None,
-        };
-        // Ctrl is required. A bare `Null` already implies Ctrl+Space.
-        if !ctrl && !matches!(key.code, KeyCode::Null) {
+        if key
+            .modifiers
+            .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META)
+        {
             return None;
         }
-        let mut s = String::from("ctrl");
-        if alt {
-            s.push_str("+alt");
+        if key.code == KeyCode::Null {
+            return Some("ctrl+space".to_string());
         }
-        s.push('+');
-        s.push_str(&base);
-        Some(s)
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let mut shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let base = match key.code {
+            KeyCode::Char('@') if ctrl => {
+                // Ctrl+Space may arrive as the physical Ctrl+Shift+2 (`@`). The
+                // resulting terminal key is still NUL, so persist Ctrl+Space.
+                shift = false;
+                "space".to_string()
+            }
+            KeyCode::Char(' ') if ctrl => "space".to_string(),
+            KeyCode::Char(' ') => "space".to_string(),
+            KeyCode::Char('+') => "plus".to_string(),
+            KeyCode::Char(character) if character.is_ascii() => {
+                character.to_ascii_lowercase().to_string()
+            }
+            KeyCode::F(number @ 1..=12) => format!("f{number}"),
+            _ => return None,
+        };
+        let mut parts = Vec::new();
+        if ctrl {
+            parts.push("ctrl");
+        }
+        if alt {
+            parts.push("alt");
+        }
+        if shift {
+            parts.push("shift");
+        }
+        parts.push(&base);
+        let candidate = parts.join("+");
+        keys::PrefixSpec::parse(&candidate).map(|prefix| prefix.spec())
     }
 
     /// The index of the preset that exactly matches the current config, or `None`
@@ -647,15 +782,130 @@ impl App {
         }
     }
 
+    fn settings_enter_theme(&mut self, cursor: usize) {
+        let index = cursor.min(self.theme_registry.entries().len().saturating_sub(1));
+        if let Some((id, removable)) = self.theme_registry.entries().get(index).map(|entry| {
+            (
+                entry.id.clone(),
+                matches!(
+                    entry.source,
+                    crate::theme::registry::ThemeSource::Local { .. }
+                ),
+            )
+        }) {
+            if removable {
+                self.request_theme_uninstall(&id);
+            } else {
+                self.apply_theme(&id);
+            }
+        }
+    }
+
     // ── apply helpers (mutate config, apply live, persist) ───────────────────
 
-    fn apply_theme(&mut self, name: &str) {
-        self.config.theme = name.to_string();
-        self.theme = theme::by_name(name);
-        if self.downsample {
-            self.theme = self.theme.to_256();
+    /// Remove one installed theme from Settings without blocking the app loop on
+    /// directory scans or filesystem writes. If it is active, first move to the
+    /// bundled default so the install layer's active-theme guard remains intact.
+    fn request_theme_uninstall(&mut self, id: &str) {
+        if self.pending_theme_uninstalls.contains_key(id) {
+            return;
         }
+        let removable = self.theme_registry.get(id).is_some_and(|entry| {
+            matches!(
+                &entry.source,
+                crate::theme::registry::ThemeSource::Local { .. }
+            )
+        });
+        if !removable {
+            self.show_toast(format!("Theme {id} is bundled and cannot be removed"));
+            return;
+        }
+
+        let previous_theme = self.config.theme.clone();
+        let restore = if theme::canonical(&previous_theme) == id {
+            self.apply_theme(theme::THEMES[0]);
+            Some((previous_theme, self.theme_selection_revision))
+        } else {
+            None
+        };
+
+        // Retire the rendered action immediately and record the in-flight worker
+        // so subsequent repaints cannot recreate an actionable remove hitbox.
+        self.settings_theme_remove_rects
+            .retain(|(theme_id, _)| theme_id != id);
+        self.pending_theme_uninstalls
+            .insert(id.to_string(), restore);
+        let tx = self.app_tx.clone();
+        let id = id.to_string();
+        self.show_toast(format!("Removing theme {id}…"));
+        std::thread::spawn(move || {
+            let result = crate::theme::install::uninstall(&id)
+                .map(|_| crate::theme::ThemeRegistry::load())
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(crate::event::AppEvent::ThemeUninstalled { id, result });
+        });
+    }
+
+    /// Apply the completed worker result on the single-writer app loop.
+    pub(crate) fn finish_theme_uninstall(
+        &mut self,
+        id: String,
+        result: Result<crate::theme::ThemeRegistry, String>,
+    ) {
+        let restore = self.pending_theme_uninstalls.remove(&id).flatten();
+        match result {
+            Ok(registry) => {
+                self.replace_theme_registry(registry);
+                self.settings_theme_remove_rects
+                    .retain(|(theme_id, _)| theme_id != &id);
+                self.clamp_settings_cursor();
+                self.show_toast(format!("Removed theme {id}"));
+            }
+            Err(error) => {
+                if let Some((previous_theme, fallback_revision)) = restore {
+                    if self.theme_selection_revision == fallback_revision {
+                        self.apply_theme(&previous_theme);
+                    }
+                }
+                self.show_toast(format!("Could not remove {id}: {error}"));
+            }
+        }
+    }
+
+    pub(crate) fn theme_uninstall_pending(&self, id: &str) -> bool {
+        self.pending_theme_uninstalls.contains_key(id)
+    }
+
+    pub(crate) fn apply_theme(&mut self, name: &str) {
+        let Some(mut selected) = self.theme_registry.theme(name) else {
+            return;
+        };
+        self.config.theme = theme::canonical(name).to_string();
+        self.theme_selection_revision = self.theme_selection_revision.wrapping_add(1);
+        if self.downsample {
+            selected = selected.to_256();
+        }
+        self.theme = selected;
+        self.changelog_rows = None;
         config::save(&self.config);
+    }
+
+    /// Swap the server's in-memory registry after an off-loop scan. A missing
+    /// configured theme falls back visually without erasing its stored ID, so
+    /// restoring the file and reloading brings the selection back.
+    pub(crate) fn replace_theme_registry(&mut self, registry: crate::theme::ThemeRegistry) -> bool {
+        let selected_exists = registry.get(&self.config.theme).is_some();
+        if self.config.theme != "terminal" {
+            let mut selected = registry.theme_or_default(&self.config.theme);
+            if self.downsample {
+                selected = selected.to_256();
+            }
+            self.theme = selected;
+        }
+        self.theme_registry = registry;
+        self.clamp_settings_cursor();
+        self.changelog_rows = None;
+        selected_exists
     }
 
     /// Swap the UI language live + persist (docs/21) — mirrors `apply_theme`.
@@ -716,6 +966,56 @@ impl App {
                     !self.config.layout.resume_in_new_workspace;
                 config::save(&self.config);
             }
+            LayoutRow::DiffLayout => {
+                self.config.layout.diff_layout = if delta < 0 {
+                    match self.config.layout.diff_layout {
+                        crate::diff::DiffLayoutPreference::Auto => {
+                            crate::diff::DiffLayoutPreference::Stack
+                        }
+                        crate::diff::DiffLayoutPreference::Split => {
+                            crate::diff::DiffLayoutPreference::Auto
+                        }
+                        crate::diff::DiffLayoutPreference::Stack => {
+                            crate::diff::DiffLayoutPreference::Split
+                        }
+                    }
+                } else {
+                    self.config.layout.diff_layout.cycle()
+                };
+                config::save(&self.config);
+            }
+            LayoutRow::DiffWrap => {
+                self.config.layout.diff_wrap = !self.config.layout.diff_wrap;
+                config::save(&self.config);
+            }
+            LayoutRow::DiffContext => {
+                self.config.layout.diff_context_lines =
+                    (self.config.layout.diff_context_lines as i32 + delta)
+                        .clamp(0, i32::from(crate::diff::MAX_CONTEXT_LINES))
+                        as u16;
+                config::save(&self.config);
+            }
+            LayoutRow::DiffLineNumbers => {
+                self.config.layout.diff_show_line_numbers =
+                    !self.config.layout.diff_show_line_numbers;
+                config::save(&self.config);
+            }
+            LayoutRow::DiffMarkers => {
+                self.config.layout.diff_marker_style = if delta < 0 {
+                    self.config.layout.diff_marker_style.reverse()
+                } else {
+                    self.config.layout.diff_marker_style.cycle()
+                };
+                config::save(&self.config);
+            }
+            LayoutRow::DiffColors => {
+                self.config.layout.diff_color_mode = self.config.layout.diff_color_mode.cycle();
+                config::save(&self.config);
+            }
+            LayoutRow::DiffLiveRefresh => {
+                self.config.layout.diff_live_refresh = !self.config.layout.diff_live_refresh;
+                config::save(&self.config);
+            }
             #[cfg(windows)]
             LayoutRow::Shell => self.cycle_shell(delta),
             LayoutRow::LeftVisible => {
@@ -735,6 +1035,27 @@ impl App {
                     self.move_dock(&kind, Side::Right);
                 } else {
                     self.unmount_dock(&kind);
+                }
+            }
+            LayoutRow::Bar(key) => {
+                let region = if delta < 0 {
+                    Some(crate::bar::BarRegion::TopRight)
+                } else if delta == 1 {
+                    Some(crate::bar::BarRegion::BottomRight)
+                } else {
+                    None
+                };
+                self.config.bars.place(&key, region);
+                self.bar.clear_geometry();
+                config::save(&self.config);
+                if let Some(next) = self
+                    .layout_rows()
+                    .iter()
+                    .position(|row| matches!(row, LayoutRow::Bar(candidate) if candidate == &key))
+                {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.cursor = next;
+                    }
                 }
             }
         }
@@ -766,6 +1087,32 @@ impl App {
                     // Both full: the dock can't be placed, so cycling leaves it off.
                 }
             },
+            Some(LayoutRow::Bar(key)) => {
+                let fallback = self
+                    .bar
+                    .declaration(&key)
+                    .map(|declaration| declaration.region)
+                    .unwrap_or(crate::bar::BarRegion::BottomRight);
+                let next = match self.config.bars.region_for(&key, fallback) {
+                    Some(crate::bar::BarRegion::TopRight) => {
+                        Some(crate::bar::BarRegion::BottomRight)
+                    }
+                    Some(crate::bar::BarRegion::BottomRight) => None,
+                    None => Some(crate::bar::BarRegion::TopRight),
+                };
+                self.config.bars.place(&key, next);
+                self.bar.clear_geometry();
+                config::save(&self.config);
+                if let Some(cursor) = self
+                    .layout_rows()
+                    .iter()
+                    .position(|row| matches!(row, LayoutRow::Bar(candidate) if candidate == &key))
+                {
+                    if let Some(settings) = self.settings.as_mut() {
+                        settings.cursor = cursor;
+                    }
+                }
+            }
             _ => self.adjust_layout(cursor, 1),
         }
     }
@@ -908,13 +1255,6 @@ impl App {
     }
 }
 
-fn theme_cursor(name: &str) -> usize {
-    // Resolve legacy names (`mocha` → `catppuccin-mocha`) first, or a config
-    // written before the rename would highlight the wrong row.
-    let name = theme::canonical(name);
-    theme::THEMES.iter().position(|n| *n == name).unwrap_or(0)
-}
-
 fn lang_cursor(code: &str) -> usize {
     crate::i18n::LANGS
         .iter()
@@ -925,6 +1265,272 @@ fn lang_cursor(code: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_capture_accepts_safe_non_ctrl_keys_and_exact_modifiers() {
+        assert_eq!(
+            App::prefix_spec_from_key(&KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE)),
+            Some("f12".to_string())
+        );
+        assert_eq!(
+            App::prefix_spec_from_key(&KeyEvent::new(
+                KeyCode::Char('\\'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            )),
+            Some("ctrl+alt+\\".to_string())
+        );
+        assert_eq!(
+            App::prefix_spec_from_key(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE,)),
+            None
+        );
+        assert_eq!(
+            App::prefix_spec_from_key(&KeyEvent::new(
+                KeyCode::Char('@'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )),
+            Some("ctrl+space".to_string())
+        );
+        assert_eq!(
+            App::prefix_spec_from_key(&KeyEvent::new(KeyCode::F(12), KeyModifiers::SUPER,)),
+            None
+        );
+    }
+
+    #[test]
+    fn prefix_capture_requires_the_same_chord_twice_before_persisting() {
+        let _env = crate::persist::test_env("prefix-capture-confirm");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.open_settings();
+        app.settings_set_tab(SettingsTab::Keys);
+        app.settings_activate(KEYS_PREFIX_ROW);
+
+        let f12 = KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE);
+        app.handle_settings_key(f12);
+        assert_eq!(app.config.prefix, "ctrl+space");
+        assert!(app.settings.as_ref().is_some_and(|ui| ui.capturing));
+        assert_eq!(
+            app.settings
+                .as_ref()
+                .and_then(|ui| ui.prefix_candidate.as_deref()),
+            Some("f12")
+        );
+
+        app.handle_settings_key(f12);
+        assert_eq!(app.config.prefix, "f12");
+        assert_eq!(app.prefix, keys::PrefixSpec::parse("f12").unwrap());
+        assert!(app.settings.as_ref().is_some_and(|ui| !ui.capturing));
+    }
+
+    #[test]
+    fn sidebar_widths_are_grouped_in_the_docks_section() {
+        let _env = crate::persist::test_env("sidebar-width-settings-order");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let app = crate::app::App::new(80, 24, tx).unwrap();
+        let rows = app.layout_rows();
+        let dock_start = app.dock_section_start();
+        let left_visible = rows
+            .iter()
+            .position(|row| matches!(row, LayoutRow::LeftVisible))
+            .unwrap();
+        let right_visible = rows
+            .iter()
+            .position(|row| matches!(row, LayoutRow::RightVisible))
+            .unwrap();
+        let left_width = rows
+            .iter()
+            .position(|row| matches!(row, LayoutRow::SidebarWidth))
+            .unwrap();
+        let right_width = rows
+            .iter()
+            .position(|row| matches!(row, LayoutRow::RightWidth))
+            .unwrap();
+
+        assert_eq!(
+            dock_start, left_visible,
+            "Docks starts with sidebar controls"
+        );
+        assert_eq!(right_visible, left_visible + 1);
+        assert_eq!(left_width, right_visible + 1);
+        assert_eq!(right_width, left_width + 1);
+    }
+
+    #[test]
+    fn bar_settings_rows_stay_stable_when_placement_changes() {
+        let _env = crate::persist::test_env("bar-settings-stable");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        let declaration = crate::bar::BarDeclaration {
+            key: crate::bar::BarWidgetKey::new("example", "ci"),
+            title: "CI status".into(),
+            region: crate::bar::BarRegion::TopRight,
+            priority: 50,
+        };
+        app.bar
+            .declarations
+            .insert(declaration.key.canonical(), declaration);
+        let expected = app.bar_setting_keys();
+
+        for region in [
+            Some(crate::bar::BarRegion::TopRight),
+            Some(crate::bar::BarRegion::BottomRight),
+            None,
+        ] {
+            app.config.bars.place("example:ci", region);
+            assert_eq!(app.bar_setting_keys(), expected);
+        }
+    }
+
+    #[test]
+    fn dock_settings_rows_stay_stable_when_placement_changes() {
+        let _env = crate::persist::test_env("dock-settings-stable");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        let alpha = DockKind::Module("example:alpha".into());
+        let beta = DockKind::Module("example:beta".into());
+        assert!(app.move_dock(&alpha, Side::Right));
+        assert!(app.move_dock(&beta, Side::Right));
+        let expected = app.available_docks();
+
+        assert!(app.move_dock(&alpha, Side::Left));
+        assert_eq!(app.available_docks(), expected);
+        app.unmount_dock(&alpha);
+        assert_eq!(app.available_docks(), expected);
+    }
+
+    #[test]
+    fn clicking_a_visible_placement_button_keeps_the_layout_viewport() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let _env = crate::persist::test_env("settings-placement-scroll");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(100, 24, tx).unwrap();
+        let declaration = crate::bar::BarDeclaration {
+            key: crate::bar::BarWidgetKey::new("example", "status"),
+            title: "Example status".into(),
+            region: crate::bar::BarRegion::BottomRight,
+            priority: 50,
+        };
+        app.bar
+            .declarations
+            .insert(declaration.key.canonical(), declaration);
+        app.open_settings();
+        let last = app.layout_rows().len().saturating_sub(1);
+        if let Some(settings) = app.settings.as_mut() {
+            settings.tab = SettingsTab::Layout;
+            settings.cursor = last;
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let before = app.settings.as_ref().unwrap().layout_scroll;
+        assert!(before > 0, "the regression requires a scrolled Layout list");
+
+        let rows = app.layout_rows();
+        let (_, _, button) = app
+            .settings_arrow_rects
+            .iter()
+            .find(|(index, delta, _)| {
+                *delta == 2
+                    && *index != last
+                    && matches!(
+                        rows.get(*index),
+                        Some(LayoutRow::Dock(_) | LayoutRow::Bar(_))
+                    )
+            })
+            .copied()
+            .expect("a visible placement button above the selected row");
+        app.handle_settings_click(button.x, button.y);
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+
+        assert_eq!(
+            app.settings.as_ref().unwrap().layout_scroll,
+            before,
+            "clicking a visible placement button must not re-anchor the modal"
+        );
+    }
+
+    #[test]
+    fn diff_marker_setting_cycles_live_and_persists() {
+        let _env = crate::persist::test_env("diff-marker-style");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.open_settings();
+        if let Some(settings) = app.settings.as_mut() {
+            settings.tab = SettingsTab::Layout;
+        }
+        let row = app
+            .layout_rows()
+            .iter()
+            .position(|row| matches!(row, LayoutRow::DiffMarkers))
+            .expect("the DIFF marker row is present");
+
+        assert_eq!(
+            app.config.layout.diff_marker_style,
+            crate::diff::DiffMarkerStyle::Symbols
+        );
+        app.settings_adjust(row, 1);
+        assert_eq!(
+            app.config.layout.diff_marker_style,
+            crate::diff::DiffMarkerStyle::Bars
+        );
+        assert_eq!(
+            crate::config::load().layout.diff_marker_style,
+            crate::diff::DiffMarkerStyle::Bars,
+            "the selection survives restart"
+        );
+        app.settings_adjust(row, 1);
+        assert_eq!(
+            app.config.layout.diff_marker_style,
+            crate::diff::DiffMarkerStyle::Both
+        );
+        app.settings_adjust(row, -1);
+        assert_eq!(
+            app.config.layout.diff_marker_style,
+            crate::diff::DiffMarkerStyle::Bars,
+            "reverse navigation follows the same ordering"
+        );
+    }
+
+    #[test]
+    fn diff_color_setting_cycles_live_and_persists() {
+        let _env = crate::persist::test_env("diff-color-mode");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.open_settings();
+        if let Some(settings) = app.settings.as_mut() {
+            settings.tab = SettingsTab::Layout;
+        }
+        let row = app
+            .layout_rows()
+            .iter()
+            .position(|row| matches!(row, LayoutRow::DiffColors))
+            .expect("the DIFF color row is present");
+
+        assert_eq!(
+            app.config.layout.diff_color_mode,
+            crate::diff::DiffColorMode::Theme
+        );
+        app.settings_adjust(row, 1);
+        assert_eq!(
+            app.config.layout.diff_color_mode,
+            crate::diff::DiffColorMode::Standard
+        );
+        assert_eq!(
+            crate::config::load().layout.diff_color_mode,
+            crate::diff::DiffColorMode::Standard,
+            "the color choice survives restart"
+        );
+        app.settings_adjust(row, -1);
+        assert_eq!(
+            app.config.layout.diff_color_mode,
+            crate::diff::DiffColorMode::Theme
+        );
+    }
 
     /// The docs/62 switch: whether resume replays each agent's own CLI options,
     /// or falls back to the plain resume command luvus used before the feature.
@@ -1071,6 +1677,20 @@ mod tests {
         assert_eq!(SettingsTab::ALL.len(), 7, "still seven tabs");
     }
 
+    #[test]
+    fn settings_tab_icons_have_consistent_terminal_width() {
+        assert_eq!(SettingsTab::General.icon(), "◆");
+        assert_eq!(SettingsTab::Layout.icon(), "▣");
+        assert_eq!(SettingsTab::Integrations.icon(), "☆");
+        for tab in SettingsTab::ALL {
+            assert_eq!(
+                unicode_width::UnicodeWidthStr::width(tab.icon()),
+                1,
+                "{tab:?} icon must occupy one terminal column"
+            );
+        }
+    }
+
     /// The General tab's "Open files with" slider cycles read-only → each detected
     /// editor → back, and steps backward with wraparound.
     #[test]
@@ -1133,5 +1753,237 @@ mod tests {
         app.settings_adjust(idx, -1);
         let last = config::SHIFT_ENTER_CHOICES.last().unwrap().0;
         assert_eq!(app.config.layout.shift_enter, last, "wraps to the last");
+    }
+
+    #[test]
+    fn missing_configured_theme_falls_back_without_erasing_the_id() {
+        let _env = crate::persist::test_env("missing-custom-theme");
+        crate::persist::ensure_config_dir();
+        let mut config = crate::config::load();
+        config.theme = "temporarily-missing".to_string();
+        crate::config::save(&config);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let app = crate::app::App::new(80, 24, tx).unwrap();
+        assert_eq!(app.config.theme, "temporarily-missing");
+        assert_eq!(
+            app.theme,
+            crate::ui::theme::Theme::quattro_rally(),
+            "rendering uses the safe default until the file returns"
+        );
+    }
+
+    #[test]
+    fn off_loop_registry_reload_swaps_the_dynamic_theme_list() {
+        let _env = crate::persist::test_env("theme-reload-event");
+        crate::persist::ensure_config_dir();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        assert!(app.theme_registry.get("reloaded-theme").is_none());
+
+        let source = crate::persist::config_dir().join("reloaded-theme.toml");
+        crate::theme::install::init(&source, "reloaded-theme", Some("noir")).unwrap();
+        crate::theme::install::install(source.to_str().unwrap(), true).unwrap();
+        let (reply, response) = std::sync::mpsc::channel();
+        app.handle_event(crate::event::AppEvent::ThemeReloaded {
+            id: "reload-1".to_string(),
+            registry: crate::theme::ThemeRegistry::load(),
+            reply,
+        });
+        assert!(app.theme_registry.get("reloaded-theme").is_some());
+        assert!(response.recv().unwrap().contains("themes_reloaded"));
+    }
+
+    #[test]
+    fn installed_theme_remove_action_is_scoped_guarded_and_off_loop() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::time::Duration;
+
+        let _env = crate::persist::test_env("installed-theme-remove-settings");
+        let source = crate::persist::ensure_config_dir().join("custom-remove.toml");
+        crate::theme::install::init(&source, "custom-remove", None).unwrap();
+        let installed = crate::theme::install::install(source.to_str().unwrap(), true).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.apply_theme("terminal");
+        app.open_settings();
+        app.settings_set_tab(SettingsTab::Theme);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+
+        assert_eq!(
+            app.settings_theme_remove_rects
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["custom-remove"],
+            "only installed files expose removal; bundled and virtual themes do not"
+        );
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("installed") && screen.contains("remove"));
+
+        app.apply_theme("custom-remove");
+        app.settings_set_tab(SettingsTab::Theme);
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let remove = app
+            .settings_theme_remove_rects
+            .iter()
+            .find(|(id, _)| id == "custom-remove")
+            .unwrap()
+            .1;
+        app.handle_settings_click(remove.x, remove.y);
+        assert_eq!(
+            app.config.theme,
+            theme::THEMES[0],
+            "removing the active file switches to the bundled default first"
+        );
+        assert!(installed.path.exists(), "filesystem removal stays off-loop");
+        assert!(
+            app.settings_theme_remove_rects
+                .iter()
+                .all(|(id, _)| id != "custom-remove"),
+            "the action is retired before the worker completes"
+        );
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        assert!(
+            app.settings_theme_remove_rects
+                .iter()
+                .all(|(id, _)| id != "custom-remove"),
+            "a repaint cannot recreate an action while removal is pending"
+        );
+
+        let event = loop {
+            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                event @ crate::event::AppEvent::ThemeUninstalled { .. } => break event,
+                other => {
+                    app.handle_event(other);
+                }
+            }
+        };
+        app.handle_event(event);
+        assert!(!installed.path.exists());
+        assert!(app.theme_registry.get("custom-remove").is_none());
+        assert!(app
+            .settings_theme_remove_rects
+            .iter()
+            .all(|(id, _)| id != "custom-remove"));
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|(message, _)| message == "Removed theme custom-remove"));
+    }
+
+    #[test]
+    fn failed_theme_removal_restores_the_previous_selection() {
+        let _env = crate::persist::test_env("failed-theme-remove-settings");
+        let source = crate::persist::ensure_config_dir().join("custom-restore.toml");
+        crate::theme::install::init(&source, "custom-restore", None).unwrap();
+        crate::theme::install::install(source.to_str().unwrap(), true).unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.apply_theme("custom-restore");
+        let previous = app.config.theme.clone();
+        app.apply_theme(theme::THEMES[0]);
+        app.pending_theme_uninstalls.insert(
+            "custom-restore".into(),
+            Some((previous, app.theme_selection_revision)),
+        );
+        app.finish_theme_uninstall(
+            "custom-restore".into(),
+            Err("still required by child-theme".into()),
+        );
+
+        assert_eq!(app.config.theme, "custom-restore");
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|(message, _)| message.contains("still required by child-theme")));
+    }
+
+    #[test]
+    fn enter_routes_an_installed_theme_through_removal() {
+        let _env = crate::persist::test_env("installed-theme-enter-remove");
+        let source = crate::persist::ensure_config_dir().join("custom-enter.toml");
+        crate::theme::install::init(&source, "custom-enter", None).unwrap();
+        crate::theme::install::install(source.to_str().unwrap(), true).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.apply_theme("custom-enter");
+        app.open_settings();
+        app.settings_set_tab(SettingsTab::Theme);
+        let index = app.theme_registry.index_of("custom-enter").unwrap();
+        app.settings_activate(index);
+        assert!(!app.theme_uninstall_pending("custom-enter"));
+        app.settings_enter_theme(index);
+
+        assert_eq!(app.config.theme, theme::THEMES[0]);
+        assert!(app.theme_uninstall_pending("custom-enter"));
+        let event = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        app.handle_event(event);
+        assert!(app.theme_registry.get("custom-enter").is_none());
+    }
+
+    #[test]
+    fn failed_theme_removal_preserves_a_newer_selection() {
+        let _env = crate::persist::test_env("failed-theme-remove-newer-selection");
+        let source = crate::persist::ensure_config_dir().join("custom-pending.toml");
+        crate::theme::install::init(&source, "custom-pending", None).unwrap();
+        crate::theme::install::install(source.to_str().unwrap(), true).unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.apply_theme("custom-pending");
+        let previous = app.config.theme.clone();
+        app.apply_theme(theme::THEMES[0]);
+        let fallback_revision = app.theme_selection_revision;
+        app.pending_theme_uninstalls
+            .insert("custom-pending".into(), Some((previous, fallback_revision)));
+        app.apply_theme("noir");
+
+        app.finish_theme_uninstall(
+            "custom-pending".into(),
+            Err("still required by child-theme".into()),
+        );
+
+        assert_eq!(app.config.theme, "noir");
+        assert!(!app.theme_uninstall_pending("custom-pending"));
+    }
+
+    #[test]
+    fn installed_theme_is_selectable_and_applies_live() {
+        let _env = crate::persist::test_env("installed-theme-settings");
+        let source = crate::persist::ensure_config_dir().join("custom-live.toml");
+        crate::theme::install::init(&source, "custom-live", None).unwrap();
+        crate::theme::install::install(source.to_str().unwrap(), true).unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        let index = app
+            .theme_registry
+            .index_of("custom-live")
+            .expect("installed theme appears in the dynamic registry");
+        assert!(
+            index < app.theme_registry.entries().len() - 1,
+            "custom themes appear before the virtual terminal theme"
+        );
+        let expected = app.theme_registry.theme("custom-live").unwrap();
+        app.apply_theme("custom-live");
+        assert_eq!(app.config.theme, "custom-live");
+        assert_eq!(app.theme, expected);
     }
 }

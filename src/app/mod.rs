@@ -2,7 +2,7 @@
 //! agent detection. Panes are stored flat and referenced by id from the tree
 //! (docs/04). Prefix-key driven.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{mpsc::Sender, Arc};
 use std::time::{Duration, Instant};
@@ -22,8 +22,10 @@ use crate::persist::{self, SessionSnapshot};
 use crate::terminal::pty::Pane;
 use crate::ui::theme::{State, Theme};
 
+mod backend;
 mod board;
 pub use board::agent_choices;
+pub(crate) mod diff;
 mod dispatch;
 pub(crate) mod files;
 mod git;
@@ -36,11 +38,11 @@ mod search;
 mod settings;
 mod switcher;
 
-pub use search::{GlobalSearch, SearchFlash, SearchHit};
+pub use search::{GlobalSearch, SearchFlash};
 
-pub use keys::{key_reference_rows, presets, Cmd, KEY_REFERENCE};
+pub use keys::{key_reference_rows, presets, Cmd, PrefixSpec, KEY_REFERENCE};
 pub use modules::ModuleMenuAction;
-pub use picker::{FolderPicker, Row};
+pub use picker::{FolderPicker, PickerHit, Row};
 pub use settings::{
     GeneralRow, LayoutRow, ModuleRow, SettingsTab, SettingsUi, KEYS_HEADER_ROWS, KEYS_PREFIX_ROW,
     KEYS_PRESET_ROW,
@@ -119,6 +121,7 @@ impl DockKind {
 /// (docs/30) can add its own variant later without another seam.
 pub enum ViewKind {
     File(crate::files::FileView),
+    Diff(Box<crate::diff::DiffView>),
 }
 
 /// Which sidebar a dock lives in (docs/29).
@@ -371,6 +374,9 @@ pub enum Mode {
 }
 
 pub struct Tab {
+    /// Stable public identity. Positions remain the human-facing CLI locator;
+    /// API integrations use this value across moves, swaps, and restarts.
+    pub id: String,
     pub layout: TileLayout,
     /// When `Some`, this is a **git tab** (docs/17): render the git dashboard
     /// instead of panes. The `layout` holds a placeholder leaf (no real pane is
@@ -393,6 +399,7 @@ impl Tab {
     /// A normal pane tab.
     fn panes(layout: TileLayout) -> Tab {
         Tab {
+            id: crate::ids::public_id("tab"),
             layout,
             git: None,
             orch: false,
@@ -434,14 +441,52 @@ pub struct CmdInspect {
 }
 
 /// The tab-rename modal (docs/28): the tab being renamed + its editable buffer,
-/// pre-filled with the current name. Opened by right-clicking a pane tab.
+/// pre-filled with the current name. Opened from a pane tab's context menu.
 pub struct TabRename {
-    pub index: usize,
+    pub target: TabMenuTarget,
     pub buffer: String,
 }
 
+/// Stable-enough identity for a tab context-menu target. A tab's complete leaf
+/// set is unique inside a live session, including dashboard placeholder leaves.
+/// Resolving this snapshot at click time prevents an intervening API reorder
+/// from making the menu act on whichever tab later occupies the old index.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TabMenuTarget {
+    pub workspace: usize,
+    pub leaves: Vec<PaneId>,
+}
+
+/// A right-click context menu on a tab. Reorder availability and module actions
+/// are snapshotted when it opens, while target identities are resolved against
+/// the live tab order when the user clicks.
+pub struct TabMenu {
+    pub target: TabMenuTarget,
+    pub anchor: (u16, u16),
+    pub items: Vec<(TabMenuItem, Rect)>,
+    pub module_actions: Vec<ModuleMenuAction>,
+    pub can_rename: bool,
+    pub can_move_left: bool,
+    pub can_move_right: bool,
+    /// Every other tab, snapshotted for the Swap With submenu.
+    pub swap_targets: Vec<(TabMenuTarget, String)>,
+    pub swap_open: bool,
+    pub swap_rects: Vec<(TabMenuTarget, Rect)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TabMenuItem {
+    Rename,
+    MoveLeft,
+    MoveRight,
+    SwapWith,
+    Divider,
+    /// The `i`-th module action declaring `contexts = ["tab"]`.
+    Module(usize),
+}
+
 /// Cap a custom tab name so a pathological paste can't bloat the session.
-const TAB_NAME_MAX: usize = 40;
+pub(crate) const TAB_NAME_MAX: usize = 40;
 
 /// A right-click context menu on a WORKSPACES row: rename / worktree / close the
 /// node. Opened by right-clicking a workspace in the sidebar.
@@ -583,6 +628,22 @@ pub struct FileMenu {
     pub editors: Vec<(String, String)>,
 }
 
+/// A right-click menu for one exact DIFF list entry. The key is snapshotted so
+/// an asynchronous status refresh cannot retarget the user's action.
+pub struct DiffMenu {
+    pub key: crate::diff::DiffKey,
+    pub anchor: (u16, u16),
+    pub items: Vec<(DiffMenuItem, Rect)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DiffMenuItem {
+    OpenPreview,
+    OpenPane,
+    OpenTab,
+    CopyPath,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FileMenuItem {
     /// Open in the native read-only viewer (files only).
@@ -710,6 +771,27 @@ pub struct PaneMoveResult {
 pub enum TabMoveError {
     PositionOutOfRange,
     SamePosition,
+    AlreadyFirst,
+    AlreadyLast,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TabMoveDirection {
+    Left,
+    Right,
+}
+
+/// Why an explicit tab focus request could not be applied.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TabFocusError {
+    PositionOutOfRange,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TabRenameError {
+    PositionOutOfRange,
+    Dashboard,
+    NameTooLong,
 }
 
 /// Why an existing agent session could not be forked into a sibling pane.
@@ -904,6 +986,8 @@ pub struct OrchStart {
 }
 
 pub struct Workspace {
+    /// Stable public identity across display reordering and restarts.
+    pub id: String,
     pub name: String,
     pub cwd: PathBuf,
     /// Current git branch of `cwd`, if it's inside a repo (for the WORKSPACES list).
@@ -925,6 +1009,19 @@ pub struct Workspace {
 pub struct AgentSession {
     pub agent: String,
     pub session_id: String,
+}
+
+/// Explicit agent lifecycle authority supplied by an integration. It is
+/// intentionally ephemeral and bounded by a lease: a crashed adapter cannot
+/// leave a pane permanently stuck in a fabricated state.
+#[derive(Clone)]
+pub struct AgentReport {
+    pub source: String,
+    pub agent: String,
+    pub state: State,
+    pub message: Option<String>,
+    pub sequence: u64,
+    pub expires_at: Instant,
 }
 
 /// Per-pane detection state (the runtime side of agent awareness).
@@ -976,6 +1073,13 @@ pub struct PaneStatus {
     /// one-key answer. Captured **once** when the pane enters Blocked (not every
     /// tick), cleared when it leaves; `None` when the pane isn't blocked.
     pub blocked_hint: Option<String>,
+    /// Explainable evidence from the last heuristic classification.
+    pub identity_source: &'static str,
+    pub state_source: &'static str,
+    pub rule_priority: Option<i32>,
+    pub rule_region: Option<&'static str>,
+    /// Optional authoritative state lease from an agent integration.
+    pub agent_report: Option<AgentReport>,
 }
 
 impl PaneStatus {
@@ -1003,6 +1107,11 @@ impl PaneStatus {
             detected_bottom: Arc::from(""),
             force_detect: true,
             blocked_hint: None,
+            identity_source: "command_fallback",
+            state_source: "no_positive_state_evidence",
+            rule_priority: None,
+            rule_region: None,
+            agent_report: None,
         }
     }
 }
@@ -1082,8 +1191,8 @@ impl Selection {
         }
     }
 
-    /// Whether terminal cell `(x, y)` is inside the linear selection (and the
-    /// pane's content area) — drives the render highlight.
+    /// Whether terminal cell `(x, y)` is inside the selection (and the pane's
+    /// content area) — drives the render highlight.
     pub fn contains(&self, x: u16, y: u16) -> bool {
         let c = self.content;
         if x < c.x || x >= c.right() || y < c.y || y >= c.bottom() {
@@ -1093,7 +1202,9 @@ impl Selection {
         if y < sy || y > ey {
             return false;
         }
-        let left = if y == sy { sx } else { c.x };
+        // Middle rows keep the drag's left edge instead of expanding into the
+        // pane margin. This keeps the highlighted range and copied text aligned.
+        let left = if y == sy { sx } else { sx.min(ex) };
         let right = if y == ey {
             ex
         } else {
@@ -1142,6 +1253,20 @@ impl CopyMode {
 
 pub struct App {
     pub panes: HashMap<PaneId, Pane>,
+    /// One random value for this server lifetime. Harness runtimes from an old
+    /// server fail closed even if a process-local pane route is later reused.
+    pub(crate) backend_server_generation: String,
+    /// O(1) stable terminal identity → mutable pane route lookup. Pending
+    /// deferred panes are absent until `PtyReady` reaches the app loop.
+    pub(crate) backend_terminal_index: HashMap<String, PaneId>,
+    /// Harness-assigned display labels are separate from addressable agent
+    /// aliases and from child-controlled OSC titles.
+    pub(crate) backend_labels: HashMap<PaneId, String>,
+    /// Bounded, event-driven protocol waits keyed by pane. These observe the
+    /// PTY's monotonic content revision and never poll from a socket worker.
+    pub(crate) backend_revision_waits:
+        HashMap<PaneId, Vec<crate::app::backend::BackendRevisionWait>>,
+    pub(crate) last_backend_wait_scan: Instant,
     pub status: HashMap<PaneId, PaneStatus>,
     /// Live agent aliases: a human name → the pane whose agent it points at, set
     /// via `agent.name` so `agent.send` / `agent.keys` / `agent.read` can address
@@ -1158,6 +1283,10 @@ pub struct App {
     pub workspaces: Vec<Workspace>,
     pub active_ws: usize,
     pub theme: Theme,
+    /// Built-in, installed, and virtual themes in Settings display order.
+    /// Loaded from the shared home-level `themes/` directory; rendering reads
+    /// this in-memory snapshot and never touches the filesystem.
+    pub theme_registry: crate::theme::ThemeRegistry,
     /// Active UI-language catalog (docs/21), resolved from `config.language`.
     pub catalog: &'static crate::i18n::Catalog,
     /// Persisted user configuration (theme, layout, notifications, keys).
@@ -1170,8 +1299,9 @@ pub struct App {
     pub settings: Option<SettingsUi>,
     /// The open folder picker (workspace chooser), if any (captures input).
     pub picker: Option<FolderPicker>,
-    /// Clickable rows in the open folder picker (row index → rect).
-    pub picker_rects: Vec<(usize, Rect)>,
+    /// Clickable targets in the open folder picker. Specific controls precede
+    /// the modal body in hit-test order.
+    pub picker_rects: Vec<(PickerHit, Rect)>,
     /// Whether the keyboard-shortcut cheat-sheet overlay is open (`Ctrl+Space ?`).
     pub help_open: bool,
     /// Whether the changelog modal is open (click the status-line version number).
@@ -1194,6 +1324,8 @@ pub struct App {
     pub worktree_prompt: Option<String>,
     /// Active tab-rename modal (docs/28); `None` when closed.
     pub tab_rename: Option<TabRename>,
+    /// Active tab context menu; `None` when closed.
+    pub tab_menu: Option<TabMenu>,
     /// The workspace right-click context menu, and the workspace-rename modal.
     pub ws_menu: Option<WsMenu>,
     /// Armed worktree-delete confirmation: the workspace index of the worktree to
@@ -1231,6 +1363,9 @@ pub struct App {
     pub module_docks: std::collections::HashMap<String, ModuleDock>,
     /// Clickable rows of module docks this frame: (dock id, row index, rect).
     pub module_dock_rects: Vec<(String, usize, Rect)>,
+    /// Server-owned Luvus Bar registry, notifications, and active-attachment
+    /// hit geometry. Rendering representations remain viewport-local.
+    pub bar: crate::bar::BarState,
     pub zoomed: bool,
     pub should_quit: bool,
     /// True when this `App` is owned by the background server. A server session
@@ -1290,6 +1425,10 @@ pub struct App {
     pub last_cursor: Option<(u16, u16)>,
     /// Foreground client asked to detach (prefix+q). Distinct from quit.
     pub detach_requested: bool,
+    /// The foreground client selected another named session in the global
+    /// finder. The server consumes this once and sends a logical handoff only
+    /// to that client.
+    pub pending_session_switch: Option<String>,
     /// The last node was closed, ending the session (docs/43 §3.3). *Every*
     /// client detaches, so the window closes, while the server stays up with no
     /// nodes — distinct from `detach_requested` (one client leaves, session
@@ -1378,6 +1517,14 @@ pub struct App {
     /// Pending server-side `wait.output` requests keyed by pane (docs/81).
     /// Satisfied by the pane's next output event, expired by the loop tick.
     output_waits: HashMap<PaneId, Vec<crate::app::dispatch::OutputWait>>,
+    /// Event-driven semantic waits keyed by pane. Unlike the old CLI-side
+    /// subscribe/poll composition, registration and the initial state check are
+    /// atomic on the app loop, so a transition cannot fall through the gap.
+    agent_waits: HashMap<PaneId, Vec<crate::app::dispatch::AgentWait>>,
+    /// Atomic launch/readiness workflows keyed by their new or selected pane.
+    agent_starts: HashMap<PaneId, crate::app::dispatch::AgentStart>,
+    /// Submitted prompts waiting for post-submission state/output evidence.
+    agent_prompts: HashMap<PaneId, Vec<crate::app::dispatch::AgentPrompt>>,
     /// Throttle for re-scanning parked waiters — the scan locks each waiting
     /// pane's VT engine and rebuilds its recent text, so it runs at ~100ms,
     /// not at the render frame rate. Deadline expiry still runs every tick.
@@ -1394,8 +1541,30 @@ pub struct App {
     /// The FILES dock (docs/38): the tree model, its scroll region, and the
     /// clickable rect per visible row (`(row index, rect)`), re-set each frame.
     pub file_tree: crate::files::FileTree,
+    /// `files.tree` callers waiting for the off-loop root directory read.
+    /// The targeted root prevents a workspace switch from redirecting a reply.
+    pending_file_tree_api: Vec<(PathBuf, crate::ipc::api::ApiRequest)>,
     pub files_area: Rect,
     pub file_tree_rects: Vec<(usize, Rect)>,
+    /// FILES/DIFF header controls and DIFF list rows (docs/88).
+    pub files_mode: crate::diff::FilesMode,
+    pub files_mode_rects: Vec<(crate::diff::FilesMode, Rect)>,
+    pub diff_row_rects: Vec<(usize, Rect)>,
+    /// Visible source rows inside native DIFF panes. A click selects the exact
+    /// stack-row identity and old/new side before note actions run.
+    pub diff_source_rects: Vec<(PaneId, usize, crate::diff::DiffSide, Rect)>,
+    /// Visible saved-note cards inside native DIFF panes. A left click opens
+    /// that exact note in the inline editor.
+    pub diff_note_rects: Vec<(PaneId, String, Rect)>,
+    /// Pane currently owning a mouse drag that selects an annotation range.
+    pub diff_note_drag: Option<PaneId>,
+    pub diff: crate::diff::DiffState,
+    pub diff_agent_picker: Option<crate::diff::DiffAgentPicker>,
+    pub diff_menu: Option<DiffMenu>,
+    /// API requests waiting for the shared off-loop FILES/DIFF status scan.
+    /// Each retains the workspace root it targeted so a later workspace switch
+    /// cannot redirect a parked mutation or read into a different repository.
+    pending_diff_api: Vec<(PathBuf, crate::ipc::api::ApiRequest)>,
     /// Working-tree git status per path, for tinting the FILES dock (docs/38).
     /// Refreshed off-loop; empty when the tree root isn't a repo.
     pub file_git_status: HashMap<PathBuf, crate::git::local::FileStatus>,
@@ -1446,9 +1615,13 @@ pub struct App {
     /// persisted — after a restart the pane is no longer that editor, so the
     /// label must not survive it. Untracked in `drop_leaf_runtime`.
     pub editor_files: HashMap<PaneId, PathBuf>,
-    /// The reused single-click **preview** file pane, if one is open — clicking
-    /// another file replaces its content instead of spawning a second pane.
-    pub preview_view: Option<PaneId>,
+    /// Most recently opened files, newest first, scoped by workspace folder.
+    /// This is a small in-memory finder convenience and is never persisted.
+    pub recent_files: VecDeque<(PathBuf, PathBuf)>,
+    /// Reused single-click **preview** panes. Each workspace may own one so
+    /// browsing FILES or DIFF never focuses and replaces another workspace's
+    /// preview.
+    pub preview_views: HashSet<PaneId>,
     /// AGENTS list filter: workspace-scoped (the default), all, or live only.
     pub agents_filter: AgentsFilter,
     /// Last active workspace shown, to auto-reveal it on a programmatic change.
@@ -1543,6 +1716,9 @@ pub struct App {
     /// Rebuilt each frame from the rows actually on screen, so scrolling a link
     /// out of view takes its click target with it.
     pub changelog_link_rects: Vec<(Rect, String)>,
+    /// Copyable installer/update command rows at the top of the changelog modal.
+    /// Each hit stores the exact untruncated command written to the clipboard.
+    pub changelog_copy_rects: Vec<(Rect, String)>,
     /// Cached display rows for the changelog modal, keyed by `(body width, theme
     /// name)`. Flattening the notes into wrapped, styled rows allocates, and the
     /// modal redraws every frame — so it is built once per open and reused until
@@ -1554,6 +1730,14 @@ pub struct App {
     pub settings_modal_rect: Option<Rect>,
     pub settings_tab_rects: Vec<(SettingsTab, Rect)>,
     pub settings_ctl_rects: Vec<(usize, Rect)>,
+    /// Right-aligned remove actions for installed theme rows. Store the stable
+    /// theme ID rather than its registry index so a reload cannot retarget a click.
+    pub settings_theme_remove_rects: Vec<(String, Rect)>,
+    /// Installed themes with an off-loop uninstall worker in flight. An optional
+    /// `(previous theme, selection revision)` restores an automatically replaced
+    /// active theme only when the user has not selected another theme meanwhile.
+    pub(crate) pending_theme_uninstalls: HashMap<String, Option<(String, u64)>>,
+    pub(crate) theme_selection_revision: u64,
     /// Slider arrows in the modal: (control index, ±1 direction, rect).
     pub settings_arrow_rects: Vec<(usize, i32, Rect)>,
     /// Installed modules (docs/13) and the ring buffer of their command logs.
@@ -1586,12 +1770,16 @@ impl App {
         let config = crate::config::load();
         let files_show_hidden = config.layout.files_show_hidden;
         crate::layout::set_gaps(config.layout.col_gap, config.layout.row_gap);
-        let theme = crate::ui::theme::by_name(&config.theme);
+        let theme_registry = crate::theme::ThemeRegistry::load();
+        let theme = theme_registry.theme_or_default(&config.theme);
         let catalog = crate::i18n::by_code(&config.language);
         let sidebars = Sidebars::from_config(&config.sidebars());
         let shell = crate::platform::resolve_shell(&config.shell);
         let keymap = keys::build_keymap(&config.keybindings);
         let prefix = keys::PrefixSpec::parse(&config.prefix).unwrap_or_default();
+        let modules = crate::module::registry::load();
+        let mut bar = crate::bar::BarState::default();
+        bar.sync_modules(&modules);
 
         let id = PaneId::alloc();
         let pane = Pane::spawn(
@@ -1607,15 +1795,30 @@ impl App {
         let command = pane.command.clone();
         let mut panes = HashMap::new();
         panes.insert(id, pane);
+        let backend_server_generation =
+            crate::terminal::backend::random_id().map_err(anyhow::Error::msg)?;
+        let backend_terminal_index = panes
+            .iter()
+            .filter_map(|(pane_id, pane)| {
+                pane.terminal_runtime()
+                    .map(|runtime| (runtime.terminal_id, *pane_id))
+            })
+            .collect();
         let mut status = HashMap::new();
         status.insert(id, PaneStatus::new(command));
 
         let mut app = App {
             panes,
+            backend_server_generation,
+            backend_terminal_index,
+            backend_labels: HashMap::new(),
+            backend_revision_waits: HashMap::new(),
+            last_backend_wait_scan: Instant::now(),
             status,
             manifests: crate::detect::Manifests::load(&crate::persist::ensure_manifests_dir()),
             editors: crate::platform::editor_choices(),
             workspaces: vec![Workspace {
+                id: crate::ids::public_id("workspace"),
                 name,
                 worktree: worktree_membership(&cwd),
                 cwd,
@@ -1627,6 +1830,7 @@ impl App {
             }],
             active_ws: 0,
             theme,
+            theme_registry,
             catalog,
             config,
             keymap,
@@ -1643,6 +1847,7 @@ impl App {
             pane_title_rects: Vec::new(),
             worktree_prompt: None,
             tab_rename: None,
+            tab_menu: None,
             ws_menu: None,
             worktree_delete: None,
             pane_menu: None,
@@ -1662,6 +1867,7 @@ impl App {
             sidebars,
             module_docks: std::collections::HashMap::new(),
             module_dock_rects: Vec::new(),
+            bar,
             zoomed: false,
             should_quit: false,
             server_mode: false,
@@ -1689,6 +1895,7 @@ impl App {
             usage_mtimes: std::collections::HashMap::new(),
             last_cursor: None,
             detach_requested: false,
+            pending_session_switch: None,
             end_session: false,
             force_redraw: false,
             pending_notify: Vec::new(),
@@ -1720,6 +1927,9 @@ impl App {
             detection_extractions: 0,
             detection_skips: 0,
             output_waits: HashMap::new(),
+            agent_waits: HashMap::new(),
+            agent_starts: HashMap::new(),
+            agent_prompts: HashMap::new(),
             last_output_wait_scan: Instant::now(),
             workspaces_scroll: 0,
             agents_scroll: 0,
@@ -1737,11 +1947,23 @@ impl App {
                 t.show_hidden = files_show_hidden;
                 t
             },
+            pending_file_tree_api: Vec::new(),
             files_area: Rect::ZERO,
             file_tree_rects: Vec::new(),
+            files_mode: crate::diff::FilesMode::Files,
+            files_mode_rects: Vec::new(),
+            diff_row_rects: Vec::new(),
+            diff_source_rects: Vec::new(),
+            diff_note_rects: Vec::new(),
+            diff_note_drag: None,
+            diff: crate::diff::DiffState::default(),
+            diff_agent_picker: None,
+            diff_menu: None,
+            pending_diff_api: Vec::new(),
             views: HashMap::new(),
             editor_files: HashMap::new(),
-            preview_view: None,
+            recent_files: VecDeque::new(),
+            preview_views: HashSet::new(),
             file_git_status: HashMap::new(),
             git_status_inflight: false,
             last_git_status_at: Instant::now()
@@ -1800,14 +2022,18 @@ impl App {
             changelog_close_rect: None,
             changelog_check_rect: None,
             changelog_link_rects: Vec::new(),
+            changelog_copy_rects: Vec::new(),
             changelog_rows: None,
             settings_icon_rect: None,
             settings_close_rect: None,
             settings_modal_rect: None,
             settings_tab_rects: Vec::new(),
             settings_ctl_rects: Vec::new(),
+            settings_theme_remove_rects: Vec::new(),
+            pending_theme_uninstalls: HashMap::new(),
+            theme_selection_revision: 0,
             settings_arrow_rects: Vec::new(),
-            modules: crate::module::registry::load(),
+            modules,
             module_logs: Vec::new(),
             module_panes: HashMap::new(),
             module_startup_done: std::collections::HashSet::new(),
@@ -1816,6 +2042,7 @@ impl App {
         // A fresh start still loads `orch.json` — its pane bindings belong to a
         // previous server run, so rebind/clear them (same as `from_snapshot`).
         app.orch_reconcile();
+        app.refresh_core_bar_widgets();
         Ok(app)
     }
 
@@ -1856,6 +2083,7 @@ impl App {
                         let view = crate::git::GitView::new(ws.cwd.clone());
                         let placeholder = PaneId::alloc();
                         tabs.push(Tab {
+                            id: tab.id.clone(),
                             layout: TileLayout::new(placeholder),
                             git: Some(Box::new(view)),
                             orch: false,
@@ -1870,6 +2098,7 @@ impl App {
                 if tab.orch {
                     let placeholder = PaneId::alloc();
                     tabs.push(Tab {
+                        id: tab.id.clone(),
                         layout: TileLayout::new(placeholder),
                         git: None,
                         orch: true,
@@ -1883,6 +2112,7 @@ impl App {
                 if tab.mission {
                     let placeholder = PaneId::alloc();
                     tabs.push(Tab {
+                        id: tab.id.clone(),
                         layout: TileLayout::new(placeholder),
                         git: None,
                         orch: false,
@@ -1915,13 +2145,60 @@ impl App {
                         remap.insert(*raw, id);
                         continue;
                     }
+                    // A DIFF leaf restores only its specification and display
+                    // state. Current patch content is fetched again off-loop.
+                    if let Some(spec) = &ps.diff {
+                        let context_lines = spec.context_lines.min(crate::diff::MAX_CONTEXT_LINES);
+                        let mut view = crate::diff::DiffView::new(
+                            spec.root.clone(),
+                            spec.key.clone(),
+                            spec.preference,
+                            context_lines,
+                            spec.show_line_numbers,
+                            spec.wrap,
+                        );
+                        view.request_token = 1;
+                        view.scroll = spec.scroll;
+                        view.selected = spec.selected;
+                        view.selected_side = spec.selected_side;
+                        view.horizontal = spec.horizontal;
+                        views.insert(id, ViewKind::Diff(Box::new(view)));
+                        let tx = app_tx.clone();
+                        let root = spec.root.clone();
+                        let file = crate::diff::DiffFile {
+                            key: spec.key.clone(),
+                            status: spec.status,
+                            additions: None,
+                            deletions: None,
+                            binary: false,
+                            unresolved_notes: 0,
+                            viewed_fingerprint: None,
+                            fingerprint: String::new(),
+                        };
+                        let context = context_lines;
+                        std::thread::spawn(move || {
+                            let result =
+                                crate::diff::git::load_diff(&root, &file, context).map(|diff| {
+                                    crate::diff::LoadedDiff {
+                                        diff,
+                                        reconciled_notes: Vec::new(),
+                                    }
+                                });
+                            let _ = tx.send(crate::event::AppEvent::DiffLoaded {
+                                id,
+                                token: 1,
+                                result,
+                            });
+                        });
+                        remap.insert(*raw, id);
+                        continue;
+                    }
                     // Resume the native agent session captured at save time (a
                     // precise hook report, or one discovered from the agent's
                     // on-disk store keyed by cwd — see `persist::snapshot`).
-                    // Preferably the shell *starts* on the resume command, so
-                    // the pane opens straight into the resuming agent (nothing
-                    // visibly typed); an unrecognised shell family falls back
-                    // to typing the command after spawn.
+                    // PowerShell can start directly on the resume command.
+                    // POSIX and unrecognised shells start normally and receive
+                    // it through the PTY after interactive profile setup.
                     // Re-apply the launch flags captured at save time (docs/62),
                     // unless Settings → General turns that off.
                     let resume = ps.agent_session.as_ref().and_then(|(agent, sid)| {
@@ -2013,6 +2290,7 @@ impl App {
                 match TileLayout::from_tree(&tab.tree, &remap, tab.focus) {
                     Some(layout) => {
                         let mut t = Tab::panes(layout);
+                        t.id = tab.id.clone();
                         t.name = tab.name.clone();
                         tabs.push(t);
                     }
@@ -2030,6 +2308,7 @@ impl App {
             }
             let active_tab = ws.active_tab.min(tabs.len() - 1);
             workspaces.push(Workspace {
+                id: ws.id,
                 name: ws.name,
                 worktree: worktree_membership(&ws.cwd),
                 cwd: ws.cwd,
@@ -2044,11 +2323,22 @@ impl App {
             return None;
         }
         let active_ws = snap.active_ws.min(workspaces.len() - 1);
+        let backend_server_generation = crate::terminal::backend::random_id().ok()?;
+        let backend_terminal_index = panes
+            .iter()
+            .filter_map(|(pane_id, pane)| {
+                pane.terminal_runtime()
+                    .map(|runtime| (runtime.terminal_id, *pane_id))
+            })
+            .collect();
 
         crate::layout::set_gaps(config.layout.col_gap, config.layout.row_gap);
-        let theme = crate::ui::theme::by_name(&config.theme);
+        let theme_registry = crate::theme::ThemeRegistry::load();
+        let theme = theme_registry.theme_or_default(&config.theme);
         let catalog = crate::i18n::by_code(&config.language);
         let sidebars = Sidebars::from_config(&config.sidebars());
+        let mut bar = crate::bar::BarState::default();
+        bar.sync_modules(&modules);
         // Restore live pane names, minus any whose pane failed to come back.
         let agent_names: HashMap<String, PaneId> = restored_names
             .into_iter()
@@ -2057,12 +2347,18 @@ impl App {
 
         let mut app = App {
             panes,
+            backend_server_generation,
+            backend_terminal_index,
+            backend_labels: HashMap::new(),
+            backend_revision_waits: HashMap::new(),
+            last_backend_wait_scan: Instant::now(),
             status,
             manifests: crate::detect::Manifests::load(&crate::persist::ensure_manifests_dir()),
             editors: crate::platform::editor_choices(),
             workspaces,
             active_ws,
             theme,
+            theme_registry,
             catalog,
             config,
             keymap,
@@ -2079,6 +2375,7 @@ impl App {
             pane_title_rects: Vec::new(),
             worktree_prompt: None,
             tab_rename: None,
+            tab_menu: None,
             ws_menu: None,
             worktree_delete: None,
             pane_menu: None,
@@ -2098,6 +2395,7 @@ impl App {
             sidebars,
             module_docks: std::collections::HashMap::new(),
             module_dock_rects: Vec::new(),
+            bar,
             zoomed: false,
             should_quit: false,
             server_mode: false,
@@ -2125,6 +2423,7 @@ impl App {
             usage_mtimes: std::collections::HashMap::new(),
             last_cursor: None,
             detach_requested: false,
+            pending_session_switch: None,
             end_session: false,
             force_redraw: false,
             pending_notify: Vec::new(),
@@ -2156,6 +2455,9 @@ impl App {
             detection_extractions: 0,
             detection_skips: 0,
             output_waits: HashMap::new(),
+            agent_waits: HashMap::new(),
+            agent_starts: HashMap::new(),
+            agent_prompts: HashMap::new(),
             last_output_wait_scan: Instant::now(),
             workspaces_scroll: 0,
             agents_scroll: 0,
@@ -2173,11 +2475,23 @@ impl App {
                 t.show_hidden = files_show_hidden;
                 t
             },
+            pending_file_tree_api: Vec::new(),
             files_area: Rect::ZERO,
             file_tree_rects: Vec::new(),
+            files_mode: crate::diff::FilesMode::Files,
+            files_mode_rects: Vec::new(),
+            diff_row_rects: Vec::new(),
+            diff_source_rects: Vec::new(),
+            diff_note_rects: Vec::new(),
+            diff_note_drag: None,
+            diff: crate::diff::DiffState::default(),
+            diff_agent_picker: None,
+            diff_menu: None,
+            pending_diff_api: Vec::new(),
             views,
             editor_files: HashMap::new(),
-            preview_view: None,
+            recent_files: VecDeque::new(),
+            preview_views: HashSet::new(),
             file_git_status: HashMap::new(),
             git_status_inflight: false,
             last_git_status_at: Instant::now()
@@ -2236,12 +2550,16 @@ impl App {
             changelog_close_rect: None,
             changelog_check_rect: None,
             changelog_link_rects: Vec::new(),
+            changelog_copy_rects: Vec::new(),
             changelog_rows: None,
             settings_icon_rect: None,
             settings_close_rect: None,
             settings_modal_rect: None,
             settings_tab_rects: Vec::new(),
             settings_ctl_rects: Vec::new(),
+            settings_theme_remove_rects: Vec::new(),
+            pending_theme_uninstalls: HashMap::new(),
+            theme_selection_revision: 0,
             settings_arrow_rects: Vec::new(),
             modules,
             module_logs: Vec::new(),
@@ -2253,6 +2571,7 @@ impl App {
         // the previous server are stale — rebind them to the restored panes (by
         // worktree cwd) or clear them, so the board never lies (docs/22).
         app.orch_reconcile();
+        app.refresh_core_bar_widgets();
         Some(app)
     }
 
@@ -2384,10 +2703,12 @@ impl App {
     }
 
     /// The **dock registry** (docs/29): every dock the settings can place —
-    /// built-ins plus every dock declared by an installed, runnable module, plus
-    /// any currently-mounted dock not otherwise listed (e.g. a stale config
-    /// entry). Deduplicated, built-ins first. Its current side is
-    /// `sidebars.side_of(kind)` (`None` = not placed yet).
+    /// built-ins plus every dock declared by an installed, runnable module, then
+    /// live/configured fallback docks sorted by id. The fallback order is
+    /// deliberately independent from sidebar placement: moving a dock appends it
+    /// on that side, but must not move its Settings row under the pointer.
+    /// Deduplicated, built-ins first. Its current side is `sidebars.side_of(kind)`
+    /// (`None` = not placed yet).
     pub fn available_docks(&self) -> Vec<DockKind> {
         let mut v = vec![DockKind::Workspaces, DockKind::Agents, DockKind::Files];
         for m in self.modules.modules.iter().filter(|m| m.is_runnable()) {
@@ -2398,7 +2719,21 @@ impl App {
                 }
             }
         }
-        for k in self.docks_flat() {
+
+        // A live API dock can exist without a currently-runnable declaration,
+        // and an explicitly-off stale dock exists only in `docks_off`. Keep all
+        // of them placeable, but sort this fallback set instead of deriving its
+        // order from left/right sidebar vectors that placement mutates.
+        let mut fallback: Vec<DockKind> = self
+            .module_docks
+            .keys()
+            .chain(self.config.docks_off.iter())
+            .map(|id| DockKind::Module(id.clone()))
+            .chain(self.docks_flat())
+            .collect();
+        fallback.sort_by(|a, b| a.id().cmp(b.id()));
+        fallback.dedup();
+        for k in fallback {
             if !v.contains(&k) {
                 v.push(k);
             }
@@ -2599,9 +2934,9 @@ impl App {
         Some(id)
     }
 
-    /// `spawn_into`, but the shell starts on the `resume` command (falling back
-    /// to typing it into the prompt when the shell family isn't recognised) —
-    /// a resumed session opens straight into its agent.
+    /// `spawn_into`, but queues an agent resume/fork command. POSIX and custom
+    /// shells receive it through a normal interactive PTY so profile-managed
+    /// executables are available; PowerShell can launch it directly.
     fn spawn_resume_pane(&mut self, cwd: PathBuf, resume: &str) -> Option<PaneId> {
         let id = PaneId::alloc();
         let shell = crate::platform::resolve_shell(&self.config.shell);
@@ -2697,12 +3032,12 @@ impl App {
             .get(&pane)
             .map(|p| p.cwd.clone())
             .ok_or(AgentForkError::PaneNotFound)?;
-        let sid = st
-            .agent_session
-            .as_ref()
-            .map(|s| s.session_id.clone())
-            .or_else(|| crate::agent::latest_session(&agent, &cwd));
-        let sid = sid.ok_or(AgentForkError::SessionUnknown)?;
+        let sid = crate::agent::fork_session_id(
+            &agent,
+            st.agent_session.as_ref().map(|s| s.session_id.as_str()),
+            &cwd,
+        )
+        .ok_or(AgentForkError::SessionUnknown)?;
         let fork =
             crate::agent::fork_command(&agent, &sid).ok_or(AgentForkError::UnsupportedAgent)?;
 
@@ -2735,16 +3070,11 @@ impl App {
         if let Some(nst) = self.status.get_mut(&new_id) {
             nst.agent = agent.clone();
         }
-        // Pin the *source* pane to the session we just forked from.
-        //
-        // We resolved `sid` above, so this pane's session is known right now —
-        // but the fork is about to write a *newer* session into the same folder,
-        // and a pane with no recorded session is resolved at save time by
-        // "newest in this folder" (`persist::resolve_pane_sessions`). Without
-        // this, the parent would later be attributed its own child's session,
-        // and the fork would be left with none. Recording it now keeps both
-        // panes pointing at the right conversation. A hook report still wins:
-        // it overwrites this, and we only fill a pane that had nothing.
+        // Pin the *source* pane to the session we just forked from. The fork is
+        // about to create another session in the same folder, and disk discovery
+        // deliberately refuses ambiguous ownership at save time. Recording this
+        // exact binding keeps the parent resumable until the fork reports its own
+        // session. A hook report still wins because we only fill an empty binding.
         if let Some(st) = self.status.get_mut(&pane) {
             if st.agent_session.is_none() {
                 st.agent_session = Some(AgentSession {
@@ -2881,6 +3211,7 @@ impl App {
             return false;
         };
         self.workspaces.push(Workspace {
+            id: crate::ids::public_id("workspace"),
             name,
             worktree: worktree_membership(&cwd),
             cwd,
@@ -3006,10 +3337,13 @@ impl App {
     /// Open the rename modal for tab `index` (docs/28). No-op for the git/orch
     /// dashboards or the `+` button (index past the last tab).
     pub fn open_tab_rename(&mut self, index: usize) {
-        if let Some(tab) = self.ws().tabs.get(index) {
+        let workspace = self.active_ws;
+        if let Some(tab) = self.workspaces[workspace].tabs.get(index) {
             if tab.is_renameable() {
                 let buffer = tab.name.clone().unwrap_or_default();
-                self.tab_rename = Some(TabRename { index, buffer });
+                if let Some(target) = self.tab_menu_target(workspace, index) {
+                    self.tab_rename = Some(TabRename { target, buffer });
+                }
             }
         }
     }
@@ -3021,13 +3355,12 @@ impl App {
             KeyCode::Esc => self.tab_rename = None,
             KeyCode::Enter => {
                 if let Some(r) = self.tab_rename.take() {
-                    let name = r.buffer.trim();
-                    let value = (!name.is_empty()).then(|| name.to_string());
-                    let ws = &mut self.workspaces[self.active_ws];
-                    if let Some(tab) = ws.tabs.get_mut(r.index) {
-                        tab.name = value;
+                    let target = self.resolve_tab_menu_target(&r.target);
+                    if let Some((workspace, index)) = target {
+                        let _ = self.rename_tab_in_workspace(workspace, index, &r.buffer);
+                    } else {
+                        self.show_toast(self.catalog.tab_changed_rename_cancelled);
                     }
-                    self.session_dirty = true;
                 }
             }
             KeyCode::Backspace => {
@@ -3043,6 +3376,196 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    // ── tab context menu (right-click a tab) ──
+
+    fn tab_menu_target(&self, workspace: usize, index: usize) -> Option<TabMenuTarget> {
+        let tab = self.workspaces.get(workspace)?.tabs.get(index)?;
+        Some(TabMenuTarget {
+            workspace,
+            leaves: tab.layout.leaves(),
+        })
+    }
+
+    fn resolve_tab_menu_target(&self, target: &TabMenuTarget) -> Option<(usize, usize)> {
+        let ws = self.workspaces.get(target.workspace)?;
+        let index = ws
+            .tabs
+            .iter()
+            .position(|tab| tab.layout.leaves() == target.leaves)?;
+        Some((target.workspace, index))
+    }
+
+    fn tab_menu_label(tab: &Tab, index: usize) -> String {
+        if let Some(name) = tab.name.as_deref() {
+            name.to_string()
+        } else if tab.is_git() {
+            "git".to_string()
+        } else if tab.is_orch() {
+            "orch".to_string()
+        } else if tab.is_mission() {
+            "ctrl".to_string()
+        } else {
+            format!("#{}", index + 1)
+        }
+    }
+
+    /// Open the context menu for the exact tab that was right-clicked. The `+`
+    /// button shares `tab_rects`, so an index past the real tabs is rejected.
+    pub fn open_tab_menu(&mut self, index: usize, col: u16, row: u16) {
+        let workspace = self.active_ws;
+        let Some(target) = self.tab_menu_target(workspace, index) else {
+            return;
+        };
+        let ws = &self.workspaces[workspace];
+        let tab = &ws.tabs[index];
+        let can_rename = tab.is_renameable();
+        let can_move_left = index > 0;
+        let can_move_right = index + 1 < ws.tabs.len();
+        let swap_targets = ws
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(other, _)| *other != index)
+            .filter_map(|(other, tab)| {
+                self.tab_menu_target(workspace, other)
+                    .map(|target| (target, Self::tab_menu_label(tab, other)))
+            })
+            .collect();
+        self.tab_menu = Some(TabMenu {
+            target,
+            anchor: (col, row),
+            items: Vec::new(),
+            module_actions: self.module_menu_actions("tab"),
+            can_rename,
+            can_move_left,
+            can_move_right,
+            swap_targets,
+            swap_open: false,
+            swap_rects: Vec::new(),
+        });
+    }
+
+    /// Stable rows for the open tab menu. Availability is snapshotted at open so
+    /// a background socket request cannot shift which action an old hitbox means.
+    pub fn tab_menu_items(&self) -> Vec<TabMenuItem> {
+        let Some(menu) = self.tab_menu.as_ref() else {
+            return Vec::new();
+        };
+        let mut items = Vec::new();
+        if menu.can_rename {
+            items.push(TabMenuItem::Rename);
+        }
+        if menu.can_move_left {
+            items.push(TabMenuItem::MoveLeft);
+        }
+        if menu.can_move_right {
+            items.push(TabMenuItem::MoveRight);
+        }
+        if !menu.swap_targets.is_empty() {
+            items.push(TabMenuItem::SwapWith);
+        }
+        if !menu.module_actions.is_empty() {
+            if !items.is_empty() {
+                items.push(TabMenuItem::Divider);
+            }
+            items.extend((0..menu.module_actions.len()).map(TabMenuItem::Module));
+        }
+        items
+    }
+
+    /// Route a click to the Swap With submenu or the main tab-menu rows.
+    pub fn tab_menu_click(&mut self, col: u16, row: u16) {
+        let in_rect = |r: &Rect| col >= r.x && col < r.right() && row >= r.y && row < r.bottom();
+        let swap_hit = self.tab_menu.as_ref().and_then(|menu| {
+            menu.swap_rects
+                .iter()
+                .find(|(_, rect)| in_rect(rect))
+                .map(|(target, _)| (menu.target.clone(), target.clone()))
+        });
+        if let Some((source, target)) = swap_hit {
+            self.tab_menu = None;
+            let source = self.resolve_tab_menu_target(&source);
+            let target = self.resolve_tab_menu_target(&target);
+            match (source, target) {
+                (Some((workspace, from)), Some((target_workspace, to)))
+                    if workspace == target_workspace =>
+                {
+                    let _ = self.swap_tabs_in_workspace(workspace, from, to);
+                }
+                _ => self.show_toast(self.catalog.tab_changed_reopen_menu),
+            }
+            return;
+        }
+
+        let hit = self.tab_menu.as_ref().and_then(|menu| {
+            menu.items
+                .iter()
+                .find(|(_, rect)| in_rect(rect))
+                .map(|(item, _)| *item)
+        });
+        match hit {
+            Some(TabMenuItem::SwapWith) => {
+                if let Some(menu) = self.tab_menu.as_mut() {
+                    menu.swap_open = true;
+                }
+            }
+            Some(TabMenuItem::Divider) => {}
+            Some(item) => self.tab_menu_action(item),
+            None => self.tab_menu = None,
+        }
+    }
+
+    /// Run a tab-menu action on the snapshotted tab, then close the menu.
+    pub fn tab_menu_action(&mut self, item: TabMenuItem) {
+        let Some((target, actions)) = self
+            .tab_menu
+            .as_ref()
+            .map(|menu| (menu.target.clone(), menu.module_actions.clone()))
+        else {
+            return;
+        };
+        self.tab_menu = None;
+        let Some((workspace, index)) = self.resolve_tab_menu_target(&target) else {
+            self.show_toast(self.catalog.tab_changed_reopen_menu);
+            return;
+        };
+        match item {
+            TabMenuItem::Rename => {
+                if workspace == self.active_ws {
+                    self.open_tab_rename(index);
+                }
+            }
+            TabMenuItem::MoveLeft => {
+                if self
+                    .move_tab_direction_in_workspace(workspace, index, TabMoveDirection::Left)
+                    .is_err()
+                {
+                    self.show_toast(self.catalog.tab_cannot_move_left);
+                }
+            }
+            TabMenuItem::MoveRight => {
+                if self
+                    .move_tab_direction_in_workspace(workspace, index, TabMoveDirection::Right)
+                    .is_err()
+                {
+                    self.show_toast(self.catalog.tab_cannot_move_right);
+                }
+            }
+            TabMenuItem::SwapWith | TabMenuItem::Divider => {}
+            TabMenuItem::Module(i) => {
+                if let Some(action) = actions.get(i).cloned() {
+                    self.run_module_menu_action("tab", action, Target::tab(workspace, index));
+                }
+            }
+        }
+    }
+
+    pub fn handle_tab_menu_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc {
+            self.tab_menu = None;
         }
     }
 
@@ -3302,7 +3825,12 @@ impl App {
 
     /// Open the pane-rename modal for `pane`, pre-filled with its current name.
     pub fn open_pane_rename(&mut self, pane: PaneId) {
-        let buffer = self.agent_name_for(pane).unwrap_or("").to_string();
+        let buffer = self
+            .agent_names
+            .iter()
+            .find_map(|(name, target)| (*target == pane).then_some(name.as_str()))
+            .unwrap_or("")
+            .to_string();
         self.pane_rename = Some(PaneRename { pane, buffer });
     }
 
@@ -3380,10 +3908,7 @@ impl App {
             return;
         }
         let move_targets = self.pane_move_targets();
-        let can_fork = self
-            .status
-            .get(&pane)
-            .is_some_and(|st| crate::agent::can_fork(&st.agent));
+        let can_fork = self.can_fork_pane(pane);
         let link = self.link_at_screen(col, row).map(|h| h.target);
         self.pane_menu = Some(PaneMenu {
             pane,
@@ -3396,6 +3921,30 @@ impl App {
             can_fork,
             link,
         });
+    }
+
+    /// Whether `pane` has both a native fork implementation and a safe source
+    /// session. Codex deliberately has no cwd-based fallback: several rollouts
+    /// commonly share a directory, so showing Fork without its exact binding
+    /// would offer an action that must fail or fork the wrong conversation.
+    fn can_fork_pane(&self, pane: PaneId) -> bool {
+        let Some(st) = self.status.get(&pane) else {
+            return false;
+        };
+        if !crate::agent::can_fork(&st.agent) {
+            return false;
+        }
+        let Some(cwd) = self.panes.get(&pane).map(|pane| &pane.cwd) else {
+            return false;
+        };
+        crate::agent::fork_session_id(
+            &st.agent,
+            st.agent_session
+                .as_ref()
+                .map(|session| session.session_id.as_str()),
+            cwd,
+        )
+        .is_some()
     }
 
     /// The tabs this pane could move into: every other real pane tab in the
@@ -3570,7 +4119,70 @@ impl App {
     /// final positions. The active tab follows the same tab object rather than
     /// staying on the old numeric slot.
     pub fn move_tab(&mut self, from: usize, to: usize) -> Result<usize, TabMoveError> {
-        let len = self.ws().tabs.len();
+        self.move_tab_in_workspace(self.active_ws, from, to)
+    }
+
+    /// Swap two tab positions in the active workspace. The active tab follows
+    /// the same tab object when either swapped position contains it.
+    pub fn swap_tabs(&mut self, first: usize, second: usize) -> Result<usize, TabMoveError> {
+        self.swap_tabs_in_workspace(self.active_ws, first, second)
+    }
+
+    /// Move one tab by one adjacent position. `from = None` targets the active
+    /// tab, which powers `luvus tab move left|right`; an explicit zero-based
+    /// source powers `--tab N` and the right-click menu.
+    pub fn move_tab_direction(
+        &mut self,
+        from: Option<usize>,
+        direction: TabMoveDirection,
+    ) -> Result<(usize, usize, usize), TabMoveError> {
+        let from = from.unwrap_or(self.ws().active_tab);
+        let to = self.adjacent_tab_position(self.active_ws, from, direction)?;
+        let active = self.move_tab_in_workspace(self.active_ws, from, to)?;
+        Ok((from, to, active))
+    }
+
+    fn move_tab_direction_in_workspace(
+        &mut self,
+        workspace: usize,
+        from: usize,
+        direction: TabMoveDirection,
+    ) -> Result<usize, TabMoveError> {
+        let to = self.adjacent_tab_position(workspace, from, direction)?;
+        self.move_tab_in_workspace(workspace, from, to)
+    }
+
+    fn adjacent_tab_position(
+        &self,
+        workspace: usize,
+        from: usize,
+        direction: TabMoveDirection,
+    ) -> Result<usize, TabMoveError> {
+        let len = self
+            .workspaces
+            .get(workspace)
+            .map(|ws| ws.tabs.len())
+            .ok_or(TabMoveError::PositionOutOfRange)?;
+        if from >= len {
+            return Err(TabMoveError::PositionOutOfRange);
+        }
+        match direction {
+            TabMoveDirection::Left => from.checked_sub(1).ok_or(TabMoveError::AlreadyFirst),
+            TabMoveDirection::Right if from + 1 < len => Ok(from + 1),
+            TabMoveDirection::Right => Err(TabMoveError::AlreadyLast),
+        }
+    }
+
+    fn move_tab_in_workspace(
+        &mut self,
+        workspace: usize,
+        from: usize,
+        to: usize,
+    ) -> Result<usize, TabMoveError> {
+        let Some(ws) = self.workspaces.get(workspace) else {
+            return Err(TabMoveError::PositionOutOfRange);
+        };
+        let len = ws.tabs.len();
         if from >= len || to >= len {
             return Err(TabMoveError::PositionOutOfRange);
         }
@@ -3578,9 +4190,9 @@ impl App {
             return Err(TabMoveError::SamePosition);
         }
 
-        let active = self.ws().active_tab;
+        let active = ws.active_tab;
         let new_active = {
-            let ws = &mut self.workspaces[self.active_ws];
+            let ws = &mut self.workspaces[workspace];
             let tab = ws.tabs.remove(from);
             ws.tabs.insert(to, tab);
             ws.active_tab = if active == from {
@@ -3598,9 +4210,52 @@ impl App {
         self.emit_event(
             "tab.moved",
             serde_json::json!({
+                "workspace": workspace.to_string(),
                 "from": (from + 1).to_string(),
                 "to": (to + 1).to_string(),
                 "active": (new_active + 1).to_string(),
+            }),
+        );
+        Ok(new_active)
+    }
+
+    fn swap_tabs_in_workspace(
+        &mut self,
+        workspace: usize,
+        first: usize,
+        second: usize,
+    ) -> Result<usize, TabMoveError> {
+        let Some(ws) = self.workspaces.get(workspace) else {
+            return Err(TabMoveError::PositionOutOfRange);
+        };
+        if first >= ws.tabs.len() || second >= ws.tabs.len() {
+            return Err(TabMoveError::PositionOutOfRange);
+        }
+        if first == second {
+            return Err(TabMoveError::SamePosition);
+        }
+
+        let new_active = {
+            let ws = &mut self.workspaces[workspace];
+            ws.tabs.swap(first, second);
+            ws.active_tab = if ws.active_tab == first {
+                second
+            } else if ws.active_tab == second {
+                first
+            } else {
+                ws.active_tab
+            };
+            ws.active_tab
+        };
+        self.session_dirty = true;
+        self.emit_event(
+            "tab.moved",
+            serde_json::json!({
+                "workspace": workspace.to_string(),
+                "from": (first + 1).to_string(),
+                "to": (second + 1).to_string(),
+                "active": (new_active + 1).to_string(),
+                "mode": "swap",
             }),
         );
         Ok(new_active)
@@ -3807,11 +4462,59 @@ impl App {
         }
     }
 
-    fn switch_tab(&mut self, i: usize) {
-        let ws = &mut self.workspaces[self.active_ws];
-        if i < ws.tabs.len() {
-            ws.active_tab = i;
+    /// Focus an exact zero-based tab position in the active workspace.
+    pub fn focus_tab(&mut self, index: usize) -> Result<(), TabFocusError> {
+        self.focus_tab_in_workspace(self.active_ws, index)
+    }
+
+    /// Rename an exact zero-based tab in the active workspace. Empty text clears
+    /// the custom label; dashboards retain their fixed product labels.
+    pub fn rename_tab(&mut self, index: usize, name: &str) -> Result<(), TabRenameError> {
+        self.rename_tab_in_workspace(self.active_ws, index, name)
+    }
+
+    fn rename_tab_in_workspace(
+        &mut self,
+        workspace: usize,
+        index: usize,
+        name: &str,
+    ) -> Result<(), TabRenameError> {
+        let name = name.trim();
+        if name.chars().count() > TAB_NAME_MAX {
+            return Err(TabRenameError::NameTooLong);
         }
+        let tab = self
+            .workspaces
+            .get_mut(workspace)
+            .and_then(|ws| ws.tabs.get_mut(index))
+            .ok_or(TabRenameError::PositionOutOfRange)?;
+        if !tab.is_renameable() {
+            return Err(TabRenameError::Dashboard);
+        }
+        tab.name = (!name.is_empty()).then(|| name.to_string());
+        self.session_dirty = true;
+        Ok(())
+    }
+
+    fn focus_tab_in_workspace(
+        &mut self,
+        workspace: usize,
+        index: usize,
+    ) -> Result<(), TabFocusError> {
+        if self
+            .workspaces
+            .get(workspace)
+            .is_none_or(|ws| index >= ws.tabs.len())
+        {
+            return Err(TabFocusError::PositionOutOfRange);
+        }
+        self.active_ws = workspace;
+        self.workspaces[workspace].active_tab = index;
+        Ok(())
+    }
+
+    fn switch_tab(&mut self, i: usize) {
+        let _ = self.focus_tab(i);
     }
 
     fn cycle_tab(&mut self, delta: isize) {
@@ -4042,6 +4745,7 @@ impl App {
         } else {
             let branch = git_branch(&s.cwd);
             self.workspaces.push(Workspace {
+                id: crate::ids::public_id("workspace"),
                 name: ws_name(&s.cwd),
                 cwd: s.cwd.clone(),
                 branch,
@@ -4071,6 +4775,16 @@ impl App {
         self.workspaces
             .iter()
             .find(|ws| ws.tabs.iter().any(|t| t.layout.leaves().contains(&id)))
+    }
+
+    /// The reusable preview owned by the active workspace, if it is still a
+    /// live native view. Preview identity is workspace-scoped: focusing a
+    /// preview must never change the active workspace as a side effect.
+    fn active_preview_view(&self) -> Option<PaneId> {
+        let workspace = self.ws();
+        self.preview_views.iter().copied().find(|id| {
+            self.views.contains_key(id) && workspace.tabs.iter().any(|tab| tab.layout.contains(*id))
+        })
     }
 
     fn focus_pane_global(&mut self, id: PaneId) {
@@ -4253,6 +4967,13 @@ impl App {
     /// split's border/gap stays grabbable. It never reaches into the sidebar body,
     /// where dock rows own the width, so it can't steal a workspace/agent click.
     fn sidebar_seam_at(&self, c: u16, r: u16) -> Option<Side> {
+        // The seam spans the full frame visually, but only the pane lane is a
+        // resize target. The tab and status rows own their cells; in particular,
+        // an overflowing tab strip places its left navigation arrow directly on
+        // the left seam column.
+        if r < self.last_pane_area.y || r >= self.last_pane_area.bottom() {
+            return None;
+        }
         for (seam, side) in [(self.left_seam, Side::Left), (self.right_seam, Side::Right)] {
             let Some(seam) = seam else { continue };
             if r < seam.y || r >= seam.bottom() {
@@ -4360,6 +5081,10 @@ impl App {
     /// path can never again forget one map (e.g. leaking a `views` entry, which
     /// made a closed file un-reopenable).
     fn drop_leaf_runtime(&mut self, id: PaneId) {
+        self.emit_backend_terminal_event(id, "terminal.closed", serde_json::json!({}));
+        self.backend_terminal_index.retain(|_, pane| *pane != id);
+        self.backend_labels.remove(&id);
+        self.cancel_backend_revision_waits(id);
         self.panes.remove(&id);
         self.status.remove(&id);
         self.views.remove(&id);
@@ -4367,11 +5092,10 @@ impl App {
         // every close path (close_pane, close_tab, close_workspace) funnels
         // through here — so cancellation cannot be forgotten by a new path.
         self.cancel_output_waits(id);
+        self.cancel_agent_waits(id);
         self.editor_files.remove(&id); // untrack an editor pane's file (docs/38)
         self.module_panes.remove(&id); // untrack a module pane (MOD-2)
-        if self.preview_view == Some(id) {
-            self.preview_view = None; // forget it as the reused preview pane
-        }
+        self.preview_views.remove(&id); // forget a closed reusable preview pane
         if self.scroll_pane == Some(id) {
             self.scroll_pane = None; // don't leave scroll mode pointing at a dead pane
         }
@@ -4422,6 +5146,17 @@ impl App {
 
     fn close_active_ws(&mut self) {
         if self.active_ws < self.workspaces.len() {
+            if self.workspaces.len() > 1 {
+                let closed_root = self.workspaces[self.active_ws].cwd.clone();
+                self.fail_pending_files_api_for_root(
+                    &closed_root,
+                    "workspace closed while FILES was loading",
+                );
+                self.fail_pending_diff_api_for_root(
+                    &closed_root,
+                    "workspace closed while DIFF was refreshing",
+                );
+            }
             self.workspaces.remove(self.active_ws);
         }
         if self.workspaces.is_empty() {
@@ -4448,6 +5183,8 @@ impl App {
     /// server to outlive, so it quits like a normal terminal app.
     fn all_workspaces_closed(&mut self) {
         self.session_dirty = true;
+        self.fail_pending_files_api("no active workspace while FILES was loading");
+        self.fail_pending_diff_api("no active workspace while DIFF was refreshing");
         if self.server_mode {
             self.end_session = true;
         } else {
@@ -4459,6 +5196,17 @@ impl App {
     fn close_workspace(&mut self, index: usize) {
         if index >= self.workspaces.len() {
             return;
+        }
+        if self.workspaces.len() > 1 {
+            let closed_root = self.workspaces[index].cwd.clone();
+            self.fail_pending_files_api_for_root(
+                &closed_root,
+                "workspace closed while FILES was loading",
+            );
+            self.fail_pending_diff_api_for_root(
+                &closed_root,
+                "workspace closed while DIFF was refreshing",
+            );
         }
         let ids: Vec<PaneId> = self.workspaces[index]
             .tabs
@@ -4702,7 +5450,11 @@ mod tests {
     fn delete_worktree_absent_for_a_plain_workspace() {
         let _env = crate::persist::test_env("wt-del-menu");
         let (tx, _rx) = mpsc::channel();
-        let app = App::new(80, 24, tx).unwrap();
+        let mut app = App::new(80, 24, tx).unwrap();
+        // `App::new` uses the test process's cwd. Test runs may themselves be
+        // launched from a linked Git worktree, so explicitly construct the plain
+        // workspace this test is about instead of depending on the checkout.
+        app.workspaces[0].worktree = None;
         let items = app.ws_menu_items(0);
         assert!(
             !items.contains(&WsMenuItem::DeleteWorktree),
@@ -4719,6 +5471,9 @@ mod tests {
         let _env = crate::persist::test_env("wt-del-confirm");
         let (tx, _rx) = mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
+        // See `delete_worktree_absent_for_a_plain_workspace`: never let this
+        // guard-path test act on the worktree that happens to run the suite.
+        app.workspaces[0].worktree = None;
 
         // A non-confirm key dismisses the modal.
         app.worktree_delete = Some(0);
@@ -4744,6 +5499,7 @@ mod tests {
 
     #[test]
     fn prefix_chord_variants() {
+        let _env = crate::persist::test_env("prefix-chord-variants");
         // Ctrl+Space arrives in different forms across terminals/OSes; each must
         // enter prefix mode and the next key (here `v`) must then split.
         let chords = [
@@ -4960,6 +5716,33 @@ mod tests {
     }
 
     #[test]
+    fn text_modal_swallowing_a_click_does_not_close_bar_overflow() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let _env = crate::persist::test_env("modal-before-bar");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.worktree_prompt = Some(String::new());
+        app.bar.overflow = Some(crate::bar::OverflowPopup {
+            region: crate::bar::BarRegion::BottomRight,
+            keys: vec![crate::bar::CORE_RUNTIME.to_string()],
+            rect: Rect::new(60, 20, 10, 3),
+        });
+        app.handle_event(AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }));
+
+        assert!(app.worktree_prompt.is_some());
+        assert!(
+            app.bar.overflow.is_some(),
+            "the modal owns the click before hidden bar hit targets"
+        );
+    }
+
+    #[test]
     fn close_tab_removes_it_and_its_panes() {
         let _env = crate::persist::test_env("close-tab");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -4982,6 +5765,7 @@ mod tests {
             entries: Vec::new(),
             cursor: 0,
             creating: None,
+            going_to: None,
             error: None,
             is_repo,
         };
@@ -5040,7 +5824,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_spans_lines_linearly() {
+    fn selection_keeps_the_drag_left_edge_between_lines() {
         // Content rect at (x=2, y=1), 10 wide × 5 tall.
         let content = Rect::new(2, 1, 10, 5);
         let sel = Selection {
@@ -5053,8 +5837,10 @@ mod tests {
         assert!(sel.contains(4, 1));
         assert!(sel.contains(11, 1)); // last column (right() == 12)
         assert!(!sel.contains(3, 1)); // before the anchor
-                                      // Middle row: the full width.
-        assert!(sel.contains(2, 2) && sel.contains(11, 2));
+                                      // Middle row: it keeps the drag's left edge instead of
+                                      // expanding into the pane's left margin.
+        assert!(!sel.contains(2, 2));
+        assert!(sel.contains(4, 2) && sel.contains(11, 2));
         // Last row: up to the cursor column.
         assert!(sel.contains(6, 3));
         assert!(!sel.contains(7, 3)); // past the cursor
@@ -5167,6 +5953,7 @@ mod tests {
             "tab.list",
             "tab.new",
             "tab.move",
+            "tab.swap",
             "tab.close",
             "tab.rename",
             "pane.move",
@@ -5468,6 +6255,7 @@ mod tests {
         let pane = app.layout().focus;
         let common_dir = PathBuf::from("/tmp/luvus-group/.git");
         app.workspaces.push(Workspace {
+            id: crate::ids::public_id("workspace"),
             name: "parent".into(),
             cwd: PathBuf::from("/tmp/luvus-group"),
             branch: None,
@@ -5481,6 +6269,7 @@ mod tests {
             pinned: false,
         });
         app.workspaces.push(Workspace {
+            id: crate::ids::public_id("workspace"),
             name: "child".into(),
             cwd: PathBuf::from("/tmp/luvus-group-child"),
             branch: None,
@@ -5950,12 +6739,11 @@ mod tests {
         );
     }
 
-    /// Panes must line up with sessions by age: the pane started first owns the
-    /// session started first. Resolving oldest-pane-first while each takes the
-    /// *newest* unclaimed session pairs them backwards, so two agent panes in one
-    /// folder swap conversations — each restores into the other's session.
+    /// Disk discovery cannot prove which of multiple sessions belongs to which
+    /// unbound pane, even if their pane and session creation orders happen to
+    /// match. It must preserve safety by leaving both panes unbound.
     #[test]
-    fn two_agent_panes_keep_their_own_sessions_by_age() {
+    fn ambiguous_unbound_sessions_do_not_guess_by_pane_age() {
         let _env = crate::persist::test_env("session-pairing");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
@@ -5992,16 +6780,67 @@ mod tests {
         std::env::remove_var("CLAUDE_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&store);
 
-        assert_eq!(
-            by_pane.get(&newer.0),
-            Some(&Some("new-sess".to_string())),
-            "the newer pane owns the newer session"
-        );
-        assert_eq!(
-            by_pane.get(&older.0),
-            Some(&Some("old-sess".to_string())),
-            "the older pane keeps its own, not its neighbour's"
-        );
+        assert_eq!(by_pane.get(&newer.0), Some(&None));
+        assert_eq!(by_pane.get(&older.0), Some(&None));
+    }
+
+    /// Regression: tabs do not establish a native agent-session boundary. A user
+    /// can create the second tab first and then start its agent before starting
+    /// one in the first tab, so global pane ids cannot be used to pair the two
+    /// session files. Restarting must not move either conversation across tabs.
+    #[test]
+    fn ambiguous_sessions_across_tabs_are_not_reassigned() {
+        let _env = crate::persist::test_env("cross-tab-session-pairing");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let first_tab_pane = app.layout().focus;
+        let cwd = app.panes.get(&first_tab_pane).unwrap().cwd.clone();
+
+        app.run_cmd(crate::app::keys::Cmd::NewTab);
+        let second_tab_pane = app.layout().focus;
+        assert_ne!(first_tab_pane, second_tab_pane);
+        assert_eq!(app.ws().tabs.len(), 2, "two tabs are present");
+        assert_eq!(app.panes.get(&second_tab_pane).unwrap().cwd, cwd);
+
+        let store =
+            std::env::temp_dir().join(format!("luvus-cross-tab-pairing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        let enc: String = cwd
+            .to_string_lossy()
+            .chars()
+            .map(|c| {
+                if matches!(c, '/' | '\\' | '.') {
+                    '-'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let proj = store.join("projects").join(enc);
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("first-session.jsonl"), "{}").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(proj.join("second-session.jsonl"), "{}").unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", &store);
+
+        for id in [first_tab_pane, second_tab_pane] {
+            let status = app.status.get_mut(&id).unwrap();
+            status.agent = "claude".into();
+            status.agent_session = None;
+        }
+
+        let snap = crate::persist::snapshot(&app);
+        let by_pane: std::collections::HashMap<u32, Option<String>> = snap.workspaces[0]
+            .tabs
+            .iter()
+            .flat_map(|tab| &tab.panes)
+            .map(|(raw, ps)| (*raw, ps.agent_session.as_ref().map(|(_, sid)| sid.clone())))
+            .collect();
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&store);
+
+        assert_eq!(by_pane.get(&first_tab_pane.0), Some(&None));
+        assert_eq!(by_pane.get(&second_tab_pane.0), Some(&None));
     }
 
     #[test]
@@ -6010,7 +6849,7 @@ mod tests {
         // hook / disk discovery) must keep its brand — e.g. "claude" — even when
         // the on-screen banner doesn't contain the word "claude" that moment, so
         // classify() falls back to the bare shell name. Otherwise the reported
-        // agent (and the notch logo keyed off it) flaps to "zsh".
+        // agent identity shown to UI/API consumers flaps to "zsh".
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
         let focus = app.layout().focus;
@@ -7455,6 +8294,135 @@ mod tests {
     }
 
     #[test]
+    fn tab_move_is_correct_for_every_source_destination_and_active_position() {
+        let _env = crate::persist::test_env("tab-move-exhaustive");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let original = ["a", "b", "c", "d"];
+
+        for active in 0..original.len() {
+            for from in 0..original.len() {
+                for to in 0..original.len() {
+                    if from == to {
+                        continue;
+                    }
+                    app.workspaces[0].tabs = original
+                        .iter()
+                        .map(|name| {
+                            let mut tab = Tab::panes(TileLayout::new(PaneId::alloc()));
+                            tab.name = Some((*name).to_string());
+                            tab
+                        })
+                        .collect();
+                    app.workspaces[0].active_tab = active;
+
+                    let active_name = original[active];
+                    let mut expected = original.to_vec();
+                    let moved = expected.remove(from);
+                    expected.insert(to, moved);
+
+                    let new_active = app.move_tab(from, to).expect("valid permutation");
+                    let actual = app
+                        .ws()
+                        .tabs
+                        .iter()
+                        .map(|tab| tab.name.as_deref().unwrap())
+                        .collect::<Vec<_>>();
+                    assert_eq!(actual, expected, "active={active}, from={from}, to={to}");
+                    assert_eq!(
+                        app.ws().tabs[new_active].name.as_deref(),
+                        Some(active_name),
+                        "active tab identity changed: active={active}, from={from}, to={to}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tab_context_menu_reorders_swaps_and_renames_its_exact_target() {
+        let _env = crate::persist::test_env("tab-context-menu");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.workspaces[0].tabs = ["a", "b", "c"]
+            .into_iter()
+            .map(|name| {
+                let mut tab = Tab::panes(TileLayout::new(PaneId::alloc()));
+                tab.name = Some(name.to_string());
+                tab
+            })
+            .collect();
+        app.workspaces[0].active_tab = 2;
+
+        app.open_tab_menu(1, 10, 2);
+        assert_eq!(
+            app.tab_menu_items(),
+            [
+                TabMenuItem::Rename,
+                TabMenuItem::MoveLeft,
+                TabMenuItem::MoveRight,
+                TabMenuItem::SwapWith,
+            ]
+        );
+        app.tab_menu_action(TabMenuItem::MoveLeft);
+        let names = app
+            .ws()
+            .tabs
+            .iter()
+            .map(|tab| tab.name.as_deref().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["b", "a", "c"]);
+        assert_eq!(app.ws().active_tab, 2, "active C stays active");
+
+        // The open menu follows B by identity even if an API reorder occurs
+        // before its action is clicked.
+        app.open_tab_menu(0, 10, 2);
+        app.move_tab(0, 2).unwrap();
+        app.tab_menu_action(TabMenuItem::MoveLeft);
+        let names = app
+            .ws()
+            .tabs
+            .iter()
+            .map(|tab| tab.name.as_deref().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["a", "b", "c"]);
+
+        // Swap With resolves both snapshots after an intervening reorder,
+        // then swaps those exact tabs rather than their old numeric positions.
+        app.open_tab_menu(0, 10, 2);
+        let target = app
+            .tab_menu
+            .as_ref()
+            .unwrap()
+            .swap_targets
+            .iter()
+            .find(|(_, label)| label == "c")
+            .unwrap()
+            .0
+            .clone();
+        app.tab_menu.as_mut().unwrap().swap_rects = vec![(target, Rect::new(20, 4, 8, 1))];
+        app.move_tab(0, 1).unwrap();
+        app.tab_menu_click(21, 4);
+        let names = app
+            .ws()
+            .tabs
+            .iter()
+            .map(|tab| tab.name.as_deref().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["b", "c", "a"]);
+        assert_eq!(app.ws().active_tab, 1, "active C follows its new position");
+
+        app.open_tab_menu(1, 10, 2);
+        app.tab_menu_action(TabMenuItem::Rename);
+        let rename_target = app.tab_rename.as_ref().unwrap().target.clone();
+        assert_eq!(app.resolve_tab_menu_target(&rename_target), Some((0, 1)));
+
+        app.tab_menu = None;
+        app.open_tab_menu(3, 10, 2); // the tab bar's `+` pseudo-index
+        assert!(app.tab_menu.is_none());
+    }
+
+    #[test]
     fn keyboard_resize_mode_enters_resizes_and_exits() {
         let _env = crate::persist::test_env("pane-resize-keys");
         use crate::event::AppEvent;
@@ -7752,6 +8720,36 @@ mod tests {
     }
 
     #[test]
+    fn fork_pane_splits_a_grok_session() {
+        let _env = crate::persist::test_env("fork-pane-grok");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let src = app.layout().focus;
+        {
+            let st = app.status.get_mut(&src).unwrap();
+            st.agent = "grok".into();
+            st.agent_session = Some(AgentSession {
+                agent: "grok".into(),
+                session_id: "sess-grok".into(),
+            });
+        }
+        assert!(app.fork_pane(src), "grok sessions fork natively");
+        let new = app.layout().focus;
+        assert_ne!(new, src);
+        assert_eq!(app.status.get(&new).unwrap().agent, "grok");
+        assert_eq!(
+            app.status
+                .get(&src)
+                .unwrap()
+                .agent_session
+                .as_ref()
+                .unwrap()
+                .session_id,
+            "sess-grok"
+        );
+    }
+
+    #[test]
     fn fork_from_mission_control_uses_the_agents_real_tab() {
         let _env = crate::persist::test_env("fork-pane-mission");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -7806,6 +8804,22 @@ mod tests {
         let fork = app.layout().focus;
         assert_ne!(fork, src);
         assert_eq!(app.status.get(&fork).unwrap().agent, "codex");
+    }
+
+    #[test]
+    fn codex_pane_menu_hides_fork_without_an_exact_session() {
+        let _env = crate::persist::test_env("fork-codex-menu-unbound");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).unwrap().agent = "codex".into();
+
+        app.open_pane_menu(pane, 1, 1);
+
+        assert!(
+            !app.pane_menu_items().contains(&PaneMenuItem::ForkPane),
+            "Codex needs the exact session bound to this pane before Fork is offered"
+        );
     }
 
     #[test]
@@ -8241,6 +9255,9 @@ mod tests {
         // Language tab was previously clipped off the right edge).
         let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let modal = app.settings_modal_rect.expect("settings modal is rendered");
+        assert_eq!(modal.height, 28, "the taller modal uses the available room");
+        assert!(modal.width <= 120 && modal.right() <= 120);
         assert_eq!(
             app.settings_tab_rects.len(),
             7,
@@ -8252,6 +9269,13 @@ mod tests {
                 .any(|(t, _)| *t == SettingsTab::Language),
             "the Language tab is present"
         );
+
+        // Small terminals still clamp the enlarged modal to the viewport.
+        let mut narrow = Terminal::new(TestBackend::new(32, 12)).unwrap();
+        narrow.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let modal = app.settings_modal_rect.expect("narrow settings modal");
+        assert!(modal.width <= 32 && modal.height <= 12);
+        assert!(modal.right() <= 32 && modal.bottom() <= 12);
     }
 
     #[test]
@@ -8388,18 +9412,23 @@ mod tests {
             app.settings.as_ref().unwrap().tab,
             crate::app::SettingsTab::Layout
         );
+        let sidebar_width_row = app
+            .layout_rows()
+            .iter()
+            .position(|row| matches!(row, crate::app::settings::LayoutRow::SidebarWidth))
+            .expect("the Layout tab has a Left sidebar width row");
+        app.settings.as_mut().unwrap().cursor = sidebar_width_row;
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-
         let left = app
             .settings_arrow_rects
             .iter()
-            .find(|(_, d, _)| *d < 0)
+            .find(|(row, d, _)| *row == sidebar_width_row && *d < 0)
             .unwrap()
             .2;
         let right = app
             .settings_arrow_rects
             .iter()
-            .find(|(_, d, _)| *d > 0)
+            .find(|(row, d, _)| *row == sidebar_width_row && *d > 0)
             .unwrap()
             .2;
         let click = |app: &mut App, r: Rect| {
@@ -8875,6 +9904,8 @@ mod tests {
         app.settings = Some(SettingsUi {
             tab: SettingsTab::Layout,
             cursor: idx,
+            prefix_candidate: None,
+            layout_scroll: 0,
             capturing: false,
         });
         app.handle_settings_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -9429,8 +10460,12 @@ mod tests {
         };
         let offset = |app: &App| app.panes.get(&id).unwrap().scroll_state().0;
 
-        send(&mut app, KeyCode::Char('V'), KeyModifiers::SHIFT);
-        assert!(app.copy_mode.is_some(), "Shift+V enters keyboard copy mode");
+        send(&mut app, KeyCode::Char(' '), KeyModifiers::CONTROL);
+        send(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(
+            app.copy_mode.is_some(),
+            "the default prefix then y enters keyboard copy mode"
+        );
         send(&mut app, KeyCode::Char('g'), KeyModifiers::NONE);
         send(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
         send(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
@@ -9441,11 +10476,91 @@ mod tests {
 
         app.panes.get(&id).unwrap().scroll(8);
         let saved = offset(&app);
-        send(&mut app, KeyCode::Char('V'), KeyModifiers::SHIFT);
+        send(&mut app, KeyCode::Char(' '), KeyModifiers::CONTROL);
+        send(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
         send(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
         send(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
         assert!(app.copy_mode.is_none(), "q cancels copy mode");
         assert_eq!(offset(&app), saved, "cancel restores the prior viewport");
+    }
+
+    #[test]
+    fn keyboard_copy_trims_a_codex_transcript_gutter() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(40, 8, tx).unwrap();
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).expect("pane status").agent = "codex".into();
+        app.panes
+            .get(&pane)
+            .expect("pane")
+            .engine
+            .lock()
+            .expect("engine")
+            .advance(b"\x1b[H\x1b[2J Hello\r\n world");
+        app.copy_mode = Some(CopyMode {
+            pane,
+            anchor: (1, 0),
+            cursor: (2, 5),
+            saved_scroll: 0,
+        });
+
+        app.finish_copy_mode();
+
+        assert_eq!(app.pending_clipboard.as_deref(), Some("Hello\nworld"));
+    }
+
+    #[test]
+    fn shift_v_never_enters_copy_mode() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(40, 8, tx).unwrap();
+        let pane = app.layout().focus;
+        app.panes
+            .get(&pane)
+            .expect("pane")
+            .engine
+            .lock()
+            .expect("engine")
+            .advance(b"terminal input");
+
+        assert!(
+            !app.handle_event(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char('V'),
+                KeyModifiers::SHIFT,
+            ))),
+            "forwarded terminal input waits for child output to repaint"
+        );
+        assert!(
+            app.copy_mode.is_none(),
+            "uppercase V never enters copy mode"
+        );
+    }
+
+    #[test]
+    fn prefix_y_starts_copy_mode() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(40, 8, tx).unwrap();
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).expect("pane status").agent = "codex".into();
+        app.panes
+            .get(&pane)
+            .expect("pane")
+            .engine
+            .lock()
+            .expect("engine")
+            .advance(b"build finished successfully");
+
+        assert!(app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::CONTROL,
+        ))));
+        assert!(
+            app.handle_event(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+            ))),
+            "the default prefix then y starts copy mode over a Codex transcript"
+        );
+        assert!(app.copy_mode.is_some());
     }
 }
 

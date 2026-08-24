@@ -29,6 +29,14 @@ jobs:
       # RUSTFLAGS, which would also fail on harmless dependency warnings.
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --locked
+      - name: Validate terminal backend contract
+        run: |
+          python3 examples/terminal-backend/consumer.py --fixtures
+          python3 examples/terminal-backend/mock_conformance.py
+          python3 examples/runtime-api/consumer.py
+          cargo build --locked
+          python3 examples/terminal-backend/live_conformance.py --luvus target/debug/luvus
+          python3 examples/terminal-backend/failure_conformance.py --luvus target/debug/luvus
       - name: Test terminal support crates
         run: |
           cargo test --manifest-path vendor/vte/Cargo.toml --lib
@@ -44,7 +52,7 @@ jobs:
             --config 'patch.crates-io.luvus-vte.path="vendor/vte"' \
             --config 'patch.crates-io.luvus-alacritty-terminal.path="vendor/alacritty_terminal"'
 
-  # macOS is the primary platform (notch companion, Apple-silicon binaries) -
+  # macOS is a primary platform and ships native Apple-silicon/Intel binaries;
   # run the full test suite there too, not just at release-tag time.
   macos:
     name: macos test
@@ -54,15 +62,47 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
+      - name: Validate terminal backend contract
+        run: |
+          python3 examples/terminal-backend/consumer.py --fixtures
+          python3 examples/terminal-backend/mock_conformance.py
+          python3 examples/runtime-api/consumer.py
+          cargo build --locked
+          python3 examples/terminal-backend/live_conformance.py --luvus target/debug/luvus
+          python3 examples/terminal-backend/failure_conformance.py --luvus target/debug/luvus
 
   windows:
-    name: windows build
+    name: windows protocol · ConPTY
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked
+      - run: cargo fmt --package luvus --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - name: Test Windows protocol boundaries
+        shell: pwsh
+        run: |
+          cargo test --locked platform::windows::tests
+          cargo test --locked ipc::transport::windows_
+          cargo test --locked app::backend::tests
+          cargo test --locked terminal::backend::tests
+      - name: Validate published protocol fixtures
+        shell: pwsh
+        run: |
+          python examples/terminal-backend/consumer.py --fixtures
+          if ($LASTEXITCODE -ne 0) { throw "terminal-backend fixture validation failed" }
+          python examples/runtime-api/consumer.py
+          if ($LASTEXITCODE -ne 0) { throw "runtime-api fixture validation failed" }
+      - name: Validate named pipes and ConPTY live
+        shell: pwsh
+        run: |
+          cargo build --locked
+          if ($LASTEXITCODE -ne 0) { throw "Windows debug build failed" }
+          .\examples\terminal-backend\live_conformance.ps1 `
+            -Luvus .\target\debug\luvus.exe
 
   # Known-vulnerability scan of the dependency tree (RustSec advisory DB).
   audit:

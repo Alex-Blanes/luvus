@@ -17,11 +17,13 @@ fn agent_hook_script(agent: &str) -> String {
     format!(
         r#"#!/usr/bin/env bash
 # luvus {agent} integration — reports the session id for native resume, and
-# (docs/24 NOTCH-6) forwards lifecycle events (permission prompt / turn end) for
-# the notch companion. Branches on the hook's event name.
+# forwards lifecycle events (permission prompt / turn end) to Luvus. Branches
+# on the hook's event name so modules and API clients get precise transitions.
 [ -n "$LUVUS_ENV" ] || exit 0
 [ -n "$LUVUS_SOCKET_PATH" ] || exit 0
-command -v luvus >/dev/null 2>&1 || exit 0
+luvus_bin="${{LUVUS_BIN_PATH:-}}"
+[ -n "$luvus_bin" ] && [ -x "$luvus_bin" ] || luvus_bin="$(command -v luvus 2>/dev/null || true)"
+[ -n "$luvus_bin" ] || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
 input="$(cat)"
 evt="$(printf '%s' "$input" | python3 -c 'import sys,json
@@ -34,14 +36,14 @@ case "$evt" in
 try:
     d=json.load(sys.stdin); print((d.get("message") or "")[:200])
 except Exception: print("")' 2>/dev/null)"
-    luvus pane report-event --agent {agent} --kind "$evt" --message "$msg" >/dev/null 2>&1
+    "$luvus_bin" pane report-event --agent {agent} --kind "$evt" --message "$msg" >/dev/null 2>&1
     ;;
   *)
     sid="$(printf '%s' "$input" | python3 -c 'import sys,json
 try:
     d=json.load(sys.stdin); print(d.get("session_id") or d.get("sessionId") or d.get("id") or "")
 except Exception: print("")' 2>/dev/null)"
-    [ -n "$sid" ] && luvus pane report --agent {agent} --session "$sid" >/dev/null 2>&1
+    [ -n "$sid" ] && "$luvus_bin" pane report --agent {agent} --session "$sid" >/dev/null 2>&1
     ;;
 esac
 exit 0
@@ -58,11 +60,12 @@ import { spawn } from "node:child_process"
 
 export const luvus = async () => {
   let last = ""
+  const luvusBin = process.env.LUVUS_BIN_PATH || "luvus"
   const report = (id) => {
     if (!id || id === last || !process.env.LUVUS_SOCKET_PATH) return
     last = id
     try {
-      spawn("luvus", ["pane", "report", "--agent", "opencode", "--session", String(id)], {
+      spawn(luvusBin, ["pane", "report", "--agent", "opencode", "--session", String(id)], {
         stdio: "ignore",
         detached: true,
       }).unref()
@@ -176,7 +179,7 @@ fn opencode_plugin_path() -> PathBuf {
 
 /// Where + how an agent's shell hook is configured (docs/23). `file` is the JSON
 /// config file inside `dir`; `event` is the hook key; `matcher` is an optional
-/// group matcher (Codex wants `startup|resume`).
+/// group matcher (Codex reports `startup` and `resume` SessionStart sources).
 struct HookSpec {
     dir: PathBuf,
     file: &'static str,
@@ -228,6 +231,7 @@ fn install_shell_hook(agent: &str) -> Result<PathBuf> {
         spec.event,
         spec.matcher,
         &script.to_string_lossy(),
+        None,
     );
     fs::write(&cfg_path, serde_json::to_string_pretty(&cfg)?)?;
     let _ = fs::remove_file(spec.dir.join("bohay-agent-hook.sh"));
@@ -236,8 +240,8 @@ fn install_shell_hook(agent: &str) -> Result<PathBuf> {
 
 pub fn install_claude() -> Result<PathBuf> {
     let dir = install_shell_hook("claude")?;
-    // Also register the same (branching) script under lifecycle events so the
-    // notch companion gets precise permission/turn-end signals (docs/24 NOTCH-6).
+    // Also register the same branching script under lifecycle events so modules
+    // and API clients get precise permission/turn-end signals.
     let cfg_path = dir.join("settings.json");
     let script = dir.join("luvus-agent-hook.sh");
     let mut cfg: Value = fs::read_to_string(&cfg_path)
@@ -245,7 +249,7 @@ pub fn install_claude() -> Result<PathBuf> {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| json!({}));
     for evt in ["Notification", "Stop"] {
-        register_hook(&mut cfg, evt, None, &script.to_string_lossy());
+        register_hook(&mut cfg, evt, None, &script.to_string_lossy(), None);
     }
     fs::write(&cfg_path, serde_json::to_string_pretty(&cfg)?)?;
     Ok(dir)
@@ -256,7 +260,25 @@ pub fn install_copilot() -> Result<PathBuf> {
 }
 
 pub fn install_codex() -> Result<PathBuf> {
-    install_shell_hook("codex")
+    let dir = install_shell_hook("codex")?;
+    let cfg_path = dir.join("hooks.json");
+    let script = dir.join("luvus-agent-hook.sh");
+    let mut cfg: Value = fs::read_to_string(&cfg_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    // Codex provides the session id to both hooks. SessionStart is the earliest
+    // report, while UserPromptSubmit covers Code mode lifecycles where startup
+    // hooks are delayed or skipped.
+    register_hook(
+        &mut cfg,
+        "UserPromptSubmit",
+        None,
+        &script.to_string_lossy(),
+        Some(5),
+    );
+    fs::write(&cfg_path, serde_json::to_string_pretty(&cfg)?)?;
+    Ok(dir)
 }
 
 /// Install the opencode plugin (NI-4). No shell hook — write the JS plugin.
@@ -270,7 +292,7 @@ pub fn install_opencode() -> Result<PathBuf> {
 
 /// The Kimi hook events we register (docs/23): `SessionStart` (matcher
 /// `startup|resume`) reports the session id for resume; `Notification` + `Stop`
-/// feed the notch companion precise lifecycle signals. Kimi's `[[hooks]]` table
+/// feed modules and API clients precise lifecycle signals. Kimi's `[[hooks]]` table
 /// accepts only `event`/`matcher`/`command`/`timeout`, so we write nothing else.
 const KIMI_HOOK_EVENTS: &[(&str, Option<&str>)] = &[
     ("SessionStart", Some("startup|resume")),
@@ -356,8 +378,8 @@ pub fn install_grok() -> Result<PathBuf> {
     set_executable(&script)?;
     let cmd = script.to_string_lossy();
 
-    // SessionStart resumes; Notification/Stop/SubagentStop feed the notch
-    // companion (docs/24), matching what install_claude registers.
+    // SessionStart resumes; Notification/Stop/SubagentStop feed event
+    // subscribers, matching what install_claude registers.
     let group = |c: &str| json!({ "hooks": [ { "type": "command", "command": c } ] });
     let doc = json!({
         "hooks": {
@@ -445,7 +467,7 @@ pub fn install(agent: &str) -> Result<()> {
 }
 
 /// Remove luvus's integration for `agent`. Deletes **only what `install` added** —
-/// the `luvus-agent-hook.sh` script + luvus's single hook entry (other entries and
+/// the `luvus-agent-hook.sh` script + luvus's hook entries (other entries and
 /// the config file itself are left intact), or the opencode plugin file. **Never
 /// touches the agent binary, its config, or its sessions.** Idempotent.
 pub fn uninstall(agent: &str) -> Result<()> {
@@ -490,11 +512,13 @@ pub fn uninstall(agent: &str) -> Result<()> {
     let cfg_path = spec.dir.join(spec.file);
     if let Ok(s) = fs::read_to_string(&cfg_path) {
         if let Ok(mut v) = serde_json::from_str::<Value>(&s) {
-            // Strip luvus's entry from the primary event and, for Claude, the
-            // extra lifecycle events install_claude added (docs/24 NOTCH-6).
+            // Strip luvus's entry from the primary event and the extra events
+            // installed alongside session detection.
             let mut events = vec![spec.event];
             if agent == "claude" {
                 events.extend(["Notification", "Stop"]);
+            } else if agent == "codex" {
+                events.push("UserPromptSubmit");
             }
             for evt in events {
                 if let Some(arr) = v
@@ -543,16 +567,38 @@ pub fn is_installed(agent: &str) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(&s) else {
         return false;
     };
-    v.get("hooks")
+    let installed = v
+        .get("hooks")
         .and_then(|h| h.get(spec.event))
         .and_then(|a| a.as_array())
         .map(|arr| arr.iter().any(group_mentions_luvus))
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !installed {
+        return false;
+    }
+    // A previously installed Codex integration can predate the prompt hook.
+    // Treat that as incomplete so Settings offers an in-place refresh instead
+    // of an uninstall.
+    if agent == "codex" {
+        return v
+            .get("hooks")
+            .and_then(|h| h.get("UserPromptSubmit"))
+            .and_then(|a| a.as_array())
+            .map(|arr| arr.iter().any(group_mentions_luvus))
+            .unwrap_or(false);
+    }
+    true
 }
 
 /// Insert a command hook under `hooks.<event>` pointing at `script` (with an
 /// optional group `matcher`), removing any prior luvus entry first.
-fn register_hook(settings: &mut Value, event: &str, matcher: Option<&str>, script: &str) {
+fn register_hook(
+    settings: &mut Value,
+    event: &str,
+    matcher: Option<&str>,
+    script: &str,
+    timeout_seconds: Option<u64>,
+) {
     if !settings.is_object() {
         *settings = json!({});
     }
@@ -575,7 +621,11 @@ fn register_hook(settings: &mut Value, event: &str, matcher: Option<&str>, scrip
     let arr = session_start.as_array_mut().unwrap();
     // Drop any previous luvus entries (idempotent reinstall).
     arr.retain(|group| !group_mentions_luvus(group));
-    let mut group = json!({ "hooks": [ { "type": "command", "command": script } ] });
+    let mut command = json!({ "type": "command", "command": script });
+    if let Some(timeout_seconds) = timeout_seconds {
+        command["timeout"] = json!(timeout_seconds);
+    }
+    let mut group = json!({ "hooks": [command] });
     if let Some(m) = matcher {
         group["matcher"] = json!(m);
     }
@@ -778,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_hook_installs_to_hooks_json_with_matcher() {
+    fn codex_hook_installs_start_and_prompt_session_reporting() {
         let _env = crate::persist::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -791,14 +841,46 @@ mod tests {
 
         let script = fs::read_to_string(tmp.join("luvus-agent-hook.sh")).unwrap();
         assert!(script.contains("--agent codex"), "reports as codex");
-        // Codex writes `hooks.json` (not settings.json), SessionStart with a matcher.
+        // Codex writes `hooks.json` (not settings.json). Keep SessionStart for
+        // immediate binding and UserPromptSubmit for Code mode fallbacks.
         let hooks: Value =
             serde_json::from_str(&fs::read_to_string(tmp.join("hooks.json")).unwrap()).unwrap();
-        let groups = hooks["hooks"]["SessionStart"].as_array().unwrap();
-        let luvus: Vec<&Value> = groups.iter().filter(|g| group_mentions_luvus(g)).collect();
-        assert_eq!(luvus.len(), 1);
-        assert_eq!(luvus[0]["matcher"].as_str(), Some("startup|resume"));
+        let start = hooks["hooks"]["SessionStart"].as_array().unwrap();
+        let start_luvus: Vec<&Value> = start.iter().filter(|g| group_mentions_luvus(g)).collect();
+        assert_eq!(start_luvus.len(), 1);
+        assert_eq!(start_luvus[0]["matcher"].as_str(), Some("startup|resume"));
+        let prompt = hooks["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        let prompt_luvus: Vec<&Value> = prompt.iter().filter(|g| group_mentions_luvus(g)).collect();
+        assert_eq!(
+            prompt_luvus.len(),
+            1,
+            "one prompt hook remains after an idempotent reinstall"
+        );
+        assert_eq!(
+            prompt_luvus[0]["hooks"][0]["timeout"].as_u64(),
+            Some(5),
+            "prompt reporting has a bounded hook timeout"
+        );
+        assert!(
+            script.contains("LUVUS_BIN_PATH"),
+            "the hook uses the exact server binary even when PATH is stale"
+        );
         assert!(is_installed("codex"));
+
+        uninstall("codex").unwrap();
+        assert!(!is_installed("codex"));
+        let after: Value =
+            serde_json::from_str(&fs::read_to_string(tmp.join("hooks.json")).unwrap()).unwrap();
+        for event in ["SessionStart", "UserPromptSubmit"] {
+            assert!(
+                after["hooks"][event]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|group| !group_mentions_luvus(group)),
+                "uninstall removes only Luvus's {event} hook"
+            );
+        }
 
         std::env::remove_var("CODEX_HOME");
         let _ = fs::remove_dir_all(&tmp);
@@ -918,6 +1000,10 @@ mod tests {
         let js = fs::read_to_string(&plugin).unwrap();
         assert!(js.contains("session.created"), "hooks the session event");
         assert!(js.contains("--agent"), "reports the session");
+        assert!(
+            js.contains("process.env.LUVUS_BIN_PATH"),
+            "uses the exact server-selected binary before PATH fallback"
+        );
         assert!(js.contains("opencode"));
         assert!(is_installed("opencode"));
 

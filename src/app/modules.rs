@@ -62,8 +62,9 @@ impl App {
             warning: None,
         });
         registry::save(&self.modules);
+        self.bar.sync_modules(&self.modules);
         // A freshly linked module gets its startup hooks now rather than at the
-        // next restart, so its docks appear immediately.
+        // next restart, so its docks and bar widgets appear immediately.
         self.run_module_startup_hooks();
         Ok(id)
     }
@@ -87,6 +88,8 @@ impl App {
         registry::save(&self.modules);
         let _ = std::fs::remove_dir_all(&root);
         self.remove_module_docks(&dock_ids);
+        self.bar.clear_owner(id);
+        self.bar.sync_modules(&self.modules);
         Ok(())
     }
 
@@ -101,6 +104,8 @@ impl App {
         }
         registry::save(&self.modules);
         self.remove_module_docks(&dock_ids);
+        self.bar.clear_owner(id);
+        self.bar.sync_modules(&self.modules);
         Ok(())
     }
 
@@ -117,8 +122,13 @@ impl App {
         if !on {
             let dock_ids = self.module_dock_ids(id);
             self.remove_module_docks(&dock_ids);
+            self.bar.clear_owner(id);
             self.module_startup_done.remove(id);
+            self.bar.sync_modules(&self.modules);
         } else {
+            // Make declarations visible before the asynchronous startup command
+            // can call `luvus bar push` (`ui.bar.push` on the socket API).
+            self.bar.sync_modules(&self.modules);
             self.run_module_startup_hooks();
         }
         Ok(())
@@ -429,10 +439,9 @@ impl App {
     /// passed to hooks as `LUVUS_MODULE_EVENT_JSON`.
     pub fn emit_event(&mut self, name: &str, data: serde_json::Value) {
         let event_json = data.to_string();
-        api::publish(
-            &self.events,
-            json!({ "event": name, "data": data }).to_string(),
-        );
+        let backend_data = data.clone();
+        api::publish_event(&self.events, name, data);
+        self.emit_backend_lifecycle_from_pane_event(name, &backend_data);
         let mut targets: Vec<(String, Vec<String>)> = Vec::new();
         for m in &self.modules.modules {
             if !m.is_runnable() {

@@ -12,6 +12,7 @@ pub mod local;
 pub mod model;
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -198,6 +199,16 @@ pub struct GitView {
     /// back with esc). Mirrors `open_pr` (docs/17).
     pub open_issue: Option<u64>,
     pub issue_detail: Load<IssueDetail>,
+    /// The explicit Status file selection as `(path, staged)`. Unlike the
+    /// cursor-list sections, Status also contains repository metadata, so its
+    /// selection must be tracked by file identity rather than a screen row.
+    pub status_selected: Option<(String, bool)>,
+    /// Row indices of staged file rows in the last Status render (for Enter/d
+    /// hit-testing and keeping the selected file visible). Empty when Status
+    /// hasn't rendered yet.
+    pub status_staged_rows: Range<usize>,
+    /// Row indices of unstaged file rows in the last Status render.
+    pub status_unstaged_rows: Range<usize>,
     /// The list body rect from the last render, so a click maps to the row under
     /// it. Transient (GitView is rebuilt on restore, never serialized).
     pub list_area: Rect,
@@ -287,6 +298,9 @@ impl GitView {
             commit_detail: Load::Idle,
             open_issue: None,
             issue_detail: Load::Idle,
+            status_selected: None,
+            status_staged_rows: 0..0,
+            status_unstaged_rows: 0..0,
             list_area: Rect::new(0, 0, 0, 0),
             contributors_expanded: false,
             show_emails: false,

@@ -8,6 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use fs2::FileExt;
 use interprocess::local_socket::prelude::*;
@@ -39,7 +40,7 @@ pub fn acquire_server_startup_lock(state_dir: &Path) -> io::Result<ServerStartup
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     }
     Ok(ServerStartupLock { _file: file })
 }
@@ -68,7 +69,7 @@ impl ServerStartupLock {
                     format!("refusing to replace non-socket path {}", path.display()),
                 ));
             }
-            if connect(path).is_ok() {
+            if connect_for_liveness(path).is_ok() {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
                     format!("a Luvus listener is already active at {}", path.display()),
@@ -79,16 +80,217 @@ impl ServerStartupLock {
     }
 }
 
+#[cfg(not(windows))]
+fn connect_for_liveness(path: &Path) -> io::Result<Conn> {
+    use interprocess::local_socket::GenericFilePath;
+    let name = path.to_fs_name::<GenericFilePath>()?;
+    Ok(Conn::new(Stream::connect(name)?))
+}
+
 /// A cloneable owned read+write handle to one connection — the portable
 /// stand-in for a cloned `UnixStream`. Clones share the full-duplex socket, so
 /// one clone can read while another writes (as `try_clone` did before).
 #[derive(Clone)]
 pub struct Conn(Arc<Stream>);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimeoutMode {
+    Kernel,
+    Nonblocking,
+}
+
 impl Conn {
     fn new(stream: Stream) -> Self {
         Conn(Arc::new(stream))
     }
+
+    /// Bound control-plane requests such as cross-session search. Unix local
+    /// sockets support kernel timeouts; named pipes may report Unsupported, in
+    /// which case the connection becomes nonblocking so the caller can enforce
+    /// an application deadline without leaving a blocked worker behind.
+    pub fn set_timeouts(&self, timeout: Duration) -> io::Result<TimeoutMode> {
+        let receive = self.set_recv_timeout(timeout)?;
+        let send = self.set_send_timeout(timeout)?;
+        Ok(
+            if receive == TimeoutMode::Nonblocking || send == TimeoutMode::Nonblocking {
+                TimeoutMode::Nonblocking
+            } else {
+                TimeoutMode::Kernel
+            },
+        )
+    }
+
+    pub fn set_recv_timeout(&self, timeout: Duration) -> io::Result<TimeoutMode> {
+        use interprocess::local_socket::traits::Stream as _;
+        match self.0.set_recv_timeout(Some(timeout)) {
+            Ok(()) => Ok(TimeoutMode::Kernel),
+            Err(_) => {
+                self.0.set_nonblocking(true)?;
+                Ok(TimeoutMode::Nonblocking)
+            }
+        }
+    }
+
+    pub fn set_send_timeout(&self, timeout: Duration) -> io::Result<TimeoutMode> {
+        use interprocess::local_socket::traits::Stream as _;
+        match self.0.set_send_timeout(Some(timeout)) {
+            Ok(()) => Ok(TimeoutMode::Kernel),
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                self.0.set_nonblocking(true)?;
+                Ok(TimeoutMode::Nonblocking)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Restore blocking I/O after a named-pipe timeout fallback. Unix kernel
+    /// timeouts do not change this mode, so callers use this only when
+    /// `set_timeouts` returned [`TimeoutMode::Nonblocking`].
+    pub fn set_blocking(&self) -> io::Result<()> {
+        use interprocess::local_socket::traits::Stream as _;
+        self.0.set_nonblocking(false)
+    }
+}
+
+#[cfg(unix)]
+fn current_euid() -> u32 {
+    // SAFETY: `geteuid` has no preconditions and does not dereference memory.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(unix)]
+fn validate_unix_socket_path(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("refusing non-socket Luvus endpoint {}", path.display()),
+        ));
+    }
+    if metadata.uid() != current_euid() || metadata.mode() & 0o777 != 0o600 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing Luvus socket without current-user ownership and mode 0600: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Verify that the connected local peer belongs to the current account.
+/// Filesystem permissions are necessary but not sufficient once a descriptor
+/// has been accepted, so Unix checks peer credentials just as Windows checks
+/// the named-pipe server process owner.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn validate_peer(conn: &Conn) -> io::Result<()> {
+    use std::mem::{size_of, zeroed};
+    use std::os::fd::AsRawFd;
+
+    let Stream::UdSocket(socket) = &*conn.0;
+    // SAFETY: the kernel writes at most `size_of::<ucred>()` bytes into a valid
+    // stack value, and `len` accurately describes that storage.
+    let mut credentials: libc::ucred = unsafe { zeroed() };
+    let mut len = size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            socket.inner().as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut credentials).cast(),
+            &raw mut len,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if credentials.uid != current_euid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "refusing a Luvus socket peer owned by another account",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+pub fn validate_peer(conn: &Conn) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let Stream::UdSocket(socket) = &*conn.0;
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    // SAFETY: both output pointers reference initialized stack storage and the
+    // descriptor belongs to a connected Unix-domain socket.
+    let result =
+        unsafe { libc::getpeereid(socket.inner().as_raw_fd(), &raw mut uid, &raw mut gid) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if uid != current_euid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "refusing a Luvus socket peer owned by another account",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))
+))]
+pub fn validate_peer(_conn: &Conn) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn validate_peer(_conn: &Conn) -> io::Result<()> {
+    // The private DACL limits clients to the owner/System. The client side also
+    // verifies the connected server process belongs to the current account.
+    Ok(())
+}
+
+/// Whether a nonblocking local-socket read should be retried. Windows reports
+/// `ERROR_NO_DATA` for a connected PIPE_NOWAIT stream with no input available,
+/// and Rust maps that code to `BrokenPipe` rather than `WouldBlock`.
+pub fn nonblocking_read_pending(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_NO_DATA as i32)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Windows byte-mode named pipes can return a successful zero-byte read while
+/// PIPE_NOWAIT has no data. Unix stream sockets reserve zero for peer EOF.
+pub const fn nonblocking_zero_is_pending() -> bool {
+    cfg!(windows)
 }
 
 impl Read for Conn {
@@ -102,7 +304,19 @@ impl Write for Conn {
         (&*self.0).write(buf)
     }
     fn flush(&mut self) -> io::Result<()> {
-        (&*self.0).flush()
+        #[cfg(windows)]
+        {
+            // `interprocess` intentionally makes `Write::flush` on its local
+            // socket wrapper a no-op on Windows. Reach the named-pipe stream
+            // so one-shot responses are delivered before this connection is
+            // dropped instead of relying on the crate's deferred drop flush.
+            let Stream::NamedPipe(pipe) = &*self.0;
+            pipe.inner().flush()
+        }
+        #[cfg(not(windows))]
+        {
+            (&*self.0).flush()
+        }
     }
 }
 
@@ -124,6 +338,47 @@ fn namespaced_pipe_id(path: &Path, namespace: &str) -> String {
     format!("{namespace}-{:016x}", h.finish())
 }
 
+#[cfg(windows)]
+fn private_pipe_security_descriptor(
+) -> io::Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
+    use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+    use widestring::U16CString;
+
+    // Protected DACL: full access only to LocalSystem and the pipe object owner
+    // (the account running this Luvus server). `interprocess` creates local-only
+    // named pipes by default, adding PIPE_REJECT_REMOTE_CLIENTS independently.
+    let sddl = U16CString::from_str("D:P(A;;GA;;;SY)(A;;GA;;;OW)")
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    SecurityDescriptor::deserialize(&sddl)
+}
+
+#[cfg(windows)]
+fn validate_connected_server(stream: &Stream) -> io::Result<()> {
+    let Stream::NamedPipe(pipe) = stream;
+    let server_pid = pipe.inner().server_process_id()?;
+    if !crate::platform::process_belongs_to_current_user(server_pid) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "refusing a Luvus named pipe owned by another Windows account",
+        ));
+    }
+    Ok(())
+}
+
+/// Return the actual address a protocol consumer passes to its platform
+/// transport. Unix uses the socket path; Windows exposes the namespaced-pipe
+/// identifier instead of asking consumers to reproduce our hash.
+pub(crate) fn discovery_address(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        format!(r"\\.\pipe\{}", pipe_id(path))
+    }
+    #[cfg(not(windows))]
+    {
+        path.display().to_string()
+    }
+}
+
 /// Connect to a server socket identified by a per-session filesystem path.
 pub fn connect(path: &Path) -> io::Result<Conn> {
     #[cfg(windows)]
@@ -131,13 +386,18 @@ pub fn connect(path: &Path) -> io::Result<Conn> {
         use interprocess::local_socket::GenericNamespaced;
         let id = pipe_id(path);
         let name = id.to_ns_name::<GenericNamespaced>()?;
-        Ok(Conn::new(Stream::connect(name)?))
+        let stream = Stream::connect(name)?;
+        validate_connected_server(&stream)?;
+        Ok(Conn::new(stream))
     }
     #[cfg(not(windows))]
     {
         use interprocess::local_socket::GenericFilePath;
+        validate_unix_socket_path(path)?;
         let name = path.to_fs_name::<GenericFilePath>()?;
-        Ok(Conn::new(Stream::connect(name)?))
+        let conn = Conn::new(Stream::connect(name)?);
+        validate_peer(&conn)?;
+        Ok(conn)
     }
 }
 
@@ -148,11 +408,16 @@ pub(crate) fn connect_legacy(path: &Path) -> io::Result<Conn> {
     {
         use interprocess::local_socket::GenericNamespaced;
         let name = legacy_pipe_id(path).to_ns_name::<GenericNamespaced>()?;
-        Ok(Conn::new(Stream::connect(name)?))
+        let stream = Stream::connect(name)?;
+        validate_connected_server(&stream)?;
+        Ok(Conn::new(stream))
     }
     #[cfg(not(windows))]
     {
-        connect(path)
+        // Migration uses this only as a liveness probe. Older Bohay releases
+        // may have created a live socket with a permissive mode; detecting it
+        // must still defer migration rather than misclassify and overwrite.
+        connect_for_liveness(path)
     }
 }
 
@@ -171,9 +436,14 @@ pub fn bind(path: &Path) -> io::Result<Listener> {
     #[cfg(windows)]
     {
         use interprocess::local_socket::GenericNamespaced;
+        use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
         let id = pipe_id(path);
         let name = id.to_ns_name::<GenericNamespaced>()?;
-        ListenerOptions::new().name(name).create_sync()
+        ListenerOptions::new()
+            .name(name)
+            .reclaim_name(false)
+            .security_descriptor(private_pipe_security_descriptor()?)
+            .create_sync()
     }
     #[cfg(not(windows))]
     {
@@ -185,7 +455,13 @@ pub fn bind(path: &Path) -> io::Result<Listener> {
         // forced to 0700 — see `persist::ensure_session_dir`).
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            if let Err(error) =
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            {
+                drop(listener);
+                let _ = std::fs::remove_file(path);
+                return Err(error);
+            }
         }
         Ok(listener)
     }
@@ -194,6 +470,38 @@ pub fn bind(path: &Path) -> io::Result<Listener> {
 /// Iterate accepted connections (errors skipped), as `Conn`s.
 pub fn incoming(listener: &Listener) -> impl Iterator<Item = Conn> + '_ {
     listener.incoming().flatten().map(Conn::new)
+}
+
+#[cfg(all(test, windows))]
+mod windows_security_tests {
+    use super::*;
+
+    fn test_pipe(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("luvus-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn private_named_pipe_accepts_the_current_user() {
+        let path = test_pipe("private-pipe");
+        let listener = bind(&path).expect("bind owner-only named pipe");
+        let client_path = path.clone();
+        let client = std::thread::spawn(move || {
+            let mut client = connect(&client_path).expect("same-user client connects");
+            client.write_all(b"luvus").unwrap();
+        });
+        let mut server = listener.accept().expect("accept same-user client");
+        let mut bytes = [0_u8; 5];
+        server.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"luvus");
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn discovery_exposes_the_real_windows_pipe_address() {
+        let address = discovery_address(&test_pipe("discovery"));
+        assert!(address.starts_with(r"\\.\pipe\luvus-"));
+        assert!(!address.ends_with(".sock"));
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -249,7 +557,8 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-    use super::{legacy_pipe_id, pipe_id};
+    use super::{legacy_pipe_id, nonblocking_read_pending, pipe_id};
+    use std::io;
     use std::path::Path;
 
     #[test]
@@ -274,5 +583,13 @@ mod windows_tests {
             current.strip_prefix("luvus-"),
             legacy.strip_prefix("bohay-")
         );
+    }
+
+    #[test]
+    fn pipe_nowait_no_data_is_retryable_despite_broken_pipe_kind() {
+        let error =
+            io::Error::from_raw_os_error(windows_sys::Win32::Foundation::ERROR_NO_DATA as i32);
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(nonblocking_read_pending(&error));
     }
 }

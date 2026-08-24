@@ -70,7 +70,16 @@ fn append_selected_row(
     ((start_row, start_col), (end_row, end_col)): ((usize, usize), (usize, usize)),
 ) {
     let chars: Vec<char> = line.chars().collect();
-    let left = if row == start_row { start_col } else { 0 };
+    // A drag that starts beside the visible text must not grow leftward on
+    // middle rows: that otherwise copies the blank cell between the pane edge
+    // and every list item. Keep the drag's leftmost edge for those rows while
+    // preserving the exact start point on the first row.
+    let middle_left = start_col.min(end_col);
+    let left = if row == start_row {
+        start_col
+    } else {
+        middle_left
+    };
     let right = if row == end_row {
         end_col
     } else {
@@ -99,8 +108,26 @@ fn finish_selected_text(mut out: String) -> Option<String> {
     (!out.trim().is_empty()).then_some(out)
 }
 
-/// Extract a linear terminal selection from logical rows. Both mouse and
-/// keyboard selection feed this function, keeping clipboard semantics aligned.
+/// Drop the one blank cell which can sit between a pane edge and uniformly
+/// aligned prose. This is deliberately narrow: code with its usual two- or
+/// four-space indentation is retained exactly as selected.
+fn strip_uniform_single_cell_margin(text: String) -> String {
+    let mut saw_text = false;
+    let uniform_margin = text.lines().filter(|line| !line.is_empty()).all(|line| {
+        saw_text = true;
+        line.starts_with(' ') && !line.starts_with("  ")
+    });
+    if !saw_text || !uniform_margin {
+        return text;
+    }
+    text.lines()
+        .map(|line| line.strip_prefix(' ').unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Extract a terminal selection from logical rows. Both mouse and keyboard
+/// selection feed this function, keeping clipboard semantics aligned.
 fn extract_rows_selection(
     rows: &[String],
     ((start_row, start_col), (end_row, end_col)): ((usize, usize), (usize, usize)),
@@ -129,11 +156,156 @@ fn extract_rows_selection(
 }
 
 impl App {
+    fn handle_api_request(&mut self, req: crate::ipc::api::ApiRequest) -> bool {
+        if req.method == "terminal.backend.create" {
+            self.start_backend_create(req);
+            return true;
+        }
+        if req.method == "terminal.backend.capture" {
+            self.start_backend_capture(req);
+            return true;
+        }
+        if matches!(
+            req.method.as_str(),
+            "terminal.backend.wait_change" | "terminal.backend.wait_output"
+        ) {
+            self.start_backend_wait(req);
+            return true;
+        }
+        if req.method == "search.query" {
+            self.start_search_api(req);
+            return true;
+        }
+        if req.method == "search.activate" {
+            let response = self.handle_search_activate(&req);
+            let _ = req.reply.send(response);
+            return true;
+        }
+        let Some(req) = self.prepare_files_api(req) else {
+            return true;
+        };
+        let Some(req) = self.prepare_diff_api(req) else {
+            return true;
+        };
+        let response = self.handle_api(&req);
+        let _ = req.reply.send(response);
+        true
+    }
+
+    fn handle_theme_reloaded(
+        &mut self,
+        id: String,
+        registry: crate::theme::ThemeRegistry,
+        reply: std::sync::mpsc::Sender<String>,
+    ) -> bool {
+        let count = registry.entries().len();
+        let problems = registry.problems().to_vec();
+        let selected = self.replace_theme_registry(registry);
+        let _ = reply.send(
+            json!({"id": id, "result": {
+                "type": "themes_reloaded",
+                "count": count,
+                "selected_available": selected,
+                "problems": problems,
+            }})
+            .to_string(),
+        );
+        true
+    }
+
     /// Apply an event; returns whether it changed the rendered UI (→ the loop
     /// should redraw). Input forwarded to a pane returns `false` — the screen only
     /// changes when the pane echoes (a separate `PtyData` event), so we don't waste
     /// a full render per keystroke.
     pub fn handle_event(&mut self, ev: AppEvent) -> bool {
+        // Theme removal starts in Settings but performs bounded filesystem work
+        // off-loop. Apply its completed registry before the empty-workspace guard
+        // so the single writer always observes the result.
+        let ev = match ev {
+            AppEvent::BackendCreateReady {
+                id,
+                reply,
+                pane_id,
+                cwd,
+                branch,
+                worktree,
+                commit,
+                result,
+            } => {
+                self.finish_backend_create(
+                    id, reply, pane_id, cwd, branch, worktree, commit, result,
+                );
+                return true;
+            }
+            AppEvent::PtyReady(id) => {
+                self.register_backend_terminal(id);
+                return true;
+            }
+            AppEvent::BackendObserve { params, reply } => {
+                let _ = reply.send(self.prepare_backend_observe(&params));
+                return false;
+            }
+            AppEvent::ThemeUninstalled { id, result } => {
+                self.finish_theme_uninstall(id, result);
+                return true;
+            }
+            AppEvent::ConfigReloaded { id, config, reply } => {
+                let response = match self.apply_socket_config(config) {
+                    Ok(()) => {
+                        json!({"id":id,"result":{"type":"config_reloaded","config":self.config}})
+                    }
+                    Err((code, message)) => {
+                        json!({"id":id,"error":{"code":code,"message":message}})
+                    }
+                };
+                let _ = reply.send(response.to_string());
+                return true;
+            }
+            AppEvent::ManifestsReloaded {
+                id,
+                manifests,
+                reply,
+            } => {
+                self.apply_socket_manifests(manifests);
+                let _ = reply.send(
+                    json!({"id":id,"result":{
+                        "type":"agent_manifests_reloaded","rules":self.manifests.rule_count()
+                    }})
+                    .to_string(),
+                );
+                return true;
+            }
+            AppEvent::SearchFilesIndexed { instance, catalogs } => {
+                return self.apply_search_files(instance, catalogs);
+            }
+            AppEvent::SearchResults {
+                instance,
+                generation,
+                matches,
+                total,
+                capped,
+            } => {
+                return self.apply_search_results(instance, generation, matches, total, capped);
+            }
+            AppEvent::SearchFederatedResults {
+                instance,
+                generation,
+                matches,
+                total,
+                partial,
+            } => {
+                return self
+                    .apply_search_federated_results(instance, generation, matches, total, partial);
+            }
+            AppEvent::SearchHandoffReady { session, result } => {
+                match result {
+                    Ok(()) => self.pending_session_switch = Some(session),
+                    Err(error) => self.show_toast(format!("session switch failed: {error}")),
+                }
+                return true;
+            }
+            other => other,
+        };
         // Control-API requests and parked `wait.output` replies must be answered
         // even with no workspace open. A server that has closed its last node
         // stays alive (docs/43 §3.3), and the methods that reopen one are the
@@ -141,12 +313,60 @@ impl App {
         // reading EOF instead of a `workspace.open` / `server.stop` answer.
         if self.workspaces.is_empty() {
             match ev {
+                AppEvent::ThemeReloaded {
+                    id,
+                    registry,
+                    reply,
+                } => return self.handle_theme_reloaded(id, registry, reply),
                 AppEvent::Api(req) => {
+                    if req.method == "terminal.backend.create" {
+                        self.start_backend_create(req);
+                        return true;
+                    }
+                    if req.method == "terminal.backend.capture" {
+                        self.start_backend_capture(req);
+                        return true;
+                    }
+                    if matches!(
+                        req.method.as_str(),
+                        "terminal.backend.wait_change" | "terminal.backend.wait_output"
+                    ) {
+                        self.start_backend_wait(req);
+                        return true;
+                    }
+                    if req.method == "search.query" {
+                        self.start_search_api(req);
+                        return true;
+                    }
+                    if req.method == "search.activate" {
+                        let response = self.handle_search_activate(&req);
+                        let _ = req.reply.send(response);
+                        return true;
+                    }
                     let resp = self.handle_api(&req);
                     let _ = req.reply.send(resp);
                     return true;
                 }
                 AppEvent::WaitOutput { id, reply, .. } => {
+                    let _ = reply.send(
+                        json!({ "id": id, "error": {
+                            "code": "no_session", "message": "no active session"
+                        }})
+                        .to_string(),
+                    );
+                    return true;
+                }
+                AppEvent::AgentWait { id, reply, .. } => {
+                    let _ = reply.send(
+                        json!({ "id": id, "error": {
+                            "code": "no_session", "message": "no active session"
+                        }})
+                        .to_string(),
+                    );
+                    return true;
+                }
+                AppEvent::AgentStart { id, reply, .. }
+                | AppEvent::AgentPrompt { id, reply, .. } => {
                     let _ = reply.send(
                         json!({ "id": id, "error": {
                             "code": "no_session", "message": "no active session"
@@ -205,20 +425,23 @@ impl App {
                 // A parked `wait.output` for this pane just got new output to
                 // test against — resolve it on the same wake (docs/81).
                 self.check_output_waits(id);
+                self.backend_output_changed(id);
                 true // the pane's screen advanced
             }
             AppEvent::PtyExit(id) => {
+                self.emit_backend_terminal_event(id, "terminal.exited", json!({}));
                 self.close_pane(id);
                 true
             }
             // Control-API requests arrive on the event channel so the loop wakes
             // for them immediately (docs/81). Answer inline: like the old
             // server-side drain, an answered request counts as activity.
-            AppEvent::Api(req) => {
-                let resp = self.handle_api(&req);
-                let _ = req.reply.send(resp);
-                true
-            }
+            AppEvent::Api(req) => self.handle_api_request(req),
+            AppEvent::ThemeReloaded {
+                id,
+                registry,
+                reply,
+            } => self.handle_theme_reloaded(id, registry, reply),
             // A `wait.output` connection parks its reply here and blocks until
             // the pane's output matches (docs/81) — no polling on either side.
             AppEvent::WaitOutput {
@@ -227,11 +450,14 @@ impl App {
                 needle,
                 reply,
                 timeout,
+                cancelled,
             } => {
                 let params = json!({ "pane": pane });
                 match self.resolve_pane(&params) {
                     Some(id) => {
-                        self.register_output_wait(id, request_id, needle, reply, timeout);
+                        self.register_output_wait(
+                            id, request_id, needle, reply, timeout, cancelled,
+                        );
                     }
                     None => {
                         let _ = reply.send(
@@ -242,6 +468,55 @@ impl App {
                         );
                     }
                 }
+                true
+            }
+            AppEvent::AgentWait {
+                id: request_id,
+                pane,
+                state,
+                reply,
+                timeout,
+                cancelled,
+            } => {
+                let params = json!({"pane":pane});
+                match (
+                    self.resolve_pane(&params),
+                    crate::app::dispatch::parse_agent_wait_state(&state),
+                ) {
+                    (Some(id), Some(state)) => {
+                        self.register_agent_wait(id, request_id, state, reply, timeout, cancelled);
+                    }
+                    (None, _) => {
+                        let _ = reply.send(
+                            json!({"id":request_id,"error":{"code":"not_found","message":"pane not found"}})
+                                .to_string(),
+                        );
+                    }
+                    (_, None) => {
+                        let _ = reply.send(
+                            json!({"id":request_id,"error":{"code":"invalid_request","message":"status must be idle, working, blocked, or done"}})
+                                .to_string(),
+                        );
+                    }
+                }
+                true
+            }
+            AppEvent::AgentStart {
+                id,
+                params,
+                reply,
+                cancelled,
+            } => {
+                self.start_agent_launch(id, params, reply, cancelled);
+                true
+            }
+            AppEvent::AgentPrompt {
+                id,
+                params,
+                reply,
+                cancelled,
+            } => {
+                self.start_agent_prompt(id, params, reply, cancelled);
                 true
             }
             AppEvent::ModuleCommandFinished {
@@ -279,14 +554,30 @@ impl App {
                 self.active_is_mission()
             }
             AppEvent::DirRead { path, entries } => {
-                self.file_tree.apply_dir(path, entries);
+                self.file_tree.apply_dir(path.clone(), entries);
+                self.finish_pending_files_api(&path);
                 true
             }
-            AppEvent::FileGitStatus(map) => {
-                self.git_status_inflight = false;
-                let changed = self.file_git_status != map;
-                self.file_git_status = map;
+            AppEvent::DiffStatus {
+                token,
+                visible_root,
+                result,
+            } => {
+                let changed = self.apply_diff_status(token, visible_root, result);
+                self.finish_pending_diff_api();
                 changed
+            }
+            AppEvent::DiffLoaded { id, token, result } => self.apply_diff_loaded(id, token, result),
+            AppEvent::DiffNotesLoaded { review_id, result } => {
+                self.apply_diff_notes_loaded(review_id, result)
+            }
+            AppEvent::DiffNoteSaved { note, result } => self.apply_diff_note_saved(note, result),
+            AppEvent::DiffNoteRemoved { id, result } => self.apply_diff_note_removed(id, result),
+            AppEvent::DiffProgressSaved { result } => {
+                if let Err(error) = result {
+                    self.show_toast(format!("review progress not saved: {error}"));
+                }
+                true
             }
             AppEvent::FileChanges { id, changes } => {
                 if let Some(crate::app::ViewKind::File(v)) = self.views.get_mut(&id) {
@@ -339,6 +630,17 @@ impl App {
             AppEvent::ClientConnected { .. }
             | AppEvent::ClientDetach { .. }
             | AppEvent::ClientInput { .. } => false,
+            // Consumed by the pre-dispatch worker-result branch above.
+            AppEvent::ThemeUninstalled { .. }
+            | AppEvent::ConfigReloaded { .. }
+            | AppEvent::ManifestsReloaded { .. }
+            | AppEvent::BackendCreateReady { .. }
+            | AppEvent::BackendObserve { .. }
+            | AppEvent::PtyReady(_)
+            | AppEvent::SearchFilesIndexed { .. }
+            | AppEvent::SearchResults { .. }
+            | AppEvent::SearchFederatedResults { .. }
+            | AppEvent::SearchHandoffReady { .. } => unreachable!(),
         }
     }
 
@@ -460,7 +762,23 @@ impl App {
         let first = |rects: &[Rect]| rects.iter().copied().find(|rect| hit(*rect));
 
         if self.changelog_open {
-            return self.changelog_check_rect.filter(|rect| hit(*rect));
+            return self
+                .changelog_check_rect
+                .filter(|rect| hit(*rect))
+                .or_else(|| {
+                    self.changelog_copy_rects
+                        .iter()
+                        .map(|(rect, _)| *rect)
+                        .find(|rect| hit(*rect))
+                });
+        }
+        if let Some(menu) = &self.tab_menu {
+            return menu
+                .items
+                .iter()
+                .map(|(_, rect)| *rect)
+                .chain(menu.swap_rects.iter().map(|(_, rect)| *rect))
+                .find(|rect| hit(*rect));
         }
         if let Some(menu) = &self.pane_menu {
             return menu
@@ -491,16 +809,28 @@ impl App {
                 .map(|(_, rect)| *rect)
                 .find(|rect| hit(*rect));
         }
+        if let Some(menu) = &self.diff_menu {
+            return menu
+                .items
+                .iter()
+                .map(|(_, rect)| *rect)
+                .find(|rect| hit(*rect));
+        }
         if let Some(menu) = &self.dock_menu {
             return first(&menu.rects);
         }
-
-        let modal = [self.modal_commit_rect, self.modal_cancel_rect]
-            .into_iter()
-            .flatten()
-            .find(|rect| hit(*rect));
-        if modal.is_some() {
-            return modal;
+        let modal_owns_mouse = self.file_prompt.is_some()
+            || self.file_delete.is_some()
+            || self.worktree_delete.is_some()
+            || self.worktree_prompt.is_some()
+            || self.tab_rename.is_some()
+            || self.ws_rename.is_some()
+            || self.pane_rename.is_some();
+        if modal_owns_mouse {
+            return [self.modal_commit_rect, self.modal_cancel_rect]
+                .into_iter()
+                .flatten()
+                .find(|rect| hit(*rect));
         }
 
         if self.switcher {
@@ -512,9 +842,25 @@ impl App {
                 .find(|rect| hit(*rect));
         }
 
+        if let Some(popup) = self.bar.overflow.as_ref() {
+            return hit(popup.rect).then_some(popup.rect);
+        }
+        if let Some(rect) = self
+            .bar
+            .hits
+            .iter()
+            .map(|hit| hit.rect)
+            .chain(self.bar.overflow_hits.iter().map(|hit| hit.rect))
+            .find(|rect| hit(*rect))
+        {
+            return Some(rect);
+        }
+
         self.file_tree_rects
             .iter()
             .map(|(_, rect)| *rect)
+            .chain(self.files_mode_rects.iter().map(|(_, rect)| *rect))
+            .chain(self.diff_row_rects.iter().map(|(_, rect)| *rect))
             .chain(
                 [
                     self.switcher_button_rect,
@@ -527,6 +873,28 @@ impl App {
                 .flatten(),
             )
             .find(|rect| hit(*rect))
+    }
+
+    fn diff_source_hit_at(
+        &self,
+        column: u16,
+        row: u16,
+    ) -> Option<(PaneId, usize, crate::diff::DiffSide)> {
+        self.diff_source_rects
+            .iter()
+            .find(|(_, _, _, rect)| {
+                column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
+            })
+            .map(|(pane, source_row, side, _)| (*pane, *source_row, *side))
+    }
+
+    fn diff_note_hit_at(&self, column: u16, row: u16) -> Option<(PaneId, String)> {
+        self.diff_note_rects
+            .iter()
+            .find(|(_, _, rect)| {
+                column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
+            })
+            .map(|(pane, note_id, _)| (*pane, note_id.clone()))
     }
 
     fn apply_mouse(&mut self, m: ratatui::crossterm::event::MouseEvent) {
@@ -566,6 +934,19 @@ impl App {
                     // answer lands where it was asked for.
                     if self.changelog_check_rect.is_some_and(hit_rect) {
                         crate::update::check_now_reporting(self.app_tx.clone());
+                        return;
+                    }
+                    // Installer/update rows copy the exact command, even when a
+                    // narrow modal clips its visual representation.
+                    if let Some(command) = self
+                        .changelog_copy_rects
+                        .iter()
+                        .find(|(rect, _)| hit_rect(*rect))
+                        .map(|(_, command)| command.clone())
+                    {
+                        self.pending_clipboard = Some(command);
+                        let message = self.catalog.copied;
+                        self.show_toast(message);
                         return;
                     }
                     // A click on a commit/PR reference (or the website row at the
@@ -670,9 +1051,11 @@ impl App {
                         .find(|(_, rect)| {
                             c >= rect.x && c < rect.right() && r >= rect.y && r < rect.bottom()
                         })
-                        .map(|(i, _)| *i);
+                        .map(|(hit, _)| *hit);
                     match hit {
-                        Some(i) => self.picker_click(i),
+                        Some(PickerHit::Row(i)) => self.picker_click(i),
+                        Some(PickerHit::GoTo) => self.picker_start_go_to(),
+                        Some(PickerHit::Modal) => {}
                         None => self.close_folder_picker(), // click outside cancels
                     }
                 }
@@ -681,6 +1064,13 @@ impl App {
                 MouseEventKind::ScrollUp => self.picker_scroll(-1),
                 MouseEventKind::ScrollDown => self.picker_scroll(1),
                 _ => {}
+            }
+            return;
+        }
+        // The tab context menu owns the mouse while open.
+        if self.tab_menu.is_some() {
+            if let MouseEventKind::Down(_) = m.kind {
+                self.tab_menu_click(m.column, m.row);
             }
             return;
         }
@@ -710,6 +1100,12 @@ impl App {
         if self.file_menu.is_some() {
             if let MouseEventKind::Down(_) = m.kind {
                 self.file_menu_click(m.column, m.row);
+            }
+            return;
+        }
+        if self.diff_menu.is_some() {
+            if let MouseEventKind::Down(_) = m.kind {
+                self.diff_menu_click(m.column, m.row);
             }
             return;
         }
@@ -784,25 +1180,36 @@ impl App {
             }
             return;
         }
+        // Bar actions and the read-only overflow popup own their rendered
+        // rectangles. This sits below every modal guard: while a modal is open,
+        // it owns the screen and a click must never invoke a hidden bar action.
+        // An open overflow popup still consumes the next click, closing when it
+        // is outside, so input never falls through to a pane behind it.
+        let bar_press = matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            || (self.bar.overflow.is_some() && matches!(m.kind, MouseEventKind::Down(_)));
+        if bar_press && self.bar_click(m.column, m.row) {
+            return;
+        }
         // Track which divider (if any) the cursor is over, for the hover
         // highlight (docs/27, RESIZE-4), plus the sidebar edge seam (docs/29).
         self.update_hover_divider(m.column, m.row);
         self.update_hover_sidebar(m.column, m.row);
-        // Right-click a pane tab to rename it (docs/28), a WORKSPACES row for its
-        // context menu (rename / worktree / close), or inside a pane for the pane
-        // menu (split / close).
+        // Right-click a pane tab, WORKSPACES row, agent, file, dock row, or pane
+        // to open the matching context menu.
         if let MouseEventKind::Down(MouseButton::Right) = m.kind {
             let (c, r) = (m.column, m.row);
             let hit =
                 |rect: Rect| c >= rect.x && c < rect.right() && r >= rect.y && r < rect.bottom();
             if let Some((i, _)) = self.tab_rects.iter().find(|(_, rect)| hit(*rect)) {
-                self.open_tab_rename(*i);
+                self.open_tab_menu(*i, c, r);
             } else if let Some((i, _)) = self.ws_rects.iter().find(|(_, rect)| hit(*rect)) {
                 self.open_ws_menu(*i, c, r);
             } else if let Some((id, _)) = self.agent_rects.iter().find(|(_, rect)| hit(*rect)) {
                 self.open_agent_menu(AgentTarget::Live(*id), c, r); // live agent → Close
             } else if let Some((i, _)) = self.session_rects.iter().find(|(_, rect)| hit(*rect)) {
                 self.open_agent_menu(AgentTarget::Session(*i), c, r); // session → Resume/Close
+            } else if let Some((row, _)) = self.diff_row_rects.iter().find(|(_, rect)| hit(*rect)) {
+                self.open_diff_menu(*row, c, r);
             } else if let Some((i, _)) = self.file_tree_rects.iter().find(|(_, rect)| hit(*rect)) {
                 self.open_file_menu(*i, c, r); // FILES-dock row → new/rename/delete (docs/38)
             } else if let Some((dock, row_i, _)) = self
@@ -820,6 +1227,26 @@ impl App {
             }
             return;
         }
+        // Once `n` arms annotation mode, the source press owns the complete
+        // left-button gesture. Dragging extends the range on the same diff
+        // side; releasing opens the inline editor. A press/release without
+        // movement naturally creates a one-line note.
+        if matches!(m.kind, MouseEventKind::Drag(MouseButton::Left))
+            && self.diff_note_drag.is_some()
+        {
+            if let Some((pane, row, side)) = self.diff_source_hit_at(m.column, m.row) {
+                self.drag_diff_source(pane, row, side);
+            }
+            return;
+        }
+        if matches!(m.kind, MouseEventKind::Up(MouseButton::Left)) && self.diff_note_drag.is_some()
+        {
+            if let Some((pane, row, side)) = self.diff_source_hit_at(m.column, m.row) {
+                self.drag_diff_source(pane, row, side);
+            }
+            self.finish_diff_source_drag();
+            return;
+        }
         // ── pane text selection: drag to select, release auto-copies (OSC 52) ──
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -835,6 +1262,20 @@ impl App {
                 // never conflicts. RESIZE-2 = drag the divider directly;
                 // RESIZE-5 = `Ctrl`+drag inside a pane grabs the nearest divider.
                 if self.begin_resize(m.column, m.row) {
+                    return;
+                }
+                // Saved DIFF note cards own their full visible rectangle. Open
+                // the exact clicked note in the existing inline editor before
+                // source selection or terminal mouse forwarding can claim it.
+                if let Some((pane, note_id)) = self.diff_note_hit_at(m.column, m.row) {
+                    self.edit_diff_note(pane, &note_id);
+                    return;
+                }
+                // Native DIFF rows own their source cells. Select the exact
+                // stack identity and old/new side before any terminal mouse
+                // forwarding or generic text selection can claim the click.
+                if let Some((pane, row, side)) = self.diff_source_hit_at(m.column, m.row) {
+                    self.press_diff_source(pane, row, side);
                     return;
                 }
                 if m.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1028,7 +1469,11 @@ impl App {
                 return;
             }
             if hit(self.files_area) {
-                self.file_tree.scroll = step(self.file_tree.scroll);
+                if self.files_mode == crate::diff::FilesMode::Diff {
+                    self.diff_scroll_by(if scroll < 0 { -1 } else { 1 });
+                } else {
+                    self.file_tree.scroll = step(self.file_tree.scroll);
+                }
                 return;
             }
             // Wheel over a git tab scrolls its active view (docs/17).
@@ -1059,9 +1504,24 @@ impl App {
                 .map(|(id, rect)| (*id, *rect))
             {
                 let viewport = rect.height.saturating_sub(1) as usize;
-                if let Some(crate::app::ViewKind::File(v)) = self.views.get_mut(&id) {
-                    let text_w = view_text_w(v, rect.width);
-                    v.scroll_by(scroll, viewport, text_w);
+                match self.views.get_mut(&id) {
+                    Some(crate::app::ViewKind::File(v)) => {
+                        let text_w = view_text_w(v, rect.width);
+                        v.scroll_by(scroll, viewport, text_w);
+                    }
+                    Some(crate::app::ViewKind::Diff(v)) => {
+                        let rows = v.stack_rows.len().max(v.split_rows.len());
+                        if scroll < 0 {
+                            v.scroll = v.scroll.saturating_sub(3);
+                        } else {
+                            v.scroll = v
+                                .scroll
+                                .saturating_add(3)
+                                .min(rows.saturating_sub(viewport));
+                        }
+                        v.selected = v.scroll;
+                    }
+                    None => {}
                 }
                 return;
             }
@@ -1259,6 +1719,20 @@ impl App {
             self.resume_session(i);
             return;
         }
+        if let Some((mode, _)) = self.files_mode_rects.iter().find(|(_, rect)| hit(*rect)) {
+            self.set_files_mode(*mode);
+            return;
+        }
+        if let Some((row, _)) = self.diff_row_rects.iter().find(|(_, rect)| hit(*rect)) {
+            let row = *row;
+            let target = if m.modifiers.contains(KeyModifiers::SHIFT) {
+                crate::app::files::OpenTarget::Pane
+            } else {
+                crate::app::files::OpenTarget::Preview
+            };
+            self.diff_row_activate(row, target);
+            return;
+        }
         // Clicking a FILES row expands/collapses a folder or opens a file (docs/38).
         // A plain click opens the file in a full tab (the native default); Shift
         // opens it in a pane split beside the focus.
@@ -1333,6 +1807,11 @@ impl App {
                 .is_some_and(hit)
             {
                 self.git_toggle_contributors();
+                return;
+            }
+            // Clicking a file row in the Status section opens its diff.
+            if let Some((path, staged)) = self.git_status_file_at(m.column, m.row) {
+                self.git_open_status_diff_with(Some((path, staged)));
                 return;
             }
             // Clicking a list row opens its detail in-tab (docs/17) — commit `git
@@ -1561,7 +2040,7 @@ impl App {
                     // forwarded, so typing to the agent resumes with no lost key.
                     pane.scroll_to_bottom();
                     exit = true;
-                    if let Some(bytes) = encode_key(&key, newline) {
+                    if let Some(bytes) = encode_key(&key, newline, pane.application_cursor()) {
                         pane.send(&bytes);
                     }
                 }
@@ -1577,7 +2056,7 @@ impl App {
 
     /// Begin keyboard copy mode at the visible viewport's top-left cell. The
     /// selection uses absolute history rows, so scrolling cannot invalidate it.
-    fn begin_copy_mode(&mut self) -> bool {
+    pub(super) fn begin_copy_mode(&mut self) -> bool {
         let id = self.layout().focus;
         let Some(pane) = self.panes.get(&id) else {
             return false;
@@ -1636,10 +2115,14 @@ impl App {
     }
 
     /// Copy the keyboard selection by the same clipboard queue as drag-to-copy.
-    fn finish_copy_mode(&mut self) {
+    pub(super) fn finish_copy_mode(&mut self) {
         let Some(copy) = self.copy_mode.take() else {
             return;
         };
+        let is_codex = self
+            .status
+            .get(&copy.pane)
+            .is_some_and(|status| status.agent == "codex");
         let text = self.panes.get(&copy.pane).and_then(|pane| {
             let range = copy.ordered();
             let mut output = String::new();
@@ -1656,7 +2139,13 @@ impl App {
             });
             finish_selected_text(output)
         });
-        if let Some(text) = text {
+        if let Some(text) = text.map(|text| {
+            if is_codex {
+                strip_uniform_single_cell_margin(text)
+            } else {
+                text
+            }
+        }) {
             self.pending_clipboard = Some(text);
             let msg = self.catalog.copied;
             self.show_toast(msg);
@@ -1668,7 +2157,7 @@ impl App {
         }
     }
 
-    /// Copy-mode navigation. `Shift+V` starts it, then hjkl/arrows, word jumps,
+    /// Copy-mode navigation starts from the configured prefix command, then hjkl/arrows, word jumps,
     /// page keys, Home/End, and g/G move the visual selection; y copies it.
     fn handle_copy_mode_key(&mut self, key: KeyEvent) -> bool {
         let Some(mut copy) = self.copy_mode else {
@@ -1828,7 +2317,7 @@ impl App {
             .visible_rows();
         let ((sx, sy), (ex, ey)) = sel.ordered();
         let (cx, cy) = (sel.content.x, sel.content.y);
-        extract_rows_selection(
+        let text = extract_rows_selection(
             &rows,
             (
                 (
@@ -1840,7 +2329,20 @@ impl App {
                     (ex as usize).saturating_sub(cx as usize),
                 ),
             ),
-        )
+        )?;
+        // A drag may begin in the single blank pane cell before uniformly
+        // aligned prose. Codex also emits that one-cell transcript gutter even
+        // when the drag starts on its first visible character. It remains
+        // visibly selected, but is padding rather than useful clipboard text.
+        let is_codex = self
+            .status
+            .get(&sel.pane)
+            .is_some_and(|status| status.agent == "codex");
+        Some(if sx == cx || is_codex {
+            strip_uniform_single_cell_margin(text)
+        } else {
+            text
+        })
     }
 
     /// Show a transient toast (e.g. "Copied") bottom-center for ~1.4s.
@@ -2011,6 +2513,9 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return false; // ignored — nothing changed
         }
+        if self.bar.overflow.take().is_some() {
+            return true;
+        }
         // Scroll mode belongs to one pane, not to the whole tab. A focus change
         // must never let the next key snap and type into the previously scrolled
         // pane. Pointer focus clears this eagerly below; this guard also covers
@@ -2104,6 +2609,11 @@ impl App {
             self.handle_tab_rename_key(key);
             return true;
         }
+        // The tab context menu captures input while open.
+        if self.tab_menu.is_some() {
+            self.handle_tab_menu_key(key);
+            return true;
+        }
         // The workspace context menu / rename modal capture all input while open.
         if self.ws_menu.is_some() {
             self.handle_ws_menu_key(key);
@@ -2135,6 +2645,12 @@ impl App {
         if self.file_menu.is_some() {
             if key.code == KeyCode::Esc {
                 self.file_menu = None;
+            }
+            return true;
+        }
+        if self.diff_menu.is_some() {
+            if key.code == KeyCode::Esc {
+                self.diff_menu = None;
             }
             return true;
         }
@@ -2205,11 +2721,16 @@ impl App {
         match self.mode {
             Mode::Prefix => {
                 self.mode = Mode::Normal;
-                // Pressing the prefix twice sends a literal prefix chord into the
-                // pane (Ctrl+Space → NUL; Ctrl+b → 0x02; etc).
+                // Pressing the prefix twice sends that exact key to the pane.
+                // Use the normal PTY encoder so F-keys and modifiers retain the
+                // same cross-platform escape sequence as ordinary input.
                 if self.prefix.matches(&key) {
-                    let bytes = self.prefix.literal_bytes();
-                    if let Some(p) = self.focused() {
+                    let prefix = self.prefix.key_event();
+                    let newline = self.config.shift_enter_bytes().to_vec();
+                    let app_cursor = self.focused().is_some_and(|p| p.application_cursor());
+                    if let (Some(p), Some(bytes)) =
+                        (self.focused(), encode_key(&prefix, &newline, app_cursor))
+                    {
                         p.send(&bytes);
                     }
                     return true; // left prefix mode → the status bar updates
@@ -2261,16 +2782,10 @@ impl App {
                 // A focused file view (docs/38 FILE-3) consumes keys itself
                 // (scroll / wrap / close) — they never reach a PTY.
                 let focus = self.layout().focus;
-                if self.views.contains_key(&focus) {
-                    return self.handle_file_key(focus, key);
-                }
-                // `Shift+V` starts a visual, keyboard-driven selection. It is a
-                // host action (not terminal input), like Shift+Up scroll mode.
-                if key.modifiers.contains(KeyModifiers::SHIFT)
-                    && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
-                    && self.begin_copy_mode()
-                {
-                    return true;
+                match self.views.get(&focus) {
+                    Some(crate::app::ViewKind::File(_)) => return self.handle_file_key(focus, key),
+                    Some(crate::app::ViewKind::Diff(_)) => return self.handle_diff_key(focus, key),
+                    None => {}
                 }
                 // `Shift+↑` / `Shift+PageUp` enter keyboard scroll mode (no prefix,
                 // works on a stock Mac keyboard). From there plain keys navigate.
@@ -2297,7 +2812,10 @@ impl App {
                     return true;
                 }
                 let newline = self.config.shift_enter_bytes();
-                if let Some(bytes) = encode_key(&key, newline) {
+                // Cursor keys follow the pane's DECCKM state: a `less` that
+                // turned application cursor mode on only recognizes SS3 codes.
+                let app_cursor = self.focused().is_some_and(|p| p.application_cursor());
+                if let Some(bytes) = encode_key(&key, newline, app_cursor) {
                     if let Some(p) = self.focused() {
                         // Typing snaps the view back to the live bottom, so you
                         // always see what you type (like every terminal).
@@ -2400,7 +2918,11 @@ fn mouse_wheel_seq(up: bool, col: u16, row: u16, sgr: bool) -> Vec<u8> {
 /// Encode a crossterm key event into the bytes a terminal program expects.
 /// `newline` is the configured Shift/Alt+Enter sequence (`config::shift_enter`),
 /// forwarded verbatim for "new line, don't submit" so it can be tuned per setup.
-fn encode_key(key: &KeyEvent, newline: &[u8]) -> Option<Vec<u8>> {
+/// `app_cursor` mirrors the pane's DECCKM state: cursor keys go out as SS3
+/// (`ESC O <letter>`) when the app enabled application cursor mode, exactly as a
+/// real terminal would send them — some apps (`less`) only recognize the SS3
+/// form once they've turned the mode on.
+fn encode_key(key: &KeyEvent, newline: &[u8], app_cursor: bool) -> Option<Vec<u8>> {
     // AltGr arrives as Ctrl+Alt on Windows (`keys::is_ctrl_chord`) and types a
     // character — it is neither a Ctrl chord nor an `ESC`-prefixed Alt key.
     let ctrl = super::keys::is_ctrl_chord(key.modifiers);
@@ -2424,7 +2946,11 @@ fn encode_key(key: &KeyEvent, newline: &[u8]) -> Option<Vec<u8>> {
                     '_' => 0x1f,
                     _ => return None,
                 };
-                vec![b]
+                if alt {
+                    vec![0x1b, b]
+                } else {
+                    vec![b]
+                }
             } else {
                 let mut s = c.to_string().into_bytes();
                 if alt && !altgr {
@@ -2453,16 +2979,39 @@ fn encode_key(key: &KeyEvent, newline: &[u8]) -> Option<Vec<u8>> {
         // from Windows console records, while terminals on Unix report them via
         // xterm/Kitty escape sequences. Dropping the modifiers here turned
         // Alt+arrow and Ctrl+arrow into plain arrows in nested prompt editors.
-        KeyCode::Left => csi_key(b'D', key.modifiers),
-        KeyCode::Right => csi_key(b'C', key.modifiers),
-        KeyCode::Up => csi_key(b'A', key.modifiers),
-        KeyCode::Down => csi_key(b'B', key.modifiers),
-        KeyCode::Home => csi_key(b'H', key.modifiers),
-        KeyCode::End => csi_key(b'F', key.modifiers),
+        KeyCode::Left => cursor_key(b'D', key.modifiers, app_cursor),
+        KeyCode::Right => cursor_key(b'C', key.modifiers, app_cursor),
+        KeyCode::Up => cursor_key(b'A', key.modifiers, app_cursor),
+        KeyCode::Down => cursor_key(b'B', key.modifiers, app_cursor),
+        KeyCode::Home => cursor_key(b'H', key.modifiers, app_cursor),
+        KeyCode::End => cursor_key(b'F', key.modifiers, app_cursor),
         KeyCode::Delete => csi_tilde_key(3, key.modifiers),
         KeyCode::Insert => csi_tilde_key(2, key.modifiers),
         KeyCode::PageUp => csi_tilde_key(5, key.modifiers),
         KeyCode::PageDown => csi_tilde_key(6, key.modifiers),
+        KeyCode::F(n) => {
+            let code = match n {
+                1..=4 => n + 10, // 11..14
+                5 => 15,
+                6 => 17,
+                7 => 18,
+                8 => 19,
+                9 => 20,
+                10 => 21,
+                11 => 23,
+                12 => 24,
+                13 => 25,
+                14 => 26,
+                15 => 28,
+                16 => 29,
+                17 => 31,
+                18 => 32,
+                19 => 33,
+                20 => 34,
+                _ => return None,
+            };
+            csi_tilde_key(code, key.modifiers)
+        }
         _ => return None,
     };
     Some(bytes)
@@ -2470,6 +3019,18 @@ fn encode_key(key: &KeyEvent, newline: &[u8]) -> Option<Vec<u8>> {
 
 fn csi(final_byte: u8) -> Vec<u8> {
     vec![0x1b, b'[', final_byte]
+}
+
+/// Encode a cursor key (arrows / Home / End). In application cursor mode
+/// (DECCKM, `ESC[?1h`) an unmodified key is SS3 (`ESC O <letter>`) — the exact
+/// bytes a real terminal sends after the app turned the mode on. Modified keys
+/// keep the CSI `1;<mod>` form, since SS3 carries no modifier parameter.
+fn cursor_key(final_byte: u8, modifiers: KeyModifiers, app_cursor: bool) -> Vec<u8> {
+    if app_cursor && key_modifier_param(modifiers) == 1 {
+        vec![0x1b, b'O', final_byte]
+    } else {
+        csi_key(final_byte, modifiers)
+    }
 }
 
 /// Xterm's modifier parameter: 1 + Shift + 2*Alt + 4*Ctrl + 8*Super +
@@ -2506,6 +3067,21 @@ fn csi_tilde_key(code: u8, modifiers: KeyModifiers) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_modal_suppresses_hover_from_covered_bar_geometry() {
+        let _env = crate::persist::test_env("modal-bar-hover");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.worktree_prompt = Some(String::new());
+        app.bar.overflow = Some(crate::bar::OverflowPopup {
+            region: crate::bar::BarRegion::BottomRight,
+            keys: vec![crate::bar::CORE_RUNTIME.to_string()],
+            rect: Rect::new(60, 20, 10, 3),
+        });
+
+        assert!(app.rendered_hover_rect(Some((61, 21))).is_none());
+    }
 
     /// A resize event forces the next frame to be a full repaint, so a terminal
     /// damaged by a window move/resize/expose heals instead of keeping stale cells
@@ -2547,6 +3123,134 @@ mod tests {
         assert!(resp.contains("pong"), "got a real pong, not EOF: {resp}");
     }
 
+    #[test]
+    fn closing_last_workspace_fails_parked_files_and_diff_requests() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        let root = app.ws().cwd.clone();
+
+        let (files_reply, files_rx) = std::sync::mpsc::channel();
+        app.pending_file_tree_api.push((
+            root.clone(),
+            crate::ipc::api::ApiRequest {
+                id: "files".into(),
+                method: "files.tree".into(),
+                params: serde_json::Value::Null,
+                reply: files_reply,
+            },
+        ));
+        let (diff_reply, diff_rx) = std::sync::mpsc::channel();
+        app.pending_diff_api.push((
+            root,
+            crate::ipc::api::ApiRequest {
+                id: "diff".into(),
+                method: "diff.list".into(),
+                params: serde_json::Value::Null,
+                reply: diff_reply,
+            },
+        ));
+
+        app.close_workspace(0);
+
+        let files = files_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("FILES waiter failed when its workspace closed");
+        assert!(files.contains("files_error"), "unexpected reply: {files}");
+        assert!(
+            files.contains("no active workspace"),
+            "unexpected reply: {files}"
+        );
+        let diff = diff_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("DIFF waiter failed when its workspace closed");
+        assert!(diff.contains("diff_error"), "unexpected reply: {diff}");
+        assert!(
+            diff.contains("no active workspace"),
+            "unexpected reply: {diff}"
+        );
+        assert!(app.pending_file_tree_api.is_empty());
+        assert!(app.pending_diff_api.is_empty());
+    }
+
+    #[test]
+    fn closing_one_workspace_fails_only_its_parked_files_and_diff_requests() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        let closed_root = app.ws().cwd.clone();
+        let open_root = closed_root.join("still-open");
+        app.workspaces.push(crate::app::Workspace {
+            id: crate::ids::public_id("workspace"),
+            name: "still-open".into(),
+            cwd: open_root.clone(),
+            branch: None,
+            git_ahead_behind: None,
+            worktree: None,
+            tabs: vec![crate::app::Tab::panes(crate::layout::TileLayout::new(
+                crate::ids::PaneId::alloc(),
+            ))],
+            active_tab: 0,
+            pinned: false,
+        });
+
+        let request = |id: &str, method: &str| {
+            let (reply, response) = std::sync::mpsc::channel();
+            (
+                crate::ipc::api::ApiRequest {
+                    id: id.into(),
+                    method: method.into(),
+                    params: serde_json::Value::Null,
+                    reply,
+                },
+                response,
+            )
+        };
+        let (closed_files, closed_files_rx) = request("closed-files", "files.tree");
+        let (open_files, open_files_rx) = request("open-files", "files.tree");
+        app.pending_file_tree_api
+            .push((closed_root.clone(), closed_files));
+        app.pending_file_tree_api
+            .push((open_root.clone(), open_files));
+        let (closed_diff, closed_diff_rx) = request("closed-diff", "diff.list");
+        let (open_diff, open_diff_rx) = request("open-diff", "diff.list");
+        app.pending_diff_api
+            .push((closed_root.clone(), closed_diff));
+        app.pending_diff_api.push((open_root.clone(), open_diff));
+
+        app.close_workspace(0);
+
+        let closed_files = closed_files_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("closed workspace FILES request failed immediately");
+        assert!(closed_files.contains("files_error"));
+        assert!(closed_files.contains("workspace closed"));
+        let closed_diff = closed_diff_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("closed workspace DIFF request failed immediately");
+        assert!(closed_diff.contains("diff_error"));
+        assert!(closed_diff.contains("workspace closed"));
+
+        assert!(matches!(
+            open_files_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            open_diff_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(app.pending_file_tree_api.len(), 1);
+        assert!(crate::platform::same_path(
+            &app.pending_file_tree_api[0].0,
+            &open_root
+        ));
+        assert_eq!(app.pending_diff_api.len(), 1);
+        assert!(crate::platform::same_path(
+            &app.pending_diff_api[0].0,
+            &open_root
+        ));
+        assert_eq!(app.workspaces.len(), 1);
+        assert!(crate::platform::same_path(&app.ws().cwd, &open_root));
+    }
+
     // Agents treat Enter as "submit" and Shift+Enter as "new line". A terminal
     // sends a bare CR for both, so luvus asks for the disambiguating keyboard
     // protocol and forwards the modified form as `ESC CR` — the sequence agent
@@ -2555,7 +3259,7 @@ mod tests {
     fn shift_enter_sends_a_newline_not_a_submit() {
         // The default newline sequence is `ESC CR`.
         let nl = b"\x1b\r";
-        let enter = |m: KeyModifiers| encode_key(&KeyEvent::new(KeyCode::Enter, m), nl);
+        let enter = |m: KeyModifiers| encode_key(&KeyEvent::new(KeyCode::Enter, m), nl, false);
         assert_eq!(
             enter(KeyModifiers::NONE),
             Some(b"\r".to_vec()),
@@ -2573,7 +3277,11 @@ mod tests {
         );
         // Ctrl+Enter keeps the legacy submit byte — agents bind it to submit.
         assert_eq!(
-            encode_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), nl),
+            encode_key(
+                &KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+                nl,
+                false
+            ),
             Some(b"\r".to_vec())
         );
     }
@@ -2586,7 +3294,8 @@ mod tests {
     fn altgr_types_its_character_instead_of_a_control_byte() {
         let nl = b"\x1b\r";
         let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
-        let enc = |c: char, m: KeyModifiers| encode_key(&KeyEvent::new(KeyCode::Char(c), m), nl);
+        let enc =
+            |c: char, m: KeyModifiers| encode_key(&KeyEvent::new(KeyCode::Char(c), m), nl, false);
         if cfg!(windows) {
             for c in ['\\', '@', '#', '[', ']', '{', '}', '|', '~'] {
                 assert_eq!(
@@ -2607,7 +3316,7 @@ mod tests {
         // The exception is for characters only: every other key keeps both
         // modifiers, so Ctrl+Alt+Enter is still a modified Enter.
         assert_eq!(
-            encode_key(&KeyEvent::new(KeyCode::Enter, altgr), nl),
+            encode_key(&KeyEvent::new(KeyCode::Enter, altgr), nl, false),
             Some(nl.to_vec()),
             "Ctrl+Alt+Enter still sends the configured newline"
         );
@@ -2618,19 +3327,41 @@ mod tests {
     #[test]
     fn shift_enter_sequence_is_configurable() {
         let shift = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
-        assert_eq!(encode_key(&shift, b"\n"), Some(b"\n".to_vec()));
+        assert_eq!(encode_key(&shift, b"\n", false), Some(b"\n".to_vec()));
         assert_eq!(
-            encode_key(&shift, b"\x1b[13;2u"),
+            encode_key(&shift, b"\x1b[13;2u", false),
             Some(b"\x1b[13;2u".to_vec())
         );
         // Plain Enter ignores the newline sequence and always submits.
         let plain = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(encode_key(&plain, b"\n"), Some(b"\r".to_vec()));
+        assert_eq!(encode_key(&plain, b"\n", false), Some(b"\r".to_vec()));
+    }
+
+    #[test]
+    fn character_keys_preserve_alt_with_control() {
+        let key = |modifiers| {
+            encode_key(
+                &KeyEvent::new(KeyCode::Char('a'), modifiers),
+                b"\x1b\r",
+                false,
+            )
+        };
+        assert_eq!(key(KeyModifiers::CONTROL), Some(vec![0x01]));
+        assert_eq!(key(KeyModifiers::ALT), Some(b"\x1ba".to_vec()));
+        // Windows reports AltGr as Ctrl+Alt (`keys::is_ctrl_chord`), so there the
+        // pair types its character instead — see
+        // `altgr_types_its_character_instead_of_a_control_byte`.
+        if !cfg!(windows) {
+            assert_eq!(
+                key(KeyModifiers::CONTROL | KeyModifiers::ALT),
+                Some(vec![0x1b, 0x01])
+            );
+        }
     }
 
     #[test]
     fn navigation_keys_preserve_modifiers_for_nested_prompt_editors() {
-        let key = |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r");
+        let key = |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", false);
 
         // The existing unmodified sequences stay byte-for-byte compatible.
         assert_eq!(
@@ -2674,8 +3405,50 @@ mod tests {
     }
 
     #[test]
+    fn application_cursor_mode_uses_ss3_cursor_keys() {
+        // When the pane enabled DECCKM (`ESC[?1h`), unmodified cursor keys go out
+        // as SS3 (`ESC O <letter>`) — the bytes a real terminal sends once the
+        // app turned the mode on. `less` is strict about this and ignores CSI.
+        let app = |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", true);
+        assert_eq!(
+            app(KeyCode::Up, KeyModifiers::NONE),
+            Some(b"\x1bOA".to_vec())
+        );
+        assert_eq!(
+            app(KeyCode::Down, KeyModifiers::NONE),
+            Some(b"\x1bOB".to_vec())
+        );
+        assert_eq!(
+            app(KeyCode::Left, KeyModifiers::NONE),
+            Some(b"\x1bOD".to_vec())
+        );
+        assert_eq!(
+            app(KeyCode::Right, KeyModifiers::NONE),
+            Some(b"\x1bOC".to_vec())
+        );
+        assert_eq!(
+            app(KeyCode::Home, KeyModifiers::NONE),
+            Some(b"\x1bOH".to_vec())
+        );
+        assert_eq!(
+            app(KeyCode::End, KeyModifiers::NONE),
+            Some(b"\x1bOF".to_vec())
+        );
+        // SS3 carries no modifier parameter, so a modified cursor key keeps the
+        // CSI `1;<mod>` form even in application cursor mode.
+        assert_eq!(
+            app(KeyCode::Up, KeyModifiers::SHIFT),
+            Some(b"\x1b[1;2A".to_vec())
+        );
+        assert_eq!(
+            app(KeyCode::Home, KeyModifiers::CONTROL),
+            Some(b"\x1b[1;5H".to_vec())
+        );
+    }
+
+    #[test]
     fn tilde_navigation_keys_preserve_modifiers() {
-        let key = |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r");
+        let key = |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", false);
         assert_eq!(
             key(KeyCode::Delete, KeyModifiers::NONE),
             Some(b"\x1b[3~".to_vec())
@@ -2688,6 +3461,26 @@ mod tests {
             key(KeyCode::Insert, KeyModifiers::SHIFT | KeyModifiers::ALT),
             Some(b"\x1b[2;4~".to_vec())
         );
+    }
+
+    #[test]
+    fn function_keys_encode_to_tilde_codes() {
+        let key =
+            |n, modifiers| encode_key(&KeyEvent::new(KeyCode::F(n), modifiers), b"\x1b\r", false);
+        // F1–F4 and F5–F12 carry the standard xterm CSI-tilde codes.
+        assert_eq!(key(1, KeyModifiers::NONE), Some(b"\x1b[11~".to_vec()));
+        assert_eq!(key(4, KeyModifiers::NONE), Some(b"\x1b[14~".to_vec()));
+        assert_eq!(key(5, KeyModifiers::NONE), Some(b"\x1b[15~".to_vec()));
+        assert_eq!(key(10, KeyModifiers::NONE), Some(b"\x1b[21~".to_vec()));
+        assert_eq!(key(12, KeyModifiers::NONE), Some(b"\x1b[24~".to_vec()));
+        // Extended function keys continue the same tilde-code numbering.
+        assert_eq!(key(15, KeyModifiers::NONE), Some(b"\x1b[28~".to_vec()));
+        assert_eq!(key(20, KeyModifiers::NONE), Some(b"\x1b[34~".to_vec()));
+        // Modifiers ride in the `;mod` parameter like every other tilde key.
+        assert_eq!(key(10, KeyModifiers::SHIFT), Some(b"\x1b[21;2~".to_vec()));
+        assert_eq!(key(6, KeyModifiers::CONTROL), Some(b"\x1b[17;5~".to_vec()));
+        // Keys past the recognized range are dropped rather than guessed at.
+        assert_eq!(key(21, KeyModifiers::NONE), None);
     }
 
     #[test]
@@ -3100,6 +3893,69 @@ mod link_click_tests {
         );
     }
 
+    #[test]
+    fn right_clicking_a_tab_opens_its_menu_instead_of_rename() {
+        let _env = crate::persist::test_env("tab-right-click-menu");
+        let Fixture { mut app, .. } = fixture();
+        let tab = Rect::new(4, 0, 10, 1);
+        app.tab_rects = vec![(0, tab)];
+
+        assert!(app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            (tab.x + 1, tab.y),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.tab_menu.is_some());
+        assert!(app.tab_rename.is_none());
+    }
+
+    #[test]
+    fn tab_menu_renders_swap_with_submenu_for_other_tabs() {
+        let _env = crate::persist::test_env("tab-switch-submenu");
+        let Fixture {
+            mut app, mut term, ..
+        } = fixture();
+        app.run_cmd(crate::app::keys::Cmd::NewTab);
+        term.draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let first_tab = app
+            .tab_rects
+            .iter()
+            .find(|(index, _)| *index == 0)
+            .map(|(_, rect)| *rect)
+            .expect("first tab is visible");
+
+        assert!(app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            (first_tab.x + 1, first_tab.y),
+            KeyModifiers::NONE,
+        )));
+        term.draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let switch_row = app
+            .tab_menu
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .find(|(item, _)| *item == TabMenuItem::SwapWith)
+            .map(|(_, rect)| *rect)
+            .expect("Swap With row");
+
+        assert!(app.handle_event(mouse(
+            MouseEventKind::Moved,
+            (switch_row.x + 1, switch_row.y),
+            KeyModifiers::NONE,
+        )));
+        term.draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        assert_eq!(
+            app.tab_menu.as_ref().unwrap().swap_rects.len(),
+            1,
+            "the other tab is available in the submenu"
+        );
+    }
+
     /// A fixture whose pane grid holds `text`, plus the screen cell sitting on
     /// the token that starts at `at` characters in.
     fn fixture_showing(text: &str, at: u16) -> (App, Terminal<TestBackend>, (u16, u16)) {
@@ -3304,5 +4160,120 @@ mod link_click_tests {
             Some("abc\ndef"),
             "a skipped first row must not produce a leading newline"
         );
+    }
+
+    #[test]
+    fn multi_line_copy_keeps_the_drag_left_edge() {
+        // The first column is blank pane-side space before a Markdown list. A
+        // drag beginning on `-` must not add that blank to every middle row.
+        let rows = vec![
+            " - first".to_string(),
+            " - second".to_string(),
+            " - third".to_string(),
+        ];
+        assert_eq!(
+            extract_rows_selection(&rows, ((0, 1), (2, 7))).as_deref(),
+            Some("- first\n- second\n- third")
+        );
+    }
+
+    #[test]
+    fn mouse_copy_drops_a_uniform_one_cell_pane_margin() {
+        assert_eq!(
+            strip_uniform_single_cell_margin(
+                " Hello, rain on a windowpane\n Hello, wind with a traveling name\n Hello, all things we almost miss"
+                    .into()
+            ),
+            "Hello, rain on a windowpane\nHello, wind with a traveling name\nHello, all things we almost miss"
+        );
+        assert_eq!(
+            strip_uniform_single_cell_margin(
+                "    let preserved = true;\n    run(preserved);".into()
+            ),
+            "    let preserved = true;\n    run(preserved);",
+            "normal code indentation must stay intact"
+        );
+    }
+
+    #[test]
+    fn mouse_drag_copy_drops_the_pane_edge_margin_from_terminal_text() {
+        let _env = crate::persist::test_env("mouse-copy-pane-margin");
+        let source = " Morning arrives without ceremony,\r\n a thin gold line on the edge of the glass.\r\n The kettle speaks in its private language,";
+        let (mut app, mut term, _) = fixture_showing(source, 0);
+        // Hide the sidebars so the test deliberately starts at the pane's
+        // leftmost content cell, matching the screenshot case.
+        app.sidebars.left.visible = false;
+        app.sidebars.right.visible = false;
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let pane = app.layout().focus;
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| *rect)
+            .expect("pane content rect");
+        let start = (content.x, content.y);
+        let end = (
+            start.0
+                + " The kettle speaks in its private language,"
+                    .chars()
+                    .count() as u16
+                - 1,
+            start.1 + 2,
+        );
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            start,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            end,
+            KeyModifiers::NONE,
+        ));
+        assert!(app.selection.is_some(), "the drag created a selection");
+        assert_eq!(
+            app.selection_text().as_deref(),
+            Some(
+                "Morning arrives without ceremony,\na thin gold line on the edge of the glass.\nThe kettle speaks in its private language,"
+            )
+        );
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            end,
+            KeyModifiers::NONE,
+        ));
+
+        assert_eq!(
+            app.pending_clipboard.as_deref(),
+            Some(
+                "Morning arrives without ceremony,\na thin gold line on the edge of the glass.\nThe kettle speaks in its private language,"
+            )
+        );
+    }
+
+    #[test]
+    fn codex_copy_drops_its_one_cell_transcript_gutter() {
+        let _env = crate::persist::test_env("codex-copy-gutter");
+        let (mut app, _term, _) = fixture_showing("  hello\r\n  world", 0);
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).expect("pane status").agent = "codex".into();
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| *rect)
+            .expect("pane content rect");
+        // The drag starts one cell in, so this verifies Codex detection rather
+        // than the generic pane-edge case above.
+        app.selection = Some(crate::app::Selection {
+            pane,
+            content,
+            anchor: (content.x + 1, content.y),
+            cursor: (content.x + 6, content.y + 1),
+        });
+
+        assert_eq!(app.selection_text().as_deref(), Some("hello\nworld"));
     }
 }

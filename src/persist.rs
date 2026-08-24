@@ -31,6 +31,8 @@ pub struct SessionSnapshot {
 
 #[derive(Serialize, Deserialize)]
 pub struct WsSnap {
+    #[serde(default = "new_workspace_id")]
+    pub id: String,
     pub name: String,
     pub cwd: PathBuf,
     pub active_tab: usize,
@@ -42,6 +44,8 @@ pub struct WsSnap {
 
 #[derive(Serialize, Deserialize)]
 pub struct TabSnap {
+    #[serde(default = "new_tab_id")]
+    pub id: String,
     pub tree: LayoutTree,
     pub focus: u32,
     /// (raw pane id at save time → its cwd/command).
@@ -60,6 +64,14 @@ pub struct TabSnap {
     /// User-chosen tab name (docs/28); `None` → the tab shows its number.
     #[serde(default)]
     pub name: Option<String>,
+}
+
+fn new_workspace_id() -> String {
+    crate::ids::public_id("workspace")
+}
+
+fn new_tab_id() -> String {
+    crate::ids::public_id("tab")
 }
 
 #[derive(Serialize, Deserialize)]
@@ -88,6 +100,42 @@ pub struct PaneSnap {
     /// restore rebuilds the view (re-reads the file) instead of spawning a shell.
     #[serde(default)]
     pub file: Option<PathBuf>,
+    /// A native DIFF view specification. Patch content is always re-fetched.
+    #[serde(default)]
+    pub diff: Option<DiffSnap>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DiffSnap {
+    pub root: PathBuf,
+    pub key: crate::diff::DiffKey,
+    pub status: crate::diff::DiffFileStatus,
+    #[serde(default)]
+    pub preference: crate::diff::DiffLayoutPreference,
+    #[serde(default)]
+    pub scroll: usize,
+    #[serde(default)]
+    pub selected: usize,
+    #[serde(default)]
+    pub selected_side: crate::diff::DiffSide,
+    #[serde(default)]
+    pub horizontal: usize,
+    #[serde(default)]
+    pub wrap: bool,
+    #[serde(default = "default_diff_snap_context_lines")]
+    pub context_lines: u16,
+    #[serde(default = "default_diff_snap_line_numbers")]
+    pub show_line_numbers: bool,
+}
+
+fn default_diff_snap_context_lines() -> u16 {
+    crate::config::Config::default().diff_context_lines()
+}
+
+fn default_diff_snap_line_numbers() -> bool {
+    crate::config::Config::default()
+        .layout
+        .diff_show_line_numbers
 }
 
 /// Serializes tests that mutate the global `$LUVUS_HOME` env + config files, so
@@ -400,6 +448,55 @@ pub fn ensure_session_dir() -> PathBuf {
     dir
 }
 
+/// Create and validate the selected server runtime directory. Unlike the
+/// best-effort helpers used by ordinary config reads, server startup fails
+/// closed because its sockets grant command execution as the current user.
+pub fn ensure_server_session_dir() -> std::io::Result<PathBuf> {
+    let dir = session_dir();
+    ensure_private_server_dir(&dir)?;
+    #[cfg(unix)]
+    for socket in [socket_path(), client_socket_path()] {
+        if let Some(parent) = socket.parent().filter(|parent| *parent != dir) {
+            ensure_private_server_dir(parent)?;
+        }
+    }
+    Ok(dir)
+}
+
+fn ensure_private_server_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if Some(dir) == crate::platform::home_dir().as_deref() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Luvus server state directory cannot be the home directory",
+            ));
+        }
+        let metadata = fs::symlink_metadata(dir)?;
+        // SAFETY: `geteuid` has no preconditions.
+        let current_uid = unsafe { libc::geteuid() };
+        if !metadata.file_type().is_dir() || metadata.uid() != current_uid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "Luvus server state must be a real directory owned by the current user: {}",
+                    dir.display()
+                ),
+            ));
+        }
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        if fs::symlink_metadata(dir)?.mode() & 0o777 != 0o700 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("could not protect Luvus server state: {}", dir.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn ensure_private_dir(dir: &std::path::Path) {
     let _ = fs::create_dir_all(dir);
     #[cfg(unix)]
@@ -520,56 +617,49 @@ pub fn client_socket_path() -> PathBuf {
 }
 
 /// Build a snapshot from the live app.
-/// Resolve every pane's native agent session for the snapshot, guaranteeing
-/// that **no two panes claim the same session**.
+/// Resolve every pane's native agent session for the snapshot without assigning
+/// a conversation to the wrong pane.
 ///
-/// A hook-reported id names its own pane exactly, so those are claimed first and
-/// always win. Every other pane falls back to `agent::latest_session(agent,
-/// cwd)`, which answers "the newest session for this agent in this folder" — a
-/// key shared by *every* pane in that folder, with tabs not part of it at all.
-/// Unchecked, several panes record the same id and all restore into one
-/// conversation: a session reappears in a pane it was never in, the same
-/// conversation shows up in two tabs, and the transcript is corrupted once two
-/// agents append to it.
+/// A hook-reported id names its pane exactly, so it is always the source of
+/// truth. Disk discovery can recover an unbound pane only when the mapping is
+/// unambiguous: exactly one unbound pane and exactly one unclaimed session for
+/// an `(agent, cwd)` pair.
 ///
-/// Each guessing pane takes the newest session **not already claimed**, so panes
-/// sharing a folder line up with distinct conversations instead of colliding on
-/// one. That matters most after a fork: the parent is live, so its transcript is
-/// usually the newest file in the folder, and a fork that could only ever see
-/// "the newest" would find it taken and fall back to a bare shell. Falling
-/// through to the next-newest gives the fork its own session back.
-///
-/// Guessing panes are matched to sessions **by age**: pane ids are handed out in
-/// order, so the newest pane is resolved first and takes the newest session, the
-/// next-newest takes the one after it, and so on. Pairing them the other way
-/// round (oldest pane first, still taking the *newest* session) hands each pane
-/// its neighbour's conversation, which is how two agent panes in one folder ended
-/// up swapping sessions across a restart.
-///
-/// A pane with nothing left to claim records nothing and restores as a plain
-/// shell. Losing a resume is much better than duplicating a live session, and
-/// the guess was never evidence that *this* pane owned it.
+/// Pane creation order is not agent-session creation order. In particular, a
+/// user can make panes in several tabs and start their agents later in any order.
+/// Matching the newest session to the newest pane therefore swaps conversations
+/// between tabs on restart. When discovery cannot prove ownership, the pane
+/// restores as a shell instead. That is recoverable and safe; resuming the wrong
+/// conversation is neither.
 fn resolve_pane_sessions(app: &App) -> HashMap<PaneId, Option<(String, String)>> {
     let mut out: HashMap<PaneId, Option<(String, String)>> = HashMap::new();
-    let mut claimed: HashSet<String> = HashSet::new();
+    let mut claimed: HashSet<(String, String)> = HashSet::new();
     let mut ids: Vec<PaneId> = app.status.keys().copied().collect();
     ids.sort_by_key(|p| p.0);
 
     // Pass 1: precise, hook-reported sessions take their id outright.
     for id in &ids {
         if let Some(a) = app.status.get(id).and_then(|s| s.agent_session.as_ref()) {
-            claimed.insert(a.session_id.clone());
-            out.insert(*id, Some((a.agent.clone(), a.session_id.clone())));
+            let key = (a.agent.clone(), a.session_id.clone());
+            if claimed.insert(key.clone()) {
+                out.insert(*id, Some(key));
+            } else {
+                // A malformed or duplicate integration report must not make two
+                // panes resume and write to the same native conversation.
+                out.insert(*id, None);
+            }
         }
     }
-    // Pass 2: everyone else takes the newest session for their folder that is
-    // still unclaimed, so panes sharing a folder get distinct conversations.
-    // Newest pane first, so pane age lines up with session age (see above).
-    for id in ids.iter().rev() {
-        if out.contains_key(id) {
+
+    // Pass 2: group unbound panes before looking at native session stores. A
+    // `(agent, cwd)` identifies a set of possible conversations, not a pane.
+    // Only a one-pane / one-session group can be recovered safely.
+    let mut unbound: HashMap<(String, PathBuf), Vec<PaneId>> = HashMap::new();
+    for id in ids {
+        if out.contains_key(&id) {
             continue;
         }
-        let Some(st) = app.status.get(id) else {
+        let Some(st) = app.status.get(&id) else {
             continue;
         };
         // The sidebar label is updated asynchronously. A restart can happen
@@ -582,18 +672,31 @@ fn resolve_pane_sessions(app: &App) -> HashMap<PaneId, Option<(String, String)>>
         // the UI state or lifecycle bookkeeping.
         let agent = snapshot_agent(
             &app.manifests,
-            app.proc_commands.get(id).map(Vec::as_slice),
+            app.proc_commands.get(&id).map(Vec::as_slice),
             &st.agent,
         );
-        let guess = app.panes.get(id).and_then(|p| {
-            crate::agent::sessions_for(&agent, &p.cwd)
-                .into_iter()
-                .find(|sid| !claimed.contains(sid))
-        });
-        if let Some(sid) = &guess {
-            claimed.insert(sid.clone());
+        if let Some(pane) = app.panes.get(&id) {
+            unbound
+                .entry((agent, pane.cwd.clone()))
+                .or_default()
+                .push(id);
         }
-        out.insert(*id, guess.map(|sid| (agent, sid)));
+    }
+    for ((agent, cwd), pane_ids) in unbound {
+        let sessions: Vec<String> = crate::agent::sessions_for(&agent, &cwd)
+            .into_iter()
+            .filter(|sid| !claimed.contains(&(agent.clone(), sid.clone())))
+            .collect();
+        if pane_ids.len() == 1 && sessions.len() == 1 {
+            let id = pane_ids[0];
+            let sid = sessions.into_iter().next().expect("length checked");
+            claimed.insert((agent.clone(), sid.clone()));
+            out.insert(id, Some((agent, sid)));
+        } else {
+            for id in pane_ids {
+                out.insert(id, None);
+            }
+        }
     }
     out
 }
@@ -625,6 +728,7 @@ pub fn snapshot(app: &App) -> SessionSnapshot {
             // re-created as the dashboard (and re-fetched) on restore.
             if tab.is_git() {
                 tabs.push(TabSnap {
+                    id: tab.id.clone(),
                     tree: tab.layout.to_tree(),
                     focus: tab.layout.focus.0,
                     panes: Vec::new(),
@@ -638,6 +742,7 @@ pub fn snapshot(app: &App) -> SessionSnapshot {
             // An orchestration board (docs/22) has no real panes either.
             if tab.is_orch() {
                 tabs.push(TabSnap {
+                    id: tab.id.clone(),
                     tree: tab.layout.to_tree(),
                     focus: tab.layout.focus.0,
                     panes: Vec::new(),
@@ -651,6 +756,7 @@ pub fn snapshot(app: &App) -> SessionSnapshot {
             // A Mission Control dashboard (docs/54) — placeholder, re-derived.
             if tab.is_mission() {
                 tabs.push(TabSnap {
+                    id: tab.id.clone(),
                     tree: tab.layout.to_tree(),
                     focus: tab.layout.focus.0,
                     panes: Vec::new(),
@@ -668,7 +774,37 @@ pub fn snapshot(app: &App) -> SessionSnapshot {
                 .filter_map(|id| {
                     // A file-view leaf (docs/38 FILE-3) is saved by its path and
                     // rebuilt on restore; it has no PTY.
-                    if let Some(crate::app::ViewKind::File(v)) = app.views.get(&id) {
+                    if let Some(view) = app.views.get(&id) {
+                        let (file, diff) = match view {
+                            crate::app::ViewKind::File(v) => (Some(v.path.clone()), None),
+                            crate::app::ViewKind::Diff(v) => {
+                                let status = app
+                                    .diff
+                                    .snapshot
+                                    .as_ref()
+                                    .and_then(|snapshot| {
+                                        snapshot.files.iter().find(|file| file.key == v.key)
+                                    })
+                                    .map(|file| file.status)
+                                    .unwrap_or(crate::diff::DiffFileStatus::Modified);
+                                (
+                                    None,
+                                    Some(DiffSnap {
+                                        root: v.root.clone(),
+                                        key: v.key.clone(),
+                                        status,
+                                        preference: v.preference,
+                                        scroll: v.scroll,
+                                        selected: v.selected,
+                                        selected_side: v.selected_side,
+                                        horizontal: v.horizontal,
+                                        wrap: v.wrap,
+                                        context_lines: v.context_lines,
+                                        show_line_numbers: v.show_line_numbers,
+                                    }),
+                                )
+                            }
+                        };
                         return Some((
                             id.0,
                             PaneSnap {
@@ -679,7 +815,8 @@ pub fn snapshot(app: &App) -> SessionSnapshot {
                                 agent_launch: None,
                                 screen: None,
                                 module: None,
-                                file: Some(v.path.clone()),
+                                file,
+                                diff,
                             },
                         ));
                     }
@@ -732,12 +869,14 @@ pub fn snapshot(app: &App) -> SessionSnapshot {
                                 screen,
                                 module,
                                 file: None,
+                                diff: None,
                             },
                         )
                     })
                 })
                 .collect();
             tabs.push(TabSnap {
+                id: tab.id.clone(),
                 tree: tab.layout.to_tree(),
                 focus: tab.layout.focus.0,
                 panes,
@@ -748,6 +887,7 @@ pub fn snapshot(app: &App) -> SessionSnapshot {
             });
         }
         workspaces.push(WsSnap {
+            id: ws.id.clone(),
             name: ws.name.clone(),
             cwd: ws.cwd.clone(),
             active_tab: ws.active_tab,
@@ -817,6 +957,59 @@ fn expand_home(p: &Path) -> PathBuf {
     match p.to_str() {
         Some(s) => crate::platform::user_path(s),
         None => p.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+mod diff_snap_schema_tests {
+    use super::*;
+
+    #[test]
+    fn diff_snapshot_display_state_defaults_without_dropping_the_session() {
+        let path = crate::diff::RepoPath::from_path(std::path::Path::new("src/lib.rs")).unwrap();
+        let snap = DiffSnap {
+            root: PathBuf::from("repo"),
+            key: crate::diff::DiffKey {
+                repo_id: "repo".into(),
+                worktree_id: "tree".into(),
+                layer: crate::diff::DiffLayer::Worktree,
+                old_path: Some(path.clone()),
+                new_path: Some(path),
+            },
+            status: crate::diff::DiffFileStatus::Modified,
+            preference: crate::diff::DiffLayoutPreference::Split,
+            scroll: 4,
+            selected: 5,
+            selected_side: crate::diff::DiffSide::Old,
+            horizontal: 6,
+            wrap: true,
+            context_lines: 7,
+            show_line_numbers: false,
+        };
+        let mut value = serde_json::to_value(snap).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for key in [
+            "preference",
+            "scroll",
+            "selected",
+            "selected_side",
+            "horizontal",
+            "wrap",
+            "context_lines",
+            "show_line_numbers",
+        ] {
+            object.remove(key);
+        }
+
+        let restored: DiffSnap = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.preference, crate::diff::DiffLayoutPreference::Auto);
+        assert_eq!(restored.scroll, 0);
+        assert_eq!(restored.selected, 0);
+        assert_eq!(restored.selected_side, crate::diff::DiffSide::New);
+        assert_eq!(restored.horizontal, 0);
+        assert!(!restored.wrap);
+        assert_eq!(restored.context_lines, 3);
+        assert!(restored.show_line_numbers);
     }
 }
 

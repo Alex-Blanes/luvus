@@ -13,6 +13,15 @@ use crate::git::{
 
 impl App {
     /// Open (or focus) the git tab for `workspace`. Idempotent — one git tab per workspace.
+    ///
+    /// `Workspace.cwd` is fixed at workspace creation and never follows a
+    /// pane's live shell `cd` (see `App::refresh_cwds`). A user who just `cd`s
+    /// into a repo inside a pane, instead of opening a dedicated workspace
+    /// there, got a silent no-op from `Ctrl+Space g`: the check ran against
+    /// the stale workspace root, correctly saw "not a repo", and stopped
+    /// (issue/67). So when the workspace root itself isn't a repo, fall back
+    /// to the now-active workspace's focused pane's actual live cwd before
+    /// giving up.
     pub fn open_git_tab(&mut self, wsi: usize) {
         if wsi >= self.workspaces.len() {
             return;
@@ -22,15 +31,48 @@ impl App {
             self.workspaces[wsi].active_tab = i;
             return;
         }
-        let root = self.workspaces[wsi].cwd.clone();
-        if !local::is_repo(&root) {
-            return; // a workspace that isn't a git repo has no git tab
+        let ws_root = self.workspaces[wsi].cwd.clone();
+        let mut root = ws_root.clone();
+        let mut check = local::repo_check(&root);
+        // Only fall back on an ordinary "not a repo" root. A workspace-root
+        // `Error` (broken `git`, bad `PATH`, ...) must still surface as a
+        // toast, even when the focused pane happens to be a valid repo.
+        if matches!(check, local::RepoCheck::NotRepo) {
+            let pane_cwd = self.focused_cwd();
+            if pane_cwd != ws_root {
+                let pane_check = local::repo_check(&pane_cwd);
+                match pane_check {
+                    local::RepoCheck::Repo => {
+                        root = pane_cwd;
+                        check = pane_check;
+                    }
+                    // The pane cwd itself failed to check (bad permissions, a
+                    // broken `git`, ...): that's worth surfacing even if the
+                    // workspace root was just an ordinary non-repo folder.
+                    local::RepoCheck::Error(_) => check = pane_check,
+                    local::RepoCheck::NotRepo => {}
+                }
+            }
+        }
+        match check {
+            local::RepoCheck::Repo => {}
+            // A workspace that genuinely isn't a git repo stays a silent
+            // no-op (the common case, e.g. a scratch folder).
+            local::RepoCheck::NotRepo => return,
+            // `git` missing or failing to run is surfaced instead of
+            // swallowed, so `Ctrl+Space g` never again looks like it did
+            // nothing (issue/67).
+            local::RepoCheck::Error(e) => {
+                self.show_toast(format!("git tab: {e}"));
+                return;
+            }
         }
         let view = GitView::new(root.clone());
         let view_id = view.id;
         let placeholder = PaneId::alloc(); // never inserted into `panes`
         let ws = &mut self.workspaces[wsi];
         ws.tabs.push(Tab {
+            id: crate::ids::public_id("tab"),
             layout: TileLayout::new(placeholder),
             git: Some(Box::new(view)),
             orch: false,
@@ -327,6 +369,8 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') => self.git_close_commit_detail(),
             KeyCode::Char('j') | KeyCode::Down => self.git_scroll(1),
             KeyCode::Char('k') | KeyCode::Up => self.git_scroll(-1),
+            KeyCode::PageUp => self.git_scroll(-self.git_page_size()),
+            KeyCode::PageDown => self.git_scroll(self.git_page_size()),
             KeyCode::Char('g') | KeyCode::Home => {
                 if let Some(g) = self.active_git_mut() {
                     g.scroll = 0;
@@ -359,6 +403,135 @@ impl App {
         std::thread::spawn(move || {
             let _ = github::browse_commit(&root, &sha);
         });
+    }
+
+    /// The explicitly selected file in the Status section, if it still exists
+    /// in the current status result.
+    fn git_status_selected_file(&self) -> Option<(String, bool)> {
+        let g = self.active_git()?;
+        if g.section != Section::Status {
+            return None;
+        }
+        let selected = g.status_selected.as_ref()?;
+        let Load::Loaded(status) = &g.status else {
+            return None;
+        };
+        let exists = if selected.1 {
+            status.staged.iter().any(|change| change.path == selected.0)
+        } else {
+            status
+                .unstaged
+                .iter()
+                .any(|change| change.path == selected.0)
+        };
+        exists.then(|| selected.clone())
+    }
+
+    /// Status files in their display order: staged first, then unstaged.
+    fn git_status_files(&self) -> Vec<(String, bool)> {
+        let Some(g) = self.active_git() else {
+            return Vec::new();
+        };
+        if g.section != Section::Status {
+            return Vec::new();
+        }
+        let Load::Loaded(status) = &g.status else {
+            return Vec::new();
+        };
+        status
+            .staged
+            .iter()
+            .map(|change| (change.path.clone(), true))
+            .chain(
+                status
+                    .unstaged
+                    .iter()
+                    .map(|change| (change.path.clone(), false)),
+            )
+            .collect()
+    }
+
+    /// Store a Status file selection and keep its rendered row in view when
+    /// possible. The identity remains valid across a status refresh until the
+    /// file is no longer present.
+    fn git_select_status_file(&mut self, selected: (String, bool)) {
+        let Some(g) = self.active_git_mut() else {
+            return;
+        };
+        let row = match &g.status {
+            Load::Loaded(status) if selected.1 => status
+                .staged
+                .iter()
+                .position(|change| change.path == selected.0)
+                .map(|index| g.status_staged_rows.start + index),
+            Load::Loaded(status) => status
+                .unstaged
+                .iter()
+                .position(|change| change.path == selected.0)
+                .map(|index| g.status_unstaged_rows.start + index),
+            _ => None,
+        };
+        g.status_selected = Some(selected);
+        let available = g.list_area.height as usize;
+        if let Some(row) = row.filter(|_| available > 0) {
+            if row < g.scroll {
+                g.scroll = row;
+            } else if row >= g.scroll.saturating_add(available) {
+                g.scroll = row + 1 - available;
+            }
+        }
+    }
+
+    /// Move the explicit Status file selection. `j`/`k` retain their existing
+    /// scrolling behavior because Status also includes repository metadata;
+    /// the arrow keys select changed files for Enter and `d`.
+    fn git_status_move(&mut self, delta: isize) {
+        let files = self.git_status_files();
+        if files.is_empty() {
+            return;
+        }
+        let current = self.git_status_selected_file();
+        let index = current
+            .as_ref()
+            .and_then(|selected| files.iter().position(|file| file == selected));
+        let next = match (index, delta.cmp(&0)) {
+            (Some(index), std::cmp::Ordering::Greater) => (index + 1).min(files.len() - 1),
+            (Some(index), std::cmp::Ordering::Less) => index.saturating_sub(1),
+            (Some(index), std::cmp::Ordering::Equal) => index,
+            (None, std::cmp::Ordering::Less) => files.len() - 1,
+            (None, _) => 0,
+        };
+        self.git_select_status_file(files[next].clone());
+    }
+
+    /// Whether a click at `(col, row)` lands on a staged or unstaged file row
+    /// in the Status section. Returns `(path, staged)` if so.
+    pub fn git_status_file_at(&self, col: u16, row: u16) -> Option<(String, bool)> {
+        let g = self.active_git()?;
+        if g.section != Section::Status {
+            return None;
+        }
+        let la = g.list_area;
+        if la.height == 0 || col < la.x || col >= la.right() || row < la.y || row >= la.bottom() {
+            return None;
+        }
+        let idx = g.scroll + (row - la.y) as usize;
+        if let Load::Loaded(s) = &g.status {
+            // Check unstaged first (more common action).
+            if g.status_unstaged_rows.contains(&idx) {
+                let i = idx - g.status_unstaged_rows.start;
+                if let Some(fc) = s.unstaged.get(i) {
+                    return Some((fc.path.clone(), false));
+                }
+            }
+            if g.status_staged_rows.contains(&idx) {
+                let i = idx - g.status_staged_rows.start;
+                if let Some(fc) = s.staged.get(i) {
+                    return Some((fc.path.clone(), true));
+                }
+            }
+        }
+        None
     }
 
     // ── issue detail view (docs/17): mirrors the PR detail, in-tab ────────────
@@ -433,6 +606,8 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') => self.git_close_issue_detail(),
             KeyCode::Char('j') | KeyCode::Down => self.git_scroll(1),
             KeyCode::Char('k') | KeyCode::Up => self.git_scroll(-1),
+            KeyCode::PageUp => self.git_scroll(-self.git_page_size()),
+            KeyCode::PageDown => self.git_scroll(self.git_page_size()),
             KeyCode::Char('g') | KeyCode::Home => {
                 if let Some(g) = self.active_git_mut() {
                     g.scroll = 0;
@@ -460,7 +635,8 @@ impl App {
     }
 
     /// Switch the active git tab to a clicked view-selector section. Also closes
-    /// any open detail view (PR or commit), so a tab click always lands on a list.
+    /// any open detail view (PR, commit, issue, file diff), so a tab click
+    /// always lands on a list.
     pub fn git_click_section(&mut self, section: Section) {
         if let Some(g) = self.active_git_mut() {
             let had_detail =
@@ -607,8 +783,16 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.git_scroll(1),
-            KeyCode::Char('k') | KeyCode::Up => self.git_scroll(-1),
+            KeyCode::Char('j') => self.git_scroll(1),
+            KeyCode::Char('k') => self.git_scroll(-1),
+            KeyCode::Down if self.active_git().map(|g| g.section) == Some(Section::Status) => {
+                self.git_status_move(1)
+            }
+            KeyCode::Up if self.active_git().map(|g| g.section) == Some(Section::Status) => {
+                self.git_status_move(-1)
+            }
+            KeyCode::Down => self.git_scroll(1),
+            KeyCode::Up => self.git_scroll(-1),
             KeyCode::Char('g') | KeyCode::Home => self.git_set_cursor(0),
             KeyCode::Char('G') | KeyCode::End => self.git_set_cursor(usize::MAX),
             KeyCode::Tab | KeyCode::Right => self.git_switch(true),
@@ -698,11 +882,18 @@ impl App {
         )
     }
 
+    /// Page size for PgUp/PgDn in detail views: visible rows minus one for overlap.
+    fn git_page_size(&self) -> i32 {
+        self.active_git()
+            .map(|g| g.list_area.height.saturating_sub(1) as i32)
+            .unwrap_or(20)
+    }
+
     /// Scroll the active view by `delta` rows — moves the cursor in list views,
     /// or the scroll offset in Flow/Status (clamped to content during render).
     /// Drives both `j`/`k` and the mouse wheel.
     pub fn git_scroll(&mut self, delta: i32) {
-        // The PR / commit / issue detail views all scroll as a block.
+        // The PR / commit / issue / file-diff detail views all scroll as a block.
         if self.active_git().is_some_and(|g| {
             g.open_pr.is_some() || g.open_commit.is_some() || g.open_issue.is_some()
         }) {
@@ -804,6 +995,11 @@ impl App {
             self.git_open_issue_detail();
             return;
         }
+        // A Status file row opens its diff in the native diff viewer.
+        if self.active_git().map(|g| g.section) == Some(Section::Status) {
+            self.git_open_status_diff();
+            return;
+        }
         // Branch checkout is handled directly so we can refresh in place.
         let branch = self.active_git().and_then(|g| match g.section {
             Section::Branches => match &g.branches {
@@ -824,11 +1020,57 @@ impl App {
         }
     }
 
-    /// `d`: diff/show the selection in the workspace's terminal pane.
+    /// `d`: diff/show the selection in the workspace's terminal pane, or in the
+    /// native diff viewer for Status files.
     fn git_diff(&mut self) {
+        // Status files open in the native diff viewer.
+        if self
+            .active_git()
+            .is_some_and(|g| g.section == Section::Status)
+        {
+            self.git_open_status_diff();
+            return;
+        }
         if let Some(cmd) = self.git_selected_command(true) {
             self.git_run_in_pane(cmd);
         }
+    }
+
+    /// Open the selected Status file in the native diff viewer. Ensures the
+    /// diff snapshot is loaded first; if not, triggers a refresh and shows a
+    /// toast so the user can retry. When `override_file` is `None`, uses the
+    /// explicit Status-row selection.
+    pub fn git_open_status_diff_with(&mut self, override_file: Option<(String, bool)>) {
+        if let Some(selected) = override_file.as_ref() {
+            self.git_select_status_file(selected.clone());
+        }
+        let Some((path, staged)) = override_file.or_else(|| self.git_status_selected_file()) else {
+            self.show_toast("select a changed file with ↑/↓ or click it");
+            return;
+        };
+        if !self.diff_snapshot_matches_active_workspace() {
+            self.refresh_diff_status(true);
+            self.show_toast("loading diff data — try again");
+            return;
+        }
+        let layer = if staged {
+            crate::diff::DiffLayer::Staged
+        } else {
+            crate::diff::DiffLayer::Worktree
+        };
+        match self.diff_file_for_path(&path, Some(&layer)) {
+            Ok(file) => {
+                self.open_diff_view(file.key, super::files::OpenTarget::Preview);
+            }
+            Err(e) => {
+                self.show_toast(&e);
+            }
+        }
+    }
+
+    /// Open the explicitly selected Status file in the native diff viewer.
+    fn git_open_status_diff(&mut self) {
+        self.git_open_status_diff_with(None);
     }
 
     /// The `gh`/`git` command for the selected row. `diff` chooses the diff form.
@@ -923,6 +1165,7 @@ mod tests {
         ]);
         let placeholder = PaneId::alloc();
         app.workspaces[0].tabs.push(Tab {
+            id: crate::ids::public_id("tab"),
             layout: TileLayout::new(placeholder),
             git: Some(Box::new(view)),
             orch: false,
@@ -943,6 +1186,118 @@ mod tests {
         for i in 1..5 {
             assert_eq!(cmd_at(&mut app, i), None, "hostile branch {i} is refused");
         }
+    }
+
+    /// Status is a scrolling overview, so activation must use an explicit file
+    /// identity rather than guessing from the viewport or falling back to the
+    /// first change. Arrow navigation and Status-row clicks both set it.
+    #[test]
+    fn status_selection_tracks_the_exact_file_for_diff_activation() {
+        use crate::diff::{DiffFile, DiffFileStatus, DiffKey, DiffLayer, DiffSnapshot, RepoPath};
+        use crate::git::model::{FileChange, RepoStatus};
+        use std::path::Path;
+
+        fn diff_file(path: &str, layer: DiffLayer) -> DiffFile {
+            DiffFile {
+                key: DiffKey {
+                    repo_id: "test-repo".into(),
+                    worktree_id: "test-worktree".into(),
+                    layer,
+                    old_path: None,
+                    new_path: Some(RepoPath::from_path(Path::new(path)).unwrap()),
+                },
+                status: DiffFileStatus::Modified,
+                additions: Some(1),
+                deletions: Some(0),
+                binary: false,
+                unresolved_notes: 0,
+                viewed_fingerprint: None,
+                fingerprint: format!("fingerprint-{path}"),
+            }
+        }
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let root = app.ws().cwd.clone();
+        let staged_diff = diff_file("staged-first.rs", DiffLayer::Staged);
+        let worktree_diff = diff_file("worktree.rs", DiffLayer::Worktree);
+        app.diff.snapshot = Some(DiffSnapshot {
+            generation: 1,
+            fingerprint: "test-snapshot".into(),
+            repo_id: "test-repo".into(),
+            worktree_id: "test-worktree".into(),
+            visible_root: root.clone(),
+            repo_root: root.clone(),
+            branch: "main".into(),
+            files: vec![staged_diff.clone(), worktree_diff.clone()],
+            omitted_files: 0,
+        });
+        let mut view = GitView::new(root);
+        view.section = Section::Status;
+        view.status = Load::Loaded(RepoStatus {
+            staged: vec![
+                FileChange {
+                    code: 'M',
+                    path: "staged-first.rs".into(),
+                },
+                FileChange {
+                    code: 'A',
+                    path: "staged-second.rs".into(),
+                },
+            ],
+            unstaged: vec![FileChange {
+                code: 'M',
+                path: "worktree.rs".into(),
+            }],
+            ..RepoStatus::default()
+        });
+        let placeholder = PaneId::alloc();
+        app.workspaces[0].tabs.push(Tab {
+            id: crate::ids::public_id("tab"),
+            layout: TileLayout::new(placeholder),
+            git: Some(Box::new(view)),
+            orch: false,
+            mission: false,
+            name: None,
+        });
+        app.workspaces[0].active_tab = app.workspaces[0].tabs.len() - 1;
+        let git_tab = app.ws().active_tab;
+
+        // Enter with no explicit Status selection must not silently open the
+        // first file or start a DIFF refresh for a guessed file.
+        app.handle_git_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.diff.status_inflight, "no file was guessed for Enter");
+
+        app.handle_git_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            app.git_status_selected_file(),
+            Some(("staged-first.rs".into(), true))
+        );
+        app.handle_git_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            app.git_status_selected_file(),
+            Some(("staged-second.rs".into(), true))
+        );
+        app.handle_git_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            app.git_status_selected_file(),
+            Some(("worktree.rs".into(), false))
+        );
+
+        // Mouse selection and keyboard activation resolve the exact native
+        // layer, rather than a viewport row or a generic worktree diff.
+        app.git_open_status_diff_with(Some(("staged-first.rs".into(), true)));
+        assert!(
+            app.diff_view_showing(&staged_diff.key).is_some(),
+            "the staged file opened in the staged native DIFF layer"
+        );
+        app.workspaces[0].active_tab = git_tab;
+        app.git_select_status_file(("worktree.rs".into(), false));
+        app.handle_git_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(
+            app.diff_view_showing(&worktree_diff.key).is_some(),
+            "the worktree file opened in the worktree native DIFF layer"
+        );
     }
 
     /// Enter (and a click) on a commit opens its `git show` in-tab — setting
@@ -968,6 +1323,7 @@ mod tests {
         }]);
         let placeholder = PaneId::alloc();
         app.workspaces[0].tabs.push(Tab {
+            id: crate::ids::public_id("tab"),
             layout: TileLayout::new(placeholder),
             git: Some(Box::new(view)),
             orch: false,
@@ -1021,6 +1377,7 @@ mod tests {
         // right before the git tab, so the old code would have jumped to it.
         let real_pane_tab = 0usize;
         app.workspaces[0].tabs.push(Tab {
+            id: crate::ids::public_id("tab"),
             layout: TileLayout::new(PaneId::alloc()),
             git: None,
             orch: true,
@@ -1029,6 +1386,7 @@ mod tests {
         });
         let orch_tab = 1usize;
         app.workspaces[0].tabs.push(Tab {
+            id: crate::ids::public_id("tab"),
             layout: TileLayout::new(PaneId::alloc()),
             git: Some(Box::new(GitView::new(std::path::PathBuf::from("/tmp")))),
             orch: false,
@@ -1060,6 +1418,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
         app.workspaces[0].tabs.push(Tab {
+            id: crate::ids::public_id("tab"),
             layout: TileLayout::new(PaneId::alloc()),
             git: Some(Box::new(GitView::new(std::path::PathBuf::from("/tmp")))),
             orch: false,
@@ -1110,6 +1469,7 @@ mod tests {
         }]);
         let placeholder = PaneId::alloc();
         app.workspaces[0].tabs.push(Tab {
+            id: crate::ids::public_id("tab"),
             layout: TileLayout::new(placeholder),
             git: Some(Box::new(view)),
             orch: false,
@@ -1167,6 +1527,7 @@ mod tests {
         view.section = Section::Prs;
         let placeholder = PaneId::alloc();
         app.workspaces[0].tabs.push(Tab {
+            id: crate::ids::public_id("tab"),
             layout: TileLayout::new(placeholder),
             git: Some(Box::new(view)),
             orch: false,
@@ -1208,6 +1569,7 @@ mod tests {
         view.commits = Load::Loaded(vec![mk("aaa111"), mk("bbb222"), mk("ccc333")]);
         let placeholder = PaneId::alloc();
         app.workspaces[0].tabs.push(Tab {
+            id: crate::ids::public_id("tab"),
             layout: TileLayout::new(placeholder),
             git: Some(Box::new(view)),
             orch: false,
@@ -1247,6 +1609,7 @@ mod tests {
         let mut app = App::new(80, 24, tx).unwrap();
         let placeholder = PaneId::alloc();
         app.workspaces[0].tabs.push(Tab {
+            id: crate::ids::public_id("tab"),
             layout: TileLayout::new(placeholder),
             git: Some(Box::new(view)),
             orch: false,
@@ -1299,6 +1662,7 @@ mod tests {
         let mut app = App::new(170, 24, tx).unwrap();
         let placeholder = PaneId::alloc();
         app.workspaces[0].tabs.push(Tab {
+            id: crate::ids::public_id("tab"),
             layout: TileLayout::new(placeholder),
             git: Some(Box::new(view)),
             orch: false,
@@ -1412,6 +1776,7 @@ mod tests {
         let mut app = App::new(40, 12, tx).unwrap();
         let placeholder = PaneId::alloc();
         app.workspaces[0].tabs.push(Tab {
+            id: crate::ids::public_id("tab"),
             layout: TileLayout::new(placeholder),
             git: Some(Box::new(view)),
             orch: false,
@@ -1441,6 +1806,45 @@ mod tests {
         assert_eq!(app.active_git().unwrap().scroll, 0); // reset on switch
         app.git_scroll(2);
         assert_eq!(app.active_git().unwrap().cursor, 2);
+    }
+
+    /// A workspace whose fixed `cwd` is not a repo, but whose focused pane
+    /// has since `cd`'d into one, still opens the git tab: `open_git_tab`
+    /// falls back to the pane's live cwd instead of silently no-op'ing
+    /// (issue/67).
+    #[test]
+    fn git_tab_falls_back_to_focused_pane_cwd() {
+        let repo =
+            std::env::temp_dir().join(format!("luvus-gittab-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .output()
+            .expect("git");
+
+        let not_repo =
+            std::env::temp_dir().join(format!("luvus-gittab-notrepo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&not_repo);
+        std::fs::create_dir_all(&not_repo).unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        // The workspace root stays fixed at a non-repo folder...
+        app.workspaces[0].cwd = not_repo;
+        // ...but the focused pane (created by `App::new`) has `cd`'d into the repo.
+        let focus = app.layout().focus;
+        app.panes.get_mut(&focus).unwrap().cwd = repo.clone();
+
+        app.open_git_tab(0);
+        let view = app
+            .active_git()
+            .expect("git tab opens using the focused pane's cwd, not the stale workspace root");
+        assert_eq!(
+            view.repo_root, repo,
+            "the git tab targets the focused pane's repo, not the workspace root"
+        );
     }
 
     #[test]
@@ -1571,6 +1975,7 @@ mod tests {
         view.prs = Load::Loaded(vec![pr]);
         let placeholder = PaneId::alloc();
         app.workspaces[0].tabs.push(Tab {
+            id: crate::ids::public_id("tab"),
             layout: TileLayout::new(placeholder),
             git: Some(Box::new(view)),
             orch: false,
@@ -1618,6 +2023,7 @@ mod tests {
         let vid = view.id;
         let placeholder = PaneId::alloc();
         app.workspaces[0].tabs.push(Tab {
+            id: crate::ids::public_id("tab"),
             layout: TileLayout::new(placeholder),
             git: Some(Box::new(view)),
             orch: false,
