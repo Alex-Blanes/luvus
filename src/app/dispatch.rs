@@ -64,6 +64,7 @@ impl App {
         if now.duration_since(self.last_cwd_at) >= Duration::from_secs(1) {
             self.last_cwd_at = now;
             self.refresh_cwds();
+            self.remember_session_titles();
             // Keep the FILES dock rooted at the active node and its open dirs
             // read (docs/38). Off-loop: this only schedules reads, never blocks.
             self.ensure_file_tree();
@@ -1967,6 +1968,20 @@ impl App {
             .find_map(|(name, p)| (*p == pane).then_some(name.as_str()))
     }
 
+    /// Record every live agent session's current title, so the session keeps a
+    /// readable name in the AGENTS history once its pane is gone. The agent owns
+    /// the name: it rewrites its title as the work moves on (Claude does it again
+    /// after `/compact`), and the last one seen wins.
+    fn remember_session_titles(&mut self) {
+        let seen: Vec<(String, String)> = self
+            .status
+            .iter()
+            .filter_map(|(id, s)| Some((s.agent_session.as_ref()?.session_id.clone(), *id)))
+            .filter_map(|(sid, id)| Some((sid, self.pane_title(id)?)))
+            .collect();
+        self.session_titles.extend(seen);
+    }
+
     /// The pane's live session title (the OSC title the agent set), trimmed, if
     /// non-empty. The AGENTS sidebar shows it in place of the meta line when the
     /// "show agent session title" setting is on (`config.layout.agent_title`).
@@ -2314,6 +2329,56 @@ fn state_str(s: State) -> &'static str {
 mod tests {
     use super::*;
     use crate::app::App;
+
+    /// A session keeps a readable name after its pane is gone: the title it set
+    /// while live is remembered by session id, and the AGENTS history row shows it
+    /// instead of the bare project folder. The agent owns the name — a later title
+    /// (what `/compact` produces) overwrites the earlier one.
+    #[test]
+    fn a_live_session_title_names_its_resumable_row_later() {
+        let _env = crate::persist::test_env("session-title-memory");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).unwrap().agent_session = Some(crate::app::AgentSession {
+            agent: "claude".into(),
+            session_id: "sess-1".into(),
+        });
+
+        let set_title = |app: &App, s: &str| {
+            let bytes = format!("]0;{s}");
+            app.panes[&pane]
+                .engine
+                .lock()
+                .unwrap()
+                .advance(bytes.as_bytes());
+        };
+        set_title(&app, "Ship the desktop release");
+        app.remember_session_titles();
+        assert_eq!(
+            app.session_titles.get("sess-1").map(String::as_str),
+            Some("Ship the desktop release")
+        );
+
+        // Re-titled (an agent does this on its own after a compaction): last wins.
+        set_title(&app, "Wire up the sidebar filter");
+        app.remember_session_titles();
+        assert_eq!(
+            app.session_titles.get("sess-1").map(String::as_str),
+            Some("Wire up the sidebar filter")
+        );
+
+        // The name survives a save/restore, which is what makes it useful: by the
+        // time the row is resumable, the pane that carried the title is gone.
+        let snap = crate::persist::snapshot(&app);
+        assert_eq!(
+            snap.session_titles,
+            vec![(
+                "sess-1".to_string(),
+                "Wire up the sidebar filter".to_string()
+            )]
+        );
+    }
 
     #[test]
     fn strip_title_icon_drops_a_leading_glyph_only() {

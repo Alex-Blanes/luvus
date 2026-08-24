@@ -1226,11 +1226,11 @@ impl App {
             self.update_bar_drag(which, r);
             return;
         }
-        // The AGENTS All/Active filter toggle.
+        // The AGENTS Workspace/All/Active filter toggle.
         if let Some((val, _)) = self.agents_filter_rects.iter().find(|(_, rect)| hit(*rect)) {
             let val = *val;
-            if self.agents_active_only != val {
-                self.agents_active_only = val;
+            if self.agents_filter != val {
+                self.agents_filter = val;
                 self.agents_scroll = 0;
             }
             return;

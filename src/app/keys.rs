@@ -713,7 +713,7 @@ impl App {
             Cmd::OpenSettings => self.open_settings(),
             Cmd::ToggleSidebar => self.toggle_all_sides(),
             Cmd::ToggleRightSidebar => self.toggle_side(crate::app::Side::Right),
-            Cmd::ToggleAgents => self.agents_active_only = !self.agents_active_only,
+            Cmd::ToggleAgents => self.agents_filter = self.agents_filter.next(),
             Cmd::ToggleFiles => self.toggle_files_dock(),
             Cmd::Switcher => self.toggle_switcher(),
             Cmd::GlobalSearch => self.toggle_search(),
