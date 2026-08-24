@@ -30,25 +30,15 @@ fn path_key(p: &Path) -> String {
     let s = p.to_string_lossy();
     // `\\?\C:\proj` and `C:\proj` are the same folder.
     let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
-    #[cfg(windows)]
-    // Windows accepts `/` as a separator and is case-insensitive.
-    let s = s.replace('/', "\\").to_lowercase();
-    // `C:\\Users\\me` is the same folder as `C:\Users\me` — the OS collapses a
-    // run of separators, and a path that made a round trip through something
-    // that escapes backslashes (a shell, a JSON string) arrives doubled. Two
-    // spellings of one folder used to sit in the sidebar as two workspaces.
-    // A *leading* run is kept: `\\server\share` is a UNC host, not a root.
-    // `&s[..]` and not `&s`: on Windows `s` is a `String` (the case fold above
-    // returns one) and elsewhere it is already a `&str`.
-    let s = collapse_separators(&s[..]);
+    let mut s = normalize(s);
     // Drop trailing separators so `proj\` == `proj`, but never eat a bare root
     // (`/` or `C:\`), which would make every root compare equal to the empty path.
     let sep: &[char] = &['/', '\\'];
-    let trimmed = s.trim_end_matches(sep);
-    if trimmed.is_empty() || trimmed.ends_with(':') {
-        return s.to_string();
+    let len = s.trim_end_matches(sep).len();
+    if len > 0 && !s[..len].ends_with(':') {
+        s.truncate(len);
     }
-    trimmed.to_string()
+    s
 }
 
 /// Is this exactly a drive designator (`C:`, `d:`)? Windows only: on Unix a
@@ -58,9 +48,23 @@ fn is_drive_letter(s: &str) -> bool {
     cfg!(windows) && b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
 }
 
-/// Squeeze runs of `/` or `\` down to one, leaving any leading run alone (a UNC
-/// path starts with two and means a host by it).
-fn collapse_separators(s: &str) -> String {
+/// The spelling normalizer behind [`path_key`]. One pass, and the same
+/// signature on every platform: the `#[cfg(windows)]` case fold that used to sit
+/// in `path_key` left the variable a `String` there and a `&str` elsewhere, so
+/// the one call site had two types and each way of writing it tripped a
+/// different lint on the platform it was not written for — a `-D warnings`
+/// failure only the Linux CI job could see.
+///
+/// Squeezes runs of `/` or `\` down to one, leaving any *leading* run alone
+/// (`\\server\share` names a host by it). `C:\\Users\\me` and `C:\Users\me` are
+/// the same folder: the OS collapses the run, and a path that made a round trip
+/// through something that escapes backslashes (a shell, a JSON string) comes
+/// back doubled — which is how one folder ended up in the sidebar as two
+/// workspaces.
+///
+/// On Windows it also folds `/` to `\` and folds case, both of which the
+/// filesystem ignores.
+fn normalize(s: &str) -> String {
     let lead = s.len() - s.trim_start_matches(['/', '\\']).len();
     let mut out = String::with_capacity(s.len());
     let mut last_sep = false;
@@ -70,7 +74,11 @@ fn collapse_separators(s: &str) -> String {
             continue;
         }
         last_sep = sep;
-        out.push(c);
+        match (sep, cfg!(windows)) {
+            (true, true) => out.push('\\'),
+            (false, true) => out.extend(c.to_lowercase()),
+            _ => out.push(c),
+        }
     }
     out
 }
