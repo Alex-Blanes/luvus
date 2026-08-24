@@ -2993,12 +2993,23 @@ fn encode_key(key: &KeyEvent, newline: &[u8], app_cursor: bool) -> Option<Vec<u8
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Tab => vec![b'\t'],
         KeyCode::BackTab => vec![0x1b, b'[', b'Z'],
-        // Ctrl/Alt+Backspace is "delete the word behind the cursor" in every
-        // editor, and readline binds exactly one sequence to it
-        // (`backward-kill-word` on `ESC DEL`) — which is also what the agent
-        // CLIs listen for. Dropping the modifiers here sent a bare `DEL` and
-        // deleted a single character instead, with no way to erase a word.
-        KeyCode::Backspace if ctrl || alt => vec![0x1b, 0x7f],
+        // Ctrl+Backspace is "delete the word behind the cursor" in every editor,
+        // and `0x17` is the only encoding both shells act on. Measured in a pane,
+        // typing `hola mundo` and pressing it:
+        //
+        // | bytes     | PowerShell (PSReadLine) | bash (readline)   |
+        // |-----------|-------------------------|-------------------|
+        // | `0x17`    | `hola` — the word       | `hola` — the word |
+        // | `0x08`    | `hola` — the word       | `hola mund` — one |
+        // | `ESC DEL` | a literal `^H` printed  | `hola` — the word |
+        //
+        // `ESC DEL` is readline's own `backward-kill-word`, so it reads like the
+        // right answer and is the wrong one: ConPTY hands PSReadLine an escape it
+        // cannot decode and the junk lands in the prompt.
+        KeyCode::Backspace if ctrl => vec![0x17],
+        // Alt+Backspace keeps the standard Alt encoding — `ESC` then the key —
+        // like every other Alt chord here.
+        KeyCode::Backspace if alt => vec![0x1b, 0x7f],
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Esc => vec![0x1b],
         // Keep navigation modifiers intact. Crossterm reports these directly
@@ -3401,9 +3412,10 @@ mod tests {
 
         assert_eq!(key(KeyModifiers::NONE), Some(vec![0x7f]));
         assert_eq!(key(KeyModifiers::SHIFT), Some(vec![0x7f]));
-        // `ESC DEL` is readline's `backward-kill-word`, which is what the agent
-        // CLIs and every shell understand.
-        assert_eq!(key(KeyModifiers::CONTROL), Some(vec![0x1b, 0x7f]));
+        // `0x17` rather than readline's own `ESC DEL`, which PSReadLine cannot
+        // decode through ConPTY and prints as a literal `^H` — the table on the
+        // `Backspace` arm has what each encoding does in each shell.
+        assert_eq!(key(KeyModifiers::CONTROL), Some(vec![0x17]));
         assert_eq!(key(KeyModifiers::ALT), Some(vec![0x1b, 0x7f]));
     }
 
