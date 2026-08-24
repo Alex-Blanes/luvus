@@ -69,6 +69,29 @@ pub fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// A path as the user wrote it, with a leading `~` resolved to the home
+/// directory. Shells expand `~` themselves, but not always before handing an
+/// argument to a native program — PowerShell passes a bare `~` through
+/// literally — so `luvus workspace open ~` arrived as the *path* `~` and opened
+/// a second workspace sitting next to the one at the home folder itself.
+///
+/// Only a leading `~` alone or followed by a separator: `~foo` is another user's
+/// home on Unix, which is not ours to guess, and a real folder named `~x` here.
+pub fn user_path(s: &str) -> PathBuf {
+    let rest = match s.strip_prefix('~') {
+        Some("") => "",
+        Some(r) if r.starts_with('/') || r.starts_with('\\') => &r[1..],
+        _ => return PathBuf::from(s),
+    };
+    match home_dir() {
+        Some(home) if rest.is_empty() => home,
+        Some(home) => home.join(rest),
+        // No home to expand to: leave it exactly as written rather than
+        // inventing a path relative to the working directory.
+        None => PathBuf::from(s),
+    }
+}
+
 /// Resolve a configured shell `choice` to a concrete command to spawn.
 ///
 /// `LUVUS_SHELL` always wins (the explicit escape hatch — set it in your shell
@@ -653,6 +676,25 @@ mod tests {
         assert_eq!(super::resolve_shell("default"), "/bin/sh");
         assert_eq!(super::resolve_shell("zsh"), "/bin/sh");
         std::env::remove_var("LUVUS_SHELL");
+    }
+
+    #[test]
+    fn a_leading_tilde_resolves_to_the_home_folder() {
+        let home = super::home_dir().expect("a home directory in the test env");
+        assert_eq!(super::user_path("~"), home);
+        assert_eq!(super::user_path("~/proj"), home.join("proj"));
+        // The bug this fixes: `~` and the home folder itself must be one place.
+        assert!(super::same_path(
+            &super::user_path("~"),
+            &super::user_path(home.to_str().unwrap())
+        ));
+        // Only a leading `~` on its own, so a real folder keeps its name: `~foo`
+        // is another user's home on Unix and a plain directory name here.
+        assert_eq!(super::user_path("~foo"), std::path::PathBuf::from("~foo"));
+        assert_eq!(
+            super::user_path("/work/~/x"),
+            std::path::PathBuf::from("/work/~/x")
+        );
     }
 
     #[test]

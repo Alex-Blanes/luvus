@@ -755,7 +755,7 @@ impl App {
                 // reopening `luvus` always snaps back to the launch folder (usually
                 // the first workspace), never the one you were last using. An
                 // explicit `luvus workspace open <path>` omits it and still focuses.
-                let path = PathBuf::from(req_str(p, "path")?);
+                let path = crate::platform::user_path(req_str(p, "path")?);
                 let focus = p.get("focus").and_then(|v| v.as_bool()).unwrap_or(true);
                 match self
                     .workspaces
@@ -2218,7 +2218,7 @@ fn git_err(e: String) -> (String, String) {
 fn param_path(p: &Value) -> Result<PathBuf, (String, String)> {
     p.get("path")
         .and_then(|v| v.as_str())
-        .map(PathBuf::from)
+        .map(crate::platform::user_path)
         .ok_or_else(|| ("invalid_request".to_string(), "path required".to_string()))
 }
 
