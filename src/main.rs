@@ -21,6 +21,7 @@ mod links;
 mod mission;
 mod module;
 mod orch;
+mod paste;
 mod persist;
 mod platform;
 mod session;
@@ -38,8 +39,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use ratatui::crossterm::event::{
-    read as read_event, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture,
-    EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, Event, KeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
@@ -923,7 +924,7 @@ fn input_loop(tx: Sender<AppEvent>, pending: Vec<Event>) {
             return;
         }
     }
-    while let Ok(event) = read_event() {
+    while let Ok(event) = crate::paste::read() {
         let sent = match app_event(event) {
             Some(event) => tx.send(event),
             None => Ok(()),

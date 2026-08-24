@@ -9,8 +9,8 @@ use anyhow::{anyhow, Result};
 use ratatui::backend::Backend;
 use ratatui::buffer::Cell;
 use ratatui::crossterm::event::{
-    read as read_event, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture,
-    EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, Event,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event,
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::Position;
@@ -156,7 +156,7 @@ fn input_loop<W: Write>(mut writer: W, pending: Vec<Event>) {
             return;
         }
     }
-    while let Ok(event) = read_event() {
+    while let Ok(event) = crate::paste::read() {
         let msg = match event_message(event) {
             Some(msg) => msg,
             None => continue,
