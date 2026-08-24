@@ -21,9 +21,10 @@ pub const RECENT: usize = 3;
 /// Where the footer link goes. The site renders the same `changelog/*.md` files,
 /// so it can never disagree with what is embedded here.
 pub const CHANGELOG_URL: &str = "https://luvus.dev/changelog";
+/// The only upgrade path that lands *this* fork. The site's install script and
+/// the Homebrew formula both serve upstream luvus, so offering them here would
+/// hand out a one-click downgrade — they are deliberately not listed.
 pub const LUVUS_UPDATE_COMMAND: &str = "luvus update";
-pub const CURL_UPDATE_COMMAND: &str = "curl -fsSL https://luvus.dev/install.sh | sh";
-pub const BREW_UPDATE_COMMAND: &str = "brew upgrade luvus";
 
 pub(super) fn draw_changelog(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) {
     dim_backdrop(f, area, t);
@@ -106,6 +107,22 @@ pub(super) fn draw_changelog(f: &mut RenderTarget, area: Rect, app: &mut App, t:
         );
         top += 1;
     }
+    // Upstream's own releases, for awareness only: this fork has to *merge* one
+    // to carry it, which no button here can do. Dimmer than the accent headline
+    // above so the actionable update stays the one that reads as actionable.
+    if let Some(v) = app.upstream_available.clone() {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("  ○ ", Style::new().fg(t.overlay0)),
+                Span::styled(
+                    format!("{} v{v}", cat.upstream_available),
+                    Style::new().fg(t.subtext0),
+                ),
+            ])),
+            Rect::new(inner.x, top, inner.width, 1),
+        );
+        top += 1;
+    }
     f.render_widget(
         Paragraph::new(Span::styled(
             format!("  {}", cat.update_hint),
@@ -116,11 +133,8 @@ pub(super) fn draw_changelog(f: &mut RenderTarget, area: Rect, app: &mut App, t:
     top += 1;
 
     app.changelog_copy_rects.clear();
-    for command in [
-        LUVUS_UPDATE_COMMAND,
-        CURL_UPDATE_COMMAND,
-        BREW_UPDATE_COMMAND,
-    ] {
+    {
+        let command = LUVUS_UPDATE_COMMAND;
         let row = Rect::new(inner.x + 1, top, inner.width.saturating_sub(2), 1);
         let hot = app
             .hover
@@ -482,9 +496,7 @@ fn hline(f: &mut RenderTarget, x: u16, y: u16, w: u16, t: &Theme) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BREW_UPDATE_COMMAND, CHANGELOG_URL, CURL_UPDATE_COMMAND, LUVUS_UPDATE_COMMAND, RECENT,
-    };
+    use super::{CHANGELOG_URL, LUVUS_UPDATE_COMMAND, RECENT};
     use crate::app::App;
     use crate::changelog::{Seg, CHANGELOG};
     use ratatui::backend::TestBackend;
@@ -786,8 +798,10 @@ mod tests {
         assert_eq!(btn.right(), close.x, "sits immediately left of it");
     }
 
+    /// `luvus update` is the only command offered, because it is the only one
+    /// that installs this fork instead of replacing it with upstream's release.
     #[test]
-    fn update_guide_shows_the_copyable_luvus_brew_and_curl_commands() {
+    fn update_guide_offers_only_the_fork_aware_command() {
         let _env = crate::persist::test_env("cl-update-guide");
         let (app, term) = open();
         let screen: String = term
@@ -798,19 +812,18 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(screen.contains(LUVUS_UPDATE_COMMAND));
-        assert!(screen.contains(CURL_UPDATE_COMMAND));
-        assert!(screen.contains(BREW_UPDATE_COMMAND));
-        assert!(!screen.contains("cargo install luvus"));
+        for downgrade in ["brew upgrade luvus", "install.sh", "cargo install luvus"] {
+            assert!(
+                !screen.contains(downgrade),
+                "{downgrade} installs upstream over the fork"
+            );
+        }
         assert_eq!(
             app.changelog_copy_rects
                 .iter()
                 .map(|(_, command)| command.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                LUVUS_UPDATE_COMMAND,
-                CURL_UPDATE_COMMAND,
-                BREW_UPDATE_COMMAND
-            ]
+            vec![LUVUS_UPDATE_COMMAND]
         );
     }
 

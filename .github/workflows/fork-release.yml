@@ -1,0 +1,94 @@
+# Publishes this fork's own builds, which upstream never does.
+#
+# The in-app updater reads `latest.json` off the newest release and compares its
+# `build` against the number `build.rs` baked into the running binary, so every
+# push to `main` that changes the code becomes an installable build. Assets are
+# bare executables rather than archives: nothing to extract, and one less tool
+# the updater has to find on the target machine.
+name: fork release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One release at a time: two overlapping pushes would race on the same tag.
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: target/release/luvus.exe
+            asset: luvus-x86_64-pc-windows-msvc.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      # Full history *and* tags: `build.rs` counts commits since the `v<version>`
+      # tag to get the build number, and a shallow clone has neither.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Work out the build number
+        id: build
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if ! git rev-parse "v$version" >/dev/null 2>&1; then
+            echo "::error::tag v$version is missing; push it so the build number has an origin"
+            exit 1
+          fi
+          build=$(git rev-list --count "v$version..HEAD")
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "build=$build" >>"$GITHUB_OUTPUT"
+          echo "tag=build-$build" >>"$GITHUB_OUTPUT"
+
+      - run: cargo build --release --locked
+
+      - name: Package the binary and its digest
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "${{ matrix.binary }}" "dist/${{ matrix.asset }}"
+          cd dist
+          sha256sum "${{ matrix.asset }}" >"${{ matrix.asset }}.sha256"
+          cat >latest.json <<EOF
+          {
+            "version": "${{ steps.build.outputs.version }}",
+            "build": ${{ steps.build.outputs.build }},
+            "tag": "${{ steps.build.outputs.tag }}",
+            "commit": "${{ github.sha }}"
+          }
+          EOF
+
+      # `softprops/action-gh-release` replaces the assets if the tag is re-run,
+      # so a re-dispatch of the same commit is idempotent rather than a failure.
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.build.outputs.tag }}
+          name: ${{ steps.build.outputs.version }} - 0.${{ steps.build.outputs.build }}
+          body: |
+            Fork build `${{ steps.build.outputs.build }}` on top of upstream
+            v${{ steps.build.outputs.version }} (`${{ github.sha }}`).
+
+            Installed automatically by `luvus update`, or by the in-app check
+            when **Install updates automatically** is on.
+          files: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.asset }}.sha256
+            dist/latest.json

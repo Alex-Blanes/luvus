@@ -93,6 +93,9 @@ fn emit_fork_build() {
         Err(_) => version,
     };
     println!("cargo:rustc-env=LUVUS_VERSION_LABEL={label}");
+    // The bare number, for the updater: this fork's releases all carry upstream's
+    // semver, so the build number is the only thing that can say "newer".
+    println!("cargo:rustc-env=LUVUS_BUILD={count}");
 }
 
 /// Split a note into `(version, date, body)`. Front matter is an optional

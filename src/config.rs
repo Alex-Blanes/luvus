@@ -38,12 +38,19 @@ pub struct Config {
     pub layout: LayoutConfig,
     #[serde(default)]
     pub notifications: NotifyConfig,
-    /// Check `luvus.dev/latest.json` in the background for a newer release and
-    /// show an indicator by the version number. A single periodic `curl`/`wget`
-    /// GET; on by default, toggled in Settings → General. Notify-only — luvus
-    /// never self-updates (installed via cargo/brew/etc).
+    /// Check this fork's release feed in the background for a newer build, and
+    /// upstream's for a release worth merging, showing an indicator by the
+    /// version number. Two periodic `curl`/`wget` GETs; on by default, toggled in
+    /// Settings → General. Notify-only unless [`Config::auto_update`] is set.
     #[serde(default = "yes")]
     pub check_updates: bool,
+    /// Install a newer fork build as soon as the background check finds one,
+    /// instead of only lighting the indicator. Only ever touches an installation
+    /// luvus owns outright — a binary managed by Homebrew, Cargo, Nix or an OS
+    /// package is left to its package manager. Requires `check_updates`; read
+    /// once at startup, so a change takes effect on the next launch.
+    #[serde(default = "yes")]
+    pub auto_update: bool,
     /// Replay the CLI options an agent pane was launched with when resuming it
     /// after a restart (docs/62): a pane started as
     /// `claude --permission-mode … --model …` comes back with those options
@@ -404,6 +411,7 @@ impl Default for Config {
             layout: LayoutConfig::default(),
             notifications: NotifyConfig::default(),
             check_updates: true,
+            auto_update: true,
             resume_launch_flags: false,
             keybindings: std::collections::HashMap::new(),
             prefix: default_prefix(),

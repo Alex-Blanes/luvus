@@ -180,7 +180,7 @@ pub fn run() -> Result<()> {
 
     // Background "update available" check (off if the user disabled it).
     if app.config.check_updates {
-        crate::update::spawn_check(tx.clone());
+        crate::update::spawn_check(tx.clone(), app.config.auto_update);
     }
 
     let mut clients: Clients = HashMap::new();

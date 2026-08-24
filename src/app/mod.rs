@@ -1313,6 +1313,10 @@ pub struct App {
     /// (e.g. `"0.9.3"`) when a release is available; shown as a dot by the
     /// version number and a banner in the changelog modal. `None` = up to date.
     pub update_available: Option<String>,
+    /// Upstream released something newer than the release this fork sits on.
+    /// Shown in the changelog as a note, never as an action: integrating it is
+    /// a merge of `upstream/main`, which no button can do.
+    pub upstream_available: Option<String>,
     /// The "what is actually running in this pane?" overlay (docs/07): a
     /// snapshot of the pane's process tree, taken once when it opens. Click a
     /// pane's title to open it. `None` = closed.
@@ -1843,6 +1847,7 @@ impl App {
             changelog_open: false,
             changelog_scroll: 0,
             update_available: None,
+            upstream_available: None,
             cmd_inspect: None,
             pane_title_rects: Vec::new(),
             worktree_prompt: None,
@@ -2371,6 +2376,7 @@ impl App {
             changelog_open: false,
             changelog_scroll: 0,
             update_available: None,
+            upstream_available: None,
             cmd_inspect: None,
             pane_title_rects: Vec::new(),
             worktree_prompt: None,

@@ -200,6 +200,13 @@ pub enum AppEvent {
     /// An *asked-for* check finished (the changelog's "Check for updates"
     /// button). Carries the outcome so the answer can be shown either way.
     UpdateChecked(crate::update::CheckOutcome),
+    /// A newer fork build was downloaded and put in place (the label it will
+    /// report once loaded). Only a restart is left to do.
+    SelfUpdateInstalled(String),
+    /// Upstream (RizRiyz/luvus) published a release newer than the one this
+    /// fork was merged from. Informational: catching up is a merge, not a
+    /// download, so there is no action attached.
+    UpstreamUpdateAvailable(String),
     /// A control-API request from a CLI invocation or module process. Arrives on
     /// the same channel as every other event so the loop wakes immediately —
     /// draining it on the idle tick would add a tick's latency to every CLI call.

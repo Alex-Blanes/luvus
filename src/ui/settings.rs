@@ -682,6 +682,16 @@ fn draw_content(
                         toggle(app.config.check_updates, t),
                         t,
                     )),
+                    GeneralRow::AutoUpdate => ctls.push(ctl_row(
+                        f,
+                        area,
+                        y,
+                        i,
+                        cursor,
+                        cat.set_auto_update,
+                        toggle(app.config.auto_update, t),
+                        t,
+                    )),
                     GeneralRow::ResumeFlags => ctls.push(ctl_row(
                         f,
                         area,

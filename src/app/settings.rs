@@ -121,6 +121,8 @@ pub enum GeneralRow {
     FilesShowHidden,
     ShiftEnter,
     CheckUpdates,
+    /// Install a newer fork build automatically once the check finds one.
+    AutoUpdate,
     /// Replay each agent's own CLI options on resume (docs/62).
     ResumeFlags,
     /// Show each agent's live session title in the AGENTS sidebar.
@@ -150,6 +152,7 @@ impl App {
             GeneralRow::FilesShowHidden,
             GeneralRow::ShiftEnter,
             GeneralRow::CheckUpdates,
+            GeneralRow::AutoUpdate,
             GeneralRow::ResumeFlags,
             GeneralRow::AgentTitle,
             GeneralRow::SoundDone,
@@ -159,10 +162,14 @@ impl App {
     }
 
     /// Index of the first notification row (where the `── Notify ──` divider
-    /// goes), mirroring `dock_section_start` in the Layout tab. The five general
-    /// settings sit above it.
+    /// goes), mirroring `dock_section_start` in the Layout tab. Derived from the
+    /// row list rather than hard-coded: it was a literal `5`, and every option
+    /// added above the divider silently moved the divider onto the wrong row.
     pub fn general_section_start(&self) -> usize {
-        5
+        self.general_rows()
+            .iter()
+            .position(|row| *row == GeneralRow::AgentTitle)
+            .unwrap_or(0)
     }
 
     /// The Layout tab's ordered selectable rows (docs/29). The first index of the
@@ -256,7 +263,7 @@ impl App {
                                     // question "am I current?", and the periodic check may not have come
                                     // round since the release landed.
         if self.config.check_updates {
-            crate::update::check_now(self.app_tx.clone());
+            crate::update::check_now(self.app_tx.clone(), self.config.auto_update);
         }
     }
 
@@ -1212,6 +1219,10 @@ impl App {
                 self.config.check_updates = !self.config.check_updates;
                 config::save(&self.config);
             }
+            Some(GeneralRow::AutoUpdate) => {
+                self.config.auto_update = !self.config.auto_update;
+                config::save(&self.config);
+            }
             Some(GeneralRow::ResumeFlags) => {
                 self.config.resume_launch_flags = !self.config.resume_launch_flags;
                 config::save(&self.config);
@@ -1584,7 +1595,7 @@ mod tests {
         if let Some(ui) = app.settings.as_mut() {
             ui.tab = SettingsTab::General;
         }
-        assert_eq!(app.settings_rows(SettingsTab::General), 9);
+        assert_eq!(app.settings_rows(SettingsTab::General), 10);
         let rows = app.general_rows();
         assert_eq!(rows[0], GeneralRow::FileOpen, "file-open leads the tab");
 

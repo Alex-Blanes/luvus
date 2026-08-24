@@ -841,7 +841,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
 
     // Background "update available" check (off if the user disabled it).
     if app.config.check_updates {
-        update::spawn_check(tx.clone());
+        update::spawn_check(tx.clone(), app.config.auto_update);
     }
 
     terminal.draw(|f| ui::render(f, &mut app))?;

@@ -5,34 +5,70 @@
 //! command checks first, then delegates to a detected package manager or
 //! verifies a release archive before atomically replacing a direct install.
 
-#[cfg(not(windows))]
 use std::fs;
-#[cfg(not(windows))]
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Duration;
-#[cfg(not(windows))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-#[cfg(not(windows))]
 use sha2::{Digest, Sha256};
 
 use crate::event::AppEvent;
 
-/// The version manifest the product site publishes at deploy time.
-const MANIFEST_URL: &str = "https://luvus.dev/latest.json";
+/// Where **this fork** publishes its own builds. Upstream's
+/// `luvus.dev/latest.json` is deliberately not it: this binary carries local
+/// work upstream never sees, and its semver stays whatever upstream release it
+/// was merged from, so the feed is keyed on the fork build number instead.
+const MANIFEST_URL: &str =
+    "https://github.com/Alex-Blanes/luvus/releases/latest/download/latest.json";
+/// Where the fork's release assets live, one directory per tag.
+const RELEASE_BASE: &str = "https://github.com/Alex-Blanes/luvus/releases/download";
+/// Upstream's release feed. Checked only to *say* a new upstream release exists
+/// — nothing here can install it, because integrating upstream is a merge.
+const UPSTREAM_RELEASES_URL: &str = "https://api.github.com/repos/RizRiyz/luvus/releases/latest";
 /// This build's version (no leading `v`).
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
+
+/// This build's fork build number ([`build.rs`]). `None` when the binary was
+/// built without the `v<version>` tag in reach (a crates.io tarball, a shallow
+/// clone) — there is nothing to compare then, so the fork check stays quiet
+/// rather than nagging about an update it cannot reason about.
+fn current_build() -> Option<u32> {
+    env!("LUVUS_BUILD").parse().ok()
+}
+
+/// One published fork build. `version` is upstream's semver, carried so the
+/// downloaded binary can still be verified by `--version`; `build` is what
+/// actually decides newer; `tag` names the release its assets hang off.
+struct ForkRelease {
+    version: String,
+    build: u32,
+    tag: String,
+}
+
+impl ForkRelease {
+    /// What the sidebar and the toasts show — the same shape `build.rs` bakes
+    /// into `LUVUS_VERSION_LABEL`, so "available" and "installed" are comparable
+    /// at a glance.
+    fn label(&self) -> String {
+        format!("{} - 0.{:02}", self.version, self.build)
+    }
+}
 
 /// The manifest URL to check, honoring `$LUVUS_UPDATE_MANIFEST` — an override for
 /// testing (point it at a local `file://…/latest.json` or a dev server to see the
 /// indicator without deploying the site). Falls back to the production URL.
 fn manifest_url() -> String {
     std::env::var("LUVUS_UPDATE_MANIFEST").unwrap_or_else(|_| MANIFEST_URL.to_string())
+}
+
+/// Upstream's feed, honoring `$LUVUS_UPSTREAM_RELEASES` for testing.
+fn upstream_url() -> String {
+    std::env::var("LUVUS_UPSTREAM_RELEASES").unwrap_or_else(|_| UPSTREAM_RELEASES_URL.to_string())
 }
 
 /// How often the background checker re-runs.
@@ -47,12 +83,13 @@ const CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 /// Spawn the background checker: one check shortly after startup, then every
 /// [`CHECK_EVERY`]. Sends [`AppEvent::UpdateAvailable`] only when the manifest
 /// names a strictly newer release than this build.
-pub fn spawn_check(tx: Sender<AppEvent>) {
+pub fn spawn_check(tx: Sender<AppEvent>, auto_install: bool) {
     thread::spawn(move || {
         // A short initial delay so a launch is never slowed by a network call.
         thread::sleep(Duration::from_secs(5));
         loop {
-            check_once(&tx, &manifest_url());
+            check_once(&tx, &manifest_url(), auto_install);
+            check_upstream_once(&tx, &upstream_url());
             thread::sleep(CHECK_EVERY);
         }
     });
@@ -64,8 +101,11 @@ pub fn spawn_check(tx: Sender<AppEvent>) {
 /// wants to know: waiting up to [`CHECK_EVERY`] to find out is the whole
 /// complaint. Opening the changelog is exactly the moment the question is being
 /// asked, so that asks again.
-pub fn check_now(tx: Sender<AppEvent>) {
-    thread::spawn(move || check_once(&tx, &manifest_url()));
+pub fn check_now(tx: Sender<AppEvent>, auto_install: bool) {
+    thread::spawn(move || {
+        check_once(&tx, &manifest_url(), auto_install);
+        check_upstream_once(&tx, &upstream_url());
+    });
 }
 
 /// What one check found. Only the *asked-for* check reports this.
@@ -84,16 +124,31 @@ pub enum CheckOutcome {
 
 /// One fetch-compare, with the answer handed back rather than swallowed.
 fn fetch_outcome(url: &str) -> CheckOutcome {
-    match http_get(url).as_deref().and_then(parse_version) {
-        Some(latest) if is_newer(&latest, CURRENT) => CheckOutcome::Newer(latest),
+    match fetch_release(url) {
+        Some(release) if is_newer_build(&release) => CheckOutcome::Newer(release.label()),
         Some(_) => CheckOutcome::Current,
         None => CheckOutcome::Failed,
     }
 }
 
+fn fetch_release(url: &str) -> Option<ForkRelease> {
+    http_get(url).as_deref().and_then(parse_manifest)
+}
+
+/// A published build is newer only when this binary knows its own build number.
+/// Without one every check would claim an update forever.
+fn is_newer_build(release: &ForkRelease) -> bool {
+    current_build().is_some_and(|build| release.build > build)
+}
+
 /// `luvus update`: check first, then use the installation's own safe update
 /// path. This is deliberately a single command rather than an update command
-/// tree; automatic update checks stay notification-only.
+/// tree; the background check stays notify-only unless `auto_update` is on.
+///
+/// The fork publishes one bare binary per target and nothing else, so the
+/// package-manager channels can only be reported, not driven: Homebrew and
+/// crates.io serve upstream's luvus, which by definition never carries this
+/// build.
 pub fn run_cli(args: &[String]) -> Result<i32> {
     if !args.is_empty() {
         eprintln!("usage: luvus update");
@@ -102,60 +157,44 @@ pub fn run_cli(args: &[String]) -> Result<i32> {
 
     println!("Checking for Luvus updates...");
     let manifest = manifest_url();
-    let latest = match fetch_outcome(&manifest) {
-        CheckOutcome::Current => {
-            println!("Luvus {CURRENT} is already up to date.");
-            return Ok(0);
-        }
-        CheckOutcome::Newer(version) => validate_release_version(&version)?,
-        CheckOutcome::Failed => {
-            bail!("could not check {manifest}; check your connection and try again")
-        }
+    let current = current_build();
+    let Some(release) = fetch_release(&manifest) else {
+        bail!("could not check {manifest}; check your connection and try again")
     };
+    let latest = release.label();
+    if !is_newer_build(&release) {
+        match current {
+            Some(_) => println!("Luvus {} is already up to date.", installed_label()),
+            None => println!(
+                "This build has no fork build number, so {manifest} cannot be compared against it."
+            ),
+        }
+        return Ok(0);
+    }
+    validate_release_version(&release.version)?;
 
-    println!("Luvus {latest} is available (current: {CURRENT}).");
+    println!(
+        "Luvus {latest} is available (current: {}).",
+        installed_label()
+    );
     let executable = std::env::current_exe().context("find the running Luvus binary")?;
     let executable = executable.canonicalize().unwrap_or(executable);
     let channel = classify_install(&executable, crate::platform::home_dir().as_deref());
 
     match channel {
-        InstallChannel::Homebrew => {
-            run_package_update("brew", &["upgrade", "luvus"], "Homebrew")?;
-            verify_path_version(&homebrew_binary_path()?, &latest)?;
-        }
-        InstallChannel::Cargo => {
-            #[cfg(windows)]
-            bail!(
-                "Cargo cannot replace a running Windows executable; run `cargo install luvus --locked --version {latest}` after this command exits"
-            );
-            #[cfg(not(windows))]
-            {
-                run_package_update(
-                    "cargo",
-                    &["install", "luvus", "--locked", "--version", &latest],
-                    "Cargo",
-                )?;
-                verify_path_version(&executable, &latest)?;
-            }
-        }
-        InstallChannel::Direct => {
-            #[cfg(windows)]
-            bail!(
-                "Windows cannot replace the executable while it is running; close Luvus and run `irm https://luvus.dev/install.ps1 | iex`"
-            );
-            #[cfg(not(windows))]
-            install_direct_release(&latest, &executable)?;
-        }
+        InstallChannel::Direct => install_direct_release(&release, &executable)?,
         InstallChannel::Development => bail!(
             "refusing to overwrite a development binary at {}; rebuild it with `cargo build --release`",
             executable.display()
         ),
-        InstallChannel::Nix => bail!(
-            "this Luvus binary is managed by Nix; run `nix profile upgrade luvus` or update your NixOS/Home Manager input"
+        InstallChannel::Homebrew | InstallChannel::Cargo | InstallChannel::SystemPackage => bail!(
+            "{} came from a package manager, which serves upstream Luvus and never this fork's builds; install the release binary from {RELEASE_BASE}/{} instead",
+            executable.display(),
+            release.tag
         ),
-        InstallChannel::SystemPackage => bail!(
-            "this Luvus binary is managed by an OS package in {}; upgrade it with apt or dnf using the new release package",
-            executable.display()
+        InstallChannel::Nix => bail!(
+            "this Luvus binary is managed by Nix; point your flake input at the fork's {} tag",
+            release.tag
         ),
         InstallChannel::Unknown => bail!(
             "could not safely identify the installation channel for {}; update with the same method you originally installed Luvus",
@@ -163,9 +202,14 @@ pub fn run_cli(args: &[String]) -> Result<i32> {
         ),
     }
 
-    println!("Updated Luvus {CURRENT} -> {latest}.");
-    println!("Run `luvus server restart` when you are ready to load the new server binary.");
+    println!("Updated Luvus {} -> {latest}.", installed_label());
+    println!("Restart Luvus to load it (`luvus server restart` for a running server).");
     Ok(0)
+}
+
+/// What this binary calls itself, build number and all.
+fn installed_label() -> String {
+    env!("LUVUS_VERSION_LABEL").to_string()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -238,36 +282,6 @@ fn validate_release_version(version: &str) -> Result<String> {
         .map_err(|_| anyhow!("the update manifest returned an invalid version: {version:?}"))
 }
 
-fn run_package_update(program: &str, args: &[&str], label: &str) -> Result<()> {
-    let status = Command::new(program)
-        .args(args)
-        .status()
-        .with_context(|| format!("start {label} updater `{program}`"))?;
-    if !status.success() {
-        bail!("{label} update failed with {status}");
-    }
-    Ok(())
-}
-
-fn homebrew_binary_path() -> Result<PathBuf> {
-    let output = Command::new("brew")
-        .args(["--prefix", "luvus"])
-        .output()
-        .context("ask Homebrew for the installed Luvus prefix")?;
-    if !output.status.success() {
-        bail!("Homebrew could not resolve the installed Luvus prefix");
-    }
-    homebrew_binary_from_prefix(&String::from_utf8_lossy(&output.stdout))
-}
-
-fn homebrew_binary_from_prefix(prefix: &str) -> Result<PathBuf> {
-    let prefix = prefix.trim();
-    if prefix.is_empty() {
-        bail!("Homebrew returned an empty Luvus prefix");
-    }
-    Ok(PathBuf::from(prefix).join("bin").join(executable_name()))
-}
-
 fn verify_path_version(program: &Path, expected: &str) -> Result<()> {
     let output = Command::new(program)
         .arg("--version")
@@ -284,55 +298,47 @@ fn verify_path_version(program: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
-fn install_direct_release(version: &str, destination: &Path) -> Result<()> {
+/// Fetch the release binary for this platform, check it against the published
+/// digest, then swap it in. The fork publishes one bare executable per target
+/// rather than an archive: nothing to extract, so nothing to get wrong, and it
+/// works the same on a Windows box with no `tar` in reach.
+fn install_direct_release(release: &ForkRelease, destination: &Path) -> Result<()> {
     let target = release_target()?;
-    let tag = format!("v{version}");
-    let stem = format!("luvus-{tag}-{target}");
-    let archive_name = format!("{stem}.tar.gz");
+    let name = format!("luvus-{target}{}", std::env::consts::EXE_SUFFIX);
     let base = std::env::var("LUVUS_UPDATE_RELEASE_BASE")
-        .unwrap_or_else(|_| format!("https://github.com/RizRiyz/luvus/releases/download/{tag}"));
+        .unwrap_or_else(|_| format!("{RELEASE_BASE}/{}", release.tag));
     let base = base.trim_end_matches('/');
     let temp = UpdateTempDir::new()?;
-    let archive = temp.path().join(&archive_name);
-    let checksum = temp.path().join(format!("{stem}.sha256"));
+    let binary = temp.path().join(&name);
+    let checksum = temp.path().join(format!("{name}.sha256"));
 
-    download_file(&format!("{base}/{archive_name}"), &archive)?;
-    download_file(&format!("{base}/{stem}.sha256"), &checksum)?;
-    verify_sha256(&archive, &checksum)?;
+    download_file(&format!("{base}/{name}"), &binary)?;
+    download_file(&format!("{base}/{name}.sha256"), &checksum)?;
+    verify_sha256(&binary, &checksum)?;
 
-    let status = Command::new("tar")
-        .arg("-xzf")
-        .arg(&archive)
-        .arg("-C")
-        .arg(temp.path())
-        .status()
-        .context("extract the verified Luvus release archive with tar")?;
-    if !status.success() {
-        bail!("extracting {archive_name} failed with {status}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
+            .context("make the downloaded binary executable")?;
     }
-
-    let candidate = temp.path().join("luvus");
-    if !candidate.is_file() {
-        bail!("the verified release archive did not contain `luvus`");
-    }
-    verify_path_version(&candidate, version)?;
-    replace_executable(&candidate, destination)?;
-    verify_path_version(destination, version)
+    verify_path_version(&binary, &release.version)?;
+    replace_executable(&binary, destination)?;
+    verify_path_version(destination, &release.version)
 }
 
-#[cfg(not(windows))]
 fn release_target() -> Result<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
         ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
         ("linux", "aarch64") => Ok("aarch64-unknown-linux-musl"),
         ("linux", "x86_64") => Ok("x86_64-unknown-linux-musl"),
+        ("windows", "aarch64") => Ok("aarch64-pc-windows-msvc"),
+        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
         (os, arch) => bail!("no prebuilt Luvus release exists for {os}/{arch}"),
     }
 }
 
-#[cfg(not(windows))]
 fn download_file(url: &str, destination: &Path) -> Result<()> {
     let curl = Command::new("curl")
         .args(["-fsSL", "--max-time", "120", "-H", "User-Agent: luvus"])
@@ -356,7 +362,6 @@ fn download_file(url: &str, destination: &Path) -> Result<()> {
     bail!("download failed: {url} (install curl or wget, then try again)")
 }
 
-#[cfg(not(windows))]
 fn verify_sha256(archive: &Path, checksum_file: &Path) -> Result<()> {
     let expected_body = fs::read_to_string(checksum_file)
         .with_context(|| format!("read checksum {}", checksum_file.display()))?;
@@ -379,6 +384,29 @@ fn verify_sha256(archive: &Path, checksum_file: &Path) -> Result<()> {
     let actual = format!("{:x}", hasher.finalize());
     if !actual.eq_ignore_ascii_case(expected) {
         bail!("release checksum mismatch; the existing Luvus binary was not changed");
+    }
+    Ok(())
+}
+
+/// Windows refuses to *overwrite* a running image but happily **renames** it,
+/// which is how every Windows updater does this: move the old binary aside, drop
+/// the new one in its place, and let the already-running process keep reading
+/// the renamed file through its open handle until it exits. The update is on
+/// disk immediately; it takes effect the next time luvus starts.
+#[cfg(windows)]
+fn replace_executable(candidate: &Path, destination: &Path) -> Result<()> {
+    let retired = destination.with_extension("old.exe");
+    // A leftover from a previous update, still locked if that build is running.
+    // Failing to clear it is fine; the rename below is what has to succeed.
+    let _ = fs::remove_file(&retired);
+    if destination.exists() {
+        fs::rename(destination, &retired)
+            .with_context(|| format!("move the running {} aside", destination.display()))?;
+    }
+    if let Err(error) = fs::copy(candidate, destination) {
+        // Put the old binary back rather than leaving no luvus at all.
+        let _ = fs::rename(&retired, destination);
+        return Err(error).with_context(|| format!("install the new {}", destination.display()));
     }
     Ok(())
 }
@@ -455,10 +483,8 @@ fn replace_executable(candidate: &Path, destination: &Path) -> Result<()> {
     }
 }
 
-#[cfg(not(windows))]
 struct UpdateTempDir(PathBuf);
 
-#[cfg(not(windows))]
 impl UpdateTempDir {
     fn new() -> Result<Self> {
         let base = std::env::temp_dir();
@@ -473,12 +499,16 @@ impl UpdateTempDir {
             ));
             match fs::create_dir(&path) {
                 Ok(()) => {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Err(error) =
-                        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                    // Windows already hands each user a private `%TEMP%`.
+                    #[cfg(unix)]
                     {
-                        let _ = fs::remove_dir(&path);
-                        return Err(error).context("make the update directory private");
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Err(error) =
+                            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                        {
+                            let _ = fs::remove_dir(&path);
+                            return Err(error).context("make the update directory private");
+                        }
                     }
                     return Ok(Self(path));
                 }
@@ -494,7 +524,6 @@ impl UpdateTempDir {
     }
 }
 
-#[cfg(not(windows))]
 impl Drop for UpdateTempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
@@ -510,17 +539,71 @@ pub fn check_now_reporting(tx: Sender<AppEvent>) {
 
 /// One fetch-compare-report, silent unless there is news. Takes the URL so tests
 /// can point it at a file without mutating process-wide environment.
-fn check_once(tx: &Sender<AppEvent>, url: &str) {
-    if let CheckOutcome::Newer(latest) = fetch_outcome(url) {
-        let _ = tx.send(AppEvent::UpdateAvailable(latest));
+///
+/// With `auto_install` the same pass also *applies* the update, but only to an
+/// installation luvus itself owns (see [`install_in_place`]). A binary managed
+/// by Homebrew, Cargo or an OS package is left alone: replacing it behind the
+/// package manager's back is how you end up with an installation neither side
+/// can reason about.
+fn check_once(tx: &Sender<AppEvent>, url: &str, auto_install: bool) {
+    let Some(release) = fetch_release(url).filter(is_newer_build) else {
+        return;
+    };
+    let _ = tx.send(AppEvent::UpdateAvailable(release.label()));
+    if auto_install && install_in_place(&release).unwrap_or(false) {
+        let _ = tx.send(AppEvent::SelfUpdateInstalled(release.label()));
     }
 }
 
-/// Pull the `"version"` string out of the manifest JSON (leading `v` trimmed).
-fn parse_version(body: &str) -> Option<String> {
+/// Tell the app when upstream cut a release newer than the one this fork was
+/// merged from. Informational only — there is no button, because catching up
+/// means merging `upstream/main` by hand.
+fn check_upstream_once(tx: &Sender<AppEvent>, url: &str) {
+    if let Some(tag) = http_get(url).as_deref().and_then(parse_tag_name) {
+        if is_newer(&tag, CURRENT) {
+            let _ = tx.send(AppEvent::UpstreamUpdateAvailable(tag));
+        }
+    }
+}
+
+/// Download and swap in a newer fork build, in the background, for a direct
+/// install only. `Ok(false)` means "not ours to touch", which is not an error.
+fn install_in_place(release: &ForkRelease) -> Result<bool> {
+    let executable = std::env::current_exe().context("find the running Luvus binary")?;
+    let executable = executable.canonicalize().unwrap_or(executable);
+    if classify_install(&executable, crate::platform::home_dir().as_deref())
+        != InstallChannel::Direct
+    {
+        return Ok(false);
+    }
+    install_direct_release(release, &executable)?;
+    Ok(true)
+}
+
+/// Read the fork manifest: `{"version": "0.12.0", "build": 49, "tag": "build-49"}`.
+/// `tag` is optional and defaults to `build-<n>`, which is what the release
+/// workflow names them.
+fn parse_manifest(body: &str) -> Option<ForkRelease> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let s = v.get("version")?.as_str()?.trim();
-    Some(s.trim_start_matches('v').to_string())
+    let version = v.get("version")?.as_str()?.trim().trim_start_matches('v');
+    let build = u32::try_from(v.get("build")?.as_u64()?).ok()?;
+    let tag = v
+        .get("tag")
+        .and_then(|t| t.as_str())
+        .map(|t| t.trim().to_string())
+        .unwrap_or_else(|| format!("build-{build}"));
+    Some(ForkRelease {
+        version: version.to_string(),
+        build,
+        tag,
+    })
+}
+
+/// Pull `tag_name` out of a GitHub `releases/latest` response.
+fn parse_tag_name(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let tag = v.get("tag_name")?.as_str()?.trim();
+    Some(tag.trim_start_matches('v').to_string())
 }
 
 /// True when `latest` is a strictly higher semver than `current`. Both accept an
@@ -590,28 +673,41 @@ mod tests {
     /// The whole chain, off the network: fetch, parse, compare, report. A file
     /// URL rather than the env override, so this cannot race another test.
     #[test]
-    fn check_once_reports_only_a_newer_release() {
+    fn check_once_reports_only_a_higher_build() {
         use std::sync::mpsc::channel;
+        let Some(build) = super::current_build() else {
+            return; // built without the release tag in reach; nothing to compare
+        };
         let dir = std::env::temp_dir().join(format!("luvus-upd-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("latest.json");
         let url = format!("file://{}", path.display());
+        let manifest = |b: u32| {
+            format!(
+                r#"{{"version":"{}","build":{b},"tag":"build-{b}"}}"#,
+                super::CURRENT
+            )
+        };
 
-        // Newer: reported.
-        std::fs::write(&path, r#"{"version":"99.0.0"}"#).unwrap();
+        // A higher build is news, and it is announced with the label the
+        // sidebar uses, not the bare semver both sides share.
+        std::fs::write(&path, manifest(build + 1)).unwrap();
         let (tx, rx) = channel();
-        super::check_once(&tx, &url);
+        super::check_once(&tx, &url, false);
         match rx.try_recv() {
-            Ok(crate::event::AppEvent::UpdateAvailable(v)) => assert_eq!(v, "99.0.0"),
-            _ => panic!("a newer release should have been reported"),
+            Ok(crate::event::AppEvent::UpdateAvailable(v)) => {
+                assert_eq!(v, format!("{} - 0.{:02}", super::CURRENT, build + 1));
+            }
+            _ => panic!("a higher build should have been reported"),
         }
 
-        // Same version, and an older one: silence.
-        for v in [super::CURRENT, "0.0.1"] {
-            std::fs::write(&path, format!(r#"{{"version":"{v}"}}"#)).unwrap();
+        // This build, and an older one: silence. Upstream's semver is identical
+        // in all three, which is exactly why the build number has to decide.
+        for b in [build, build.saturating_sub(1)] {
+            std::fs::write(&path, manifest(b)).unwrap();
             let (tx, rx) = channel();
-            super::check_once(&tx, &url);
-            assert!(rx.try_recv().is_err(), "{v} must not be reported");
+            super::check_once(&tx, &url, false);
+            assert!(rx.try_recv().is_err(), "build {b} must not be reported");
         }
 
         // Unreachable manifest, and junk: no panic, no event.
@@ -623,26 +719,76 @@ mod tests {
                 std::fs::write(&path, "not json").unwrap();
             }
             let (tx, rx) = channel();
-            super::check_once(&tx, &bad);
+            super::check_once(&tx, &bad, false);
             assert!(rx.try_recv().is_err());
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn parses_the_manifest_version() {
+    fn parses_the_fork_manifest() {
+        let release = parse_manifest(r#"{"version":"v0.12.0","build":49,"tag":"build-49"}"#)
+            .expect("a well-formed manifest");
+        assert_eq!(release.version, "0.12.0"); // leading `v` trimmed
+        assert_eq!(release.build, 49);
+        assert_eq!(release.tag, "build-49");
+        assert_eq!(release.label(), "0.12.0 - 0.49");
+
+        // `tag` is optional: the workflow names releases after the build.
+        let implied = parse_manifest(r#"{"version":"0.12.0","build":7}"#).expect("no tag");
+        assert_eq!(implied.tag, "build-7");
+        assert_eq!(implied.label(), "0.12.0 - 0.07");
+
+        // Garbage, or a manifest with no build number → None. Upstream's own
+        // `luvus.dev/latest.json` lands here, and must not read as an update.
+        assert!(parse_manifest("not json").is_none());
+        assert!(parse_manifest(r#"{"version":"0.13.0"}"#).is_none());
+        assert!(parse_manifest(r#"{"build":49}"#).is_none());
+    }
+
+    /// The upstream probe reads GitHub's release JSON and compares semver — the
+    /// one place where semver still decides anything.
+    #[test]
+    fn upstream_probe_reads_the_release_tag() {
         assert_eq!(
-            parse_version(r#"{"version":"0.9.3","notes":"x"}"#).as_deref(),
-            Some("0.9.3")
+            parse_tag_name(r#"{"tag_name":"v0.13.0","name":"0.13.0"}"#).as_deref(),
+            Some("0.13.0")
         );
-        // A leading `v` is trimmed.
+        assert!(parse_tag_name(r#"{"message":"Not Found"}"#).is_none());
+        assert!(is_newer("0.13.0", super::CURRENT));
+        assert!(!is_newer(super::CURRENT, super::CURRENT));
+    }
+
+    /// Windows cannot overwrite a running image, so the installer renames the
+    /// old binary aside and drops the new one into the freed path. The old one
+    /// has to survive under `.old.exe` — the running process is still reading
+    /// it, and it is the only rollback there is.
+    #[cfg(windows)]
+    #[test]
+    fn windows_install_moves_the_running_binary_aside() {
+        let dir = std::env::temp_dir().join(format!("luvus-swap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let destination = dir.join("luvus.exe");
+        let candidate = dir.join("new.exe");
+        std::fs::write(&destination, b"old").unwrap();
+        std::fs::write(&candidate, b"new").unwrap();
+
+        super::replace_executable(&candidate, &destination).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new");
         assert_eq!(
-            parse_version(r#"{"version":"v1.2.0"}"#).as_deref(),
-            Some("1.2.0")
+            std::fs::read(dir.join("luvus.old.exe")).unwrap(),
+            b"old",
+            "the replaced binary is kept as the rollback"
         );
-        // Garbage / missing field → None (no false "update available").
-        assert_eq!(parse_version("not json"), None);
-        assert_eq!(parse_version(r#"{"other":1}"#), None);
+
+        // A second update clears the previous rollback rather than piling up.
+        std::fs::write(&candidate, b"newer").unwrap();
+        super::replace_executable(&candidate, &destination).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"newer");
+        assert_eq!(std::fs::read(dir.join("luvus.old.exe")).unwrap(), b"new");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -650,17 +796,6 @@ mod tests {
         assert_eq!(validate_release_version("v1.2.3").unwrap(), "1.2.3");
         assert!(validate_release_version("1.2.3/../../asset").is_err());
         assert!(validate_release_version("latest").is_err());
-    }
-
-    #[test]
-    fn homebrew_verification_uses_the_formula_prefix() {
-        assert_eq!(
-            homebrew_binary_from_prefix("/opt/homebrew/opt/luvus\n").unwrap(),
-            Path::new("/opt/homebrew/opt/luvus")
-                .join("bin")
-                .join(executable_name())
-        );
-        assert!(homebrew_binary_from_prefix("  \n").is_err());
     }
 
     #[cfg(not(windows))]
