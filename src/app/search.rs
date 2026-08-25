@@ -1117,6 +1117,21 @@ impl App {
             _ => {}
         }
     }
+
+    /// Append pasted text to the fuzzy query and recompute once. Replaying a
+    /// paste as keys would rank metadata and queue worker requests per character.
+    pub fn search_paste(&mut self, pasted: &str) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        let previous_len = search.query.len();
+        search
+            .query
+            .extend(pasted.chars().filter(|character| !character.is_control()));
+        if search.query.len() != previous_len {
+            self.search_recompute();
+        }
+    }
 }
 
 impl GlobalSearch {
@@ -1710,6 +1725,21 @@ mod tests {
             serde_json::from_str(&app.handle_search_activate(&request)).unwrap();
         assert_eq!(value["result"]["activated"], true);
         assert_eq!(app.workspaces[0].active_tab, 1);
+    }
+
+    #[test]
+    fn pasted_text_updates_the_fuzzy_query_once() {
+        let _env = crate::persist::test_env("fuzzy-search-paste");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.open_search();
+        let generation = app.search.as_ref().unwrap().generation;
+
+        assert!(app.handle_event(crate::event::AppEvent::Paste("Cargo\n.toml".into())));
+
+        let search = app.search.as_ref().unwrap();
+        assert_eq!(search.query, "Cargo.toml");
+        assert_eq!(search.generation, generation.wrapping_add(1));
     }
 
     #[test]

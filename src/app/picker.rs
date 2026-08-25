@@ -200,49 +200,26 @@ impl App {
         }
     }
 
-    /// Jump the picker to a pasted path — the way you get to a folder that is
-    /// twenty levels deep or on another drive without walking there row by row.
-    ///
-    /// Accepts what a file manager or a shell actually puts on the clipboard:
-    /// surrounding whitespace and quotes are stripped, and a pasted *file* lands
-    /// on its parent folder (dragging a file in is a normal way to mean "this
-    /// project"). A relative path resolves against the folder being browsed, so
-    /// pasting `src/app` walks down from here — and a bare `Cargo.toml` can't
-    /// leave the picker on the empty parent path. Anything that doesn't resolve
-    /// leaves the browsed folder alone and reports it in the modal rather than
-    /// silently doing nothing.
-    pub fn picker_goto(&mut self, raw: &str) {
-        let text = raw.trim().trim_matches(['"', '\'']).trim();
+    /// Consume a paste without letting it reach the pane behind the picker.
+    /// Text sub-modes receive text; otherwise a pasted path navigates directly.
+    pub fn picker_paste(&mut self, raw: &str) {
+        let text: String = raw.chars().filter(|c| !c.is_control()).collect();
         if text.is_empty() {
             return;
         }
-        let path = PathBuf::from(text);
-        let path = match self.picker.as_ref() {
-            Some(p) if path.is_relative() => p.path.join(path),
-            _ => path,
-        };
-        let target = if path.is_dir() {
-            Some(path)
-        } else if path.is_file() {
-            path.parent().map(PathBuf::from)
-        } else {
-            None
-        };
-        match target {
-            Some(dir) => {
-                if let Some(p) = self.picker.as_mut() {
-                    p.path = dir;
-                    p.cursor = 0;
-                    p.error = None;
-                }
-                self.picker_refresh();
+        if let Some(picker) = self.picker.as_mut() {
+            if let Some(buffer) = picker.creating.as_mut() {
+                buffer.push_str(&text);
+                picker.error = None;
+                return;
             }
-            None => {
-                if let Some(p) = self.picker.as_mut() {
-                    p.error = Some(format!("no such folder: {text}"));
-                }
+            if let Some(buffer) = picker.going_to.as_mut() {
+                buffer.push_str(&text);
+                picker.error = None;
+                return;
             }
         }
+        self.picker_go_to(text);
     }
 
     /// Key handling while the folder picker is open.
@@ -363,9 +340,20 @@ impl App {
     }
 
     /// Resolve an entered path and browse to it. Absolute paths, paths relative
-    /// to the currently browsed folder, and `~` / `~/...` are supported.
+    /// to the currently browsed folder, and `~` / `~/...` are supported. A file
+    /// path browses its parent directory without opening a workspace.
     fn picker_go_to(&mut self, input: String) {
         let entered = input.trim();
+        let entered = entered
+            .strip_prefix('"')
+            .and_then(|text| text.strip_suffix('"'))
+            .or_else(|| {
+                entered
+                    .strip_prefix('\'')
+                    .and_then(|text| text.strip_suffix('\''))
+            })
+            .unwrap_or(entered)
+            .trim();
         if entered.is_empty() {
             let error = self.catalog.enter_folder_path.to_string();
             if let Some(p) = self.picker.as_mut() {
@@ -391,7 +379,16 @@ impl App {
             })
         };
 
-        let Some(target) = target.filter(|path| path.is_dir()) else {
+        let target = target.and_then(|path| {
+            if path.is_dir() {
+                Some(path)
+            } else if path.is_file() {
+                path.parent().map(PathBuf::from)
+            } else {
+                None
+            }
+        });
+        let Some(target) = target else {
             let error = format!("{}: {entered}", self.catalog.folder_not_found);
             if let Some(p) = self.picker.as_mut() {
                 p.error = Some(error);
@@ -816,6 +813,40 @@ mod tests {
             app.picker.as_ref().unwrap().path,
             deep,
             "walked down from here"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn paste_respects_picker_text_modes() {
+        let _env = crate::persist::test_env("picker-paste-modes");
+        let tmp = std::env::temp_dir().join(format!("luvus-pickmodes-{}", std::process::id()));
+        let deep = tmp.join("nested");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&deep).unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.open_folder_picker_at(tmp.clone());
+
+        app.picker_start_go_to();
+        app.handle_event(AppEvent::Paste(format!("\"{}\"\n", deep.display())));
+        let picker = app.picker.as_ref().unwrap();
+        assert_eq!(picker.path, tmp, "paste only fills the Go To field");
+        assert_eq!(
+            picker.going_to.as_deref(),
+            Some(format!("\"{}\"", deep.display()).as_str())
+        );
+
+        app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.picker.as_ref().unwrap().path, deep);
+
+        app.handle_picker_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        app.handle_event(AppEvent::Paste("new\nfolder".into()));
+        assert_eq!(
+            app.picker.as_ref().unwrap().creating.as_deref(),
+            Some("newfolder")
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
