@@ -1933,17 +1933,19 @@ mod tests {
         );
         assert!(app.dispatch("ping", &serde_json::json!({})).is_ok());
 
+        // Five seconds for the scan as a whole, not per event: rendering is
+        // change driven, so nothing fills the silence while `git status` runs
+        // and on Windows a cold spawn alone outlasts a short per-event slice.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            let event = rx
-                .recv_timeout(std::time::Duration::from_millis(250))
-                .expect("status worker event");
-            let completed = matches!(&event, AppEvent::DiffStatus { .. });
+        let mut done = false;
+        while !done && std::time::Instant::now() < deadline {
+            let Ok(event) = rx.recv_timeout(std::time::Duration::from_millis(250)) else {
+                continue;
+            };
+            done = matches!(&event, AppEvent::DiffStatus { .. });
             app.handle_event(event);
-            if completed {
-                break;
-            }
         }
+        assert!(done, "the status worker never reported back");
         let first: serde_json::Value = serde_json::from_str(
             &response
                 .recv_timeout(std::time::Duration::from_secs(1))

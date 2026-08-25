@@ -94,7 +94,7 @@ pub enum DockKind {
 }
 
 impl DockKind {
-    /// Stable id used in `config.json` and the socket API.
+    /// Stable id used in `config.json` and the UHP.
     pub fn id(&self) -> &str {
         match self {
             DockKind::Workspaces => "workspaces",
@@ -387,8 +387,8 @@ pub struct Tab {
     /// -leaf trick as a git tab; mutually exclusive with `git`.
     pub orch: bool,
     /// When `true`, this is the **Mission Control** dashboard (docs/54): the
-    /// per-workspace agent overview. Same placeholder-leaf trick as git/orch;
-    /// mutually exclusive with both.
+    /// workspace or all-workspaces agent overview. Same placeholder-leaf trick
+    /// as git/orch; mutually exclusive with both.
     pub mission: bool,
     /// User-chosen tab name (docs/28). `None` → the tab bar shows its number.
     /// Git/orch/mission tabs keep their fixed label and are never named.
@@ -491,8 +491,13 @@ pub(crate) const TAB_NAME_MAX: usize = 40;
 /// A right-click context menu on a WORKSPACES row: rename / worktree / close the
 /// node. Opened by right-clicking a workspace in the sidebar.
 pub struct WsMenu {
-    /// Target workspace index.
-    pub index: usize,
+    /// Stable target identity. Workspace indices shift when another workspace
+    /// is closed through the API while this menu is open.
+    pub workspace_id: String,
+    /// Whether the target was a Git repository when the menu opened. Repository
+    /// detection launches `git`, so snapshot it once instead of doing process
+    /// I/O on every frame while the popup is visible.
+    pub is_repo: bool,
     /// Top-left corner of the popup (the click point, clamped to fit on screen).
     pub anchor: (u16, u16),
     /// Each visible item + its clickable rect, filled in by the renderer.
@@ -906,7 +911,9 @@ impl AgentMenu {
 /// The workspace-rename modal: like [`TabRename`] but for a node's **label** (the
 /// folder on disk is never touched). Pre-filled with the current name.
 pub struct WsRename {
-    pub index: usize,
+    /// Stable target identity. Workspace indices can shift while the modal is
+    /// open if another workspace closes through the API.
+    pub workspace_id: String,
     pub buffer: String,
 }
 
@@ -1332,10 +1339,11 @@ pub struct App {
     pub tab_menu: Option<TabMenu>,
     /// The workspace right-click context menu, and the workspace-rename modal.
     pub ws_menu: Option<WsMenu>,
-    /// Armed worktree-delete confirmation: the workspace index of the worktree to
-    /// delete once confirmed (`y`/⏎). Destructive — removes the folder + git
-    /// worktree — so it goes through the confirm modal like the file delete.
-    pub worktree_delete: Option<usize>,
+    /// Armed worktree-delete confirmation: the stable workspace identity of the
+    /// worktree to delete once confirmed (`y`/⏎). Destructive — removes the
+    /// folder + git worktree — so it goes through the confirm modal like the file
+    /// delete. Resolve the current index only when confirmation is committed.
+    pub worktree_delete: Option<String>,
     /// Active pane context menu (right-click inside a pane); `None` when closed.
     pub pane_menu: Option<PaneMenu>,
     /// Active AGENTS-list context menu (right-click a row); `None` when closed.
@@ -1400,10 +1408,17 @@ pub struct App {
     /// The board's content rect, for mouse-wheel hit-testing.
     pub orch_area: Rect,
     /// Mission Control (docs/54): scroll + selected row of the active mission tab,
-    /// its content rect (mouse hit-testing), the rows currently displayed (so a
-    /// click/⏎ maps back to a pane or session), and the async token/cost cache.
+    /// its content rect (mouse-wheel hit-testing), the rows currently displayed
+    /// (so keyboard activation maps back to a pane or session), and the async
+    /// token/cost cache.
     pub mission_scroll: usize,
     pub mission_cursor: usize,
+    /// Current workspace only, or every open workspace.
+    pub mission_scope: crate::mission::MissionScope,
+    /// Click targets for the two scope tabs. Agent rows remain keyboard-only.
+    pub mission_scope_rects: Vec<(crate::mission::MissionScope, Rect)>,
+    /// Click target for the explicit Mission Control usage refresh action.
+    pub mission_refresh_rect: Option<Rect>,
     pub mission_area: Rect,
     pub mission_rows: Vec<crate::mission::MissionRowView>,
     /// Row index whose Mission Control detail overlay is open (`o`), if any (MC-5).
@@ -1416,15 +1431,17 @@ pub struct App {
     pub mission_burn: Option<f64>,
     /// Previous (total cost, time) sample, for the burn-rate delta.
     pub mission_last_cost: Option<(f64, std::time::Instant)>,
-    /// Best-effort usage (tokens/context/cost) keyed by **session id**, so both a
-    /// live pane and a resumable on-disk session share one entry. Refreshed
+    /// Best-effort usage (tokens/context/cost) keyed by **agent + session id**, so
+    /// a live pane and its resumable on-disk session share one entry without
+    /// colliding with another agent's local session namespace. Refreshed
     /// off-loop and blitted by the mission render — never computed on the render
     /// path (docs/54 MC-2/MC-4).
-    pub agent_usage: std::collections::HashMap<String, crate::mission::AgentUsage>,
+    pub agent_usage:
+        std::collections::HashMap<crate::mission::UsageKey, crate::mission::AgentUsage>,
     /// Each scanned transcript's mtime, so the next usage scan re-reads a session
     /// only when its file actually changed (docs/54) — an idle session costs one
     /// `stat`, not a full read+parse.
-    pub usage_mtimes: std::collections::HashMap<String, std::time::SystemTime>,
+    pub usage_mtimes: std::collections::HashMap<crate::mission::UsageKey, std::time::SystemTime>,
     /// Cursor position from the last render (for headless frame streaming).
     pub last_cursor: Option<(u16, u16)>,
     /// Foreground client asked to detach (prefix+q). Distinct from quit.
@@ -1516,17 +1533,31 @@ pub struct App {
     /// Throttle for rescanning the agents' on-disk session stores.
     last_sessions_at: Instant,
     last_proc_at: Instant,
-    /// Mission Control usage scan (docs/54, MC-2): throttle + in-flight guard, so
-    /// the token/cost read runs off-loop and only while a mission tab is open.
-    last_usage_at: Instant,
+    /// Mission Control usage is demand-driven: opening/focusing the dashboard,
+    /// changing its scope, or choosing refresh queues one off-loop scan. No
+    /// usage reader runs merely because a hidden Mission Control tab exists.
+    mission_usage_requested: bool,
+    /// Workspace whose Mission Control tab was visible on the previous sync.
+    /// `None` also records transitions away from Mission Control.
+    mission_active_workspace: Option<usize>,
     usage_scan_inflight: bool,
     /// Throttle for per-pane agent classification — it locks each pane's VT engine
     /// and scans its grid, so it runs at ~100ms, not at the render frame rate.
     last_detect_at: Instant,
+    /// Panes whose PTY generation or identity inputs changed since their last
+    /// classification pass. The detector consumes this bounded set instead of
+    /// walking every quiet pane on each 100 ms cadence.
+    detection_dirty: HashSet<PaneId>,
+    /// A bounded fleet audit repairs any missed invalidation without making the
+    /// audit the normal scheduling path.
+    last_detection_audit_at: Instant,
     /// Runtime evidence for the generation gate, exposed additively by
     /// `pane.list` for diagnostics and performance comparisons.
     detection_extractions: u64,
     detection_skips: u64,
+    detection_panes_considered: u64,
+    detection_full_fleet_audits: u64,
+    detection_audit_recoveries: u64,
     /// Pending server-side `wait.output` requests keyed by pane (docs/81).
     /// Satisfied by the pane's next output event, expired by the loop tick.
     output_waits: HashMap<PaneId, Vec<crate::app::dispatch::OutputWait>>,
@@ -1901,6 +1932,9 @@ impl App {
             orch_area: Rect::ZERO,
             mission_scroll: 0,
             mission_cursor: 0,
+            mission_scope: crate::mission::MissionScope::Workspace,
+            mission_scope_rects: Vec::new(),
+            mission_refresh_rect: None,
             mission_area: Rect::ZERO,
             mission_rows: Vec::new(),
             mission_detail: None,
@@ -1936,14 +1970,22 @@ impl App {
             proc_scan_inflight: false,
             dismissed_sessions: HashSet::new(),
             last_sessions_at: Instant::now(),
-            last_usage_at: Instant::now(),
+            mission_usage_requested: false,
+            mission_active_workspace: None,
             usage_scan_inflight: false,
             last_proc_at: Instant::now(),
             last_detect_at: Instant::now()
                 .checked_sub(Duration::from_secs(1))
                 .unwrap_or_else(Instant::now),
+            detection_dirty: HashSet::new(),
+            last_detection_audit_at: Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .unwrap_or_else(Instant::now),
             detection_extractions: 0,
             detection_skips: 0,
+            detection_panes_considered: 0,
+            detection_full_fleet_audits: 0,
+            detection_audit_recoveries: 0,
             output_waits: HashMap::new(),
             agent_waits: HashMap::new(),
             agent_starts: HashMap::new(),
@@ -2239,45 +2281,51 @@ impl App {
                     let (pane, module_rec) = match restored {
                         Some((p, rec)) => (p, Some(rec)),
                         None => {
-                            // A pane whose saved cwd vanished (deleted project
-                            // dir, unmounted volume) must not cost the whole
-                            // session: fall back to the workspace dir, then
-                            // home, before giving up on just this one pane.
+                            // Resolve a usable cwd before handing the shell to
+                            // the deferred worker. Session loading must not wait
+                            // for macOS/Linux/Windows PTY allocation, which can
+                            // occasionally stall inside the OS. The saved screen
+                            // is still replayed synchronously for the first frame.
                             let home = crate::platform::home_dir().unwrap_or_default();
-                            let mut spawned = None;
-                            for cwd in [&ps.cwd, &ws.cwd, &home] {
-                                let attempt = match &resume_argv {
-                                    Some(argv) => Pane::spawn_shell_with(
-                                        id,
-                                        80,
-                                        24,
-                                        cwd.clone(),
-                                        app_tx.clone(),
-                                        ps.screen.as_deref(),
-                                        &shell,
-                                        argv,
-                                        history_budget_bytes,
-                                    ),
-                                    None => Pane::spawn(
-                                        id,
-                                        80,
-                                        24,
-                                        cwd.clone(),
-                                        app_tx.clone(),
-                                        ps.screen.as_deref(),
-                                        &shell,
-                                        history_budget_bytes,
-                                    ),
-                                };
-                                if let Ok(p) = attempt {
-                                    spawned = Some(p);
-                                    break;
+                            let mut cwd_candidates = Vec::new();
+                            for candidate in [&ps.cwd, &ws.cwd, &home] {
+                                if candidate.is_dir() && !cwd_candidates.contains(candidate) {
+                                    cwd_candidates.push(candidate.clone());
                                 }
                             }
-                            match spawned {
-                                Some(p) => (p, None),
-                                None => continue, // skip this pane, keep the rest
-                            }
+                            let Some((cwd, fallback_cwds)) = cwd_candidates.split_first() else {
+                                continue;
+                            };
+                            let pane = match &resume_argv {
+                                Some(argv) => Pane::spawn_shell_with_deferred(
+                                    id,
+                                    80,
+                                    24,
+                                    cwd.clone(),
+                                    fallback_cwds,
+                                    app_tx.clone(),
+                                    ps.screen.as_deref(),
+                                    &shell,
+                                    argv,
+                                    history_budget_bytes,
+                                )
+                                .ok(),
+                                None => Some(Pane::spawn_restored(
+                                    id,
+                                    80,
+                                    24,
+                                    cwd.clone(),
+                                    fallback_cwds,
+                                    app_tx.clone(),
+                                    ps.screen.as_deref(),
+                                    &shell,
+                                    history_budget_bytes,
+                                )),
+                            };
+                            let Some(pane) = pane else {
+                                continue;
+                            };
+                            (pane, None)
                         }
                     };
                     let direct_resume = resume_argv.is_some() && module_rec.is_none();
@@ -2433,6 +2481,9 @@ impl App {
             orch_area: Rect::ZERO,
             mission_scroll: 0,
             mission_cursor: 0,
+            mission_scope: crate::mission::MissionScope::Workspace,
+            mission_scope_rects: Vec::new(),
+            mission_refresh_rect: None,
             mission_area: Rect::ZERO,
             mission_rows: Vec::new(),
             mission_detail: None,
@@ -2468,14 +2519,22 @@ impl App {
             proc_scan_inflight: false,
             dismissed_sessions: HashSet::new(),
             last_sessions_at: Instant::now(),
-            last_usage_at: Instant::now(),
+            mission_usage_requested: false,
+            mission_active_workspace: None,
             usage_scan_inflight: false,
             last_proc_at: Instant::now(),
             last_detect_at: Instant::now()
                 .checked_sub(Duration::from_secs(1))
                 .unwrap_or_else(Instant::now),
+            detection_dirty: HashSet::new(),
+            last_detection_audit_at: Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .unwrap_or_else(Instant::now),
             detection_extractions: 0,
             detection_skips: 0,
+            detection_panes_considered: 0,
+            detection_full_fleet_audits: 0,
+            detection_audit_recoveries: 0,
             output_waits: HashMap::new(),
             agent_waits: HashMap::new(),
             agent_starts: HashMap::new(),
@@ -2885,6 +2944,11 @@ impl App {
         (visible, background)
     }
 
+    /// Whether any PTY reader is currently coalescing an output notification.
+    pub fn has_pending_pty_output(&self) -> bool {
+        self.panes.values().any(|pane| pane.has_data_pending())
+    }
+
     /// Whether a pane is rendered in the active tab.
     pub fn pane_is_visible(&self, id: PaneId) -> bool {
         self.workspaces
@@ -3176,7 +3240,7 @@ impl App {
     }
 
     /// Change only a workspace's display label. The folder on disk remains
-    /// untouched. The same validation is shared by the TUI and socket API.
+    /// untouched. The same validation is shared by the TUI and UHP.
     pub fn rename_workspace(
         &mut self,
         index: usize,
@@ -3620,8 +3684,10 @@ impl App {
     /// Open the workspace context menu for row `index`, anchored at the cursor.
     pub fn open_ws_menu(&mut self, index: usize, col: u16, row: u16) {
         if index < self.workspaces.len() {
+            let is_repo = crate::git::local::is_repo(&self.workspaces[index].cwd);
             self.ws_menu = Some(WsMenu {
-                index,
+                workspace_id: self.workspaces[index].id.clone(),
+                is_repo,
                 anchor: (col, row),
                 items: Vec::new(),
                 module_actions: self.module_menu_actions("workspace"),
@@ -3634,7 +3700,16 @@ impl App {
     /// (git / orch). Worktree + git actions only appear for nodes in a git repo.
     pub fn ws_menu_items(&self, index: usize) -> Vec<WsMenuItem> {
         let ws = self.workspaces.get(index);
-        let is_repo = ws.is_some_and(|w| crate::git::local::is_repo(&w.cwd));
+        let is_repo = self
+            .ws_menu
+            .as_ref()
+            .filter(|menu| {
+                ws.is_some_and(|workspace| workspace.id.as_str() == menu.workspace_id.as_str())
+            })
+            .map(|menu| menu.is_repo)
+            // Keep this helper useful to callers that inspect rows before
+            // opening a menu. The renderer always takes the cached branch.
+            .unwrap_or_else(|| ws.is_some_and(|w| crate::git::local::is_repo(&w.cwd)));
         // A linked worktree (a `git worktree add` checkout) can be deleted; a main
         // checkout or plain workspace cannot — only closed.
         let is_worktree = ws
@@ -3666,6 +3741,15 @@ impl App {
             items.extend((0..extras).map(WsMenuItem::Module));
         }
         items
+    }
+
+    /// Resolve the open menu's stable target after any API-driven workspace
+    /// mutation. A missing target means the menu is stale and must be dismissed.
+    pub fn ws_menu_target_index(&self) -> Option<usize> {
+        let target = &self.ws_menu.as_ref()?.workspace_id;
+        self.workspaces
+            .iter()
+            .position(|workspace| workspace.id == *target)
     }
 
     /// The pane context-menu items: the built-ins, then any module actions
@@ -3742,14 +3826,21 @@ impl App {
 
     /// Run a context-menu action for the menu's target, then close the menu.
     pub fn ws_menu_action(&mut self, item: WsMenuItem) {
-        let Some((index, actions)) = self
+        let Some((workspace_id, actions)) = self
             .ws_menu
             .as_ref()
-            .map(|m| (m.index, m.module_actions.clone()))
+            .map(|m| (m.workspace_id.clone(), m.module_actions.clone()))
         else {
             return;
         };
         self.ws_menu = None;
+        let Some(index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == workspace_id)
+        else {
+            return;
+        };
         let cwd = self.workspaces.get(index).map(|w| w.cwd.clone());
         match item {
             WsMenuItem::Divider => {}
@@ -3767,7 +3858,7 @@ impl App {
             WsMenuItem::Rename => self.open_ws_rename(index),
             WsMenuItem::Close => self.close_workspace(index),
             // Destructive: arm the confirm modal rather than delete immediately.
-            WsMenuItem::DeleteWorktree => self.worktree_delete = Some(index),
+            WsMenuItem::DeleteWorktree => self.worktree_delete = Some(workspace_id),
             WsMenuItem::NewWorktree => {
                 if let Some(cwd) = cwd.filter(|p| crate::git::local::is_repo(p)) {
                     self.worktree_repo = Some(cwd);
@@ -3811,7 +3902,14 @@ impl App {
     /// Guarded so it only ever acts on a **linked worktree**, never a main
     /// checkout.
     fn confirm_worktree_delete(&mut self) {
-        let Some(index) = self.worktree_delete.take() else {
+        let Some(workspace_id) = self.worktree_delete.take() else {
+            return;
+        };
+        let Some(index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == workspace_id)
+        else {
             return;
         };
         // Extract owned paths under an immutable borrow, then act (mutable).
@@ -3847,7 +3945,7 @@ impl App {
     pub fn open_ws_rename(&mut self, index: usize) {
         if let Some(w) = self.workspaces.get(index) {
             self.ws_rename = Some(WsRename {
-                index,
+                workspace_id: w.id.clone(),
                 buffer: w.name.clone(),
             });
         }
@@ -3921,7 +4019,13 @@ impl App {
             KeyCode::Esc => self.ws_rename = None,
             KeyCode::Enter => {
                 if let Some(r) = self.ws_rename.take() {
-                    let _ = self.rename_workspace(r.index, &r.buffer);
+                    if let Some(index) = self
+                        .workspaces
+                        .iter()
+                        .position(|workspace| workspace.id == r.workspace_id)
+                    {
+                        let _ = self.rename_workspace(index, &r.buffer);
+                    }
                 }
             }
             KeyCode::Backspace => {
@@ -5192,6 +5296,7 @@ impl App {
 
     fn close_active_ws(&mut self) {
         if self.active_ws < self.workspaces.len() {
+            let closed_workspace_id = self.workspaces[self.active_ws].id.clone();
             if self.workspaces.len() > 1 {
                 let closed_root = self.workspaces[self.active_ws].cwd.clone();
                 self.fail_pending_files_api_for_root(
@@ -5203,6 +5308,7 @@ impl App {
                     "workspace closed while DIFF was refreshing",
                 );
             }
+            self.clear_workspace_transients(&closed_workspace_id);
             self.workspaces.remove(self.active_ws);
         }
         if self.workspaces.is_empty() {
@@ -5243,6 +5349,7 @@ impl App {
         if index >= self.workspaces.len() {
             return;
         }
+        let closed_workspace_id = self.workspaces[index].id.clone();
         if self.workspaces.len() > 1 {
             let closed_root = self.workspaces[index].cwd.clone();
             self.fail_pending_files_api_for_root(
@@ -5262,6 +5369,7 @@ impl App {
         for id in ids {
             self.drop_leaf_runtime(id);
         }
+        self.clear_workspace_transients(&closed_workspace_id);
         self.workspaces.remove(index);
         if self.workspaces.is_empty() {
             self.all_workspaces_closed();
@@ -5273,6 +5381,20 @@ impl App {
             "workspace.closed",
             serde_json::json!({"workspace": index.to_string()}),
         );
+    }
+
+    /// Dismiss deferred UI actions whose stable target is being removed.
+    fn clear_workspace_transients(&mut self, workspace_id: &str) {
+        if self
+            .ws_rename
+            .as_ref()
+            .is_some_and(|rename| rename.workspace_id == workspace_id)
+        {
+            self.ws_rename = None;
+        }
+        if self.worktree_delete.as_deref() == Some(workspace_id) {
+            self.worktree_delete = None;
+        }
     }
 
     /// Close a tab and all its panes (the "X" button / prefix+X).
@@ -5522,14 +5644,14 @@ mod tests {
         app.workspaces[0].worktree = None;
 
         // A non-confirm key dismisses the modal.
-        app.worktree_delete = Some(0);
+        app.worktree_delete = Some(app.workspaces[0].id.clone());
         app.worktree_delete_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         assert!(app.worktree_delete.is_none(), "n cancels");
 
         // Confirming on the default node (a main checkout, not a linked worktree)
         // removes nothing — the guard refuses to delete a plain workspace.
         let before = app.workspaces.len();
-        app.worktree_delete = Some(0);
+        app.worktree_delete = Some(app.workspaces[0].id.clone());
         app.worktree_delete_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         assert!(app.worktree_delete.is_none());
         assert_eq!(
@@ -5814,6 +5936,7 @@ mod tests {
             going_to: None,
             error: None,
             is_repo,
+            show_hidden: false,
         };
 
         // On a git repo: `w` closes the picker and opens the branch prompt,
@@ -5969,7 +6092,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// With no node open, the socket API must answer with an error rather than
+    /// With no node open, the UHP must answer with an error rather than
     /// indexing an empty `workspaces` and taking the server down. `handle_api`
     /// already guards this centrally; the session can now *stay* empty rather
     /// than being a brief pre-quit window, so this pins that guard in place.
@@ -6333,6 +6456,125 @@ mod tests {
             app.workspace_display_order(),
             vec![(1, false), (2, true), (0, false)]
         );
+    }
+
+    #[test]
+    fn open_workspace_menu_reuses_snapshotted_repo_capability() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        // A deliberately missing path would fail a fresh `git rev-parse`. The
+        // open menu must still use its captured result instead of launching Git
+        // again during rendering.
+        app.workspaces[0].cwd = std::path::PathBuf::from("luvus-missing-menu-repo");
+        app.ws_menu = Some(WsMenu {
+            workspace_id: app.workspaces[0].id.clone(),
+            is_repo: true,
+            anchor: (0, 0),
+            items: Vec::new(),
+            module_actions: Vec::new(),
+        });
+
+        assert!(app.ws_menu_items(0).contains(&WsMenuItem::OpenGit));
+        assert!(app.ws_menu_items(0).contains(&WsMenuItem::NewWorktree));
+    }
+
+    #[test]
+    fn workspace_menu_follows_target_identity_after_an_index_shift() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let target_id = crate::ids::public_id("workspace");
+        app.workspaces.push(Workspace {
+            id: target_id.clone(),
+            name: "target".into(),
+            cwd: app.workspaces[0].cwd.clone(),
+            branch: None,
+            git_ahead_behind: None,
+            worktree: None,
+            tabs: vec![Tab::panes(TileLayout::new(PaneId::alloc()))],
+            active_tab: 0,
+            pinned: false,
+        });
+
+        app.open_ws_menu(1, 0, 0);
+        app.close_workspace(0);
+        assert_eq!(app.ws_menu_target_index(), Some(0));
+
+        app.ws_menu_action(WsMenuItem::Rename);
+        let rename = app
+            .ws_rename
+            .as_ref()
+            .expect("rename targets surviving node");
+        assert_eq!(rename.workspace_id, target_id);
+    }
+
+    #[test]
+    fn workspace_rename_keeps_target_identity_while_modal_is_open() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let target_id = crate::ids::public_id("workspace");
+        app.workspaces.push(Workspace {
+            id: target_id.clone(),
+            name: "target".into(),
+            cwd: app.workspaces[0].cwd.clone(),
+            branch: None,
+            git_ahead_behind: None,
+            worktree: None,
+            tabs: vec![Tab::panes(TileLayout::new(PaneId::alloc()))],
+            active_tab: 0,
+            pinned: false,
+        });
+
+        app.open_ws_rename(1);
+        app.close_workspace(0);
+        app.ws_rename.as_mut().unwrap().buffer = "renamed".into();
+        app.handle_ws_rename_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.workspaces[0].id, target_id);
+        assert_eq!(app.workspaces[0].name, "renamed");
+    }
+
+    #[test]
+    fn deferred_workspace_actions_abort_after_target_closes() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let survivor_id = crate::ids::public_id("workspace");
+        app.workspaces.push(Workspace {
+            id: survivor_id.clone(),
+            name: "survivor".into(),
+            cwd: app.workspaces[0].cwd.clone(),
+            branch: None,
+            git_ahead_behind: None,
+            worktree: None,
+            tabs: vec![Tab::panes(TileLayout::new(PaneId::alloc()))],
+            active_tab: 0,
+            pinned: false,
+        });
+
+        let removed_id = app.workspaces[0].id.clone();
+        app.open_ws_rename(0);
+        app.worktree_delete = Some(removed_id);
+        app.close_workspace(0);
+
+        assert_eq!(app.workspaces.len(), 1);
+        assert_eq!(app.workspaces[0].id, survivor_id);
+        assert_eq!(app.workspaces[0].name, "survivor");
+        assert!(app.ws_rename.is_none());
+        assert!(app.worktree_delete.is_none());
+    }
+
+    #[test]
+    fn workspace_menu_dismisses_when_its_target_was_closed() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.open_ws_menu(0, 0, 0);
+        app.close_workspace(0);
+
+        assert_eq!(app.ws_menu_target_index(), None);
+        app.ws_menu_action(WsMenuItem::Rename);
+        assert!(app.ws_menu.is_none());
+        assert!(app.ws_rename.is_none());
     }
 
     #[test]
@@ -6851,18 +7093,8 @@ mod tests {
         let store =
             std::env::temp_dir().join(format!("luvus-cross-tab-pairing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
-        let enc: String = cwd
-            .to_string_lossy()
-            .chars()
-            .map(|c| {
-                if matches!(c, '/' | '\\' | '.') {
-                    '-'
-                } else {
-                    c
-                }
-            })
-            .collect();
-        let proj = store.join("projects").join(enc);
+        // The real encoder, so a test can never drift from what luvus looks up.
+        let proj = crate::agent::claude_project_dir(&store, &cwd);
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(proj.join("first-session.jsonl"), "{}").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -6920,11 +7152,11 @@ mod tests {
         let mut app = App::new(80, 24, tx).unwrap();
         let focus = app.layout().focus;
         assert!(
-            !crate::agent::is_resumable("gemini"),
+            !crate::agent::is_resumable("aider"),
             "the regression needs an agent whose identity is visible but not persisted"
         );
 
-        app.proc_commands.insert(focus, vec!["gemini".into()]);
+        app.proc_commands.insert(focus, vec!["aider".into()]);
         let now = Instant::now();
         app.last_detect_at = now - Duration::from_secs(1);
         app.last_proc_at = now;
@@ -6935,7 +7167,7 @@ mod tests {
             app.detect_tick(now),
             "an idle identity change adds a sidebar row and must request a frame"
         );
-        assert_eq!(app.status.get(&focus).unwrap().agent, "gemini");
+        assert_eq!(app.status.get(&focus).unwrap().agent, "aider");
         assert!(
             !app.session_dirty,
             "a non-resumable identity repaint does not create persistence work"
@@ -7668,7 +7900,7 @@ mod tests {
         );
         assert_eq!(app.workspaces.len(), before, "no half-built node is added");
         assert_eq!(app.active_ws, active_before, "focus must not move");
-        // The socket API must not answer with the *previously* active node, which
+        // The UHP must not answer with the *previously* active node, which
         // read as success to `luvus` itself and to any scripting agent.
         let (reply, _r) = std::sync::mpsc::channel();
         let resp = app.handle_api(&crate::ipc::api::ApiRequest {
@@ -9663,6 +9895,7 @@ mod tests {
         if let Some(p) = app.panes.get(&id) {
             p.scroll(60);
         }
+        app.detection_dirty.insert(id);
         let visible = app
             .panes
             .get(&id)
@@ -9742,6 +9975,7 @@ mod tests {
 
         // The user just typed: the recent output is keystroke echo → stays Idle.
         app.status.get_mut(&id).unwrap().last_input = now;
+        app.detection_dirty.insert(id);
         app.detect_tick(now);
         assert_eq!(
             app.status.get(&id).unwrap().state,
@@ -9753,6 +9987,7 @@ mod tests {
         let later = now + std::time::Duration::from_millis(150);
         app.status.get_mut(&id).unwrap().last_activity = later;
         app.status.get_mut(&id).unwrap().last_input = now - std::time::Duration::from_secs(5);
+        app.detection_dirty.insert(id);
         app.detect_tick(later);
         assert_eq!(
             app.status.get(&id).unwrap().state,
@@ -9782,6 +10017,7 @@ mod tests {
             s.last_input = t0 - std::time::Duration::from_secs(5);
             s.last_resize = Some(t0);
         }
+        app.detection_dirty.insert(id);
         app.detect_tick(t0);
         assert_eq!(
             app.status.get(&id).unwrap().state,
@@ -9796,6 +10032,7 @@ mod tests {
             s.last_activity = t1;
             s.last_input = t1 - std::time::Duration::from_secs(5);
         }
+        app.detection_dirty.insert(id);
         app.detect_tick(t1);
         assert_eq!(
             app.status.get(&id).unwrap().state,
@@ -9990,7 +10227,7 @@ mod tests {
     }
 
     // docs/54 MC-1: Mission Control opens as a dashboard tab, lists the node's
-    // live agents, renders them, and ⏎/click jumps back to the agent's pane.
+    // live agents, renders them, and Enter jumps back to the agent's pane.
     #[test]
     /// Every dashboard must survive a hostile terminal. Mission Control lays its
     /// rows out in fixed-width columns, which is exactly the shape that panics on
@@ -10070,6 +10307,7 @@ mod tests {
             text.contains("Mission Control"),
             "the dashboard title shows"
         );
+        assert!(text.contains("BETA"), "the dashboard beta badge shows");
         assert!(text.contains("claude"), "the agent row shows");
 
         // ⏎ jumps back to the agent's pane (leaving the dashboard).
@@ -10077,6 +10315,156 @@ mod tests {
         assert!(!app.active_is_mission(), "jumped off the dashboard");
         assert_eq!(app.ws().active_tab, agent_tab, "landed on the agent's tab");
         assert_eq!(app.layout().focus, agent_pane, "focused the agent's pane");
+    }
+
+    #[test]
+    fn mission_usage_refresh_is_demand_driven() {
+        use ratatui::crossterm::event::{
+            KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let _env = crate::persist::test_env("mission-demand-refresh");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let normal_tab = app.ws().active_tab;
+        app.open_mission_control(0);
+        let mission_tab = app.ws().active_tab;
+        assert!(app.mission_usage_requested, "opening requests one refresh");
+
+        app.sync_mission_usage_visibility();
+        app.mission_usage_requested = false; // simulate the worker consuming it
+        app.sync_mission_usage_visibility();
+        assert!(
+            !app.mission_usage_requested,
+            "remaining on Mission Control does not poll"
+        );
+
+        app.handle_mission_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(app.mission_usage_requested, "r requests a refresh");
+
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let refresh = app
+            .mission_refresh_rect
+            .expect("wide dashboard exposes refresh button");
+        app.mission_usage_requested = false;
+        app.handle_event(crate::event::AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: refresh.x,
+            row: refresh.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(app.mission_usage_requested, "click requests a refresh");
+
+        app.mission_usage_requested = false;
+        app.focus_tab(normal_tab).unwrap();
+        app.sync_mission_usage_visibility();
+        app.focus_tab(mission_tab).unwrap();
+        app.sync_mission_usage_visibility();
+        assert!(
+            app.mission_usage_requested,
+            "returning to Mission Control requests one fresh snapshot"
+        );
+    }
+
+    #[test]
+    fn mission_usage_refreshes_when_switching_between_workspace_dashboards() {
+        let _env = crate::persist::test_env("mission-workspace-refresh");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let second = PaneId::alloc();
+        app.workspaces.push(Workspace {
+            id: crate::ids::public_id("workspace"),
+            name: "beta".into(),
+            cwd: PathBuf::from("/tmp/luvus-mission-beta"),
+            branch: None,
+            git_ahead_behind: None,
+            worktree: None,
+            tabs: vec![Tab::panes(TileLayout::new(second))],
+            active_tab: 0,
+            pinned: false,
+        });
+
+        app.open_mission_control(0);
+        app.open_mission_control(1);
+        app.sync_mission_usage_visibility();
+        app.mission_usage_requested = false;
+
+        app.active_ws = 0;
+        app.sync_mission_usage_visibility();
+
+        assert!(
+            app.mission_usage_requested,
+            "switching directly to another workspace dashboard requests fresh usage"
+        );
+    }
+
+    #[test]
+    fn mission_control_scope_tabs_include_every_workspace_without_row_clicks() {
+        use crate::mission::{MissionRow, MissionScope};
+        use ratatui::crossterm::event::{
+            KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let _env = crate::persist::test_env("mission-scope");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let first = app.layout().focus;
+        app.workspaces[0].name = "alpha".into();
+        app.status.get_mut(&first).unwrap().agent = "claude".into();
+
+        let second = PaneId::alloc();
+        let mut second_status = PaneStatus::new("codex".into());
+        second_status.agent_session = Some(AgentSession {
+            agent: "codex".into(),
+            session_id: "beta-session".into(),
+        });
+        app.status.insert(second, second_status);
+        app.workspaces.push(Workspace {
+            id: crate::ids::public_id("workspace"),
+            name: "beta".into(),
+            cwd: PathBuf::from("/tmp/luvus-mission-beta"),
+            branch: None,
+            git_ahead_behind: None,
+            worktree: None,
+            tabs: vec![Tab::panes(TileLayout::new(second))],
+            active_tab: 0,
+            pinned: false,
+        });
+
+        app.open_mission_control(0);
+        assert_eq!(app.mission_scope, MissionScope::Workspace);
+        assert_eq!(app.build_mission_rows().len(), 1, "current workspace only");
+
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let all = app
+            .mission_scope_rects
+            .iter()
+            .find(|(scope, _)| *scope == MissionScope::All)
+            .expect("all-workspaces scope tab is rendered")
+            .1;
+        app.handle_event(AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: all.x + 1,
+            row: all.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(app.mission_scope, MissionScope::All);
+        let rows = app.build_mission_rows();
+        assert_eq!(rows.len(), 2, "both workspaces contribute agents");
+        assert!(rows.iter().any(|row| {
+            row.row == MissionRow::Live(second) && row.location.starts_with("beta · t1")
+        }));
+
+        app.handle_mission_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            app.mission_scope,
+            MissionScope::Workspace,
+            "Tab provides a keyboard equivalent"
+        );
     }
 
     // docs/54 MC-2/MC-4: live rows carry cached usage (tokens/cost/context), and
@@ -10097,9 +10485,10 @@ mod tests {
                 session_id: "live-1".into(),
             });
         }
-        // Seed the usage cache (what the async scan produces), keyed by session id.
+        // Seed the usage cache (what the async scan produces), keyed by agent and
+        // session id.
         app.agent_usage.insert(
-            "live-1".into(),
+            crate::mission::UsageKey::new("claude", "live-1"),
             AgentUsage {
                 model: "claude-opus-4-8".into(),
                 tokens_in: 4000,
@@ -10117,7 +10506,7 @@ mod tests {
             updated: std::time::SystemTime::now(),
         }];
         app.agent_usage.insert(
-            "resume-1".into(),
+            crate::mission::UsageKey::new("claude", "resume-1"),
             AgentUsage {
                 model: "claude-sonnet-4".into(),
                 tokens_in: 1000,
@@ -10127,7 +10516,6 @@ mod tests {
                 cost: Some(0.02),
             },
         );
-
         app.open_mission_control(0);
         let rows = app.build_mission_rows();
 
@@ -10152,8 +10540,8 @@ mod tests {
             "the resumable row carries its historical cost"
         );
 
-        // Render the dashboard and confirm the new layout draws: the column
-        // header, the per-row context gauge, and the bottom cost-by-model chart.
+        // Render the dashboard and confirm the full command deck draws: agent
+        // sessions, selected agent, status summary, and model-spend telemetry.
         {
             use ratatui::{backend::TestBackend, Terminal};
             let mut term = Terminal::new(TestBackend::new(140, 30)).unwrap();
@@ -10165,14 +10553,60 @@ mod tests {
                         .map(move |c| buf.cell((c, r)).map(|x| x.symbol()).unwrap_or(" "))
                 })
                 .collect();
-            assert!(text.contains("status"), "column header row draws");
-            assert!(text.contains("context"), "the context column header draws");
+            assert!(text.contains("AGENT SESSIONS"), "the agent panel draws");
+            assert!(text.contains("LOCATION"), "the table location header draws");
+            assert!(text.contains("TOKENS"), "the table usage header draws");
             assert!(
-                text.contains("cost by model"),
-                "the bottom cost chart draws"
+                text.contains("SELECTED AGENT"),
+                "the selected-agent panel draws"
             );
-            assert!(text.contains('█'), "a bar (context gauge / chart) draws");
+            assert!(
+                text.contains("COST BY MODEL"),
+                "the model-spend panel draws"
+            );
+            assert!(text.contains("AGENT STATUS"), "the state panel draws");
+            assert!(text.contains('█'), "a telemetry bar draws");
         }
+
+        // A narrow terminal falls back to a full-width, single-column agent list.
+        {
+            use ratatui::{backend::TestBackend, Terminal};
+            let mut term = Terminal::new(TestBackend::new(60, 18)).unwrap();
+            term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+            let buf = term.backend().buffer();
+            let text: String = (0..buf.area.height)
+                .flat_map(|r| {
+                    (0..buf.area.width)
+                        .map(move |c| buf.cell((c, r)).map(|x| x.symbol()).unwrap_or(" "))
+                })
+                .collect();
+            assert!(text.contains("AGENT SESSIONS"), "compact agent panel draws");
+        }
+
+        // Plain clicks are intentionally inert: opening a pane is an explicit
+        // keyboard action through Enter, not an accidental dashboard click.
+        let active_tab = app.ws().active_tab;
+        let cursor = app.mission_cursor;
+        app.handle_event(crate::event::AppEvent::Mouse(
+            ratatui::crossterm::event::MouseEvent {
+                kind: ratatui::crossterm::event::MouseEventKind::Down(
+                    ratatui::crossterm::event::MouseButton::Left,
+                ),
+                column: app.mission_area.x.saturating_add(2),
+                row: app.mission_area.y.saturating_add(7),
+                modifiers: KeyModifiers::NONE,
+            },
+        ));
+        assert!(app.active_is_mission(), "click stays in Mission Control");
+        assert_eq!(
+            app.ws().active_tab,
+            active_tab,
+            "click does not open a pane"
+        );
+        assert_eq!(
+            app.mission_cursor, cursor,
+            "click does not change selection"
+        );
 
         // The detail overlay opens on `o` and closes on esc. (`render` publishes
         // `mission_rows`, so it's set now.)
@@ -10369,14 +10803,19 @@ mod tests {
         // spinner rather than just poking `last_activity`.
         // Newlines scroll the previous marker away and land the new text in the
         // bottom rows, which is the region detection actually scans.
-        let paint = |app: &App, text: &str| {
-            if let Some(p) = app.panes.get(&id) {
-                if let Ok(mut e) = p.engine.lock() {
-                    let mut buf = vec![b'\n'; 30];
-                    buf.extend_from_slice(text.as_bytes());
-                    e.advance(&buf);
+        let paint = |app: &mut App, text: &str| {
+            {
+                if let Some(p) = app.panes.get(&id) {
+                    if let Ok(mut e) = p.engine.lock() {
+                        let mut buf = vec![b'\n'; 30];
+                        buf.extend_from_slice(text.as_bytes());
+                        e.advance(&buf);
+                    }
                 }
             }
+            // Production output reaches detection through `PtyData`, which marks
+            // the pane dirty. This direct VT mutation must model the same event.
+            app.detection_dirty.insert(id);
         };
         let go_working = |app: &mut App, base: std::time::Instant| {
             paint(app, "⠋ Thinking… (esc to interrupt)\r\n");

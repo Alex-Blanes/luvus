@@ -16,8 +16,7 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use crate::event::AppEvent;
 use crate::ids::PaneId;
 use crate::terminal::backend::TerminalRuntime;
-use crate::terminal::vt::alacritty::AlacrittyEngine;
-use crate::terminal::vt::VtEngine;
+use crate::terminal::vt::{create_engine, VtEngine, VtEngineKind};
 
 const CHILD_REAPER_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -360,12 +359,83 @@ impl Pane {
             cols,
             rows,
             cwd,
+            &[],
             app_tx,
+            None,
             cmd,
             basename(shell),
             &[],
             history_budget_bytes,
         )
+    }
+
+    /// Restore an interactive shell pane without making session loading wait
+    /// for the operating system to allocate its PTY. The saved screen is
+    /// replayed before this returns, so clients can render useful content while
+    /// the shell starts in the background.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_restored(
+        id: PaneId,
+        cols: u16,
+        rows: u16,
+        cwd: PathBuf,
+        fallback_cwds: &[PathBuf],
+        app_tx: Sender<AppEvent>,
+        initial: Option<&str>,
+        shell: &str,
+        history_budget_bytes: usize,
+    ) -> Pane {
+        let cmd = CommandBuilder::new(shell);
+        Self::build_deferred(
+            id,
+            cols,
+            rows,
+            cwd,
+            fallback_cwds,
+            app_tx,
+            initial,
+            cmd,
+            basename(shell),
+            &[],
+            history_budget_bytes,
+        )
+    }
+
+    /// Deferred counterpart to [`Pane::spawn_shell_with`] for restoring a
+    /// PowerShell agent session without blocking server startup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_shell_with_deferred(
+        id: PaneId,
+        cols: u16,
+        rows: u16,
+        cwd: PathBuf,
+        fallback_cwds: &[PathBuf],
+        app_tx: Sender<AppEvent>,
+        initial: Option<&str>,
+        shell: &str,
+        argv: &[String],
+        history_budget_bytes: usize,
+    ) -> Result<Pane> {
+        let Some((program, args)) = argv.split_first() else {
+            return Err(anyhow::anyhow!("empty shell command"));
+        };
+        let mut cmd = CommandBuilder::new(program);
+        for arg in args {
+            cmd.arg(arg);
+        }
+        Ok(Self::build_deferred(
+            id,
+            cols,
+            rows,
+            cwd,
+            fallback_cwds,
+            app_tx,
+            initial,
+            cmd,
+            basename(shell),
+            &[],
+            history_budget_bytes,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -406,12 +476,13 @@ impl Pane {
         // All bytes (user input + terminal responses) funnel through one channel
         // to a single writer thread — keeps ordering correct, needs no mutex.
         let (input_tx, input_rx) = mpsc::channel::<InputAction>();
-        let engine: Arc<Mutex<dyn VtEngine>> = Arc::new(Mutex::new(AlacrittyEngine::new(
+        let engine = create_engine(
+            VtEngineKind::default(),
             cols,
             rows,
             input_tx.clone(),
             history_budget_bytes,
-        )));
+        );
         // Replay the saved screen so a restored pane shows its prior content.
         if let Some(screen) = initial {
             if let Ok(mut e) = engine.lock() {
@@ -470,8 +541,10 @@ impl Pane {
         cols: u16,
         rows: u16,
         cwd: PathBuf,
+        fallback_cwds: &[PathBuf],
         app_tx: Sender<AppEvent>,
-        mut cmd: CommandBuilder,
+        initial: Option<&str>,
+        cmd: CommandBuilder,
         command: String,
         extra_env: &[(String, String)],
         history_budget_bytes: usize,
@@ -479,12 +552,18 @@ impl Pane {
         // Everything a caller can observe before the child exists: the engine
         // (pane.read, detection, rendering) and the input queue.
         let (input_tx, input_rx) = mpsc::channel::<InputAction>();
-        let engine: Arc<Mutex<dyn VtEngine>> = Arc::new(Mutex::new(AlacrittyEngine::new(
+        let engine = create_engine(
+            VtEngineKind::default(),
             cols,
             rows,
             input_tx.clone(),
             history_budget_bytes,
-        )));
+        );
+        if let Some(screen) = initial {
+            if let Ok(mut engine) = engine.lock() {
+                engine.advance(screen.as_bytes());
+            }
+        }
 
         // The writer thread starts with the pane and blocks until the spawn
         // worker hands over the PTY writer; bytes sent meanwhile queue in
@@ -536,6 +615,7 @@ impl Pane {
             let tx = app_tx.clone();
             // Owned copies for the 'static worker thread.
             let worker_cwd = cwd.clone();
+            let worker_fallback_cwds = fallback_cwds.to_vec();
             let worker_env = extra_env.to_vec();
             thread::spawn(move || {
                 let fail = || {
@@ -553,14 +633,24 @@ impl Pane {
                     Ok(pair) => pair,
                     Err(_) => return fail(),
                 };
-                apply_pane_env(&mut cmd, id, &worker_cwd, &worker_env);
                 // Closed before the fork: abort without creating the child.
                 if cancelled.load(Ordering::SeqCst) {
                     return;
                 }
-                let mut child = match pair.slave.spawn_command(cmd) {
-                    Ok(child) => child,
-                    Err(_) => return fail(),
+                let mut spawned = None;
+                for candidate in std::iter::once(worker_cwd)
+                    .chain(worker_fallback_cwds)
+                    .filter(|candidate| candidate.is_dir())
+                {
+                    let mut candidate_cmd = cmd.clone();
+                    apply_pane_env(&mut candidate_cmd, id, &candidate, &worker_env);
+                    if let Ok(child) = pair.slave.spawn_command(candidate_cmd) {
+                        spawned = Some((child, candidate));
+                        break;
+                    }
+                }
+                let Some((mut child, spawned_cwd)) = spawned else {
+                    return fail();
                 };
                 let Some(pid) = child.process_id() else {
                     terminate_spawned_child(child.as_mut());
@@ -639,7 +729,10 @@ impl Pane {
                 *terminal_runtime
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime);
-                let _ = ready_tx.send(AppEvent::PtyReady(id));
+                let _ = ready_tx.send(AppEvent::PtyReady {
+                    id,
+                    cwd: spawned_cwd,
+                });
             })
         };
         drop(worker);
@@ -673,6 +766,13 @@ impl Pane {
             }
         }
         pending
+    }
+
+    /// Observe whether output is waiting for a coalescing boundary without
+    /// consuming it. The server uses this to arm the 100 ms fallback only while
+    /// a pane actually has pending bytes, instead of waking forever when idle.
+    pub fn has_data_pending(&self) -> bool {
+        self.data_pending.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Clear the pending-output coalescing flag so the reader's next
@@ -1132,6 +1232,67 @@ mod reap_tests {
         );
     }
 
+    #[test]
+    fn restored_deferred_pane_replays_saved_screen_immediately() {
+        let (tx, _rx) = mpsc::channel();
+        let pane = Pane::spawn_restored(
+            PaneId::alloc(),
+            80,
+            24,
+            std::env::temp_dir(),
+            &[],
+            tx,
+            Some("RESTORED-SCREEN\r\n"),
+            "/bin/sh",
+            500,
+        );
+        assert!(
+            pane.engine
+                .lock()
+                .unwrap()
+                .detection_text(24)
+                .contains("RESTORED-SCREEN"),
+            "saved content is visible without waiting for the PTY worker"
+        );
+    }
+
+    #[test]
+    fn restored_deferred_pane_retries_a_fallback_cwd() {
+        let (tx, rx) = mpsc::channel();
+        let id = PaneId::alloc();
+        let fallback = std::env::temp_dir();
+        let missing = fallback.join(format!("luvus-missing-cwd-{}", std::process::id()));
+        let pane = Pane::spawn_restored(
+            id,
+            80,
+            24,
+            missing,
+            std::slice::from_ref(&fallback),
+            tx,
+            None,
+            "/bin/sh",
+            500,
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "the fallback PTY never became ready");
+            match rx.recv_timeout(remaining) {
+                Ok(AppEvent::PtyReady { id: ready, cwd }) if ready == id => {
+                    assert_eq!(cwd, fallback);
+                    break;
+                }
+                Ok(AppEvent::PtyExit(exited)) if exited == id => {
+                    panic!("the restored pane closed instead of using its fallback cwd")
+                }
+                Ok(_) => {}
+                Err(error) => panic!("the fallback PTY never became ready: {error}"),
+            }
+        }
+        assert_ne!(pane.child_pid.load(Ordering::SeqCst), 0);
+    }
+
     /// A resize issued before the deferred fork must still reach the child:
     /// the worker opens the PTY at the latest recorded size (docs/82).
     #[test]
@@ -1240,6 +1401,17 @@ mod tests {
             path.as_bytes(),
             "sent bare when it did not, so a plain shell is unaffected"
         );
+    }
+
+    #[test]
+    fn paste_preserves_windows_paths_quotes_and_unicode() {
+        let command = r#".\.venv\Scripts\python.exe .\youtube_folder_uploader.py --folder "E:\Vídeos\Pendientes €""#;
+        assert_eq!(wrap_paste(command, false), command.as_bytes());
+
+        let mut expected = b"\x1b[200~".to_vec();
+        expected.extend_from_slice(command.as_bytes());
+        expected.extend_from_slice(b"\x1b[201~");
+        assert_eq!(wrap_paste(command, true), expected);
     }
 
     #[test]

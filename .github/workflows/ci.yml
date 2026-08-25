@@ -46,12 +46,12 @@ jobs:
       - run: cargo test --locked
       - name: Validate terminal backend contract
         run: |
-          python3 examples/terminal-backend/consumer.py --fixtures
-          python3 examples/terminal-backend/mock_conformance.py
-          python3 examples/runtime-api/consumer.py
+          python3 examples/uhp/terminal/consumer.py --fixtures
+          python3 examples/uhp/terminal/mock_conformance.py
+          python3 examples/uhp/consumer.py
           cargo build --locked
-          python3 examples/terminal-backend/live_conformance.py --luvus target/debug/luvus
-          python3 examples/terminal-backend/failure_conformance.py --luvus target/debug/luvus
+          python3 examples/uhp/terminal/live_conformance.py --luvus target/debug/luvus
+          python3 examples/uhp/terminal/failure_conformance.py --luvus target/debug/luvus
       - name: Test terminal support crates
         run: |
           cargo test --manifest-path vendor/vte/Cargo.toml --lib
@@ -79,12 +79,12 @@ jobs:
       - run: cargo test --locked
       - name: Validate terminal backend contract
         run: |
-          python3 examples/terminal-backend/consumer.py --fixtures
-          python3 examples/terminal-backend/mock_conformance.py
-          python3 examples/runtime-api/consumer.py
+          python3 examples/uhp/terminal/consumer.py --fixtures
+          python3 examples/uhp/terminal/mock_conformance.py
+          python3 examples/uhp/consumer.py
           cargo build --locked
-          python3 examples/terminal-backend/live_conformance.py --luvus target/debug/luvus
-          python3 examples/terminal-backend/failure_conformance.py --luvus target/debug/luvus
+          python3 examples/uhp/terminal/live_conformance.py --luvus target/debug/luvus
+          python3 examples/uhp/terminal/failure_conformance.py --luvus target/debug/luvus
 
   windows:
     name: windows protocol · ConPTY
@@ -101,22 +101,26 @@ jobs:
         shell: pwsh
         run: |
           cargo test --locked platform::windows::tests
+          cargo test --locked platform::tests::no_window_keeps_the_command_working
           cargo test --locked ipc::transport::windows_
           cargo test --locked app::backend::tests
           cargo test --locked terminal::backend::tests
+          cargo test --locked altgr
+          cargo test --locked diff::git::tests::tree_tint_uses_nested_visible_spelling_and_new_rename_path
+          cargo test --locked agent::tests::claude_project_dir_encodes_every_non_alphanumeric
       - name: Validate published protocol fixtures
         shell: pwsh
         run: |
-          python examples/terminal-backend/consumer.py --fixtures
-          if ($LASTEXITCODE -ne 0) { throw "terminal-backend fixture validation failed" }
-          python examples/runtime-api/consumer.py
-          if ($LASTEXITCODE -ne 0) { throw "runtime-api fixture validation failed" }
+          python examples/uhp/terminal/consumer.py --fixtures
+          if ($LASTEXITCODE -ne 0) { throw "UHP terminal fixture validation failed" }
+          python examples/uhp/consumer.py
+          if ($LASTEXITCODE -ne 0) { throw "UHP fixture validation failed" }
       - name: Validate named pipes and ConPTY live
         shell: pwsh
         run: |
           cargo build --locked
           if ($LASTEXITCODE -ne 0) { throw "Windows debug build failed" }
-          .\examples\terminal-backend\live_conformance.ps1 `
+          .\examples\uhp\terminal\live_conformance.ps1 `
             -Luvus .\target\debug\luvus.exe
 
   # Known-vulnerability scan of the dependency tree (RustSec advisory DB).
