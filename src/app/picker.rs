@@ -61,10 +61,21 @@ pub enum PickerHit {
 }
 
 impl FolderPicker {
+    /// Is the picker on the drive list — the virtual folder above `C:\` that
+    /// [`crate::platform::drive_roots`] fills? Marked by an empty path, which is
+    /// never a real browsed folder.
+    pub fn at_drives(&self) -> bool {
+        self.path.as_os_str().is_empty()
+    }
+
     /// Number of action rows before the directory entries: "open" + (optional)
     /// "open with worktree" + "home" + "..".
     fn leading(&self) -> usize {
-        if self.is_repo {
+        if self.at_drives() {
+            // The drive list is not a folder to open, and nothing is above it.
+            // `~` and `g` still work as accelerators; they just have no row here.
+            0
+        } else if self.is_repo {
             4
         } else {
             3
@@ -78,12 +89,15 @@ impl FolderPicker {
 
     /// Classify the row at index `i`.
     pub fn row(&self, i: usize) -> Row {
+        let leading = self.leading();
         match (i, self.is_repo) {
+            // Checked first so a drive list, whose `leading` is 0, is all entries
+            // rather than falling into the action arms below.
+            _ if i >= leading => Row::Entry(i - leading),
             (0, _) => Row::OpenFolder,
             (1, true) => Row::OpenWorktree,
             (1, false) | (2, true) => Row::Home,
-            (2, false) | (3, true) => Row::Up,
-            _ => Row::Entry(i - self.leading()),
+            _ => Row::Up,
         }
     }
 }
@@ -125,9 +139,22 @@ impl App {
         self.picker = None;
     }
 
-    /// Re-read the browsed path's entries (folders + files), dirs first.
+    /// Re-read the browsed path's entries (folders + files), dirs first. On the
+    /// drive list there is nothing to read: the entries *are* the drives.
     fn picker_refresh(&mut self) {
         if let Some(p) = self.picker.as_mut() {
+            if p.at_drives() {
+                p.entries = crate::platform::drive_roots()
+                    .into_iter()
+                    .map(|d| Entry {
+                        name: d.display().to_string(),
+                        is_dir: true,
+                    })
+                    .collect();
+                p.is_repo = false;
+                p.cursor = p.cursor.min(p.row_count().saturating_sub(1));
+                return;
+            }
             let mut entries: Vec<Entry> = std::fs::read_dir(&p.path)
                 .map(|rd| {
                     rd.filter_map(Result::ok)
@@ -267,7 +294,9 @@ impl App {
             KeyCode::Right | KeyCode::Char('l') => self.picker_descend(),
             KeyCode::Enter => self.picker_activate(),
             KeyCode::Char('n') => {
-                if let Some(p) = self.picker.as_mut() {
+                // Not on the drive list: there is no folder to create in, and the
+                // relative `create_dir` would land in luvus' own working directory.
+                if let Some(p) = self.picker.as_mut().filter(|p| !p.at_drives()) {
                     p.creating = Some(String::new());
                     p.going_to = None;
                     p.error = None;
@@ -293,11 +322,17 @@ impl App {
         self.picker_move(delta);
     }
 
-    /// Browse up to the parent directory.
+    /// Browse up to the parent directory — and, above a Windows drive root, to
+    /// the list of drives. `C:\` has no parent, so without that step `..` was a
+    /// dead end and the only way to another drive was knowing its letter and
+    /// typing it into "Go to".
     fn picker_up(&mut self) {
         if let Some(p) = self.picker.as_mut() {
-            if let Some(parent) = p.path.parent() {
-                p.path = parent.to_path_buf();
+            if let Some(parent) = p.path.parent().map(PathBuf::from) {
+                p.path = parent;
+                p.cursor = 0;
+            } else if cfg!(windows) && !p.at_drives() {
+                p.path = PathBuf::new();
                 p.cursor = 0;
             }
         }
@@ -629,6 +664,42 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Windows has no path above `C:\`, so `..` was a dead end and the picker
+    /// stayed on whichever drive it opened on: a repo on `D:\` or on a mapped
+    /// share could not be reached by browsing at all. `..` from a drive root
+    /// lists the drives.
+    #[cfg(windows)]
+    #[test]
+    fn walking_up_from_a_drive_root_lists_the_drives() {
+        let _env = crate::persist::test_env("picker-drives");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()) + "\\";
+        app.open_folder_picker_at(PathBuf::from(&system));
+
+        app.handle_picker_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        let p = app.picker.as_ref().expect("the picker is still open");
+        assert!(p.at_drives(), "`..` from a drive root opens the drive list");
+        assert!(
+            matches!(p.row(0), Row::Entry(0)),
+            "no `open this folder`, `home` or `..` row above the drives"
+        );
+        let drive = p
+            .entries
+            .iter()
+            .position(|e| e.name.eq_ignore_ascii_case(&system))
+            .expect("the system drive is listed");
+
+        // `⏎` on a drive browses into it — the way to another letter or a share.
+        app.picker.as_mut().unwrap().cursor = drive;
+        app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.picker.as_ref().expect("still open").path,
+            PathBuf::from(&system),
+            "browsed into the drive, not into a relative `C:` path"
+        );
     }
 
     #[test]

@@ -48,6 +48,36 @@ fn is_drive_letter(s: &str) -> bool {
     cfg!(windows) && b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
 }
 
+/// The roots you can browse *above* every folder: the drive letters on Windows
+/// (`C:\`, `D:\`, and any network drive this logon session has mapped), and
+/// nothing on Unix, where `/` really is the top of the tree.
+///
+/// Windows has no path above `C:\` — `Path::parent()` returns `None` there — so
+/// the picker could only ever walk inside the drive it opened on. Typing `D:`
+/// into "Go to" gets you off it ([`user_path`]), but only if you already know
+/// the letter; this is the half you can *discover* from the modal.
+///
+/// A bitmask read, no IO: probing `A:\`..`Z:\` with `is_dir()` instead would
+/// block the caller for seconds on a mapped drive whose server has gone away.
+/// Only drives mapped by this logon session are listed (drive letters are
+/// per-session on Windows); an unmapped share still arrives by pasting its
+/// `\\server\share` path, as before.
+#[cfg(windows)]
+pub fn drive_roots() -> Vec<PathBuf> {
+    // SAFETY: takes no arguments, touches no memory, and only reads the
+    // per-session drive-letter bitmask.
+    let mask = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
+    (0..26u32)
+        .filter(|i| mask & (1 << i) != 0)
+        .map(|i| PathBuf::from(format!("{}:\\", (b'A' + i as u8) as char)))
+        .collect()
+}
+
+#[cfg(not(windows))]
+pub fn drive_roots() -> Vec<PathBuf> {
+    Vec::new()
+}
+
 /// The spelling normalizer behind [`path_key`]. One pass, and the same
 /// signature on every platform: the `#[cfg(windows)]` case fold that used to sit
 /// in `path_key` left the variable a `String` there and a `&str` elsewhere, so
