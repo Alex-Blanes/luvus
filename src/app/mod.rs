@@ -421,8 +421,9 @@ pub(crate) const TAB_NAME_MAX: usize = 40;
 /// A right-click context menu on a WORKSPACES row: rename / worktree / close the
 /// node. Opened by right-clicking a workspace in the sidebar.
 pub struct WsMenu {
-    /// Target workspace index.
-    pub index: usize,
+    /// Stable target identity. Workspace indices shift when another workspace
+    /// is closed through the API while this menu is open.
+    pub workspace_id: String,
     /// Whether the target was a Git repository when the menu opened. Repository
     /// detection launches `git`, so snapshot it once instead of doing process
     /// I/O on every frame while the popup is visible.
@@ -3478,7 +3479,7 @@ impl App {
         if index < self.workspaces.len() {
             let is_repo = crate::git::local::is_repo(&self.workspaces[index].cwd);
             self.ws_menu = Some(WsMenu {
-                index,
+                workspace_id: self.workspaces[index].id.clone(),
                 is_repo,
                 anchor: (col, row),
                 items: Vec::new(),
@@ -3495,7 +3496,9 @@ impl App {
         let is_repo = self
             .ws_menu
             .as_ref()
-            .filter(|menu| menu.index == index)
+            .filter(|menu| {
+                ws.is_some_and(|workspace| workspace.id.as_str() == menu.workspace_id.as_str())
+            })
             .map(|menu| menu.is_repo)
             // Keep this helper useful to callers that inspect rows before
             // opening a menu. The renderer always takes the cached branch.
@@ -3531,6 +3534,15 @@ impl App {
             items.extend((0..extras).map(WsMenuItem::Module));
         }
         items
+    }
+
+    /// Resolve the open menu's stable target after any API-driven workspace
+    /// mutation. A missing target means the menu is stale and must be dismissed.
+    pub fn ws_menu_target_index(&self) -> Option<usize> {
+        let target = &self.ws_menu.as_ref()?.workspace_id;
+        self.workspaces
+            .iter()
+            .position(|workspace| workspace.id == *target)
     }
 
     /// The pane context-menu items: the built-ins, then any module actions
@@ -3607,14 +3619,21 @@ impl App {
 
     /// Run a context-menu action for the menu's target, then close the menu.
     pub fn ws_menu_action(&mut self, item: WsMenuItem) {
-        let Some((index, actions)) = self
+        let Some((workspace_id, actions)) = self
             .ws_menu
             .as_ref()
-            .map(|m| (m.index, m.module_actions.clone()))
+            .map(|m| (m.workspace_id.clone(), m.module_actions.clone()))
         else {
             return;
         };
         self.ws_menu = None;
+        let Some(index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == workspace_id)
+        else {
+            return;
+        };
         let cwd = self.workspaces.get(index).map(|w| w.cwd.clone());
         match item {
             WsMenuItem::Divider => {}
@@ -6130,7 +6149,7 @@ mod tests {
         // again during rendering.
         app.workspaces[0].cwd = std::path::PathBuf::from("luvus-missing-menu-repo");
         app.ws_menu = Some(WsMenu {
-            index: 0,
+            workspace_id: app.workspaces[0].id.clone(),
             is_repo: true,
             anchor: (0, 0),
             items: Vec::new(),
@@ -6139,6 +6158,49 @@ mod tests {
 
         assert!(app.ws_menu_items(0).contains(&WsMenuItem::OpenGit));
         assert!(app.ws_menu_items(0).contains(&WsMenuItem::NewWorktree));
+    }
+
+    #[test]
+    fn workspace_menu_follows_target_identity_after_an_index_shift() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let target_id = crate::ids::public_id("workspace");
+        app.workspaces.push(Workspace {
+            id: target_id.clone(),
+            name: "target".into(),
+            cwd: app.workspaces[0].cwd.clone(),
+            branch: None,
+            git_ahead_behind: None,
+            worktree: None,
+            tabs: vec![Tab::panes(TileLayout::new(PaneId::alloc()))],
+            active_tab: 0,
+            pinned: false,
+        });
+
+        app.open_ws_menu(1, 0, 0);
+        app.close_workspace(0);
+        assert_eq!(app.ws_menu_target_index(), Some(0));
+
+        app.ws_menu_action(WsMenuItem::Rename);
+        let rename = app
+            .ws_rename
+            .as_ref()
+            .expect("rename targets surviving node");
+        assert_eq!(rename.index, 0);
+        assert_eq!(app.workspaces[rename.index].id, target_id);
+    }
+
+    #[test]
+    fn workspace_menu_dismisses_when_its_target_was_closed() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.open_ws_menu(0, 0, 0);
+        app.close_workspace(0);
+
+        assert_eq!(app.ws_menu_target_index(), None);
+        app.ws_menu_action(WsMenuItem::Rename);
+        assert!(app.ws_menu.is_none());
+        assert!(app.ws_rename.is_none());
     }
 
     #[test]
