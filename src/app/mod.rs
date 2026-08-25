@@ -423,6 +423,10 @@ pub(crate) const TAB_NAME_MAX: usize = 40;
 pub struct WsMenu {
     /// Target workspace index.
     pub index: usize,
+    /// Whether the target was a Git repository when the menu opened. Repository
+    /// detection launches `git`, so snapshot it once instead of doing process
+    /// I/O on every frame while the popup is visible.
+    pub is_repo: bool,
     /// Top-left corner of the popup (the click point, clamped to fit on screen).
     pub anchor: (u16, u16),
     /// Each visible item + its clickable rect, filled in by the renderer.
@@ -3472,8 +3476,10 @@ impl App {
     /// Open the workspace context menu for row `index`, anchored at the cursor.
     pub fn open_ws_menu(&mut self, index: usize, col: u16, row: u16) {
         if index < self.workspaces.len() {
+            let is_repo = crate::git::local::is_repo(&self.workspaces[index].cwd);
             self.ws_menu = Some(WsMenu {
                 index,
+                is_repo,
                 anchor: (col, row),
                 items: Vec::new(),
                 module_actions: self.module_menu_actions("workspace"),
@@ -3486,7 +3492,14 @@ impl App {
     /// (git / orch). Worktree + git actions only appear for nodes in a git repo.
     pub fn ws_menu_items(&self, index: usize) -> Vec<WsMenuItem> {
         let ws = self.workspaces.get(index);
-        let is_repo = ws.is_some_and(|w| crate::git::local::is_repo(&w.cwd));
+        let is_repo = self
+            .ws_menu
+            .as_ref()
+            .filter(|menu| menu.index == index)
+            .map(|menu| menu.is_repo)
+            // Keep this helper useful to callers that inspect rows before
+            // opening a menu. The renderer always takes the cached branch.
+            .unwrap_or_else(|| ws.is_some_and(|w| crate::git::local::is_repo(&w.cwd)));
         // A linked worktree (a `git worktree add` checkout) can be deleted; a main
         // checkout or plain workspace cannot — only closed.
         let is_worktree = ws
@@ -6106,6 +6119,26 @@ mod tests {
             app.workspace_display_order(),
             vec![(1, false), (2, true), (0, false)]
         );
+    }
+
+    #[test]
+    fn open_workspace_menu_reuses_snapshotted_repo_capability() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        // A deliberately missing path would fail a fresh `git rev-parse`. The
+        // open menu must still use its captured result instead of launching Git
+        // again during rendering.
+        app.workspaces[0].cwd = std::path::PathBuf::from("luvus-missing-menu-repo");
+        app.ws_menu = Some(WsMenu {
+            index: 0,
+            is_repo: true,
+            anchor: (0, 0),
+            items: Vec::new(),
+            module_actions: Vec::new(),
+        });
+
+        assert!(app.ws_menu_items(0).contains(&WsMenuItem::OpenGit));
+        assert!(app.ws_menu_items(0).contains(&WsMenuItem::NewWorktree));
     }
 
     #[test]
