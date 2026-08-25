@@ -6830,18 +6830,8 @@ mod tests {
         let store =
             std::env::temp_dir().join(format!("luvus-cross-tab-pairing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
-        let enc: String = cwd
-            .to_string_lossy()
-            .chars()
-            .map(|c| {
-                if matches!(c, '/' | '\\' | '.') {
-                    '-'
-                } else {
-                    c
-                }
-            })
-            .collect();
-        let proj = store.join("projects").join(enc);
+        // The real encoder, so a test can never drift from what luvus looks up.
+        let proj = crate::agent::claude_project_dir(&store, &cwd);
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(proj.join("first-session.jsonl"), "{}").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));

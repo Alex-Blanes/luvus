@@ -1407,25 +1407,39 @@ mod tests {
     /// and no Windows project with a space in its path was ever found.
     #[test]
     fn claude_project_dir_encodes_every_non_alphanumeric() {
+        let base = Path::new("claude-store");
         let enc = |cwd: &str| {
-            claude_project_dir(Path::new("/base"), Path::new(cwd))
+            claude_project_dir(base, Path::new(cwd))
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
                 .into_owned()
         };
-        assert_eq!(enc(r"C:\Users\me\proj"), "C--Users-me-proj", "drive colon");
         assert_eq!(
-            enc(r"D:\Users\me\Codigo fuente\Personal"),
-            "D--Users-me-Codigo-fuente-Personal",
+            enc(r"C:\Users\developer\project"),
+            "C--Users-developer-project",
+            "drive colon"
+        );
+        assert_eq!(
+            enc(r"D:\Work\source code\project"),
+            "D--Work-source-code-project",
             "the space too"
         );
         assert_eq!(
-            enc("/home/me/JV_CO2_ETL"),
-            "-home-me-JV-CO2-ETL",
+            enc("/home/developer/data_pipeline"),
+            "-home-developer-data-pipeline",
             "underscore"
         );
-        assert_eq!(enc("/home/me/Área"), "-home-me--rea", "non-ASCII letter");
+        assert_eq!(
+            enc("/workspace/café"),
+            "-workspace-caf-",
+            "non-ASCII letter"
+        );
+        assert_eq!(
+            claude_project_dir(base, Path::new(r"C:\Users\developer\project")),
+            base.join("projects").join("C--Users-developer-project"),
+            "a Windows drive path stays inside Claude's configured store"
+        );
     }
     #[test]
     fn resume_commands() {
