@@ -89,6 +89,7 @@ jobs:
           cargo test --locked ipc::transport::windows_
           cargo test --locked app::backend::tests
           cargo test --locked terminal::backend::tests
+          cargo test --locked altgr
       - name: Validate published protocol fixtures
         shell: pwsh
         run: |

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 
 use super::App;
@@ -1443,6 +1443,25 @@ mod tests {
             .metadata_matches
             .iter()
             .any(|result| result.entry.kind == SearchKind::Workspace));
+    }
+
+    #[test]
+    fn altgr_character_is_text_on_windows_and_a_ctrl_chord_elsewhere() {
+        let _env = crate::persist::test_env("search-altgr");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.open_search();
+        app.search_key(KeyEvent::new(
+            KeyCode::Char('€'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+
+        let query = &app.search.as_ref().unwrap().query;
+        if cfg!(windows) {
+            assert_eq!(query, "€");
+        } else {
+            assert!(query.is_empty(), "Ctrl+Alt remains a real chord");
+        }
     }
 
     #[test]

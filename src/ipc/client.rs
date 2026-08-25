@@ -706,6 +706,16 @@ mod render_tests {
     use ratatui::backend::TestBackend;
 
     #[test]
+    fn paste_event_preserves_windows_paths_quotes_and_unicode() {
+        let command = r#".\.venv\Scripts\python.exe .\youtube_folder_uploader.py --folder "E:\Vídeos\Pendientes €""#;
+        let message = event_message(Event::Paste(command.to_string()));
+        assert!(matches!(
+            message,
+            Some(ClientMessage::Paste(text)) if text == command
+        ));
+    }
+
+    #[test]
     fn session_handoff_replaces_only_the_session_selector() {
         let raw = vec![
             "luvus".to_string(),

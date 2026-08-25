@@ -1399,6 +1399,17 @@ mod tests {
     }
 
     #[test]
+    fn paste_preserves_windows_paths_quotes_and_unicode() {
+        let command = r#".\.venv\Scripts\python.exe .\youtube_folder_uploader.py --folder "E:\Vídeos\Pendientes €""#;
+        assert_eq!(wrap_paste(command, false), command.as_bytes());
+
+        let mut expected = b"\x1b[200~".to_vec();
+        expected.extend_from_slice(command.as_bytes());
+        expected.extend_from_slice(b"\x1b[201~");
+        assert_eq!(wrap_paste(command, true), expected);
+    }
+
+    #[test]
     fn reaper_retries_child_poll_errors() {
         assert!(!child_poll_finished(Ok(None)));
         assert!(!child_poll_finished(Err(std::io::Error::other(

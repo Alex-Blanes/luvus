@@ -3186,11 +3186,10 @@ mod tests {
     fn altgr_types_its_character_instead_of_a_control_byte() {
         let nl = b"\x1b\r";
         let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
-        let enc = |c: char, m: KeyModifiers| {
-            encode_key(&KeyEvent::new(KeyCode::Char(c), m), nl, false)
-        };
+        let enc =
+            |c: char, m: KeyModifiers| encode_key(&KeyEvent::new(KeyCode::Char(c), m), nl, false);
         if cfg!(windows) {
-            for c in ['\\', '@', '#', '[', ']', '{', '}', '|', '~'] {
+            for c in ['\\', '@', '#', '[', ']', '{', '}', '|', '~', '€'] {
                 assert_eq!(
                     enc(c, altgr),
                     Some(c.to_string().into_bytes()),
@@ -3199,17 +3198,23 @@ mod tests {
             }
         } else {
             // Elsewhere AltGr arrives unmodified, so Ctrl+Alt stays the real
-            // chord it always was: the control byte, with Ctrl winning over Alt
-            // exactly as before this change.
-            assert_eq!(enc('\\', altgr), Some(vec![0x1c]));
+            // chord it is on current main: an Alt-prefixed control byte.
+            assert_eq!(enc('\\', altgr), Some(vec![0x1b, 0x1c]));
         }
         // A real Ctrl chord is untouched on every platform.
         assert_eq!(enc('\\', KeyModifiers::CONTROL), Some(vec![0x1c]));
         assert_eq!(enc('c', KeyModifiers::CONTROL), Some(vec![0x03]));
+        for c in ['ñ', 'á'] {
+            assert_eq!(
+                enc(c, KeyModifiers::NONE),
+                Some(c.to_string().into_bytes()),
+                "unmodified Unicode input must remain valid UTF-8"
+            );
+        }
         // The exception is for characters only: every other key keeps both
         // modifiers, so Ctrl+Alt+Enter is still a modified Enter.
         assert_eq!(
-            encode_key(&KeyEvent::new(KeyCode::Enter, altgr), nl),
+            encode_key(&KeyEvent::new(KeyCode::Enter, altgr), nl, false),
             Some(nl.to_vec()),
             "Ctrl+Alt+Enter still sends the configured newline"
         );
