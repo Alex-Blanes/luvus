@@ -975,6 +975,47 @@ mod tests {
         assert!(app.relaunch_requested, "an idle session restarts at once");
     }
 
+    /// The restart button and the background installer are independent threads,
+    /// and the installer used to lose the race: pressing restart while a build
+    /// was still downloading brought the server back on the binary that was
+    /// about to be replaced. The new build then landed seconds later and sat on
+    /// disk unloaded — an update that worked, looking exactly like one that did
+    /// nothing. Restart now waits for the install instead of racing it.
+    #[test]
+    fn the_restart_button_waits_for_an_install_still_in_flight() {
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let _env = crate::persist::test_env("cl-restart-installing");
+        let (mut app, _term) = open();
+        let btn = app.changelog_restart_rect.expect("restart button drawn");
+        let idle = app.layout().focus;
+        app.status.get_mut(&idle).unwrap().state = crate::ui::theme::State::Idle;
+
+        crate::update::set_installing(true);
+        app.handle_event(crate::event::AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: btn.x + 1,
+            row: btn.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        crate::update::set_installing(false);
+        assert!(
+            !app.relaunch_requested,
+            "an idle session still waits while the new binary is landing"
+        );
+        assert!(app.relaunch_after_install, "the restart is parked, not lost");
+        assert!(app.toast.is_some(), "and the click said why");
+
+        // It lands: the parked restart goes without a second click.
+        app.handle_event(crate::event::AppEvent::SelfUpdateInstalled(
+            "0.12.0 - 0.77".into(),
+        ));
+        assert!(app.relaunch_requested, "the parked restart fires on its own");
+        assert!(
+            !app.relaunch_after_install,
+            "and does not stay armed for the next install"
+        );
+    }
+
     /// Every outcome of an asked-for check says something. A button that can
     /// silently do nothing reads as broken.
     #[test]

@@ -219,9 +219,14 @@ pub(crate) fn spawn_successor(args: &[String]) -> Result<()> {
         // records meant for the successor; `release_console` detaches this
         // process alone — the successor inherited the console when it spawned
         // and keeps it — which fails that read and ends the thread.
+        // Logged because this is where "two luvus processes" comes from: on
+        // Windows the old client stays alive, parked in `wait`, until the
+        // successor exits. It looks like a leak in a process list and is not.
+        crate::persist::log_event(&format!("successor spawned pid={}", child.id()));
         #[cfg(windows)]
         crate::platform::release_console();
         let _ = child.wait();
+        crate::persist::log_event("successor exited");
         Ok(())
     }
 }

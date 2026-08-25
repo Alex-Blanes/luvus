@@ -621,6 +621,10 @@ impl App {
                         self.show_toast(self.catalog.update_current)
                     }
                     crate::update::CheckOutcome::Failed => {
+                        // Nothing is going to land, so a restart parked waiting
+                        // for it would wait forever. Release it: the next press
+                        // restarts onto whatever is installed, as it always did.
+                        self.relaunch_after_install = false;
                         self.show_toast(self.catalog.update_failed)
                     }
                 }
@@ -629,6 +633,14 @@ impl App {
             AppEvent::SelfUpdateInstalled(label) => {
                 self.update_available = None; // it is no longer *available*, it is installed
                 self.show_toast(format!("{} v{label}", self.catalog.update_installed));
+                // A restart parked while this was downloading: there is finally
+                // a new binary to restart *onto*, so let it go now. Back through
+                // `request_relaunch`, so a busy agent still gets its say.
+                if std::mem::take(&mut self.relaunch_after_install) {
+                    if let Some(warning) = self.request_relaunch() {
+                        self.show_toast(warning);
+                    }
+                }
                 true
             }
             AppEvent::UpstreamUpdateAvailable(version) => {

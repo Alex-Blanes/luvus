@@ -434,6 +434,45 @@ pub fn session_dir() -> PathBuf {
     crate::session::active_dir()
 }
 
+/// The one log luvus keeps: `<session dir>/restart.log`, a line per decision in
+/// the update → restart → resume chain.
+///
+/// The server runs detached with stdout and stderr on null
+/// ([`crate::main::spawn_server`] uses `DETACHED_PROCESS`), so when a restart
+/// brings one agent pane back and leaves the pane next to it as a bare shell,
+/// there is nothing left anywhere to read. Resume is decided in two places that
+/// both discard their reasoning: [`resolve_pane_sessions`] at save time, which
+/// gives a pane *no* session rather than risk handing it a neighbour's
+/// conversation, and the restore in `App::restore_or_new`, which falls back to a
+/// plain shell whenever the resume command cannot be built. From the outside
+/// both look identical — the agent just did not come back. This records which
+/// one happened, per pane.
+///
+/// Deliberately small: a handful of lines per restart, never per frame, and
+/// never pane output. Times are Unix seconds, the same clock the rest of the
+/// codebase records; read one with
+/// `[DateTimeOffset]::FromUnixTimeSeconds(n).ToLocalTime()`.
+pub fn log_event(event: &str) {
+    const MAX_BYTES: u64 = 256 * 1024;
+    let dir = session_dir();
+    let path = dir.join("restart.log");
+    // Start over rather than grow without bound. 256 KB is hundreds of restarts;
+    // a diagnosis that needs more than that needs a different tool.
+    if fs::metadata(&path).is_ok_and(|m| m.len() > MAX_BYTES) {
+        let _ = fs::remove_file(&path);
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Best effort throughout: a log that cannot be written must never take the
+    // server down with it, and the directory may not exist yet on a first run.
+    let _ = fs::create_dir_all(&dir);
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(file, "{stamp} pid={} {event}", std::process::id());
+    }
+}
+
 /// Create the selected runtime directory with the same owner-only protection as
 /// the global root. This is the startup-lock namespace for one server only.
 pub fn ensure_session_dir() -> PathBuf {
@@ -637,15 +676,25 @@ fn resolve_pane_sessions(app: &App) -> HashMap<PaneId, Option<(String, String)>>
     let mut ids: Vec<PaneId> = app.status.keys().copied().collect();
     ids.sort_by_key(|p| p.0);
 
+    // What each agent pane ended up with, for `restart.log`. Collected rather
+    // than logged inline because this runs on every debounced save, not only
+    // before a restart: only a *change* is worth a line (see `log_resolution`).
+    let mut resolved: Vec<(u32, String)> = Vec::new();
+
     // Pass 1: precise, hook-reported sessions take their id outright.
     for id in &ids {
         if let Some(a) = app.status.get(id).and_then(|s| s.agent_session.as_ref()) {
             let key = (a.agent.clone(), a.session_id.clone());
             if claimed.insert(key.clone()) {
+                resolved.push((id.0, format!("{}:{}=hook/{}", id.0, a.agent, a.session_id)));
                 out.insert(*id, Some(key));
             } else {
                 // A malformed or duplicate integration report must not make two
                 // panes resume and write to the same native conversation.
+                resolved.push((
+                    id.0,
+                    format!("{}:{}=none/duplicate-hook-report", id.0, a.agent),
+                ));
                 out.insert(*id, None);
             }
         }
@@ -691,14 +740,57 @@ fn resolve_pane_sessions(app: &App) -> HashMap<PaneId, Option<(String, String)>>
             let id = pane_ids[0];
             let sid = sessions.into_iter().next().expect("length checked");
             claimed.insert((agent.clone(), sid.clone()));
+            resolved.push((id.0, format!("{}:{agent}=disk/{sid}", id.0)));
             out.insert(id, Some((agent, sid)));
         } else {
+            // The give-up branch, and the one worth naming: an agent pane that
+            // no hook ever reported, in a folder where the mapping cannot be
+            // proved. It restores as a bare shell — the "why did this one not
+            // come back?" case — and the two counts say which half was
+            // ambiguous, the panes or the conversations on disk.
+            let panes = pane_ids.len();
+            let found = sessions.len();
+            let agent_pane = app.manifests.is_agent(&agent);
             for id in pane_ids {
+                if agent_pane {
+                    resolved.push((
+                        id.0,
+                        format!("{}:{agent}=none/ambiguous(panes={panes},sessions={found})", id.0),
+                    ));
+                }
                 out.insert(id, None);
             }
         }
     }
+    log_resolution(&mut resolved);
     out
+}
+
+/// Write one `save` line to `restart.log`, but only when the picture changed.
+///
+/// A snapshot is written on a two-second debounce for as long as the session is
+/// dirty, so logging every resolution would bury the restart it is meant to
+/// explain under thousands of identical lines. What matters is the transition —
+/// a hook finally reporting, a second pane making a folder ambiguous — and the
+/// last line before a restart is by construction the state that restart used.
+fn log_resolution(resolved: &mut [(u32, String)]) {
+    use std::sync::Mutex;
+    static LAST: Mutex<String> = Mutex::new(String::new());
+
+    resolved.sort_by_key(|(id, _)| *id);
+    let line = resolved
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let Ok(mut last) = LAST.lock() else {
+        return;
+    };
+    if *last == line {
+        return;
+    }
+    *last = line.clone();
+    log_event(&format!("save resolved [{line}]"));
 }
 
 /// The agent identity to use only while writing a restart snapshot.
@@ -1043,6 +1135,57 @@ mod workspace_dedupe_tests {
         merge_duplicate_workspaces(&mut snap);
         assert_eq!(snap.workspaces.len(), 2);
         assert_eq!(snap.active_ws, 1);
+    }
+}
+
+#[cfg(test)]
+mod restart_log_tests {
+    use super::*;
+
+    /// The resolution is recomputed on every debounced save, so an unchanged
+    /// picture must not add a line — otherwise the one restart the log exists to
+    /// explain is buried under thousands of identical ones. The change itself is
+    /// what carries the information: a hook finally reporting, or a second pane
+    /// making a folder ambiguous.
+    #[test]
+    fn the_restart_log_records_a_resolution_once_per_change() {
+        let _env = test_env("restart-log");
+        let path = session_dir().join("restart.log");
+
+        log_event("server start build=test-build");
+        let resolved = vec![
+            (9, "9:claude=none/ambiguous(panes=2,sessions=3)".to_string()),
+            (7, "7:claude=hook/abc-123".to_string()),
+        ];
+        log_resolution(&mut resolved.clone());
+        log_resolution(&mut resolved.clone()); // same picture: nothing new to say
+
+        let text = fs::read_to_string(&path).expect("the log was written");
+        assert!(
+            text.contains("server start build=test-build"),
+            "got: {text}"
+        );
+        let saves: Vec<&str> = text.lines().filter(|l| l.contains("save resolved")).collect();
+        assert_eq!(saves.len(), 1, "the repeat added nothing: {text}");
+        // Sorted by pane id, so a line reads in the order the panes were made,
+        // and two saves of the same state compare equal.
+        assert!(
+            saves[0].ends_with(
+                "save resolved [7:claude=hook/abc-123 \
+                 9:claude=none/ambiguous(panes=2,sessions=3)]"
+            ),
+            "got: {}",
+            saves[0]
+        );
+
+        // A change does get its own line.
+        log_resolution(&mut [(7, "7:claude=hook/def-456".to_string())]);
+        let text = fs::read_to_string(&path).expect("the log was written");
+        assert_eq!(
+            text.lines().filter(|l| l.contains("save resolved")).count(),
+            2,
+            "a changed resolution is recorded: {text}"
+        );
     }
 }
 
