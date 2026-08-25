@@ -774,7 +774,8 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     // worktree since it also removes the git worktree, not just a folder.
     if let Some(path) = app
         .worktree_delete
-        .and_then(|i| app.workspaces.get(i))
+        .as_deref()
+        .and_then(|id| app.workspaces.iter().find(|workspace| workspace.id == id))
         .map(|w| w.cwd.clone())
     {
         let (c, x) = files::draw_delete_confirm(

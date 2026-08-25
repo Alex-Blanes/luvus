@@ -834,7 +834,9 @@ impl AgentMenu {
 /// The workspace-rename modal: like [`TabRename`] but for a node's **label** (the
 /// folder on disk is never touched). Pre-filled with the current name.
 pub struct WsRename {
-    pub index: usize,
+    /// Stable target identity. Workspace indices can shift while the modal is
+    /// open if another workspace closes through the API.
+    pub workspace_id: String,
     pub buffer: String,
 }
 
@@ -1256,10 +1258,11 @@ pub struct App {
     pub tab_menu: Option<TabMenu>,
     /// The workspace right-click context menu, and the workspace-rename modal.
     pub ws_menu: Option<WsMenu>,
-    /// Armed worktree-delete confirmation: the workspace index of the worktree to
-    /// delete once confirmed (`y`/⏎). Destructive — removes the folder + git
-    /// worktree — so it goes through the confirm modal like the file delete.
-    pub worktree_delete: Option<usize>,
+    /// Armed worktree-delete confirmation: the stable workspace identity of the
+    /// worktree to delete once confirmed (`y`/⏎). Destructive — removes the
+    /// folder + git worktree — so it goes through the confirm modal like the file
+    /// delete. Resolve the current index only when confirmation is committed.
+    pub worktree_delete: Option<String>,
     /// Active pane context menu (right-click inside a pane); `None` when closed.
     pub pane_menu: Option<PaneMenu>,
     /// Active AGENTS-list context menu (right-click a row); `None` when closed.
@@ -3651,7 +3654,7 @@ impl App {
             WsMenuItem::Rename => self.open_ws_rename(index),
             WsMenuItem::Close => self.close_workspace(index),
             // Destructive: arm the confirm modal rather than delete immediately.
-            WsMenuItem::DeleteWorktree => self.worktree_delete = Some(index),
+            WsMenuItem::DeleteWorktree => self.worktree_delete = Some(workspace_id),
             WsMenuItem::NewWorktree => {
                 if let Some(cwd) = cwd.filter(|p| crate::git::local::is_repo(p)) {
                     self.worktree_repo = Some(cwd);
@@ -3695,7 +3698,14 @@ impl App {
     /// Guarded so it only ever acts on a **linked worktree**, never a main
     /// checkout.
     fn confirm_worktree_delete(&mut self) {
-        let Some(index) = self.worktree_delete.take() else {
+        let Some(workspace_id) = self.worktree_delete.take() else {
+            return;
+        };
+        let Some(index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == workspace_id)
+        else {
             return;
         };
         // Extract owned paths under an immutable borrow, then act (mutable).
@@ -3731,7 +3741,7 @@ impl App {
     pub fn open_ws_rename(&mut self, index: usize) {
         if let Some(w) = self.workspaces.get(index) {
             self.ws_rename = Some(WsRename {
-                index,
+                workspace_id: w.id.clone(),
                 buffer: w.name.clone(),
             });
         }
@@ -3805,7 +3815,13 @@ impl App {
             KeyCode::Esc => self.ws_rename = None,
             KeyCode::Enter => {
                 if let Some(r) = self.ws_rename.take() {
-                    let _ = self.rename_workspace(r.index, &r.buffer);
+                    if let Some(index) = self
+                        .workspaces
+                        .iter()
+                        .position(|workspace| workspace.id == r.workspace_id)
+                    {
+                        let _ = self.rename_workspace(index, &r.buffer);
+                    }
                 }
             }
             KeyCode::Backspace => {
@@ -5326,14 +5342,14 @@ mod tests {
         app.workspaces[0].worktree = None;
 
         // A non-confirm key dismisses the modal.
-        app.worktree_delete = Some(0);
+        app.worktree_delete = Some(app.workspaces[0].id.clone());
         app.worktree_delete_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         assert!(app.worktree_delete.is_none(), "n cancels");
 
         // Confirming on the default node (a main checkout, not a linked worktree)
         // removes nothing — the guard refuses to delete a plain workspace.
         let before = app.workspaces.len();
-        app.worktree_delete = Some(0);
+        app.worktree_delete = Some(app.workspaces[0].id.clone());
         app.worktree_delete_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         assert!(app.worktree_delete.is_none());
         assert_eq!(
@@ -6186,8 +6202,69 @@ mod tests {
             .ws_rename
             .as_ref()
             .expect("rename targets surviving node");
-        assert_eq!(rename.index, 0);
-        assert_eq!(app.workspaces[rename.index].id, target_id);
+        assert_eq!(rename.workspace_id, target_id);
+    }
+
+    #[test]
+    fn workspace_rename_keeps_target_identity_while_modal_is_open() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let target_id = crate::ids::public_id("workspace");
+        app.workspaces.push(Workspace {
+            id: target_id.clone(),
+            name: "target".into(),
+            cwd: app.workspaces[0].cwd.clone(),
+            branch: None,
+            git_ahead_behind: None,
+            worktree: None,
+            tabs: vec![Tab::panes(TileLayout::new(PaneId::alloc()))],
+            active_tab: 0,
+            pinned: false,
+        });
+
+        app.open_ws_rename(1);
+        app.close_workspace(0);
+        app.ws_rename.as_mut().unwrap().buffer = "renamed".into();
+        app.handle_ws_rename_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.workspaces[0].id, target_id);
+        assert_eq!(app.workspaces[0].name, "renamed");
+    }
+
+    #[test]
+    fn deferred_workspace_actions_abort_after_target_closes() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let survivor_id = crate::ids::public_id("workspace");
+        app.workspaces.push(Workspace {
+            id: survivor_id.clone(),
+            name: "survivor".into(),
+            cwd: app.workspaces[0].cwd.clone(),
+            branch: None,
+            git_ahead_behind: None,
+            worktree: None,
+            tabs: vec![Tab::panes(TileLayout::new(PaneId::alloc()))],
+            active_tab: 0,
+            pinned: false,
+        });
+
+        let removed_id = app.workspaces[0].id.clone();
+        app.open_ws_rename(0);
+        app.worktree_delete = Some(removed_id);
+        app.close_workspace(0);
+
+        app.ws_rename.as_mut().unwrap().buffer = "wrong target".into();
+        app.handle_ws_rename_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.worktree_delete_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.workspaces.len(), 1);
+        assert_eq!(app.workspaces[0].id, survivor_id);
+        assert_eq!(app.workspaces[0].name, "survivor");
+        assert!(app.worktree_delete.is_none());
     }
 
     #[test]
