@@ -9,6 +9,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Duration;
@@ -604,9 +605,62 @@ fn check_once(tx: &Sender<AppEvent>, url: &str, auto_install: bool) {
     let Some(release) = fetch_release(url).filter(is_newer_build) else {
         return;
     };
+    if !auto_install {
+        let _ = tx.send(AppEvent::UpdateAvailable(release.label()));
+        return;
+    }
+    // Raised *before* the app is told, so there is no window in which the
+    // restart button can see "an update is available" without also seeing that
+    // it is being installed. Restarting inside that window comes back on the old
+    // binary and makes the update look like it did nothing.
+    set_installing(true);
+    let _guard = InstallGuard;
     let _ = tx.send(AppEvent::UpdateAvailable(release.label()));
-    if auto_install && install_in_place(&release).unwrap_or(false) {
-        let _ = tx.send(AppEvent::SelfUpdateInstalled(release.label()));
+    crate::persist::log_event(&format!(
+        "update install start build={} tag={}",
+        release.label(),
+        release.tag
+    ));
+    match install_in_place(&release) {
+        Ok(true) => {
+            crate::persist::log_event(&format!("update install ok build={}", release.label()));
+            let _ = tx.send(AppEvent::SelfUpdateInstalled(release.label()));
+        }
+        // Not ours to replace (Homebrew, cargo, an OS package). Nothing failed,
+        // and nothing is landing, so there is nothing to say.
+        Ok(false) => crate::persist::log_event("update install skipped reason=managed-install"),
+        // A failed install has to be announced. A restart may be parked waiting
+        // for this, and silence would leave the button looking dead.
+        Err(error) => {
+            crate::persist::log_event(&format!("update install failed error={error}"));
+            let _ = tx.send(AppEvent::UpdateChecked(CheckOutcome::Failed));
+        }
+    }
+}
+
+/// Is a newer fork build being downloaded, verified and swapped into place right
+/// now? The restart button asks: a relaunch mid-install starts the server from
+/// the binary that is about to be replaced, so it comes back on the old build
+/// while the *new* one sits on disk — which reads as "the update did nothing".
+pub fn installing() -> bool {
+    INSTALLING.load(Ordering::Acquire)
+}
+
+/// Set while [`install_direct_release`] is downloading and swapping the binary.
+static INSTALLING: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_installing(value: bool) {
+    INSTALLING.store(value, Ordering::Release);
+}
+
+/// Lowers [`INSTALLING`] however the install ends — success, failure, or an
+/// early return added later. A flag left raised would block the restart button
+/// for the rest of the session.
+struct InstallGuard;
+
+impl Drop for InstallGuard {
+    fn drop(&mut self) {
+        set_installing(false);
     }
 }
 

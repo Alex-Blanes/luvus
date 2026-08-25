@@ -154,6 +154,14 @@ pub fn run() -> Result<()> {
         }
     };
 
+    // Opens the restart record for this server (see `persist::log_event`). Put
+    // before the restore so the per-pane `restore` lines follow it, and so a
+    // restore that dies takes the blame instead of leaving a silent gap.
+    persist::log_event(&format!(
+        "server start build={} session={}",
+        env!("LUVUS_VERSION_LABEL"),
+        crate::session::display_name()
+    ));
     let mut app = match App::restore_or_new(DEFAULT_SIZE.0, DEFAULT_SIZE.1, tx.clone()) {
         Ok(app) => app,
         Err(err) => {
@@ -260,6 +268,7 @@ pub fn run() -> Result<()> {
         }
 
         if app.should_quit {
+            persist::log_event("server stop reason=stopped");
             broadcast(
                 &mut clients,
                 ServerMessage::ServerShutdown {
@@ -281,8 +290,16 @@ pub fn run() -> Result<()> {
             // the session would stay down until someone ran `luvus` again.
             app.relaunch_requested = false;
             match relaunch_plan(&clients, foreground) {
-                None => app.show_toast("no attached client to restart".to_string()),
+                None => {
+                    persist::log_event("relaunch refused reason=no-attached-client");
+                    app.show_toast("no attached client to restart".to_string())
+                }
                 Some(plan) => {
+                    persist::log_event(&format!(
+                        "relaunch handing off clients={} build={}",
+                        plan.len(),
+                        env!("LUVUS_VERSION_LABEL")
+                    ));
                     persist::save(&app);
                     app.session_dirty = false;
                     for (id, message) in plan {
@@ -298,6 +315,7 @@ pub fn run() -> Result<()> {
         // exit: notify clients and fall through to the final session save below,
         // so the snapshot is current when the machine comes back.
         if shutdown::requested() {
+            persist::log_event("server stop reason=terminated");
             broadcast(
                 &mut clients,
                 ServerMessage::ServerShutdown {

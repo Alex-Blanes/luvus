@@ -1438,6 +1438,10 @@ pub struct App {
     /// A restart was asked for while agents were still working, and is waiting
     /// for the ask to be repeated. Cleared by any other action.
     pub relaunch_confirm: bool,
+    /// A restart was asked for while a new build was still downloading, and is
+    /// parked until it lands. Restarting mid-install brings the server back on
+    /// the binary being replaced, so the update looks like it did nothing.
+    pub relaunch_after_install: bool,
     /// The foreground client selected another named session in the global
     /// finder. The server consumes this once and sends a logical handoff only
     /// to that client.
@@ -1913,6 +1917,7 @@ impl App {
             detach_requested: false,
             relaunch_requested: false,
             relaunch_confirm: false,
+            relaunch_after_install: false,
             pending_session_switch: None,
             end_session: false,
             force_redraw: false,
@@ -2281,6 +2286,24 @@ impl App {
                         }
                     };
                     let direct_resume = resume_argv.is_some() && module_rec.is_none();
+                    // The other half of the restart story (see
+                    // `persist::log_event`): the save said which conversation
+                    // this pane owns, and this says what the restore could
+                    // actually do with it. A pane saved *with* a session that
+                    // still comes back as `resume=none` is a different failure
+                    // from one the save never bound at all, and from the outside
+                    // the two are indistinguishable.
+                    if let Some((agent, sid)) = &ps.agent_session {
+                        let how = match (&resume, direct_resume) {
+                            (Some(_), true) => "argv",   // the shell starts on it
+                            (Some(_), false) => "typed", // sent through the PTY
+                            (None, _) => "none",         // no resume command exists
+                        };
+                        crate::persist::log_event(&format!(
+                            "restore pane={} agent={agent} session={sid} resume={how}",
+                            id.0
+                        ));
+                    }
                     if let Some(rec) = module_rec {
                         module_panes.insert(id, rec);
                     }
@@ -2445,6 +2468,7 @@ impl App {
             detach_requested: false,
             relaunch_requested: false,
             relaunch_confirm: false,
+            relaunch_after_install: false,
             pending_session_switch: None,
             end_session: false,
             force_redraw: false,
@@ -2834,6 +2858,16 @@ impl App {
     /// the first ask into a confirmation rather than a restart. Returns what to
     /// tell the user, or `None` when the restart is already under way.
     pub fn request_relaunch(&mut self) -> Option<String> {
+        // A build still downloading is about to replace the binary this restart
+        // would start from: relaunching now brings the server back on the *old*
+        // build while the new one lands on disk seconds later, which is exactly
+        // how an update that worked looks like an update that did nothing.
+        // Park it instead — `SelfUpdateInstalled` fires it the moment it lands.
+        if crate::update::installing() {
+            crate::persist::log_event("relaunch parked reason=install-in-flight");
+            self.relaunch_after_install = true;
+            return Some(self.catalog.restart_after_install.to_string());
+        }
         let working = self
             .status
             .values()
@@ -2845,6 +2879,10 @@ impl App {
         }
         self.relaunch_confirm = false;
         self.relaunch_requested = true;
+        crate::persist::log_event(&format!(
+            "relaunch requested build={}",
+            env!("LUVUS_VERSION_LABEL")
+        ));
         None
     }
 
