@@ -105,6 +105,19 @@ pub fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command 
     cmd
 }
 
+/// Let go of the terminal this process is attached to, so it stops competing
+/// for the keyboard with whoever else is using it. Windows only: elsewhere a
+/// process that hands over replaces itself with `exec` and never coexists.
+///
+/// Only for a process that is on its way out and has already handed its console
+/// to a successor. Anything written to stdout/stderr afterwards goes nowhere.
+#[cfg(windows)]
+pub fn release_console() {
+    unsafe {
+        windows_sys::Win32::System::Console::FreeConsole();
+    }
+}
+
 /// The user's home directory, cross-platform (`$HOME`, else `%USERPROFILE%`).
 pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")

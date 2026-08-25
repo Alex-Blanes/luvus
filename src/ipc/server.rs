@@ -486,6 +486,22 @@ fn apply(
         } => {
             let activity = *next_activity;
             *next_activity = next_activity.saturating_add(1);
+            // One display client at a time: the newcomer takes over and every
+            // client already attached is told to detach.
+            //
+            // Two of them is not a harmless duplicate view. A second `luvus` in
+            // a terminal that still has one running leaves two processes reading
+            // the *same* console, and the console hands each key record to
+            // whichever reader asks first: both forward their share to this
+            // server, which writes them to the same pane. Nothing is lost and
+            // everything is out of order — a pasted path arrives as its own
+            // characters shuffled, which is unreadable and, in a shell, runs
+            // something other than what you pasted.
+            //
+            // `spawn_successor` already avoids this for a client it replaces
+            // itself ("never left reading alongside the new client"); this is
+            // the same rule for the ones it does not spawn.
+            detach_others(clients);
             clients.insert(
                 id,
                 ClientState::new(
@@ -562,6 +578,15 @@ fn apply(
         // Redraw only if the event actually changed the UI — a plain keystroke
         // forwarded to a pane does not (its echo arrives as a separate `PtyData`).
         other => app.handle_event(other),
+    }
+}
+
+/// Tell every attached display client to detach, and forget them. Called when a
+/// new one attaches: see the note at `ClientConnected` for why two of them on
+/// one terminal shuffle the keyboard between themselves.
+fn detach_others(clients: &mut Clients) {
+    for (_, previous) in clients.drain() {
+        let _ = previous.send_control(ServerMessage::Detach);
     }
 }
 
@@ -1010,9 +1035,9 @@ mod shutdown {
 mod tests {
     use super::ServerMessage;
     use super::{
-        apply, broadcast, frame_interval, needs_render, next_background_only, relaunch_plan,
-        render_clients, ClientSender, ClientState, FrameSendError, BACKGROUND_FRAME_INTERVAL,
-        FRAME_INTERVAL,
+        apply, broadcast, detach_others, frame_interval, needs_render, next_background_only,
+        relaunch_plan, render_clients, ClientSender, ClientState, FrameSendError,
+        BACKGROUND_FRAME_INTERVAL, FRAME_INTERVAL,
     };
     use crate::app::App;
     use crate::event::{AppEvent, ClientInput};
@@ -1069,6 +1094,25 @@ mod tests {
         // the restart never degrades into a plain stop.
         assert!(relaunch_plan(&clients, None).is_none());
         assert!(relaunch_plan(&clients, Some(404)).is_none());
+    }
+
+    /// A second `luvus` in a terminal that already has one leaves two processes
+    /// reading the same console, and the keyboard is split between them: the
+    /// text that reaches a pane is its own characters shuffled. The newcomer
+    /// takes over instead.
+    #[test]
+    fn attaching_detaches_whoever_was_already_there() {
+        let mut clients = HashMap::new();
+        let (first, first_rx) = display_client(80, 24, 1);
+        clients.insert(1, first);
+
+        detach_others(&mut clients);
+
+        assert!(clients.is_empty(), "the previous client is forgotten");
+        assert!(matches!(
+            first_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(ServerMessage::Detach)
+        ));
     }
 
     fn received_frame_size(rx: &mpsc::Receiver<ServerMessage>) -> (u16, u16) {
