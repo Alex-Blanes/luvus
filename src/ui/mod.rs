@@ -772,12 +772,15 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     }
     // Worktree-delete confirm (docs/18 WT): reuses the delete modal, worded for a
     // worktree since it also removes the git worktree, not just a folder.
-    if let Some(path) = app
+    let worktree_path = app
         .worktree_delete
         .as_deref()
         .and_then(|id| app.workspaces.iter().find(|workspace| workspace.id == id))
-        .map(|w| w.cwd.clone())
-    {
+        .map(|w| w.cwd.clone());
+    if app.worktree_delete.is_some() && worktree_path.is_none() {
+        app.worktree_delete = None;
+    }
+    if let Some(path) = worktree_path {
         let (c, x) = files::draw_delete_confirm(
             f,
             area,

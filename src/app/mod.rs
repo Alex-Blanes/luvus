@@ -5012,6 +5012,7 @@ impl App {
 
     fn close_active_ws(&mut self) {
         if self.active_ws < self.workspaces.len() {
+            let closed_workspace_id = self.workspaces[self.active_ws].id.clone();
             if self.workspaces.len() > 1 {
                 let closed_root = self.workspaces[self.active_ws].cwd.clone();
                 self.fail_pending_files_api_for_root(
@@ -5023,6 +5024,7 @@ impl App {
                     "workspace closed while DIFF was refreshing",
                 );
             }
+            self.clear_workspace_transients(&closed_workspace_id);
             self.workspaces.remove(self.active_ws);
         }
         if self.workspaces.is_empty() {
@@ -5063,6 +5065,7 @@ impl App {
         if index >= self.workspaces.len() {
             return;
         }
+        let closed_workspace_id = self.workspaces[index].id.clone();
         if self.workspaces.len() > 1 {
             let closed_root = self.workspaces[index].cwd.clone();
             self.fail_pending_files_api_for_root(
@@ -5082,6 +5085,7 @@ impl App {
         for id in ids {
             self.drop_leaf_runtime(id);
         }
+        self.clear_workspace_transients(&closed_workspace_id);
         self.workspaces.remove(index);
         if self.workspaces.is_empty() {
             self.all_workspaces_closed();
@@ -5093,6 +5097,20 @@ impl App {
             "workspace.closed",
             serde_json::json!({"workspace": index.to_string()}),
         );
+    }
+
+    /// Dismiss deferred UI actions whose stable target is being removed.
+    fn clear_workspace_transients(&mut self, workspace_id: &str) {
+        if self
+            .ws_rename
+            .as_ref()
+            .is_some_and(|rename| rename.workspace_id == workspace_id)
+        {
+            self.ws_rename = None;
+        }
+        if self.worktree_delete.as_deref() == Some(workspace_id) {
+            self.worktree_delete = None;
+        }
     }
 
     /// Close a tab and all its panes (the "X" button / prefix+X).
@@ -6235,8 +6253,6 @@ mod tests {
 
     #[test]
     fn deferred_workspace_actions_abort_after_target_closes() {
-        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
         let survivor_id = crate::ids::public_id("workspace");
@@ -6257,13 +6273,10 @@ mod tests {
         app.worktree_delete = Some(removed_id);
         app.close_workspace(0);
 
-        app.ws_rename.as_mut().unwrap().buffer = "wrong target".into();
-        app.handle_ws_rename_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        app.worktree_delete_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
         assert_eq!(app.workspaces.len(), 1);
         assert_eq!(app.workspaces[0].id, survivor_id);
         assert_eq!(app.workspaces[0].name, "survivor");
+        assert!(app.ws_rename.is_none());
         assert!(app.worktree_delete.is_none());
     }
 
