@@ -413,7 +413,7 @@ fn autodetect_and_attach() -> Result<()> {
         // An upgraded binary silently attaching to an older running server means
         // none of the new version shows up — tell the user how to load it (the
         // brief pause keeps the note readable before the UI takes the screen).
-        let binary = env!("CARGO_PKG_VERSION");
+        let binary = env!("LUVUS_VERSION_LABEL");
         if let Some(running) = server_version().filter(|running| running != binary) {
             eprintln!(
                 "luvus v{binary} installed, but the running server is v{running} — \
@@ -751,7 +751,7 @@ fn server_status() -> Result<()> {
                 "luvus server: running (v{running}, session {})",
                 session::display_name()
             );
-            let binary = env!("CARGO_PKG_VERSION");
+            let binary = env!("LUVUS_VERSION_LABEL");
             if running != binary {
                 println!(
                     "  note: this binary is v{binary} — run `luvus server restart` to load it"
@@ -787,7 +787,18 @@ fn server_version() -> Option<String> {
     let mut line = String::new();
     BufReader::new(s).read_line(&mut line).ok()?;
     let v: serde_json::Value = serde_json::from_str(&line).ok()?;
-    v.get("result")?.get("version")?.as_str().map(String::from)
+    let result = v.get("result")?;
+    // The build label, not the semver: this fork's releases all carry upstream's
+    // `0.12.0`, so comparing versions could never tell yesterday's server from
+    // today's binary and the "restart to load it" note never fired — you ran the
+    // old code with nothing to say so. A server old enough not to send `build`
+    // answers with its bare semver, which differs from this binary's label, so it
+    // is reported stale too — which it is.
+    result
+        .get("build")
+        .or_else(|| result.get("version"))?
+        .as_str()
+        .map(String::from)
 }
 
 /// Returns whether the session asked to restart onto the installed binary, so
@@ -2068,7 +2079,15 @@ mod tests {
             line
         };
 
-        assert!(send(r#"{"id":"1","method":"ping","params":{}}"#).contains("pong"));
+        let pong = send(r#"{"id":"1","method":"ping","params":{}}"#);
+        assert!(pong.contains("pong"), "got: {pong}");
+        // `server_version` reads this field to decide whether the running server
+        // is this binary. Without it the comparison falls back to the semver,
+        // which is identical across every build of this fork.
+        assert!(
+            pong.contains(&format!(r#""build":"{}""#, env!("LUVUS_VERSION_LABEL"))),
+            "the pong carries the build label: {pong}"
+        );
         let list = send(r#"{"id":"2","method":"pane.list","params":{}}"#);
         assert!(list.contains("pane_list"), "got: {list}");
         let split = send(r#"{"id":"3","method":"pane.split","params":{}}"#);

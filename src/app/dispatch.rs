@@ -914,6 +914,12 @@ impl App {
             "ping" => Ok(json!({
                 "type":"pong",
                 "version": env!("CARGO_PKG_VERSION"),
+                // `version` alone cannot answer "is this server my binary?": every
+                // build of this fork carries whatever upstream release it was
+                // merged from, so an auto-installed build attaching to yesterday's
+                // server compared equal and nothing said the new code was not
+                // running. The build label is the only field that differs.
+                "build": env!("LUVUS_VERSION_LABEL"),
                 "protocol":1,
                 "session": crate::session::display_name()
             })),
