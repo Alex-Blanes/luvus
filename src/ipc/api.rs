@@ -74,6 +74,7 @@ const API_WORKER_STACK_BYTES: usize = 256 * 1024;
 const EVENT_FORWARDER_STACK_BYTES: usize = 128 * 1024;
 const INITIAL_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const INITIAL_FRAME_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+const MAX_REQUEST_ID_BYTES: usize = 128;
 
 static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 static REJECTED_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
@@ -88,6 +89,7 @@ static ACTIVE_TERMINAL_STREAMS: AtomicUsize = AtomicUsize::new(0);
 static CONTROL_TERMINALS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 const MAX_AUTH_TOKENS: usize = 64;
+const MAX_AUTH_TOKEN_BYTES: usize = 256;
 const MAX_AUTH_TTL: std::time::Duration = std::time::Duration::from_secs(86_400);
 const AUTH_SCOPES: &[&str] = &[
     "read",
@@ -99,6 +101,20 @@ const AUTH_SCOPES: &[&str] = &[
     "admin",
     "all",
 ];
+
+fn valid_request_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_REQUEST_ID_BYTES
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+}
+
+fn valid_auth_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_AUTH_TOKEN_BYTES
+        && token.bytes().all(|byte| byte.is_ascii_graphic())
+}
 
 struct AuthToken {
     id: String,
@@ -234,11 +250,11 @@ pub fn active_terminal_streams() -> usize {
     ACTIVE_TERMINAL_STREAMS.load(Ordering::Acquire)
 }
 
-pub fn socket_stats() -> Value {
+pub fn uhp_stats() -> Value {
     let completed = REQUESTS_COMPLETED.load(Ordering::Relaxed);
     let latency = REQUEST_LATENCY_NS.load(Ordering::Relaxed);
     json!({
-        "type":"socket_stats",
+        "type":"uhp_stats",
         "uptime_ms":SERVER_STARTED.get().map(|started| started.elapsed().as_millis() as u64).unwrap_or(0),
         "connections":{
             "active":active_connections(),
@@ -290,7 +306,7 @@ fn authorize_request(
                 && crate::api::capabilities::is_read_only(method))
     });
     allowed
-        .then(|| (method == "socket.token.create").then(|| token.scopes.clone()))
+        .then(|| (method == "uhp.token.create").then(|| token.scopes.clone()))
         .ok_or("auth token scope denied")
 }
 
@@ -301,8 +317,8 @@ fn handle_auth_method(
     caller_scopes: Option<&[String]>,
 ) -> Option<String> {
     match method {
-        "socket.stats" => Some(json!({"id":id,"result":socket_stats()}).to_string()),
-        "socket.token.create" => {
+        "uhp.stats" => Some(json!({"id":id,"result":uhp_stats()}).to_string()),
+        "uhp.token.create" => {
             let valid_fields = params.as_object().is_some_and(|object| {
                 object
                     .keys()
@@ -376,16 +392,16 @@ fn handle_auth_method(
                 },
             );
             Some(
-                json!({"id":id,"result":{"type":"socket_token","id":token_id,
+                json!({"id":id,"result":{"type":"uhp_token","id":token_id,
                 "token":secret,"scopes":scopes,"expires_at":expires_unix}})
                 .to_string(),
             )
         }
-        "socket.token.list" => {
+        "uhp.token.list" => {
             if !params.as_object().is_some_and(serde_json::Map::is_empty) {
                 return Some(
                     json!({"id":id,"error":{"code":"invalid_request",
-                    "message":"socket.token.list takes no parameters"}})
+                    "message":"uhp.token.list takes no parameters"}})
                     .to_string(),
                 );
             }
@@ -402,19 +418,19 @@ fn handle_auth_method(
                 })
                 .collect();
             Some(
-                json!({"id":id,"result":{"type":"socket_tokens","tokens":tokens,
+                json!({"id":id,"result":{"type":"uhp_tokens","tokens":tokens,
                 "capacity":MAX_AUTH_TOKENS}})
                 .to_string(),
             )
         }
-        "socket.token.revoke" => {
+        "uhp.token.revoke" => {
             if params
                 .as_object()
                 .is_none_or(|object| object.keys().any(|key| key != "id"))
             {
                 return Some(
                     json!({"id":id,"error":{"code":"invalid_request",
-                    "message":"socket.token.revoke accepts only id"}})
+                    "message":"uhp.token.revoke accepts only id"}})
                     .to_string(),
                 );
             }
@@ -430,7 +446,7 @@ fn handle_auth_method(
             let before = store.tokens.len();
             store.tokens.retain(|_, token| token.id != token_id);
             Some(
-                json!({"id":id,"result":{"type":"socket_token_revoked",
+                json!({"id":id,"result":{"type":"uhp_token_revoked",
                 "id":token_id,"revoked":store.tokens.len() != before}})
                 .to_string(),
             )
@@ -540,25 +556,36 @@ fn read_frame(reader: &mut impl BufRead) -> Result<Vec<u8>, FrameError> {
     }
 }
 
-fn read_text_frame(reader: &mut impl BufRead, kind: &str) -> io::Result<String> {
-    let frame = read_frame(reader).map_err(|error| {
-        let (kind, message) = match error {
-            FrameError::TooLarge => (
-                io::ErrorKind::InvalidData,
-                format!("{kind} frame is too large"),
-            ),
-            FrameError::MissingLf => (
-                io::ErrorKind::UnexpectedEof,
-                format!("{kind} is missing LF"),
-            ),
-            FrameError::Eof => (io::ErrorKind::UnexpectedEof, format!("{kind} is empty")),
-            FrameError::Timeout => (io::ErrorKind::TimedOut, format!("{kind} timed out")),
-            FrameError::Io => (io::ErrorKind::Other, format!("{kind} read failed")),
-        };
-        io::Error::new(kind, message)
-    })?;
+fn frame_error(error: FrameError, frame_kind: &str) -> io::Error {
+    let (kind, message) = match error {
+        FrameError::TooLarge => (
+            io::ErrorKind::InvalidData,
+            format!("{frame_kind} frame is too large"),
+        ),
+        FrameError::MissingLf => (
+            io::ErrorKind::UnexpectedEof,
+            format!("{frame_kind} is missing LF"),
+        ),
+        FrameError::Eof => (
+            io::ErrorKind::UnexpectedEof,
+            format!("{frame_kind} is empty"),
+        ),
+        FrameError::Timeout => (io::ErrorKind::TimedOut, format!("{frame_kind} timed out")),
+        FrameError::Io => (io::ErrorKind::Other, format!("{frame_kind} read failed")),
+    };
+    io::Error::new(kind, message)
+}
+
+fn frame_text(frame: Vec<u8>, kind: &str) -> io::Result<String> {
     String::from_utf8(frame[..frame.len() - 1].to_vec())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("{kind} is not UTF-8")))
+}
+
+fn read_text_frame(reader: &mut impl BufRead, kind: &str) -> io::Result<String> {
+    frame_text(
+        read_frame(reader).map_err(|error| frame_error(error, kind))?,
+        kind,
+    )
 }
 
 /// Read one bounded frame from a long-lived event stream. A clean EOF ends the
@@ -598,6 +625,17 @@ pub(crate) fn read_request_frame(reader: &mut impl BufRead) -> io::Result<String
 /// Read one bounded ordinary API response for CLI and adapter callers.
 pub(crate) fn read_response_frame(reader: &mut impl BufRead) -> io::Result<String> {
     read_text_frame(reader, "response")
+}
+
+/// Read one ordinary API response with an application deadline. Lifecycle
+/// commands use this so an unresponsive app loop cannot block a terminal.
+pub(crate) fn read_response_frame_with_deadline(
+    stream: &mut Conn,
+    timeout: std::time::Duration,
+) -> io::Result<String> {
+    let frame =
+        read_initial_frame(stream, timeout).map_err(|error| frame_error(error, "response"))?;
+    frame_text(frame, "response")
 }
 
 fn write_response(writer: &mut impl Write, id: &str, response: &str) -> io::Result<()> {
@@ -957,16 +995,13 @@ fn control_action_response(
                 .to_string()
         }
     };
-    let id = value
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty() && id.chars().count() <= 128)
-        .unwrap_or("0");
+    let raw_id = value.get("id").and_then(Value::as_str);
+    let id = raw_id.filter(|id| valid_request_id(id)).unwrap_or("0");
     let valid_envelope = value.as_object().is_some_and(|object| {
         object
             .keys()
             .all(|key| matches!(key.as_str(), "id" | "action" | "params"))
-            && value.get("id").is_some_and(Value::is_string)
+            && raw_id.is_some_and(valid_request_id)
             && value.get("action").is_some_and(Value::is_string)
             && value.get("params").is_some_and(Value::is_object)
     });
@@ -1365,18 +1400,29 @@ fn handle_conn(
         }
     };
     let raw_id = val.get("id");
-    let id = raw_id.and_then(|v| v.as_str()).unwrap_or("0").to_string();
+    let id = raw_id
+        .and_then(Value::as_str)
+        .filter(|id| valid_request_id(id))
+        .unwrap_or("0")
+        .to_string();
     let method = val
         .get("method")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    if !raw_id.and_then(Value::as_str).is_some_and(valid_request_id) {
+        let response = json!({"id":id,"error":{"code":"invalid_request",
+            "message":"id must contain 1 to 128 ASCII letters, digits, '.', '_', ':', or '-'"}})
+        .to_string();
+        let _ = write_response(&mut writer, &id, &response);
+        return;
+    }
     let auth = match val.get("auth") {
         None => None,
-        Some(Value::String(auth)) if !auth.is_empty() && auth.len() <= 256 => Some(auth.as_str()),
+        Some(Value::String(auth)) if valid_auth_token(auth) => Some(auth.as_str()),
         Some(_) => {
             let response = json!({"id":id,"error":{"code":"invalid_request",
-                "message":"auth must be a non-empty string of at most 256 bytes"}})
+                "message":"auth must be a non-empty printable ASCII string of at most 256 bytes"}})
             .to_string();
             let _ = write_response(&mut writer, &id, &response);
             return;
@@ -1384,8 +1430,7 @@ fn handle_conn(
     };
     let versioned_runtime = matches!(
         method.as_str(),
-        "runtime.capabilities"
-            | "session.snapshot"
+        "session.snapshot"
             | "pane.processes"
             | "agent.explain"
             | "agent.report"
@@ -1395,13 +1440,13 @@ fn handle_conn(
             | "agent.wait"
             | "events.subscribe"
     );
-    let versioned_socket = matches!(
+    let versioned_uhp = matches!(
         method.as_str(),
-        "socket.capabilities"
-            | "socket.stats"
-            | "socket.token.create"
-            | "socket.token.list"
-            | "socket.token.revoke"
+        "uhp.capabilities"
+            | "uhp.stats"
+            | "uhp.token.create"
+            | "uhp.token.list"
+            | "uhp.token.revoke"
             | "events.wait"
             | "workspace.get"
             | "workspace.move"
@@ -1428,7 +1473,7 @@ fn handle_conn(
             | "server.reload_agent_manifests"
     );
     let versioned_api =
-        method.starts_with("terminal.backend.") || versioned_runtime || versioned_socket;
+        method.starts_with("terminal.backend.") || versioned_runtime || versioned_uhp;
     let params = match val.get("params") {
         None | Some(Value::Null) if versioned_api => json!({}),
         None => Value::Null,
@@ -1439,9 +1484,6 @@ fn handle_conn(
             object
                 .keys()
                 .all(|key| matches!(key.as_str(), "id" | "method" | "params" | "auth"))
-                && raw_id.is_some_and(Value::is_string)
-                && !id.is_empty()
-                && id.chars().count() <= 128
                 && params.is_object()
         });
         if !valid_envelope {
@@ -1450,7 +1492,6 @@ fn handle_conn(
             return;
         }
     }
-
     let delegated_scopes = match authorize_request(&method, auth) {
         Ok(scopes) => scopes,
         Err(message) => {
@@ -2115,6 +2156,16 @@ mod tests {
     }
 
     #[test]
+    fn delegated_auth_tokens_are_bounded_printable_ascii() {
+        assert!(valid_auth_token("luv_tok_example"));
+        assert!(valid_auth_token(&"a".repeat(MAX_AUTH_TOKEN_BYTES)));
+        assert!(!valid_auth_token(""));
+        assert!(!valid_auth_token("luv_tok_é"));
+        assert!(!valid_auth_token("luv_tok_\n"));
+        assert!(!valid_auth_token(&"a".repeat(MAX_AUTH_TOKEN_BYTES + 1)));
+    }
+
+    #[test]
     fn responses_are_lf_framed_and_flushed_before_disconnect() {
         let mut writer = FlushProbe::default();
         write_response(&mut writer, "test", r#"{"id":"test","result":{}}"#).unwrap();
@@ -2144,6 +2195,37 @@ mod tests {
         let mut oversized =
             std::io::Cursor::new(vec![b'x'; crate::terminal::backend::MAX_FRAME_BYTES + 1]);
         assert_eq!(read_frame(&mut oversized), Err(FrameError::TooLarge));
+    }
+
+    #[test]
+    fn deadline_response_reader_does_not_wait_for_a_silent_peer() {
+        let path = std::env::temp_dir().join(format!(
+            "luvus-response-deadline-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = transport::bind(&path).expect("bind test control socket");
+        let worker = std::thread::spawn(move || {
+            let _connection = transport::incoming(&listener)
+                .next()
+                .expect("accept test connection");
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        });
+
+        let mut client = transport::connect(&path).expect("connect test control socket");
+        writeln!(client, "request").unwrap();
+        let started = std::time::Instant::now();
+        let error =
+            read_response_frame_with_deadline(&mut client, std::time::Duration::from_millis(100))
+                .expect_err("silent peer must time out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "deadline reader blocked too long"
+        );
+        worker.join().unwrap();
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -2593,7 +2675,7 @@ mod tests {
     }
 
     #[test]
-    fn versioned_envelopes_reject_non_string_ids_and_normalize_null_params() {
+    fn versioned_envelopes_reject_invalid_ids_and_normalize_null_params() {
         let _env = crate::persist::test_env("versioned-env");
         let root = crate::persist::ensure_config_dir();
         let path = root.join("v.sock");
@@ -2607,7 +2689,7 @@ mod tests {
         writeln!(
             invalid,
             "{}",
-            json!({"id":7,"method":"runtime.capabilities","params":{}})
+            json!({"id":7,"method":"uhp.capabilities","params":{}})
         )
         .unwrap();
         let mut response = String::new();
@@ -2620,13 +2702,30 @@ mod tests {
             "invalid request reached the app loop"
         );
 
+        let mut invalid = transport::connect(&path).unwrap();
+        writeln!(
+            invalid,
+            "{}",
+            json!({"id":"unicode-é","method":"workspace.list","params":{}})
+        )
+        .unwrap();
+        let mut response = String::new();
+        BufReader::new(invalid).read_line(&mut response).unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], "0");
+        assert_eq!(response["error"]["code"], "invalid_request");
+        assert!(
+            rx.try_recv().is_err(),
+            "unsafe request ID reached the app loop"
+        );
+
         let client_path = path.clone();
         let client = thread::spawn(move || {
             let mut stream = transport::connect(&client_path).unwrap();
             writeln!(
                 stream,
                 "{}",
-                json!({"id":"null-params","method":"runtime.capabilities","params":null})
+                json!({"id":"null-params","method":"uhp.capabilities","params":null})
             )
             .unwrap();
             let mut response = String::new();
@@ -2718,7 +2817,7 @@ mod tests {
         let created: Value = serde_json::from_str(
             &handle_auth_method(
                 "create",
-                "socket.token.create",
+                "uhp.token.create",
                 &json!({"scopes":["read"],"ttl_s":60}),
                 None,
             )
@@ -2732,13 +2831,7 @@ mod tests {
             authorize_request("workspace.close", Some(secret)),
             Err("auth token scope denied")
         );
-        handle_auth_method(
-            "revoke",
-            "socket.token.revoke",
-            &json!({"id":token_id}),
-            None,
-        )
-        .unwrap();
+        handle_auth_method("revoke", "uhp.token.revoke", &json!({"id":token_id}), None).unwrap();
         assert_eq!(
             authorize_request("workspace.get", Some(secret)),
             Err("invalid or expired auth token")
@@ -2747,7 +2840,7 @@ mod tests {
         let admin: Value = serde_json::from_str(
             &handle_auth_method(
                 "admin",
-                "socket.token.create",
+                "uhp.token.create",
                 &json!({"scopes":["admin"],"ttl_s":60}),
                 None,
             )
@@ -2755,13 +2848,13 @@ mod tests {
         )
         .unwrap();
         let admin_secret = admin["result"]["token"].as_str().unwrap();
-        let caller = authorize_request("socket.token.create", Some(admin_secret))
+        let caller = authorize_request("uhp.token.create", Some(admin_secret))
             .unwrap()
             .unwrap();
         let escalated: Value = serde_json::from_str(
             &handle_auth_method(
                 "escalate",
-                "socket.token.create",
+                "uhp.token.create",
                 &json!({"scopes":["all"],"ttl_s":60}),
                 Some(&caller),
             )
@@ -2772,7 +2865,7 @@ mod tests {
         let delegated: Value = serde_json::from_str(
             &handle_auth_method(
                 "delegate",
-                "socket.token.create",
+                "uhp.token.create",
                 &json!({"scopes":["admin"],"ttl_s":60}),
                 Some(&caller),
             )

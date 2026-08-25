@@ -113,6 +113,19 @@ fn normalize(s: &str) -> String {
     out
 }
 
+/// Let go of the terminal this process is attached to, so it stops competing
+/// for the keyboard with whoever else is using it. Windows only: elsewhere a
+/// process that hands over replaces itself with `exec` and never coexists.
+///
+/// Only for a process that is on its way out and has already handed its console
+/// to a successor. Anything written to stdout/stderr afterwards goes nowhere.
+#[cfg(windows)]
+pub fn release_console() {
+    unsafe {
+        windows_sys::Win32::System::Console::FreeConsole();
+    }
+}
+
 /// Keep a spawned console program from flashing a window on Windows.
 ///
 /// `luvus server` runs detached (`main::spawn_server` uses `DETACHED_PROCESS`),
@@ -130,22 +143,10 @@ pub fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command 
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd
-}
-
-/// Let go of the terminal this process is attached to, so it stops competing
-/// for the keyboard with whoever else is using it. Windows only: elsewhere a
-/// process that hands over replaces itself with `exec` and never coexists.
-///
-/// Only for a process that is on its way out and has already handed its console
-/// to a successor. Anything written to stdout/stderr afterwards goes nowhere.
-#[cfg(windows)]
-pub fn release_console() {
-    unsafe {
-        windows_sys::Win32::System::Console::FreeConsole();
-    }
 }
 
 /// The user's home directory, cross-platform (`$HOME`, else `%USERPROFILE%`).
@@ -850,25 +851,6 @@ mod tests {
         }
     }
 
-    /// The hidden-window flag must not break output capture: a command routed
-    /// through [`no_window`] still runs and still reports its exit code. On
-    /// Windows that is the whole contract (no window, same result); elsewhere
-    /// the helper is a no-op and this pins that it stays one.
-    #[test]
-    fn no_window_keeps_the_command_working() {
-        let mut cmd = if cfg!(windows) {
-            let mut c = std::process::Command::new("cmd");
-            c.args(["/C", "exit 3"]);
-            c
-        } else {
-            let mut c = std::process::Command::new("sh");
-            c.args(["-c", "exit 3"]);
-            c
-        };
-        let status = super::no_window(&mut cmd).status().expect("spawns");
-        assert_eq!(status.code(), Some(3));
-    }
-
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     #[test]
     fn process_start_marker_is_stable_for_the_current_process() {
@@ -877,6 +859,26 @@ mod tests {
         let second = super::process_start_marker(pid).expect("same live process marker");
         assert_eq!(first, second);
         assert!(!first.is_empty());
+    }
+
+    /// The hidden-window flag must not break output capture: a command routed
+    /// through [`no_window`] still runs and still reports its exit code. On
+    /// Windows that is the whole contract (no window, same result); elsewhere
+    /// the helper is a no-op and this pins that it stays one.
+    #[test]
+    fn no_window_keeps_the_command_working() {
+        let mut cmd = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "echo captured & exit /b 3"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sh");
+            c.args(["-c", "printf captured; exit 3"]);
+            c
+        };
+        let output = super::no_window(&mut cmd).output().expect("spawns");
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "captured");
     }
 
     #[cfg(unix)]

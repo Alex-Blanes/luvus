@@ -92,11 +92,15 @@ pub(super) fn draw_ws_menu(
     cat: &Catalog,
     t: &Theme,
 ) {
+    let Some(index) = app.ws_menu_target_index() else {
+        app.ws_menu = None;
+        return;
+    };
     let Some(menu) = app.ws_menu.as_ref() else {
         return;
     };
     let anchor = menu.anchor;
-    let items = app.ws_menu_items(menu.index);
+    let items = app.ws_menu_items(index);
     let extras = menu.module_actions.clone();
     let rows: Vec<MenuRow> = items
         .iter()

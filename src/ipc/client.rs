@@ -63,7 +63,9 @@ enum ClientExit {
 /// first — a successor that starts too early just attaches to the corpse and
 /// the update appears not to have happened.
 fn relaunch_after_shutdown() -> Result<()> {
-    crate::wait_for_server_shutdown(&crate::persist::client_socket_path());
+    // Best effort: if the old server outlasts the wait, coming back up anyway
+    // beats leaving the user with no TUI at all.
+    let _ = crate::wait_for_server_shutdown(&crate::persist::client_socket_path());
     // Verbatim: coming back the way you came in is the whole promise, and the
     // arguments are not all single tokens — `--session <name>` is two, so any
     // attempt to keep "just the flags" drops the value and the successor dies
@@ -745,6 +747,16 @@ mod tests {
 mod render_tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn paste_event_preserves_windows_paths_quotes_and_unicode() {
+        let command = r#".\.venv\Scripts\python.exe .\youtube_folder_uploader.py --folder "E:\Vídeos\Pendientes €""#;
+        let message = event_message(Event::Paste(command.to_string()));
+        assert!(matches!(
+            message,
+            Some(ClientMessage::Paste(text)) if text == command
+        ));
+    }
 
     #[test]
     fn session_handoff_replaces_only_the_session_selector() {

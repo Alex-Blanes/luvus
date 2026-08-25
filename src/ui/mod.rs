@@ -26,6 +26,21 @@ pub struct RenderTarget<'a> {
     buf: &'a mut Buffer,
     area: Rect,
     cursor: Option<(u16, u16)>,
+    animation_mask: AnimationMask,
+}
+
+/// Allocation-free record of animated surfaces that were actually drawn into a
+/// client projection. The server uses this instead of global agent state, which
+/// avoids repainting when every working indicator is clipped or hidden.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AnimationMask(u8);
+
+impl AnimationMask {
+    const WORKING_SPINNER: u8 = 1 << 0;
+
+    pub fn has_working_spinner(self) -> bool {
+        self.0 & Self::WORKING_SPINNER != 0
+    }
 }
 
 impl<'a> RenderTarget<'a> {
@@ -35,6 +50,7 @@ impl<'a> RenderTarget<'a> {
             buf,
             area,
             cursor: None,
+            animation_mask: AnimationMask::default(),
         }
     }
     pub fn area(&self) -> Rect {
@@ -52,6 +68,15 @@ impl<'a> RenderTarget<'a> {
     }
     pub fn cursor(&self) -> Option<(u16, u16)> {
         self.cursor
+    }
+
+    /// Mark that this projection contains a live working-state spinner.
+    pub fn mark_working_animation(&mut self) {
+        self.animation_mask.0 |= AnimationMask::WORKING_SPINNER;
+    }
+
+    pub fn animation_mask(&self) -> AnimationMask {
+        self.animation_mask
     }
 }
 
@@ -83,6 +108,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             buf: f.buffer_mut(),
             area,
             cursor: None,
+            animation_mask: AnimationMask::default(),
         };
         render_into(&mut target, app);
         target.cursor
@@ -123,6 +149,7 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     let orch_area = app.orch_area;
     let mission_scroll = app.mission_scroll;
     let mission_area = app.mission_area;
+    let mission_refresh_rect = app.mission_refresh_rect;
     let changelog_scroll = app.changelog_scroll;
     let file_tree_scroll = app.file_tree.scroll;
 
@@ -158,6 +185,7 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     let switcher_rects = std::mem::take(&mut app.switcher_rects);
     let switcher_scope_rects = std::mem::take(&mut app.switcher_scope_rects);
     let mission_rows = std::mem::take(&mut app.mission_rows);
+    let mission_scope_rects = std::mem::take(&mut app.mission_scope_rects);
     let bar_hits = std::mem::take(&mut app.bar.hits);
     let bar_overflow_hits = std::mem::take(&mut app.bar.overflow_hits);
     let bar_overflow = app.bar.overflow.clone();
@@ -248,6 +276,7 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     app.orch_area = orch_area;
     app.mission_scroll = mission_scroll;
     app.mission_area = mission_area;
+    app.mission_refresh_rect = mission_refresh_rect;
     app.changelog_scroll = changelog_scroll;
     app.file_tree.scroll = file_tree_scroll;
     app.pane_rects = pane_rects;
@@ -280,6 +309,7 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     app.switcher_rects = switcher_rects;
     app.switcher_scope_rects = switcher_scope_rects;
     app.mission_rows = mission_rows;
+    app.mission_scope_rects = mission_scope_rects;
     app.bar.hits = bar_hits;
     app.bar.overflow_hits = bar_overflow_hits;
     app.bar.overflow = bar_overflow;
@@ -577,22 +607,27 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
         None
     } else if app.active_is_mission() {
         // Mission Control (docs/54): rows are precomputed from `App` first (so the
-        // render borrows nothing mutable), stashed for click/⏎ hit-testing, then
+        // render borrows nothing mutable), stashed for keyboard activation, then
         // drawn; the scroll offset is written back.
         app.mission_area = pane_area;
         let rows = app.build_mission_rows();
-        app.mission_scroll = mission::render(
+        let rendered = mission::render(
             f,
             pane_area,
             &rows,
             app.mission_scroll,
             app.mission_cursor,
+            app.mission_scope,
+            app.mission_usage_refreshing(),
             app.mission_burn,
             app.config.mission_budget,
             compact,
             cat,
             &t,
         );
+        app.mission_scroll = rendered.scroll;
+        app.mission_scope_rects = rendered.scope_rects;
+        app.mission_refresh_rect = rendered.refresh_rect;
         app.mission_rows = rows;
         None
     } else if let Some(g) = app.active_git_mut() {
@@ -755,11 +790,15 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     }
     // Worktree-delete confirm (docs/18 WT): reuses the delete modal, worded for a
     // worktree since it also removes the git worktree, not just a folder.
-    if let Some(path) = app
+    let worktree_path = app
         .worktree_delete
-        .and_then(|i| app.workspaces.get(i))
-        .map(|w| w.cwd.clone())
-    {
+        .as_deref()
+        .and_then(|id| app.workspaces.iter().find(|workspace| workspace.id == id))
+        .map(|w| w.cwd.clone());
+    if app.worktree_delete.is_some() && worktree_path.is_none() {
+        app.worktree_delete = None;
+    }
+    if let Some(path) = worktree_path {
         let (c, x) = files::draw_delete_confirm(
             f,
             area,
@@ -889,11 +928,25 @@ pub(super) const LONE_PANE_HPAD: u16 = 1;
 /// by the modals (Settings / picker) and the git-tab footer. A pair with an
 /// empty label is a bare key (e.g. `j/k`).
 pub(super) fn hint_line(pairs: &[(&str, &str)], t: &Theme) -> Line<'static> {
+    hint_line_with_offsets(pairs, t).0
+}
+
+/// Same rendering as [`hint_line`], plus each pair's start column within the
+/// rendered line (so hitboxes can be aligned to the visible hints without
+/// re-deriving the layout).
+pub(super) fn hint_line_with_offsets(
+    pairs: &[(&str, &str)],
+    t: &Theme,
+) -> (Line<'static>, Vec<u16>) {
     let mut spans = vec![Span::raw(" ")];
+    let mut offsets = Vec::with_capacity(pairs.len());
     for (i, (key, label)) in pairs.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled(" · ", Style::new().fg(t.overlay0)));
         }
+        // Column where this pair's key begins: width of everything before it
+        // (leading pad + separators + earlier pairs).
+        offsets.push(spans.iter().map(|span| span.width() as u16).sum());
         spans.push(Span::styled(
             key.to_string(),
             Style::new().fg(t.accent).bold(),
@@ -905,7 +958,7 @@ pub(super) fn hint_line(pairs: &[(&str, &str)], t: &Theme) -> Line<'static> {
             ));
         }
     }
-    Line::from(spans)
+    (Line::from(spans), offsets)
 }
 
 /// Display width of `s` in terminal columns (CJK = 2 cells, etc.). Fixed-width

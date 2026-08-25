@@ -13,6 +13,8 @@ pub(crate) const MAX_AGENT_REPORT_MESSAGE_CHARS: usize = 4096;
 pub(crate) const MAX_AGENT_PROMPT_CHARS: usize = 262_144;
 pub(crate) const MAX_AGENT_START_ARGS: usize = 64;
 const AGENT_PROMPT_QUIET: Duration = Duration::from_millis(1200);
+const DETECTION_INTERVAL: Duration = Duration::from_millis(100);
+const DETECTION_AUDIT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// A parked `wait.output` request (docs/81): reply when the pane's recent
 /// output contains `needle`, or the optional deadline passes.
@@ -33,6 +35,80 @@ mod socket_api_tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let app = App::new(100, 40, tx).unwrap();
         (env, app)
+    }
+
+    #[test]
+    fn quiet_runtime_can_leave_the_fast_detection_cadence() {
+        let (_env, mut app) = app("quiet-runtime-cadence");
+        let now = Instant::now();
+        assert!(app.needs_fast_runtime_tick(now));
+
+        for status in app.status.values_mut() {
+            status.force_detect = false;
+            status.candidate = status.state;
+            status.last_activity = now - ACTIVITY_WINDOW - QUIET_DWELL - Duration::from_secs(1);
+        }
+        assert!(
+            !app.needs_fast_runtime_tick(now),
+            "a quiet fleet without parked deadlines should use the coarse audit"
+        );
+
+        let status = app.status.values_mut().next().unwrap();
+        status.candidate = State::Working;
+        assert!(
+            app.needs_fast_runtime_tick(now),
+            "an in-flight state dwell retains the fast cadence"
+        );
+    }
+
+    #[test]
+    fn detection_considers_changed_panes_between_bounded_audits() {
+        let (_env, mut app) = app("dirty-pane-detection");
+        let pane = app.layout().focus;
+        let start = Instant::now();
+        app.last_detect_at = start - DETECTION_INTERVAL;
+        app.last_detection_audit_at = start;
+        for status in app.status.values_mut() {
+            status.force_detect = false;
+            status.state = State::Idle;
+            status.candidate = State::Idle;
+            status.last_activity = start - Duration::from_secs(60);
+        }
+
+        let considered = app.detection_panes_considered;
+        app.detect_tick(start + DETECTION_INTERVAL);
+        assert_eq!(
+            app.detection_panes_considered, considered,
+            "quiet panes are skipped between fleet audits"
+        );
+
+        assert!(app.handle_event(AppEvent::PtyData(pane)));
+        app.detect_tick(start + 2 * DETECTION_INTERVAL);
+        assert_eq!(
+            app.detection_panes_considered,
+            considered + 1,
+            "PTY invalidation schedules only its pane"
+        );
+    }
+
+    #[test]
+    fn hidden_pty_title_change_is_a_presentation_invalidation() {
+        let (_env, mut app) = app("hidden-title-invalidation");
+        let hidden = app.layout().focus;
+        app.run_cmd(crate::app::keys::Cmd::NewTab);
+        assert!(!app.pane_is_visible(hidden));
+        {
+            let mut engine = app.panes[&hidden].engine.lock().unwrap();
+            engine.advance(b"\x1b]0;Background build\x07");
+        }
+        assert!(app.handle_event(AppEvent::PtyData(hidden)));
+        let now = Instant::now();
+        app.last_detect_at = now - DETECTION_INTERVAL;
+        app.last_detection_audit_at = now;
+        assert!(
+            app.detect_tick(now),
+            "an inactive pane title can change visible tab metadata"
+        );
     }
 
     #[test]
@@ -363,6 +439,30 @@ fn blocking_hint(bottom: &str) -> Option<String> {
 }
 
 impl App {
+    /// Whether the server loop must retain its 100 ms runtime cadence.
+    ///
+    /// Quiet panes do not need a 33 ms poll. Fresh output, an in-flight
+    /// classification dwell, an expiring integration lease, or a parked API
+    /// workflow does: these paths have user-visible deadlines and keep the
+    /// existing detection latency until the scheduler can sleep again.
+    pub(crate) fn needs_fast_runtime_tick(&self, now: Instant) -> bool {
+        let detection_active = self.status.values().any(|status| {
+            status.force_detect
+                || status.candidate != status.state
+                || status.agent_report.is_some()
+                || now.saturating_duration_since(status.last_activity)
+                    < ACTIVITY_WINDOW + QUIET_DWELL
+        });
+        detection_active
+            || !self.output_waits.is_empty()
+            || !self.agent_waits.is_empty()
+            || !self.agent_starts.is_empty()
+            || !self.agent_prompts.is_empty()
+            || !self.backend_revision_waits.is_empty()
+            || self.toast.is_some()
+            || self.search_flash.is_some()
+    }
+
     /// Recompute every pane's agent state. Cheap; called a few times a second.
     /// Returns whether anything the sidebar shows changed, so the loop repaints a
     /// silent agent's Working→Done transition even when no other event fires.
@@ -428,61 +528,39 @@ impl App {
                 let _ = tx.send(AppEvent::ProcScanned(found));
             });
         }
-        // Mission Control usage (docs/54, MC-2): read tokens/context/cost from the
-        // agents' on-disk stores on a worker thread, and only while a mission tab is
-        // open — the default session pays nothing. Targets are gathered here (cheap);
-        // the worker does the file IO and posts the fresh cache back.
-        let mission_open = self
-            .workspaces
-            .iter()
-            .any(|w| w.tabs.iter().any(Tab::is_mission));
-        if mission_open
-            && now.duration_since(self.last_usage_at) >= Duration::from_secs(5)
-            && !self.usage_scan_inflight
-        {
-            self.last_usage_at = now;
+        // Mission Control usage is demand-driven. Opening/focusing the dashboard,
+        // changing scope, or pressing/clicking refresh queues one worker scan;
+        // merely retaining a hidden mission tab performs no usage IO.
+        self.sync_mission_usage_visibility();
+        if self.mission_usage_requested && !self.usage_scan_inflight {
+            self.mission_usage_requested = false;
             self.usage_scan_inflight = true;
-            // Targets: every live pane with a session, plus every resumable session
-            // on disk. Keyed by session id (dedup), so a live pane and its resumable
-            // twin share one read (`(agent, cwd, session_id)`).
-            let mut targets: std::collections::HashMap<String, (String, std::path::PathBuf)> =
-                std::collections::HashMap::new();
-            for (id, p) in self.panes.iter() {
-                if let Some(sess) = self.status.get(id).and_then(|s| s.agent_session.as_ref()) {
-                    targets
-                        .entry(sess.session_id.clone())
-                        .or_insert((sess.agent.clone(), p.cwd.clone()));
-                }
-            }
-            for s in self.resumable.iter() {
-                targets
-                    .entry(s.session_id.clone())
-                    .or_insert((s.agent.clone(), s.cwd.clone()));
-            }
+            let targets = self.mission_usage_targets();
             let overrides = self.config.mission_pricing.clone();
-            // Previous scan's results, so an unchanged transcript is reused instead
-            // of re-read+parsed (the heavy part). Cloned once per scan (every 5s,
-            // only while a mission tab is open) — a handful of small entries.
+            // Previous results let an explicit refresh reuse unchanged transcripts:
+            // one stat per idle session, with no read or parse.
             let prev_usage = self.agent_usage.clone();
             let prev_mtimes = self.usage_mtimes.clone();
             let tx = self.app_tx.clone();
             std::thread::spawn(move || {
                 let mut usage = std::collections::HashMap::new();
                 let mut mtimes = std::collections::HashMap::new();
-                for (sid, (agent, cwd)) in targets {
-                    let mtime = crate::agent::session_mtime(&agent, &cwd, &sid);
+                for (key, cwd) in targets {
+                    let mtime = crate::agent::session_mtime(&key.agent, &cwd, &key.session_id);
                     if let Some(mt) = mtime {
-                        mtimes.insert(sid.clone(), mt);
+                        mtimes.insert(key.clone(), mt);
                     }
                     // Unchanged since last scan → reuse the cached figures (one
                     // `stat`, no read/parse).
-                    if mtime.is_some() && prev_mtimes.get(&sid) == mtime.as_ref() {
-                        if let Some(u) = prev_usage.get(&sid) {
-                            usage.insert(sid, u.clone());
+                    if mtime.is_some() && prev_mtimes.get(&key) == mtime.as_ref() {
+                        if let Some(u) = prev_usage.get(&key) {
+                            usage.insert(key, u.clone());
                             continue;
                         }
                     }
-                    if let Some(mut u) = crate::agent::session_usage(&agent, &cwd, &sid) {
+                    if let Some(mut u) =
+                        crate::agent::session_usage(&key.agent, &cwd, &key.session_id)
+                    {
                         // Re-price with any user overrides (MC-5); empty ⇒ unchanged.
                         if !overrides.is_empty() {
                             u.cost = crate::mission::estimate_cost_with(
@@ -493,7 +571,7 @@ impl App {
                                 &overrides,
                             );
                         }
-                        usage.insert(sid, u);
+                        usage.insert(key, u);
                     }
                 }
                 let _ = tx.send(AppEvent::UsageScanned { usage, mtimes });
@@ -502,12 +580,34 @@ impl App {
         // The per-pane classification below locks each pane's VT engine + scans its
         // grid; agent state (blocked/working/done) is human-paced, so ~100ms is
         // plenty — running it at the render frame rate (up to 60fps) just burns CPU.
-        if now.duration_since(self.last_detect_at) < Duration::from_millis(100) {
+        if now.duration_since(self.last_detect_at) < DETECTION_INTERVAL {
             return false;
         }
         self.last_detect_at = now;
         let focus = self.layout().focus;
-        let ids: Vec<PaneId> = self.panes.keys().copied().collect();
+        self.detection_dirty
+            .retain(|id| self.panes.contains_key(id));
+        let full_audit =
+            now.duration_since(self.last_detection_audit_at) >= DETECTION_AUDIT_INTERVAL;
+        if full_audit {
+            self.last_detection_audit_at = now;
+            self.detection_full_fleet_audits = self.detection_full_fleet_audits.saturating_add(1);
+        }
+        let ids: Vec<PaneId> = self
+            .panes
+            .keys()
+            .copied()
+            .filter(|id| {
+                full_audit
+                    || self.detection_dirty.contains(id)
+                    || self.status.get(id).is_some_and(|status| {
+                        status.force_detect
+                            || status.candidate != status.state
+                            || status.state == State::Working
+                            || status.agent_report.is_some()
+                    })
+            })
+            .collect();
         let mut changes: Vec<(PaneId, State, String)> = Vec::new();
         // Panes that just finished a working stretch (Working → Idle/Done) — the
         // retro "done" chime fires on these, whether or not the pane is focused.
@@ -519,8 +619,22 @@ impl App {
         // the state remains Idle. Keep this separate from `agent_appeared`:
         // non-resumable agents still need a repaint, but not a persisted session.
         let mut visible_identity_changed = false;
+        // OSC title changes can alter tab labels even when their pane is not in
+        // the active tab. Hidden PTY bytes do not schedule presentation, so the
+        // detector must explicitly surface this metadata-only invalidation.
+        let mut presentation_metadata_changed = false;
         let mut expired_reports: Vec<(PaneId, String)> = Vec::new();
         for id in ids {
+            self.detection_panes_considered = self.detection_panes_considered.saturating_add(1);
+            let audit_only = full_audit
+                && !self.detection_dirty.contains(&id)
+                && self.status.get(&id).is_none_or(|status| {
+                    !status.force_detect
+                        && status.candidate == status.state
+                        && status.state != State::Working
+                        && status.agent_report.is_none()
+                });
+            self.detection_dirty.remove(&id);
             let Some(pane) = self.panes.get(&id) else {
                 continue;
             };
@@ -579,7 +693,12 @@ impl App {
             };
             if let Some(s) = self.status.get_mut(&id) {
                 if let Some((generation, title, bottom)) = inspected {
+                    if audit_only {
+                        self.detection_audit_recoveries =
+                            self.detection_audit_recoveries.saturating_add(1);
+                    }
                     s.last_detect_generation = Some(generation);
+                    presentation_metadata_changed |= s.detected_title != title;
                     s.detected_title = title;
                     s.detected_bottom = bottom;
                     s.force_detect = false;
@@ -750,9 +869,23 @@ impl App {
         if agent_appeared {
             self.session_dirty = true;
         }
+        // A state transition needs presentation only when that state has a
+        // rendered consumer: a visible pane, a live AGENTS/Mission row, or an
+        // orchestration board. Quiet shells in inactive tabs still publish API
+        // events below, but no longer force a known-no-change full projection.
+        let state_presentation_changed = changes.iter().any(|(id, _, agent)| {
+            self.pane_is_visible(*id)
+                || self.manifests.is_agent(agent)
+                || self.status.get(id).is_some_and(|status| {
+                    status.agent_session.is_some() || status.agent_report.is_some()
+                })
+                || self.active_is_orch()
+                || self.active_is_mission()
+        });
         // State and visible identity transitions both change the sidebar. Session
         // persistence remains limited to resumable agents via `agent_appeared`.
-        let changed = !changes.is_empty() || visible_identity_changed;
+        let changed =
+            state_presentation_changed || visible_identity_changed || presentation_metadata_changed;
         let (sound_done, sound_blocked) = {
             let n = &self.config.notifications;
             (n.sound_on_done, n.sound_on_blocked)
@@ -835,8 +968,7 @@ impl App {
         // *server's* cwd — the very thing §3.3 removed.
         const WITHOUT_NODE: &[&str] = &[
             "ping",
-            "socket.capabilities",
-            "runtime.capabilities",
+            "uhp.capabilities",
             "session.snapshot",
             "search.capabilities",
             "server.stop",
@@ -865,10 +997,7 @@ impl App {
             return json!({ "id": req.id, "error": { "code": "no_session", "message": "no active session" } }).to_string();
         }
         let read_only = crate::api::capabilities::is_read_only(&req.method);
-        let revisioned = !matches!(
-            req.method.as_str(),
-            "runtime.capabilities" | "session.snapshot"
-        );
+        let revisioned = !matches!(req.method.as_str(), "uhp.capabilities" | "session.snapshot");
         let mut params = req.params.clone();
         let expected_revision = revisioned
             .then(|| {
@@ -923,11 +1052,18 @@ impl App {
                 "protocol":1,
                 "session": crate::session::display_name()
             })),
-            "socket.capabilities" => {
+            "uhp.capabilities" => {
                 reject_api_fields(p, &[])?;
-                Ok(crate::api::capabilities(crate::ipc::api::current_sequence(
-                    &self.events,
-                )))
+                let mut capabilities =
+                    crate::api::capabilities(crate::ipc::api::current_sequence(&self.events));
+                if let Some(object) = capabilities.as_object_mut() {
+                    object.insert("session".into(), json!(crate::session::display_name()));
+                    object.insert(
+                        "server_generation".into(),
+                        json!(self.backend_server_generation),
+                    );
+                }
+                Ok(capabilities)
             }
             "config.get" => {
                 reject_api_fields(p, &[])?;
@@ -966,32 +1102,6 @@ impl App {
                 self.apply_socket_manifests(manifests);
                 let rules = self.manifests.rule_count();
                 Ok(json!({"type":"agent_manifests_reloaded","rules":rules}))
-            }
-            "runtime.capabilities" => {
-                reject_api_fields(p, &[])?;
-                Ok(json!({
-                "type":"runtime_capabilities",
-                "protocol":{
-                    "name":crate::runtime_api::PROTOCOL_NAME,
-                    "major":crate::runtime_api::PROTOCOL_MAJOR,
-                    "minor":crate::runtime_api::PROTOCOL_MINOR,
-                },
-                "session":crate::session::display_name(),
-                "event_sequence":crate::ipc::api::current_sequence(&self.events),
-                "methods":crate::runtime_api::METHODS,
-                "agent_authorities":["integration_report", "process_tree", "launch_command", "osc_title", "screen_text", "prior_identity", "command_fallback"],
-                "agent_states":["idle", "working", "blocked", "done"],
-                "limits":{
-                    "agent_wait_timeout_s":MAX_AGENT_WAIT.as_secs(),
-                    "agent_prompt_characters":MAX_AGENT_PROMPT_CHARS,
-                    "agent_prompt_quiet_ms":AGENT_PROMPT_QUIET.as_millis(),
-                    "agent_start_arguments":MAX_AGENT_START_ARGS,
-                    "agent_report_ttl_s":MAX_AGENT_REPORT_TTL_S,
-                    "agent_report_message_characters":MAX_AGENT_REPORT_MESSAGE_CHARS,
-                    "agent_waits_per_pane":MAX_AGENT_WAITS_PER_PANE,
-                    "agent_waits_total":MAX_AGENT_WAITS_TOTAL,
-                }
-                }))
             }
             "session.snapshot" => {
                 reject_api_fields(p, &[])?;
@@ -1125,6 +1235,13 @@ impl App {
                     "panes":panes,
                     "detection_extractions": self.detection_extractions,
                     "detection_skips": self.detection_skips,
+                    "detection_performance": {
+                        "panes_considered": self.detection_panes_considered,
+                        "panes_extracted": self.detection_extractions,
+                        "panes_generation_skipped": self.detection_skips,
+                        "full_fleet_audits": self.detection_full_fleet_audits,
+                        "audit_recoveries": self.detection_audit_recoveries,
+                    },
                     "render_performance": crate::ipc::server::performance_snapshot(),
                 }))
             }
@@ -3801,9 +3918,9 @@ impl App {
         json!({
             "type":"session_snapshot",
             "protocol":{
-                "name":crate::runtime_api::PROTOCOL_NAME,
-                "major":crate::runtime_api::PROTOCOL_MAJOR,
-                "minor":crate::runtime_api::PROTOCOL_MINOR,
+                "name":crate::api::PROTOCOL_NAME,
+                "major":crate::api::PROTOCOL_MAJOR,
+                "minor":crate::api::PROTOCOL_MINOR,
             },
             "session":crate::session::display_name(),
             "server_generation":self.backend_server_generation,
@@ -6485,7 +6602,7 @@ command = ["true"]
 
         let snapshot = app.dispatch("session.snapshot", &json!({})).unwrap();
         assert_eq!(snapshot["type"], "session_snapshot");
-        assert_eq!(snapshot["protocol"]["name"], "luvus-runtime");
+        assert_eq!(snapshot["protocol"]["name"], "luvus-uhp");
         assert_eq!(
             snapshot["workspaces"][0]["tabs"][0]["panes"][0]["pane_id"],
             pane.0.to_string()
@@ -7101,6 +7218,15 @@ command = ["true"]
         let listed = app.dispatch("pane.list", &json!({})).expect("pane list");
         assert!(listed["detection_extractions"].as_u64().is_some());
         assert!(listed["detection_skips"].as_u64().is_some());
+        assert!(listed["detection_performance"]["panes_considered"]
+            .as_u64()
+            .is_some());
+        assert!(listed["detection_performance"]["full_fleet_audits"]
+            .as_u64()
+            .is_some());
+        assert!(listed["detection_performance"]["audit_recoveries"]
+            .as_u64()
+            .is_some());
         assert!(listed["render_performance"]["frames_sent"]
             .as_u64()
             .is_some());

@@ -125,8 +125,35 @@ impl Conn {
         match self.0.set_recv_timeout(Some(timeout)) {
             Ok(()) => Ok(TimeoutMode::Kernel),
             Err(_) => {
-                self.0.set_nonblocking(true)?;
+                self.set_nonblocking_when_the_pipe_settles()?;
                 Ok(TimeoutMode::Nonblocking)
+            }
+        }
+    }
+
+    /// Switch to non-blocking, waiting out a pipe that is mid-write.
+    ///
+    /// Windows named pipes have no kernel receive timeout, so a bounded read
+    /// gets there by going non-blocking — but `SetNamedPipeHandleState` answers
+    /// `ERROR_PIPE_BUSY` while the handle still has a write in flight, which is
+    /// the normal state for the request/response pattern (`server status`,
+    /// `stop`, `restart` all write and then read). Failing there reported "the
+    /// server did not answer" against a server that was answering fine.
+    ///
+    /// The busy state clears as soon as the peer takes the request, so a short
+    /// wait is enough; a server too wedged to read is exactly the one the
+    /// caller's deadline is meant to give up on, and giving up here says the
+    /// same thing.
+    fn set_nonblocking_when_the_pipe_settles(&self) -> io::Result<()> {
+        use interprocess::local_socket::traits::Stream as _;
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            match self.0.set_nonblocking(true) {
+                Ok(()) => return Ok(()),
+                Err(error) if pipe_busy(&error) && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -273,6 +300,20 @@ pub fn validate_peer(_conn: &Conn) -> io::Result<()> {
 /// Whether a nonblocking local-socket read should be retried. Windows reports
 /// `ERROR_NO_DATA` for a connected PIPE_NOWAIT stream with no input available,
 /// and Rust maps that code to `BrokenPipe` rather than `WouldBlock`.
+/// Is this the "a write is still in flight" refusal from
+/// `SetNamedPipeHandleState`? Windows only; nothing else reports it.
+fn pipe_busy(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 pub fn nonblocking_read_pending(error: &io::Error) -> bool {
     if error.kind() == io::ErrorKind::WouldBlock {
         return true;
@@ -583,6 +624,40 @@ mod windows_tests {
             current.strip_prefix("luvus-"),
             legacy.strip_prefix("bohay-")
         );
+    }
+
+    /// Arming a read deadline *after* sending the request is the whole shape of
+    /// `server status` / `stop` / `restart`, and on a named pipe the mode switch
+    /// is refused with `ERROR_PIPE_BUSY` while that write is in flight. Failing
+    /// there made every one of those commands report that a perfectly healthy
+    /// server "did not answer".
+    #[test]
+    fn a_read_deadline_can_be_armed_after_the_request_is_written() {
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "luvus-pipe-busy-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = super::bind(&path).expect("bind test socket");
+        // The peer accepts but does not read: the request stays in flight, which
+        // is exactly the state that used to make the switch fail.
+        let worker = std::thread::spawn(move || {
+            let _connection = super::incoming(&listener).next().expect("accept");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+
+        let mut client = super::connect(&path).expect("connect test socket");
+        writeln!(client, r#"{{"id":"1","method":"ping","params":{{}}}}"#).expect("write request");
+        let mode = client
+            .set_recv_timeout(std::time::Duration::from_millis(100))
+            .expect("arming the deadline must survive a write in flight");
+        assert_eq!(mode, super::TimeoutMode::Nonblocking);
+
+        worker.join().unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

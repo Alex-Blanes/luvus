@@ -27,7 +27,6 @@ mod orch;
 mod paste;
 mod persist;
 mod platform;
-mod runtime_api;
 mod search;
 mod session;
 mod skill;
@@ -54,6 +53,8 @@ use ratatui::DefaultTerminal;
 
 use crate::app::App;
 use crate::event::AppEvent;
+
+const SERVER_CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn main() -> Result<()> {
     // Run the whole process at 1ms timer resolution so the event loop's timed
@@ -120,7 +121,7 @@ fn is_backend_discovery_request(args: &[String]) -> bool {
         args,
         [_, session, list, json]
             if session == "session" && list == "list" && json == "--json"
-    ) || matches!(args, [_, api, schema] if api == "api" && matches!(schema.as_str(), "schema" | "runtime-schema" | "socket-schema"))
+    ) || matches!(args, [_, uhp, schema] if uhp == "uhp" && schema == "schema")
 }
 
 /// After `ratatui::init()` (which restores raw mode + alt-screen on panic), also
@@ -266,6 +267,7 @@ fn wav_bytes(samples: &[i16], sr: u32) -> Vec<u8> {
 
 /// Play a WAV with the platform's audio tool (blocking — called in a thread).
 fn play_sound_file(path: &Path) {
+    #[cfg(not(target_os = "windows"))]
     let run = |cmd: &str, args: &[&str]| -> bool {
         platform::no_window(
             Command::new(cmd)
@@ -277,7 +279,9 @@ fn play_sound_file(path: &Path) {
         .status()
         .is_ok()
     };
+    #[cfg(not(target_os = "windows"))]
     let owned = path.to_string_lossy().into_owned();
+    #[cfg(not(target_os = "windows"))]
     let p = owned.as_str();
     #[cfg(target_os = "macos")]
     {
@@ -285,8 +289,20 @@ fn play_sound_file(path: &Path) {
     }
     #[cfg(target_os = "windows")]
     {
-        let script = format!("(New-Object Media.SoundPlayer '{p}').PlaySync()");
-        let _ = run("powershell", &["-NoProfile", "-Command", &script]);
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Media::Audio::{PlaySoundW, SND_FILENAME, SND_NODEFAULT};
+
+        let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // `PlaySoundW` is synchronous, but this function already runs on the
+        // notification thread. Native playback avoids launching a PowerShell
+        // process and therefore cannot flash a console window per sound.
+        unsafe {
+            let _ = PlaySoundW(
+                path.as_ptr(),
+                std::ptr::null_mut(),
+                SND_FILENAME | SND_NODEFAULT,
+            );
+        }
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
@@ -414,12 +430,14 @@ fn autodetect_and_attach() -> Result<()> {
         // none of the new version shows up — tell the user how to load it (the
         // brief pause keeps the note readable before the UI takes the screen).
         let binary = env!("LUVUS_VERSION_LABEL");
-        if let Some(running) = server_version().filter(|running| running != binary) {
-            eprintln!(
-                "luvus v{binary} installed, but the running server is v{running} — \
-                 run `luvus server restart` to load it (your session is saved and restored)."
-            );
-            thread::sleep(Duration::from_millis(2000));
+        if let Ok(running) = server_version() {
+            if running != binary {
+                eprintln!(
+                    "luvus v{binary} installed, but the running server is v{running} — \
+                     run `luvus server restart` to load it (your session is saved and restored)."
+                );
+                thread::sleep(Duration::from_millis(2000));
+            }
         }
     }
     // Always ask the server to open the launch folder. A *fresh* server may have
@@ -688,11 +706,11 @@ fn server_start() -> Result<()> {
 
 fn server_stop() -> Result<()> {
     let sock = persist::client_socket_path();
-    if send_server_stop() {
+    if send_server_stop()? {
         // The server acks before it actually exits, so wait for it to release the
         // socket — then `stop` returning means it's really down (and a following
         // `status` reports "not running", not a half-shutdown "running").
-        wait_for_shutdown(&sock);
+        wait_for_server_shutdown(&sock)?;
         println!("luvus server stopped (session {})", session::display_name());
     } else {
         println!("no luvus server running");
@@ -704,8 +722,8 @@ fn server_stop() -> Result<()> {
 /// the way to load a newly-installed binary without rebooting a live session.
 fn server_restart() -> Result<()> {
     let sock = persist::client_socket_path();
-    if send_server_stop() {
-        wait_for_shutdown(&sock);
+    if send_server_stop()? {
+        wait_for_server_shutdown(&sock)?;
     }
     spawn_server()?;
     wait_for_socket(&sock)?;
@@ -718,20 +736,18 @@ fn server_restart() -> Result<()> {
 
 /// Poll (bounded) until the server releases its socket, so `stop`/`restart`
 /// return only once the old server is truly gone.
-fn wait_for_shutdown(sock: &Path) {
-    wait_for_server_shutdown(sock)
-}
-
-/// Block until nothing answers on `sock`, or five seconds pass. Shared with the
-/// display client, which has to outlive a server restart and must not race the
-/// old server's exit when it comes back up.
-pub(crate) fn wait_for_server_shutdown(sock: &Path) {
+/// Shared with the display client, which has to outlive a server restart and
+/// must not race the old server's exit when it comes back up.
+pub(crate) fn wait_for_server_shutdown(sock: &Path) -> Result<()> {
     for _ in 0..100 {
         if !server_running(sock) {
-            return;
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(50));
     }
+    Err(anyhow!(
+        "luvus server did not stop in time; refusing to start a second server"
+    ))
 }
 
 /// Report whether a server is up and, if so, the version it's *running* — which
@@ -746,7 +762,7 @@ fn server_status() -> Result<()> {
         return Ok(());
     }
     match server_version() {
-        Some(running) => {
+        Ok(running) => {
             println!(
                 "luvus server: running (v{running}, session {})",
                 session::display_name()
@@ -758,47 +774,79 @@ fn server_status() -> Result<()> {
                 );
             }
         }
-        None => println!(
-            "luvus server: running (session {})",
-            session::display_name()
-        ),
+        Err(error) => {
+            return Err(anyhow!(
+                "luvus server is running but did not answer: {error}"
+            ));
+        }
     }
     Ok(())
 }
 
-/// Send `server.stop` to a running server; returns whether one answered.
-fn send_server_stop() -> bool {
-    match ipc::transport::connect(&persist::socket_path()) {
-        Ok(mut s) => {
-            let _ = writeln!(s, r#"{{"id":"1","method":"server.stop","params":{{}}}}"#);
-            // Read the ack so the server has processed the request before we return.
-            let mut line = String::new();
-            let _ = BufReader::new(s).read_line(&mut line);
-            true
-        }
-        Err(_) => false,
+/// Send `server.stop` to a running server; returns whether one was present.
+fn send_server_stop() -> Result<bool> {
+    let client_socket = persist::client_socket_path();
+    if !server_running(&client_socket) {
+        return Ok(false);
     }
+    let response = match server_control_request("server.stop") {
+        Ok(response) => response,
+        Err(error) => {
+            // The old server may exit between the liveness probe and connect,
+            // or Windows may observe the named pipe closing before the final
+            // stop acknowledgement is readable. A completed shutdown is still
+            // success; a live, unresponsive server keeps the original error.
+            if wait_for_server_shutdown(&client_socket).is_ok() {
+                return Ok(true);
+            }
+            return Err(error);
+        }
+    };
+    let acknowledged = response
+        .get("result")
+        .and_then(|result| result.get("type"))
+        .and_then(serde_json::Value::as_str)
+        == Some("ok");
+    if !acknowledged {
+        return Err(anyhow!("luvus server returned an invalid stop response"));
+    }
+    Ok(true)
 }
 
-/// Ask the running server its version via `ping`. `None` if unreachable/unparsable.
-fn server_version() -> Option<String> {
-    let mut s = ipc::transport::connect(&persist::socket_path()).ok()?;
-    writeln!(s, r#"{{"id":"1","method":"ping","params":{{}}}}"#).ok()?;
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&line).ok()?;
-    let result = v.get("result")?;
+/// Ask the running server its version via `ping`.
+fn server_version() -> Result<String> {
+    let response = server_control_request("ping")?;
     // The build label, not the semver: this fork's releases all carry upstream's
     // `0.12.0`, so comparing versions could never tell yesterday's server from
     // today's binary and the "restart to load it" note never fired — you ran the
     // old code with nothing to say so. A server old enough not to send `build`
     // answers with its bare semver, which differs from this binary's label, so it
     // is reported stale too — which it is.
-    result
-        .get("build")
-        .or_else(|| result.get("version"))?
-        .as_str()
+    response
+        .get("result")
+        .and_then(|result| result.get("build").or_else(|| result.get("version")))
+        .and_then(serde_json::Value::as_str)
         .map(String::from)
+        .ok_or_else(|| anyhow!("luvus server returned an invalid ping response"))
+}
+
+/// Perform one lifecycle request with a bounded response wait. This keeps
+/// `status`, `stop`, and `restart` responsive when a socket exists but the app
+/// loop cannot answer, including through Windows named pipes.
+fn server_control_request(method: &str) -> Result<serde_json::Value> {
+    let mut stream = ipc::transport::connect(&persist::socket_path())
+        .map_err(|error| anyhow!("cannot connect to luvus server: {error}"))?;
+    writeln!(stream, r#"{{"id":"1","method":"{method}","params":{{}}}}"#)?;
+    let frame = ipc::api::read_response_frame_with_deadline(&mut stream, SERVER_CONTROL_TIMEOUT)?;
+    let response: serde_json::Value = serde_json::from_str(&frame)
+        .map_err(|error| anyhow!("invalid server control response: {error}"))?;
+    if response.get("id").and_then(serde_json::Value::as_str) != Some("1") {
+        return Err(anyhow!("server control response id does not match request"));
+    }
+    if let Some(error) = response.get("error") {
+        return Err(anyhow!("server rejected control request: {error}"));
+    }
+    Ok(response)
 }
 
 /// Returns whether the session asked to restart onto the installed binary, so
@@ -1026,17 +1074,7 @@ mod tests {
             "luvus", "session", "list", "--json", "extra"
         ])));
         assert!(is_backend_discovery_request(&strings(&[
-            "luvus", "api", "schema"
-        ])));
-        assert!(is_backend_discovery_request(&strings(&[
-            "luvus",
-            "api",
-            "runtime-schema"
-        ])));
-        assert!(is_backend_discovery_request(&strings(&[
-            "luvus",
-            "api",
-            "socket-schema"
+            "luvus", "uhp", "schema"
         ])));
     }
 

@@ -237,7 +237,10 @@ impl App {
                 );
                 return true;
             }
-            AppEvent::PtyReady(id) => {
+            AppEvent::PtyReady { id, cwd } => {
+                if let Some(pane) = self.panes.get_mut(&id) {
+                    pane.cwd = cwd;
+                }
                 self.register_backend_terminal(id);
                 return true;
             }
@@ -422,6 +425,7 @@ impl App {
                 if let Some(s) = self.status.get_mut(&id) {
                     s.last_activity = Instant::now();
                 }
+                self.detection_dirty.insert(id);
                 // A parked `wait.output` for this pane just got new output to
                 // test against — resolve it on the same wake (docs/81).
                 self.check_output_waits(id);
@@ -646,7 +650,7 @@ impl App {
             | AppEvent::ManifestsReloaded { .. }
             | AppEvent::BackendCreateReady { .. }
             | AppEvent::BackendObserve { .. }
-            | AppEvent::PtyReady(_)
+            | AppEvent::PtyReady { .. }
             | AppEvent::SearchFilesIndexed { .. }
             | AppEvent::SearchResults { .. }
             | AppEvent::SearchFederatedResults { .. }
@@ -686,20 +690,27 @@ impl App {
     /// all single-line fields.
     fn paste_into_modal(&mut self, s: &str) -> bool {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        // The folder picker has no text field to fill: a pasted path *is* the
-        // navigation. Pasting a path is how you reach a deep folder, so this is
-        // the one modal where the text means "go here" rather than "type here".
-        if self.picker.as_ref().is_some_and(|p| p.creating.is_none()) {
-            self.picker_goto(s);
+        if self.module_setting_edit.is_some() {
+            for character in s.chars().filter(|character| !character.is_control()) {
+                self.handle_module_setting_key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                ));
+            }
             return true;
         }
-        let handler: fn(&mut Self, KeyEvent) = if self.module_setting_edit.is_some() {
-            Self::handle_module_setting_key
-        } else if self.search.is_some() {
-            Self::search_key
-        } else if self.picker.is_some() {
-            Self::handle_picker_key // the new-folder name sub-mode
-        } else if self.worktree_prompt.is_some() {
+        // Search can rank a large catalog, so append the whole paste and launch
+        // one recomputation instead of replaying one query per character.
+        if self.search.is_some() {
+            self.search_paste(s);
+            return true;
+        }
+        // The picker owns both text sub-modes and direct path navigation.
+        if self.picker.is_some() {
+            self.picker_paste(s);
+            return true;
+        }
+        let handler: fn(&mut Self, KeyEvent) = if self.worktree_prompt.is_some() {
             Self::handle_worktree_prompt_key
         } else if self.tab_rename.is_some() {
             Self::handle_tab_rename_key
@@ -1074,7 +1085,9 @@ impl App {
                         .map(|(hit, _)| *hit);
                     match hit {
                         Some(PickerHit::Row(i)) => self.picker_click(i),
-                        Some(PickerHit::GoTo) => self.picker_start_go_to(),
+                        Some(PickerHit::Hint(k)) => {
+                            self.handle_picker_key(KeyEvent::new(k, KeyModifiers::NONE))
+                        }
                         Some(PickerHit::Modal) => {}
                         None => self.close_folder_picker(), // click outside cancels
                     }
@@ -1860,14 +1873,16 @@ impl App {
             if self.mission_detail.take().is_some() || self.mission_answer.take().is_some() {
                 return;
             }
-            let body_top = self.mission_area.y + 2; // header + separator
-            if hit(self.mission_area) && m.row >= body_top {
-                let idx = self.mission_scroll + (m.row - body_top) as usize;
-                if idx < self.mission_rows.len() {
-                    self.mission_cursor = idx;
-                    self.mission_activate(idx);
-                }
+            if self.mission_refresh_rect.is_some_and(hit) {
+                self.request_mission_usage_refresh();
+                return;
             }
+            if let Some((scope, _)) = self.mission_scope_rects.iter().find(|(_, rect)| hit(*rect)) {
+                self.set_mission_scope(*scope);
+                return;
+            }
+            // Agent rows are intentionally keyboard-only for now. A plain click
+            // must never jump away from Mission Control unexpectedly.
             return;
         }
         if let Some((id, _)) = self.pane_rects.iter().find(|(_, rect)| hit(*rect)) {
@@ -3334,7 +3349,7 @@ mod tests {
         let enc =
             |c: char, m: KeyModifiers| encode_key(&KeyEvent::new(KeyCode::Char(c), m), nl, false);
         if cfg!(windows) {
-            for c in ['\\', '@', '#', '[', ']', '{', '}', '|', '~'] {
+            for c in ['\\', '@', '#', '[', ']', '{', '}', '|', '~', '€'] {
                 assert_eq!(
                     enc(c, altgr),
                     Some(c.to_string().into_bytes()),
@@ -3343,14 +3358,19 @@ mod tests {
             }
         } else {
             // Elsewhere AltGr arrives unmodified, so Ctrl+Alt stays the real
-            // chord it always was — the control byte, `ESC`-prefixed because
-            // Alt is genuinely held. See
-            // `character_keys_preserve_alt_with_control`.
+            // chord it is on current main: an Alt-prefixed control byte.
             assert_eq!(enc('\\', altgr), Some(vec![0x1b, 0x1c]));
         }
         // A real Ctrl chord is untouched on every platform.
         assert_eq!(enc('\\', KeyModifiers::CONTROL), Some(vec![0x1c]));
         assert_eq!(enc('c', KeyModifiers::CONTROL), Some(vec![0x03]));
+        for c in ['ñ', 'á'] {
+            assert_eq!(
+                enc(c, KeyModifiers::NONE),
+                Some(c.to_string().into_bytes()),
+                "unmodified Unicode input must remain valid UTF-8"
+            );
+        }
         // The exception is for characters only: every other key keeps both
         // modifiers, so Ctrl+Alt+Enter is still a modified Enter.
         assert_eq!(
