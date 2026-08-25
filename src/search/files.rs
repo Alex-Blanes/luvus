@@ -93,15 +93,16 @@ pub fn index_cached(root: &Path) -> Arc<FileCatalog> {
 
 fn git_files(root: &Path) -> Option<FileCatalog> {
     let deadline = Instant::now() + GIT_INDEX_TIMEOUT;
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(root)
         .args(["ls-files", "-co", "--exclude-standard", "-z"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    crate::platform::no_window(&mut command);
+    let mut child = command.spawn().ok()?;
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();

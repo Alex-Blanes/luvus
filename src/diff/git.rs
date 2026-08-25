@@ -515,6 +515,7 @@ fn run_git_bytes_truncating(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    crate::platform::no_window(&mut command);
     let mut child = command.spawn().map_err(|e| format!("git not found: {e}"))?;
     let mut stdout = child
         .stdout

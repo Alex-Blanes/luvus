@@ -60,7 +60,8 @@ pub fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command 
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd
 }
@@ -654,15 +655,16 @@ mod tests {
     fn no_window_keeps_the_command_working() {
         let mut cmd = if cfg!(windows) {
             let mut c = std::process::Command::new("cmd");
-            c.args(["/C", "exit 3"]);
+            c.args(["/C", "echo captured & exit /b 3"]);
             c
         } else {
             let mut c = std::process::Command::new("sh");
-            c.args(["-c", "exit 3"]);
+            c.args(["-c", "printf captured; exit 3"]);
             c
         };
-        let status = super::no_window(&mut cmd).status().expect("spawns");
-        assert_eq!(status.code(), Some(3));
+        let output = super::no_window(&mut cmd).output().expect("spawns");
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "captured");
     }
 
     #[cfg(unix)]

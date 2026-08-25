@@ -48,10 +48,12 @@ pub enum RepoCheck {
 /// collapses "ran, exited non-zero" (the ordinary not-a-repo case) and "could
 /// not run at all" (the actual problem) into the same `Err`.
 pub fn repo_check(cwd: &Path) -> RepoCheck {
-    match Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(cwd)
-        .output()
+    match crate::platform::no_window(
+        Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .current_dir(cwd),
+    )
+    .output()
     {
         Err(e) => RepoCheck::Error(format!("git not found: {e}")),
         Ok(out) if out.status.success() => {
