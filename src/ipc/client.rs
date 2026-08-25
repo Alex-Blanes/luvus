@@ -176,9 +176,8 @@ where
 }
 
 /// Hand this thin client process to the same launch mode targeting another
-/// logical session. Unix replaces the process. Windows starts the successor
-/// and immediately lets this process exit, so the old terminal-input thread is
-/// never left reading alongside the new client. Local launches and `--remote`
+/// logical session. Unix replaces the process; Windows spawns the successor and
+/// stands in for it (see [`spawn_successor`]). Local launches and `--remote`
 /// retain their existing arguments and SSH options.
 fn switch_session_process(name: &str) -> Result<()> {
     crate::session::validate_name(name).map_err(anyhow::Error::msg)?;
@@ -187,10 +186,11 @@ fn switch_session_process(name: &str) -> Result<()> {
 }
 
 /// Replace this client with a fresh one carrying `args`. Unix replaces the
-/// process; Windows starts the successor and immediately lets this process
-/// exit, so the old terminal-input thread is never left reading alongside the
-/// new client. Resolving the executable path again is deliberate: after an
-/// update that is where the *new* binary lives.
+/// process. Windows cannot, so this process gives up its console and waits out
+/// the successor instead — never left reading the keyboard alongside it, and
+/// never handing the shell a prompt on a screen the successor is drawing.
+/// Resolving the executable path again is deliberate: after an update that is
+/// where the *new* binary lives.
 pub(crate) fn spawn_successor(args: &[String]) -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut command = std::process::Command::new(exe);
@@ -205,7 +205,23 @@ pub(crate) fn spawn_successor(args: &[String]) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        command.spawn()?;
+        let mut child = command.spawn()?;
+        // Windows has no `exec`, so this process cannot *become* the successor —
+        // it has to stand in for it until it exits. Letting it return instead
+        // hands the console back to the shell that launched luvus, which prints
+        // its prompt onto the screen the successor is drawing and then reads the
+        // same keyboard: the paste that reaches a pane arrives as its own
+        // characters shuffled between the two readers, and the frame is painted
+        // by both. That is what an in-app restart looked like after an update.
+        //
+        // Waiting is only safe once this process has let go of the console. Its
+        // input thread is blocked in a console read and would keep taking key
+        // records meant for the successor; `release_console` detaches this
+        // process alone — the successor inherited the console when it spawned
+        // and keeps it — which fails that read and ends the thread.
+        #[cfg(windows)]
+        crate::platform::release_console();
+        let _ = child.wait();
         Ok(())
     }
 }
