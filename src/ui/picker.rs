@@ -36,7 +36,13 @@ pub(super) fn draw_picker(
         )),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
-    let path = p.path.display().to_string();
+    // The drive list has no path of its own — it is the virtual folder above
+    // `C:\` — so it gets a title instead of a blank line.
+    let path = if p.at_drives() {
+        cat.drives.to_string()
+    } else {
+        p.path.display().to_string()
+    };
     let path = trunc_tail(&path, inner.width.saturating_sub(2) as usize);
     f.render_widget(
         Paragraph::new(Span::styled(format!(" {path}"), Style::new().fg(t.accent))),
@@ -158,7 +164,9 @@ pub(super) fn draw_picker(
             Row::Entry(idx) => {
                 let e = &p.entries[idx];
                 if e.is_dir {
-                    ("▪", format!("{}/", e.name), t.text)
+                    // A drive row is already `C:\` — no second separator.
+                    let sep = if e.name.ends_with('\\') { "" } else { "/" };
+                    ("▪", format!("{}{sep}", e.name), t.text)
                 } else {
                     ("·", e.name.clone(), t.overlay0)
                 }

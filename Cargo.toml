@@ -89,12 +89,14 @@ libc = "0.2"
 
 # Native Windows terminal-backend safety: owner verification for named-pipe
 # peers, PID-reuse-safe process creation timestamps, and one bounded ToolHelp
-# process snapshot for agent/runtime inspection.
+# process snapshot for agent/runtime inspection. `Win32_Storage_FileSystem` is
+# there for the drive-letter bitmask the folder picker lists.
 [target.'cfg(windows)'.dependencies]
 widestring = "1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
