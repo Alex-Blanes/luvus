@@ -696,20 +696,18 @@ mod tests {
         std::fs::write(dir.join("src/a.rs"), b"one\ntwo\n").unwrap(); // modified
         std::fs::write(dir.join("src/b.rs"), b"new\n").unwrap(); // untracked
         let map = super::tree_status(&dir);
-        // Keys carry the caller's own spelling of `root` — that is what the file
-        // tree holds, and what the dock looks up. Anything canonicalized (the
-        // `\\?\` prefix on Windows, a resolved `/tmp` on macOS) would miss.
+        let canon = std::fs::canonicalize(&dir).unwrap();
         assert_eq!(
-            map.get(&dir.join("src/a.rs")).copied(),
+            map.get(&canon.join("src/a.rs")).copied(),
             Some(super::FileStatus::Modified)
         );
         assert_eq!(
-            map.get(&dir.join("src/b.rs")).copied(),
+            map.get(&canon.join("src/b.rs")).copied(),
             Some(super::FileStatus::Untracked)
         );
         // the `src` dir is marked dirty (contains changes)
         assert_eq!(
-            map.get(&dir.join("src")).copied(),
+            map.get(&canon.join("src")).copied(),
             Some(super::FileStatus::DirDirty)
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -963,21 +961,14 @@ fn classify_code(code: &str) -> FileStatus {
 pub fn tree_status(root: &Path) -> std::collections::HashMap<PathBuf, FileStatus> {
     use std::collections::HashMap;
     let mut map: HashMap<PathBuf, FileStatus> = HashMap::new();
-    // `--porcelain` paths are relative to the repo toplevel; `--show-prefix` is
-    // where `root` sits inside it. Both are built onto `root` in the caller's own
-    // spelling, never onto what git prints or what `canonicalize` returns: git
-    // reports `C:/proj` with forward slashes and `canonicalize` adds the `\\?\`
-    // verbatim prefix, while the file tree holds `C:\proj`. Comparing those three
-    // spellings dropped every entry on Windows, so the FILES dock rendered
-    // untinted no matter how dirty the repo was (docs/43 WIN-6). Symlinked
-    // parents (`/tmp` on macOS) diverged the same way.
-    let Ok(prefix) = run(root, &["rev-parse", "--show-prefix"]) else {
+    let Ok(top) = run(root, &["rev-parse", "--show-toplevel"]) else {
         return map;
     };
-    let prefix = prefix.trim();
+    let top = PathBuf::from(top.trim());
     let Ok(raw) = run(root, &["status", "--porcelain=v1"]) else {
         return map;
     };
+    let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     for line in raw.lines() {
         if line.len() < 4 {
             continue;
@@ -985,16 +976,16 @@ pub fn tree_status(root: &Path) -> std::collections::HashMap<PathBuf, FileStatus
         let code = &line[..2];
         // A rename shows "old -> new"; the new path is what's on disk.
         let path_str = line[3..].rsplit(" -> ").next().unwrap_or(&line[3..]);
+        let abs = top.join(path_str.trim_end_matches('/'));
         // Only entries inside the visible tree.
-        let Some(rel) = path_str.strip_prefix(prefix) else {
+        if !abs.starts_with(&canon_root) {
             continue;
-        };
-        let abs = root.join(rel.trim_end_matches('/'));
+        }
         map.insert(abs.clone(), classify_code(code));
         // Mark intermediate directories (between root and the file) as dirty.
         let mut cur = abs.parent();
         while let Some(dir) = cur {
-            if dir == root || !dir.starts_with(root) {
+            if dir == canon_root || !dir.starts_with(&canon_root) {
                 break;
             }
             map.entry(dir.to_path_buf()).or_insert(FileStatus::DirDirty);

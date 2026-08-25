@@ -91,6 +91,7 @@ jobs:
           cargo test --locked app::backend::tests
           cargo test --locked terminal::backend::tests
           cargo test --locked altgr
+          cargo test --locked diff::git::tests::tree_tint_uses_nested_visible_spelling_and_new_rename_path
       - name: Validate published protocol fixtures
         shell: pwsh
         run: |
