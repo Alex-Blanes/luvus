@@ -635,6 +635,12 @@ impl App {
                 self.show_toast(format!("{} v{label}", self.catalog.update_installed));
                 true
             }
+            AppEvent::SelfUpdateFailed(reason) => {
+                // The indicator stays: the update is still available, it just is
+                // not installed, and hiding that would be the old bug again.
+                self.show_toast(format!("{} {reason}", self.catalog.update_install_failed));
+                true
+            }
             AppEvent::UpstreamUpdateAvailable(version) => {
                 let changed = self.upstream_available.as_deref() != Some(version.as_str());
                 self.upstream_available = Some(version);

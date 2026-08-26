@@ -473,10 +473,7 @@ fn verify_sha256(archive: &Path, checksum_file: &Path) -> Result<()> {
 /// disk immediately; it takes effect the next time luvus starts.
 #[cfg(windows)]
 fn replace_executable(candidate: &Path, destination: &Path) -> Result<()> {
-    let retired = destination.with_extension("old.exe");
-    // A leftover from a previous update, still locked if that build is running.
-    // Failing to clear it is fine; the rename below is what has to succeed.
-    let _ = fs::remove_file(&retired);
+    let retired = retire_path(destination);
     if destination.exists() {
         fs::rename(destination, &retired)
             .with_context(|| format!("move the running {} aside", destination.display()))?;
@@ -486,7 +483,67 @@ fn replace_executable(candidate: &Path, destination: &Path) -> Result<()> {
         let _ = fs::rename(&retired, destination);
         return Err(error).with_context(|| format!("install the new {}", destination.display()));
     }
+    // Only now, with the new binary in place, sweep what *earlier* updates left
+    // behind — never the one just made, which is the rollback. Whatever is still
+    // running keeps its file; the rest go.
+    sweep_retired(destination, &retired);
     Ok(())
+}
+
+/// A free name to move the outgoing binary to, next to it.
+///
+/// Never a fixed `luvus.old.exe`. Windows lets you rename a running image but
+/// not delete one, and `rename` onto an existing path has to delete what is
+/// there — so the moment any earlier build was still running under that one
+/// name, every future update failed at this step. That is not a rare corner:
+/// this fork's restart hands the console over by leaving the old process in
+/// `wait()`, so a previous build running is the normal state after an update.
+///
+/// Ten candidates is plenty — they only survive while their process does.
+#[cfg(windows)]
+fn retire_path(destination: &Path) -> PathBuf {
+    for n in 0..10 {
+        let candidate = destination.with_extension(format!("old{n}.exe"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    // Everything taken means ten live builds, which cannot really happen; fall
+    // back to a stamped name rather than returning a path that must fail.
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    destination.with_extension(format!("old-{stamp}.exe"))
+}
+
+/// Delete the retired binaries of past updates, leaving `keep` — the rollback
+/// this update just made — alone. Each is held open for as long as the build it
+/// belongs to is still running, so a failure here means exactly "that one is
+/// still in use" and is not worth reporting.
+#[cfg(windows)]
+fn sweep_retired(destination: &Path, keep: &Path) {
+    let Some(dir) = destination.parent() else {
+        return;
+    };
+    let Some(stem) = destination.file_stem().and_then(|s| s.to_str()) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // `luvus.old3.exe`, `luvus.old-1756223.exe`, and the `luvus.old.exe` of
+        // every build that predates this scheme.
+        if name.starts_with(&format!("{stem}.old"))
+            && name.ends_with(".exe")
+            && !crate::platform::same_path(&entry.path(), keep)
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -628,8 +685,23 @@ fn check_once(tx: &Sender<AppEvent>, url: &str, auto_install: bool) {
         return;
     };
     let _ = tx.send(AppEvent::UpdateAvailable(release.label()));
-    if auto_install && install_in_place(&release).unwrap_or(false) {
-        let _ = tx.send(AppEvent::SelfUpdateInstalled(release.label()));
+    if !auto_install {
+        return;
+    }
+    // Say so when it fails. This used to be `.unwrap_or(false)`, which turned
+    // every install error into silence: the update was announced, the install
+    // died on something as ordinary as an old binary that could not be moved
+    // aside, and nothing distinguished that from having nothing to install.
+    match install_in_place(&release) {
+        Ok(true) => {
+            let _ = tx.send(AppEvent::SelfUpdateInstalled(release.label()));
+        }
+        // Not a direct install — a package manager owns this binary, and saying
+        // so on every check would be nagging about a thing luvus must not touch.
+        Ok(false) => {}
+        Err(error) => {
+            let _ = tx.send(AppEvent::SelfUpdateFailed(format!("{error:#}")));
+        }
     }
 }
 
@@ -875,10 +947,23 @@ mod tests {
         assert!(!is_newer(super::CURRENT, super::CURRENT));
     }
 
+    /// Every `luvus.old*.exe` in `dir`, sorted — the rollbacks an install left.
+    #[cfg(windows)]
+    fn retired_files(dir: &std::path::Path) -> Vec<String> {
+        let mut found: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.starts_with("luvus.old"))
+            .collect();
+        found.sort();
+        found
+    }
+
     /// Windows cannot overwrite a running image, so the installer renames the
     /// old binary aside and drops the new one into the freed path. The old one
-    /// has to survive under `.old.exe` — the running process is still reading
-    /// it, and it is the only rollback there is.
+    /// has to survive — the running process is still reading it, and it is the
+    /// only rollback there is — while earlier ones are cleared rather than piling up.
     #[cfg(windows)]
     #[test]
     fn windows_install_moves_the_running_binary_aside() {
@@ -892,8 +977,10 @@ mod tests {
 
         super::replace_executable(&candidate, &destination).unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), b"new");
+        let retired = retired_files(&dir);
+        assert_eq!(retired.len(), 1, "exactly one rollback: {retired:?}");
         assert_eq!(
-            std::fs::read(dir.join("luvus.old.exe")).unwrap(),
+            std::fs::read(dir.join(&retired[0])).unwrap(),
             b"old",
             "the replaced binary is kept as the rollback"
         );
@@ -902,9 +989,83 @@ mod tests {
         std::fs::write(&candidate, b"newer").unwrap();
         super::replace_executable(&candidate, &destination).unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), b"newer");
-        assert_eq!(std::fs::read(dir.join("luvus.old.exe")).unwrap(), b"new");
+        let retired = retired_files(&dir);
+        assert_eq!(retired.len(), 1, "still exactly one: {retired:?}");
+        assert_eq!(std::fs::read(dir.join(&retired[0])).unwrap(), b"new");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bug that stranded a real install. A rollback whose build is still
+    /// running cannot be deleted, and `rename` onto an existing path has to
+    /// delete what is there — so reusing one fixed `luvus.old.exe` made every
+    /// later update fail at that step, and the error was swallowed, so the
+    /// update button did nothing and said nothing.
+    ///
+    /// The lock is the real thing, not a stand-in: a handle opened without
+    /// `FILE_SHARE_DELETE`, which is how Windows holds a running image and the
+    /// only property that mattered. Read-only would not do — `remove_file`
+    /// clears that attribute itself and the file would vanish.
+    #[cfg(windows)]
+    #[test]
+    fn an_undeletable_rollback_does_not_block_the_next_update() {
+        let dir = std::env::temp_dir().join(format!("luvus-locked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let destination = dir.join("luvus.exe");
+        let candidate = dir.join("new.exe");
+        std::fs::write(&destination, b"old").unwrap();
+        std::fs::write(&candidate, b"new").unwrap();
+
+        // What every build before this scheme left behind, still in use.
+        let stuck = dir.join("luvus.old.exe");
+        std::fs::write(&stuck, b"ancient").unwrap();
+        let handle = deny_delete(&stuck);
+        assert!(
+            std::fs::remove_file(&stuck).is_err(),
+            "the setup is only meaningful if the file really cannot be deleted"
+        );
+
+        super::replace_executable(&candidate, &destination)
+            .expect("an undeletable rollback must not stop the install");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read(&stuck).unwrap(),
+            b"ancient",
+            "the one still in use is left exactly as it was"
+        );
+
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Hold `path` open the way Windows holds a running executable: readable by
+    /// others, but not deletable. Close the returned handle when done.
+    #[cfg(windows)]
+    fn deny_delete(path: &std::path::Path) -> windows_sys::Win32::Foundation::HANDLE {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, OPEN_EXISTING,
+        };
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                windows_sys::Win32::Foundation::GENERIC_READ,
+                FILE_SHARE_READ, // no FILE_SHARE_DELETE: this is the whole point
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(
+            !handle.is_null() && handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
+            "could not open {} to hold it",
+            path.display()
+        );
+        handle
     }
 
     #[test]
