@@ -135,9 +135,32 @@ fn fetch_release(url: &str) -> Option<ForkRelease> {
     http_get(url).as_deref().and_then(parse_manifest)
 }
 
-/// A published build is newer only when this binary knows its own build number.
-/// Without one every check would claim an update forever.
+/// Is `release` newer than what is running? Semver first, build number only as
+/// the tiebreaker within one release.
+///
+/// The build number counts commits since the `v<version>` tag, so **it resets
+/// every time the fork merges a new upstream release** — the count starts again
+/// from the new tag. Comparing the two numbers alone therefore reads a version
+/// bump as going backwards: at the 0.12.0 → 0.13.1 merge the running build was
+/// 94 and the first build of the newer release was 68, so `68 > 94` was false
+/// and the updater refused that release, and every release after it, until the
+/// fork happened to accumulate 27 more commits. Nothing looked wrong — the label
+/// still built, the check still ran, and it reported being up to date while two
+/// upstream releases behind.
+///
+/// A strictly newer semver is enough on its own, even from a binary that has no
+/// build number of its own (a crates.io tarball, a shallow clone). Within one
+/// version the build number is still the only thing that can say "newer", so
+/// there it keeps deciding — and with no number to compare, it stays quiet
+/// rather than claiming an update forever.
 fn is_newer_build(release: &ForkRelease) -> bool {
+    let running = env!("CARGO_PKG_VERSION");
+    if is_newer(&release.version, running) {
+        return true;
+    }
+    if is_newer(running, &release.version) {
+        return false;
+    }
     current_build().is_some_and(|build| release.build > build)
 }
 
@@ -723,6 +746,44 @@ mod tests {
         assert!(!is_newer("0.9.1", "0.9.2"), "older is not newer");
         // A pre-release suffix on a component doesn't break the compare.
         assert!(is_newer("0.9.3-rc1", "0.9.2"));
+    }
+
+    /// The build number restarts from zero at every upstream release the fork
+    /// merges, so across a version bump the newer release carries the *smaller*
+    /// number. Deciding on that number alone stranded the updater: it refused
+    /// the new release, and every release after it, while reporting no update
+    /// available.
+    #[test]
+    fn a_newer_release_wins_even_though_its_build_number_is_lower() {
+        let running = env!("CARGO_PKG_VERSION");
+        let release = |version: &str, build: u32| ForkRelease {
+            version: version.to_string(),
+            build,
+            tag: format!("build-{build}"),
+        };
+
+        // The exact shape that stranded it: running 0.12.0 at build 94, the
+        // first build of 0.13.1 counted only 68 commits past its own tag.
+        assert!(
+            is_newer_build(&release("99.0.0", 0)),
+            "a newer release is newer whatever its build number"
+        );
+        assert!(
+            !is_newer_build(&release("0.0.1", u32::MAX)),
+            "an older release never wins on build number alone"
+        );
+
+        // Within one version the build number still decides, as it always did:
+        // every fork release carries upstream's semver, so nothing else can.
+        let Some(build) = super::current_build() else {
+            return; // built without the release tag in reach; nothing to compare
+        };
+        assert!(is_newer_build(&release(running, build + 1)));
+        assert!(
+            !is_newer_build(&release(running, build)),
+            "same is not newer"
+        );
+        assert!(!is_newer_build(&release(running, build.saturating_sub(1))));
     }
 
     /// The whole chain, off the network: fetch, parse, compare, report. A file
