@@ -9,6 +9,9 @@
 //! partial translation can't compile, and an unknown `config.language` falls back
 //! to [`EN`] (worst case: shows English, never a crash or a blank label).
 
+pub mod cli;
+pub mod settings;
+
 /// Every translatable UI label. One field per string; all required. Footer/hint
 /// "action words" are shared across surfaces (picker, git tab, help) for
 /// consistency and to keep the table small.
@@ -23,6 +26,7 @@ pub struct Catalog {
     pub switch_scope_all: &'static str,
     pub switch_scope_tabs: &'static str,
     pub switch_filter_hint: &'static str,
+    pub mobile_actions: &'static str,
     pub agents: &'static str,
     pub no_active_agents: &'static str,
     pub no_agents_or_sessions: &'static str,
@@ -76,6 +80,8 @@ pub struct Catalog {
     pub act_go_to: &'static str,
     pub act_show_hidden: &'static str,
     pub act_close: &'static str,
+    pub act_open_menu: &'static str,
+    pub act_exit: &'static str,
     pub act_split: &'static str,
     pub act_search: &'static str,
     pub act_new_tab: &'static str,
@@ -152,8 +158,10 @@ pub struct Catalog {
     /// indistinguishable from no update existing.
     pub update_install_failed: &'static str,
     pub set_resume_flags: &'static str,
+    pub set_new_pane_to_workspace_root: &'static str,
     pub set_agent_title: &'static str,
     // ── settings ──
+    pub settings: &'static settings::Catalog,
     pub settings_title: &'static str,
     pub tab_theme: &'static str,
     pub tab_layout: &'static str,
@@ -176,6 +184,7 @@ pub struct Catalog {
     pub set_column_gap: &'static str,
     pub set_row_gap: &'static str,
     pub set_scrollback: &'static str,
+    pub set_mobile_width: &'static str,
     pub set_diff_layout: &'static str,
     pub set_diff_wrap: &'static str,
     pub set_diff_context: &'static str,
@@ -352,6 +361,7 @@ pub struct Catalog {
 
 /// The English baseline — every other catalog mirrors this shape exactly.
 pub static EN: Catalog = Catalog {
+    settings: &settings::EN,
     workspaces: "WORKSPACES",
     agents: "AGENTS",
     files: "FILES",
@@ -360,6 +370,7 @@ pub static EN: Catalog = Catalog {
     switch_scope_all: "All",
     switch_scope_tabs: "Tabs",
     switch_filter_hint: "type to filter",
+    mobile_actions: "Actions",
     no_active_agents: "no active agents",
     no_agents_or_sessions: "no agents or sessions",
     no_agents_waiting: "no agents waiting",
@@ -404,6 +415,8 @@ pub static EN: Catalog = Catalog {
     act_go_to: "go to",
     act_show_hidden: "show hidden",
     act_close: "close",
+    act_open_menu: "open",
+    act_exit: "Exit",
     act_split: "split",
     act_search: "search",
     act_new_tab: "new tab",
@@ -466,6 +479,7 @@ pub static EN: Catalog = Catalog {
     update_failed: "Could not check for updates",
     update_install_failed: "Could not install the update:",
     set_resume_flags: "Remember CLI option on resume",
+    set_new_pane_to_workspace_root: "Open new pane/tab at workspace root",
     set_agent_title: "Show agent session title",
     settings_title: "Settings",
     tab_theme: "Theme",
@@ -489,6 +503,7 @@ pub static EN: Catalog = Catalog {
     set_column_gap: "Column gap",
     set_row_gap: "Row gap",
     set_scrollback: "Scrollback budget",
+    set_mobile_width: "Mobile width",
     set_diff_layout: "Diff layout",
     set_diff_wrap: "Wrap diff lines",
     set_diff_context: "Diff context lines",
@@ -654,6 +669,7 @@ pub static EN: Catalog = Catalog {
 };
 
 static ES: Catalog = Catalog {
+    settings: &settings::ES,
     workspaces: "ESPACIOS",
     agents: "AGENTES",
     files: "ARCHIVOS",
@@ -662,6 +678,7 @@ static ES: Catalog = Catalog {
     switch_scope_all: "Todo",
     switch_scope_tabs: "Pestañas",
     switch_filter_hint: "escribe para filtrar",
+    mobile_actions: "Acciones",
     no_active_agents: "sin agentes activos",
     no_agents_or_sessions: "sin agentes ni sesiones",
     no_agents_waiting: "no hay agentes esperando",
@@ -706,6 +723,8 @@ static ES: Catalog = Catalog {
     act_go_to: "ir a",
     act_show_hidden: "mostrar ocultos",
     act_close: "cerrar",
+    act_open_menu: "abrir",
+    act_exit: "Salir",
     act_split: "dividir",
     act_search: "buscar",
     act_new_tab: "pestaña",
@@ -768,6 +787,7 @@ static ES: Catalog = Catalog {
     update_failed: "No se pudo buscar actualizaciones",
     update_install_failed: "No se pudo instalar la actualización:",
     set_resume_flags: "Recordar las opciones de CLI al reanudar",
+    set_new_pane_to_workspace_root: "Abrir nuevo panel/pestaña en la raíz del espacio",
     set_agent_title: "Mostrar título de sesión del agente",
     settings_title: "Ajustes",
     tab_theme: "Tema",
@@ -791,6 +811,7 @@ static ES: Catalog = Catalog {
     set_column_gap: "Espacio columna",
     set_row_gap: "Espacio fila",
     set_scrollback: "Presupuesto de historial",
+    set_mobile_width: "Ancho móvil",
     set_diff_layout: "Diseño de DIFF",
     set_diff_wrap: "Ajustar líneas de DIFF",
     set_diff_context: "Líneas de contexto de DIFF",
@@ -956,6 +977,7 @@ static ES: Catalog = Catalog {
 };
 
 static PT: Catalog = Catalog {
+    settings: &settings::PT,
     workspaces: "ESPAÇOS",
     agents: "AGENTES",
     files: "ARQUIVOS",
@@ -964,6 +986,7 @@ static PT: Catalog = Catalog {
     switch_scope_all: "Tudo",
     switch_scope_tabs: "Abas",
     switch_filter_hint: "digite para filtrar",
+    mobile_actions: "Ações",
     no_active_agents: "nenhum agente ativo",
     no_agents_or_sessions: "nenhum agente ou sessão",
     no_agents_waiting: "nenhum agente aguardando",
@@ -1008,6 +1031,8 @@ static PT: Catalog = Catalog {
     act_go_to: "ir para",
     act_show_hidden: "mostrar ocultos",
     act_close: "fechar",
+    act_open_menu: "abrir",
+    act_exit: "Sair",
     act_split: "dividir",
     act_search: "buscar",
     act_new_tab: "aba",
@@ -1070,6 +1095,7 @@ static PT: Catalog = Catalog {
     update_failed: "Não foi possível verificar atualizações",
     update_install_failed: "Não foi possível instalar a atualização:",
     set_resume_flags: "Lembrar as opções de CLI ao retomar",
+    set_new_pane_to_workspace_root: "Abrir novo painel/aba na raiz do espaço",
     set_agent_title: "Mostrar título da sessão do agente",
     settings_title: "Configurações",
     tab_theme: "Tema",
@@ -1093,6 +1119,7 @@ static PT: Catalog = Catalog {
     set_column_gap: "Espaço coluna",
     set_row_gap: "Espaço linha",
     set_scrollback: "Orçamento do histórico",
+    set_mobile_width: "Largura móvel",
     set_diff_layout: "Layout do DIFF",
     set_diff_wrap: "Quebrar linhas do DIFF",
     set_diff_context: "Linhas de contexto do DIFF",
@@ -1258,6 +1285,7 @@ static PT: Catalog = Catalog {
 };
 
 static FR: Catalog = Catalog {
+    settings: &settings::FR,
     workspaces: "ESPACES",
     agents: "AGENTS",
     files: "FICHIERS",
@@ -1266,6 +1294,7 @@ static FR: Catalog = Catalog {
     switch_scope_all: "Tout",
     switch_scope_tabs: "Onglets",
     switch_filter_hint: "filtrer en tapant",
+    mobile_actions: "Actions",
     no_active_agents: "aucun agent actif",
     no_agents_or_sessions: "aucun agent ni session",
     no_agents_waiting: "aucun agent en attente",
@@ -1310,6 +1339,8 @@ static FR: Catalog = Catalog {
     act_go_to: "aller à",
     act_show_hidden: "afficher les cachés",
     act_close: "fermer",
+    act_open_menu: "ouvrir",
+    act_exit: "Quitter",
     act_split: "diviser",
     act_search: "rechercher",
     act_new_tab: "onglet",
@@ -1372,6 +1403,7 @@ static FR: Catalog = Catalog {
     update_failed: "Impossible de rechercher des mises à jour",
     update_install_failed: "Impossible d'installer la mise à jour :",
     set_resume_flags: "Mémoriser les options CLI à la reprise",
+    set_new_pane_to_workspace_root: "Ouvrir un nouveau volet/onglet à la racine de l'espace",
     set_agent_title: "Afficher le titre de session de l'agent",
     settings_title: "Paramètres",
     tab_theme: "Thème",
@@ -1395,6 +1427,7 @@ static FR: Catalog = Catalog {
     set_column_gap: "Écart colonne",
     set_row_gap: "Écart ligne",
     set_scrollback: "Budget d’historique",
+    set_mobile_width: "Largeur mobile",
     set_diff_layout: "Disposition DIFF",
     set_diff_wrap: "Renvoyer les lignes DIFF",
     set_diff_context: "Lignes de contexte DIFF",
@@ -1560,6 +1593,7 @@ static FR: Catalog = Catalog {
 };
 
 static DE: Catalog = Catalog {
+    settings: &settings::DE,
     workspaces: "BEREICHE",
     agents: "AGENTEN",
     files: "DATEIEN",
@@ -1568,6 +1602,7 @@ static DE: Catalog = Catalog {
     switch_scope_all: "Alle",
     switch_scope_tabs: "Tabs",
     switch_filter_hint: "zum Filtern tippen",
+    mobile_actions: "Aktionen",
     no_active_agents: "keine aktiven Agenten",
     no_agents_or_sessions: "keine Agenten oder Sitzungen",
     no_agents_waiting: "keine wartenden Agenten",
@@ -1612,6 +1647,8 @@ static DE: Catalog = Catalog {
     act_go_to: "gehe zu",
     act_show_hidden: "versteckte zeigen",
     act_close: "schließen",
+    act_open_menu: "öffnen",
+    act_exit: "Beenden",
     act_split: "teilen",
     act_search: "suchen",
     act_new_tab: "neuer Tab",
@@ -1674,6 +1711,7 @@ static DE: Catalog = Catalog {
     update_failed: "Suche nach Updates fehlgeschlagen",
     update_install_failed: "Update konnte nicht installiert werden:",
     set_resume_flags: "CLI-Optionen beim Fortsetzen merken",
+    set_new_pane_to_workspace_root: "Neuen Bereich/Tab im Arbeitsbereich-Stammverzeichnis öffnen",
     set_agent_title: "Agenten-Sitzungstitel anzeigen",
     settings_title: "Einstellungen",
     tab_theme: "Thema",
@@ -1697,6 +1735,7 @@ static DE: Catalog = Catalog {
     set_column_gap: "Spaltenabstand",
     set_row_gap: "Zeilenabstand",
     set_scrollback: "Verlaufsbudget",
+    set_mobile_width: "Mobile Breite",
     set_diff_layout: "DIFF-Layout",
     set_diff_wrap: "DIFF-Zeilen umbrechen",
     set_diff_context: "DIFF-Kontextzeilen",
@@ -1862,6 +1901,7 @@ static DE: Catalog = Catalog {
 };
 
 static ID: Catalog = Catalog {
+    settings: &settings::ID,
     workspaces: "RUANG KERJA",
     agents: "AGEN",
     files: "BERKAS",
@@ -1870,6 +1910,7 @@ static ID: Catalog = Catalog {
     switch_scope_all: "Semua",
     switch_scope_tabs: "Tab",
     switch_filter_hint: "ketik untuk memfilter",
+    mobile_actions: "Tindakan",
     no_active_agents: "tidak ada agen aktif",
     no_agents_or_sessions: "tidak ada agen atau sesi",
     no_agents_waiting: "tidak ada agen menunggu",
@@ -1914,6 +1955,8 @@ static ID: Catalog = Catalog {
     act_go_to: "ke lokasi",
     act_show_hidden: "tampilkan tersembunyi",
     act_close: "tutup",
+    act_open_menu: "buka",
+    act_exit: "Keluar",
     act_split: "bagi",
     act_search: "cari",
     act_new_tab: "tab baru",
@@ -1976,6 +2019,7 @@ static ID: Catalog = Catalog {
     update_failed: "Gagal memeriksa pembaruan",
     update_install_failed: "Gagal memasang pembaruan:",
     set_resume_flags: "Ingat opsi CLI saat melanjutkan",
+    set_new_pane_to_workspace_root: "Buka tab/panel baru di root workspace",
     set_agent_title: "Tampilkan judul sesi agen",
     settings_title: "Pengaturan",
     tab_theme: "Tema",
@@ -1999,6 +2043,7 @@ static ID: Catalog = Catalog {
     set_column_gap: "Jarak kolom",
     set_row_gap: "Jarak baris",
     set_scrollback: "Batas riwayat",
+    set_mobile_width: "Lebar seluler",
     set_diff_layout: "Tata letak DIFF",
     set_diff_wrap: "Bungkus baris DIFF",
     set_diff_context: "Baris konteks DIFF",
@@ -2164,6 +2209,7 @@ static ID: Catalog = Catalog {
 };
 
 static ZH: Catalog = Catalog {
+    settings: &settings::ZH,
     workspaces: "工作区",
     agents: "代理",
     files: "文件",
@@ -2172,6 +2218,7 @@ static ZH: Catalog = Catalog {
     switch_scope_all: "全部",
     switch_scope_tabs: "标签",
     switch_filter_hint: "输入以筛选",
+    mobile_actions: "操作",
     no_active_agents: "无活动代理",
     no_agents_or_sessions: "无代理或会话",
     no_agents_waiting: "没有等待的代理",
@@ -2216,6 +2263,8 @@ static ZH: Catalog = Catalog {
     act_go_to: "前往",
     act_show_hidden: "显示隐藏文件",
     act_close: "关闭",
+    act_open_menu: "打开",
+    act_exit: "退出",
     act_split: "分割",
     act_search: "搜索",
     act_new_tab: "新标签",
@@ -2278,6 +2327,7 @@ static ZH: Catalog = Catalog {
     update_failed: "无法检查更新",
     update_install_failed: "无法安装更新：",
     set_resume_flags: "恢复时记住 CLI 选项",
+    set_new_pane_to_workspace_root: "在工作区根目录打开新标签/窗格",
     set_agent_title: "显示智能体会话标题",
     settings_title: "设置",
     tab_theme: "主题",
@@ -2301,6 +2351,7 @@ static ZH: Catalog = Catalog {
     set_column_gap: "列间距",
     set_row_gap: "行间距",
     set_scrollback: "历史记录预算",
+    set_mobile_width: "移动端宽度",
     set_diff_layout: "DIFF 布局",
     set_diff_wrap: "DIFF 自动换行",
     set_diff_context: "DIFF 上下文行数",
@@ -2466,6 +2517,7 @@ static ZH: Catalog = Catalog {
 };
 
 static JA: Catalog = Catalog {
+    settings: &settings::JA,
     workspaces: "ワークスペース",
     agents: "エージェント",
     files: "ファイル",
@@ -2474,6 +2526,7 @@ static JA: Catalog = Catalog {
     switch_scope_all: "すべて",
     switch_scope_tabs: "タブ",
     switch_filter_hint: "入力して絞り込み",
+    mobile_actions: "操作",
     no_active_agents: "アクティブなエージェントなし",
     no_agents_or_sessions: "エージェント・セッションなし",
     no_agents_waiting: "待機中のエージェントなし",
@@ -2518,6 +2571,8 @@ static JA: Catalog = Catalog {
     act_go_to: "移動",
     act_show_hidden: "隠しファイル表示",
     act_close: "閉じる",
+    act_open_menu: "開く",
+    act_exit: "終了",
     act_split: "分割",
     act_search: "検索",
     act_new_tab: "新規タブ",
@@ -2580,6 +2635,7 @@ static JA: Catalog = Catalog {
     update_failed: "アップデートを確認できませんでした",
     update_install_failed: "アップデートをインストールできませんでした:",
     set_resume_flags: "再開時に CLI オプションを記憶",
+    set_new_pane_to_workspace_root: "ワークスペースのルートで新しいタブ/ペインを開く",
     set_agent_title: "エージェントのセッションタイトルを表示",
     settings_title: "設定",
     tab_theme: "テーマ",
@@ -2603,6 +2659,7 @@ static JA: Catalog = Catalog {
     set_column_gap: "列の間隔",
     set_row_gap: "行の間隔",
     set_scrollback: "履歴の上限",
+    set_mobile_width: "モバイル幅",
     set_diff_layout: "DIFF レイアウト",
     set_diff_wrap: "DIFF 行を折り返す",
     set_diff_context: "DIFF のコンテキスト行数",
@@ -2828,5 +2885,74 @@ mod tests {
         assert_ne!(by_code("de").board_title, EN.board_title);
         assert_ne!(by_code("es").task_done, EN.task_done);
         assert_ne!(by_code("ja").board_new_task, EN.board_new_task);
+        assert_ne!(
+            by_code("es").settings.keys_intro_prefix,
+            EN.settings.keys_intro_prefix
+        );
+        assert_ne!(
+            by_code("id").settings.preset_custom,
+            EN.settings.preset_custom
+        );
+        assert_ne!(
+            by_code("zh").settings.modules_empty,
+            EN.settings.modules_empty
+        );
+    }
+
+    #[test]
+    fn every_language_covers_the_complete_settings_reference() {
+        for &code in LANGS {
+            let settings = by_code(code).settings;
+            assert_eq!(
+                settings.key_reference_headings.len(),
+                settings::KEY_REFERENCE_KEYS.len(),
+                "{code} settings reference heading count"
+            );
+            assert!(
+                settings.keys_intro_prefix.contains("{prefix}"),
+                "{code} prefix introduction keeps its placeholder"
+            );
+            assert!(
+                settings.keys_intro_move.contains("{prefix}"),
+                "{code} movement introduction keeps its placeholder"
+            );
+            assert!(
+                settings.keys_capture_again.contains("{key}"),
+                "{code} capture prompt keeps its placeholder"
+            );
+            assert!(
+                settings.key_prefix_twice.contains("{prefix}"),
+                "{code} doubled-prefix label keeps its placeholder"
+            );
+            assert!(
+                settings.keys_confirm_prefix.contains("{key}"),
+                "{code} confirmation prompt keeps its placeholder"
+            );
+            assert!(
+                settings.theme_bundled.contains("{id}")
+                    && settings.theme_removing.contains("{id}")
+                    && settings.theme_removed.contains("{id}")
+                    && settings.theme_remove_failed.contains("{id}")
+                    && settings.theme_remove_failed.contains("{error}"),
+                "{code} theme messages keep their placeholders"
+            );
+            for (section, keys) in settings::KEY_REFERENCE_KEYS.iter().enumerate() {
+                assert!(
+                    !settings.key_reference_headings[section].is_empty(),
+                    "{code} reference section {section} has a heading"
+                );
+                assert_eq!(
+                    settings.key_reference_descriptions[section].len(),
+                    keys.len(),
+                    "{code} reference section {section} covers every key row"
+                );
+                assert!(
+                    settings.key_reference_descriptions[section]
+                        .iter()
+                        .all(|description| !description.is_empty()),
+                    "{code} reference section {section} has no blank descriptions"
+                );
+            }
+        }
     }
 }

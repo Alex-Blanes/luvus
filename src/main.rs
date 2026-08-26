@@ -21,6 +21,7 @@ mod integration;
 mod ipc;
 mod layout;
 mod links;
+mod logging;
 mod mission;
 mod module;
 mod orch;
@@ -104,7 +105,9 @@ fn main() -> Result<()> {
         // `attach <id>` (docs/18 WA-2): focus + zoom the pane, then open the TUI
         // straight into that fullscreen terminal.
         Some("attach") => return attach_cmd(&args),
-        Some("integration") => std::process::exit(integration::run(&args)?),
+        Some("integration") => {
+            std::process::exit(integration::run(&args, i18n::cli::Context::configured())?)
+        }
         Some("--local") => return run_local(),
         Some(_) if cli::is_cli(&args) => {
             let code = cli::run(&args)?;
@@ -397,6 +400,11 @@ pub(crate) fn window_title() -> String {
 
 /// Run the app monolithically against the real terminal (dev/escape hatch).
 fn run_local() -> Result<()> {
+    let _logging = logging::init(logging::Role::Local);
+    logging::event(
+        logging::EventKind::ServerStart,
+        &[logging::Field::Role(logging::Role::Local)],
+    );
     let mut terminal = ratatui::init();
     install_tui_panic_hook();
     let result = run(&mut terminal);
@@ -408,14 +416,30 @@ fn run_local() -> Result<()> {
         DisableBracketedPaste
     );
     ratatui::restore();
-    // `--local` is its own server, so there is no separate client to bring the
-    // session back: this process has to replace itself. The snapshot is already
-    // written by `run`, and the successor restores from it.
-    if result? {
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        return ipc::client::spawn_successor(&args);
+    match result? {
+        // `--local` is its own server, so there is no separate client to bring
+        // the session back: this process has to replace itself. The snapshot is
+        // already written by `run`, and the successor restores from it.
+        LocalExit::Relaunch => {
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            ipc::client::spawn_successor(&args)
+        }
+        LocalExit::Detached => {
+            print_detached_status(i18n::cli::Context::configured());
+            Ok(())
+        }
+        LocalExit::Done => Ok(()),
     }
-    Ok(())
+}
+
+/// How a `--local` session ended. A plain `bool` carried this until two of them
+/// were needed at once: this fork asks whether to restart onto a freshly
+/// installed binary, upstream asks whether the session detached, and the two
+/// answers are not the same question.
+enum LocalExit {
+    Done,
+    Detached,
+    Relaunch,
 }
 
 fn autodetect_and_attach() -> Result<()> {
@@ -593,16 +617,25 @@ fn wait_for_socket(sock: &Path) -> Result<()> {
 /// Bare `luvus server` (no subcommand) is the internal headless role that
 /// `spawn_server` launches via setsid; users go through the subcommands.
 fn server_cmd(args: &[String]) -> Result<()> {
-    match args.get(2).map(String::as_str) {
-        None => ipc::server::run(), // internal role: run the server in the foreground
-        Some("start") => server_start(),
-        Some("stop") => server_stop(),
-        Some("restart") => server_restart(),
-        Some("status") => server_status(),
-        Some("update-manifest") => update_manifest(),
-        Some(other) => {
-            eprintln!("unknown server command: {other}");
-            eprintln!("usage: luvus server <start|stop|restart|status|update-manifest>");
+    let Some(command) = args.get(2).map(String::as_str) else {
+        return ipc::server::run(); // internal role: run the server in the foreground
+    };
+    let context = i18n::cli::Context::configured();
+    match command {
+        "start" => server_start(context),
+        "stop" => server_stop(context),
+        "restart" => server_restart(context),
+        "status" => server_status(context),
+        "update-manifest" => update_manifest(context),
+        other => {
+            eprintln!("{}: {other}", context.text("unknown server command"));
+            eprintln!(
+                "{}",
+                i18n::cli::help(
+                    "usage: luvus server <start|stop|restart|status|update-manifest>",
+                    context.language(),
+                )
+            );
             std::process::exit(2);
         }
     }
@@ -620,7 +653,7 @@ struct ManifestIndex {
 /// user's own manifests) and apply live if a server is running, else on next
 /// start. The source is `https://luvus.dev/manifests` (override with
 /// `$LUVUS_MANIFEST_URL`, e.g. a `file://` dir for testing).
-fn update_manifest() -> Result<()> {
+fn update_manifest(context: i18n::cli::Context) -> Result<()> {
     let base = std::env::var("LUVUS_MANIFEST_URL")
         .unwrap_or_else(|_| "https://luvus.dev/manifests".to_string());
     let index_url = format!("{base}/index.json");
@@ -641,21 +674,28 @@ fn update_manifest() -> Result<()> {
             || name.contains('\\')
             || name.contains("..");
         if bad {
-            eprintln!("skipping suspicious manifest name: {name}");
+            eprintln!(
+                "{}: {name}",
+                context.text("skipping suspicious manifest name")
+            );
             skipped += 1;
             continue;
         }
         let body = match crate::module::discovery::http_get(&format!("{base}/{name}")) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("skipping {name}: {e}");
+                eprintln!("{} {name}: {e}", context.text("skipping"));
                 skipped += 1;
                 continue;
             }
         };
         // Reject a garbled download before it can land in the managed dir.
         if !crate::detect::manifest_parses(&body) {
-            eprintln!("skipping {name}: not a valid detection manifest");
+            eprintln!(
+                "{} {name}: {}",
+                context.text("skipping"),
+                context.text("not a valid detection manifest")
+            );
             skipped += 1;
             continue;
         }
@@ -664,9 +704,11 @@ fn update_manifest() -> Result<()> {
         written += 1;
     }
     println!(
-        "updated {written} detection manifest(s){} -> {}",
+        "{} {written} {}{} -> {}",
+        context.text("updated"),
+        context.text("detection manifest(s)"),
         if skipped > 0 {
-            format!(", {skipped} skipped")
+            format!(", {skipped} {}", context.text("skipped"))
         } else {
             String::new()
         },
@@ -681,55 +723,72 @@ fn update_manifest() -> Result<()> {
                 .and_then(|r| r.get("rules"))
                 .and_then(|x| x.as_u64())
                 .unwrap_or(0);
-            println!("reloaded into the running server ({n} rules active) - no restart needed");
+            println!(
+                "{} ({n} {}) - {}",
+                context.text("reloaded into the running server"),
+                context.text("rules active"),
+                context.text("no restart needed")
+            );
         }
-        Err(_) => println!("no server running - the update loads on next start"),
+        Err(_) => println!(
+            "{}",
+            context.text("no server running - the update loads on next start")
+        ),
     }
     Ok(())
 }
 
 /// Spawn the detached server if one isn't already up.
-fn server_start() -> Result<()> {
+fn server_start(context: i18n::cli::Context) -> Result<()> {
     let sock = persist::client_socket_path();
     if server_running(&sock) {
-        println!(
-            "luvus server already running (session {})",
-            session::display_name()
-        );
+        print_server_card(context, context.text("running"), None, &sock);
         return Ok(());
     }
     spawn_server()?;
     wait_for_socket(&sock)?;
-    println!("luvus server started (session {})", session::display_name());
+    print_server_card(
+        context,
+        context.text("started"),
+        Some(env!("LUVUS_VERSION_LABEL")),
+        &sock,
+    );
     Ok(())
 }
 
-fn server_stop() -> Result<()> {
+fn server_stop(context: i18n::cli::Context) -> Result<()> {
     let sock = persist::client_socket_path();
     if send_server_stop()? {
         // The server acks before it actually exits, so wait for it to release the
         // socket — then `stop` returning means it's really down (and a following
         // `status` reports "not running", not a half-shutdown "running").
         wait_for_server_shutdown(&sock)?;
-        println!("luvus server stopped (session {})", session::display_name());
+        print_server_card(context, context.text("server stopped"), None, &sock);
     } else {
-        println!("no luvus server running");
+        print_server_card(
+            context,
+            context.text("no luvus server running"),
+            None,
+            &sock,
+        );
     }
     Ok(())
 }
 
 /// Stop (if running), wait for the socket to close, then start a fresh server —
 /// the way to load a newly-installed binary without rebooting a live session.
-fn server_restart() -> Result<()> {
+fn server_restart(context: i18n::cli::Context) -> Result<()> {
     let sock = persist::client_socket_path();
     if send_server_stop()? {
         wait_for_server_shutdown(&sock)?;
     }
     spawn_server()?;
     wait_for_socket(&sock)?;
-    println!(
-        "luvus server restarted (session {})",
-        session::display_name()
+    print_server_card(
+        context,
+        context.text("restarted"),
+        Some(env!("LUVUS_VERSION_LABEL")),
+        &sock,
     );
     Ok(())
 }
@@ -752,35 +811,66 @@ pub(crate) fn wait_for_server_shutdown(sock: &Path) -> Result<()> {
 
 /// Report whether a server is up and, if so, the version it's *running* — which
 /// can differ from this binary when a new install hasn't been restarted yet.
-fn server_status() -> Result<()> {
+fn server_status(context: i18n::cli::Context) -> Result<()> {
     let sock = persist::client_socket_path();
     if !server_running(&sock) {
-        println!(
-            "luvus server: not running (session {})",
-            session::display_name()
-        );
+        print_server_card(context, context.text("not running"), None, &sock);
         return Ok(());
     }
     match server_version() {
         Ok(running) => {
-            println!(
-                "luvus server: running (v{running}, session {})",
-                session::display_name()
-            );
+            print_server_card(context, context.text("running"), Some(&running), &sock);
+            // The build label, not the bare semver: `server_version` reports the
+            // label, so comparing against `CARGO_PKG_VERSION` would find every
+            // fork build "stale" — they all carry upstream's version.
             let binary = env!("LUVUS_VERSION_LABEL");
             if running != binary {
                 println!(
-                    "  note: this binary is v{binary} — run `luvus server restart` to load it"
+                    "  {} v{binary} — {}",
+                    context.text("note: this binary is"),
+                    context.text("run `luvus server restart` to load it")
                 );
             }
         }
         Err(error) => {
             return Err(anyhow!(
-                "luvus server is running but did not answer: {error}"
+                "luvus {}: {error}",
+                context.text("server is running but did not answer")
             ));
         }
     }
     Ok(())
+}
+
+fn print_server_card(
+    context: i18n::cli::Context,
+    state: &str,
+    version: Option<&str>,
+    socket: &Path,
+) {
+    let session = session::display_name();
+    let socket = socket.display().to_string();
+    let version = version.map(|value| format!("v{value}"));
+    let mut rows = vec![
+        (context.text("status"), state),
+        (context.text("session"), session.as_str()),
+    ];
+    if let Some(version) = version.as_deref() {
+        rows.push((context.text("version"), version));
+    }
+    rows.push((context.text("socket"), socket.as_str()));
+    cli::print_status_card("Luvus server", &rows);
+}
+
+fn print_detached_status(context: i18n::cli::Context) {
+    let session = session::display_name();
+    let runtime = format!("{} + {}", context.text("server"), context.text("panes"));
+    let rows = [
+        (context.text("status"), context.text("detached")),
+        (context.text("session"), session.as_str()),
+        (runtime.as_str(), context.text("running")),
+    ];
+    cli::print_status_card("Luvus session", &rows);
 }
 
 /// Send `server.stop` to a running server; returns whether one was present.
@@ -849,9 +939,9 @@ fn server_control_request(method: &str) -> Result<serde_json::Value> {
     Ok(response)
 }
 
-/// Returns whether the session asked to restart onto the installed binary, so
-/// the caller can replace this process once the terminal is back to normal.
-fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
+/// Returns how the session ended, so the caller can replace this process, print
+/// the detached card, or simply return — once the terminal is back to normal.
+fn run(terminal: &mut DefaultTerminal) -> Result<LocalExit> {
     let (tx, rx) = mpsc::channel::<AppEvent>();
 
     let size = terminal.size()?;
@@ -995,8 +1085,17 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
         app.rearm_pty_notify();
     }
 
+    let detached = app.detach_requested;
+    let relaunch = app.relaunch_requested;
     persist::save(&app);
-    Ok(app.relaunch_requested)
+    // Relaunch wins: a restart also leaves the session detached in every sense
+    // that matters, and printing "detached" before replacing the process would
+    // be a farewell to a session that is coming straight back.
+    Ok(match (relaunch, detached) {
+        (true, _) => LocalExit::Relaunch,
+        (false, true) => LocalExit::Detached,
+        (false, false) => LocalExit::Done,
+    })
 }
 
 /// Clean up a just-bound Unix socket before a local startup aborts. The caller
@@ -1328,6 +1427,44 @@ mod tests {
         let client_blit = t.elapsed() / n;
         println!("    CLIENT old re-blit:{client_blit:>10?}  (terminal.draw full frame — REMOVED; client now writes only changed cells)");
         println!();
+    }
+
+    /// Focused docs/100 check: compare forced desktop/mobile frames at the same
+    /// viewport and measure the full-screen navigator separately. It intentionally
+    /// performs no IO and creates no background task.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn bench_mobile_render_hotpath() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let render = |label: &str, app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(64, 35)).unwrap();
+            terminal.draw(|frame| ui::render(frame, app)).unwrap();
+            let frames = 5_000u32;
+            let started = Instant::now();
+            for _ in 0..frames {
+                terminal.draw(|frame| ui::render(frame, app)).unwrap();
+            }
+            let elapsed = started.elapsed();
+            println!("{label:>18}: {:>10?}/frame", elapsed / frames);
+            elapsed / frames
+        };
+
+        let (tx, _rx) = mpsc::channel::<AppEvent>();
+        let mut desktop = App::new(64, 35, tx.clone()).unwrap();
+        desktop.config.layout.mobile_width = 0;
+        let desktop_frame = render("desktop 64x35", &mut desktop);
+
+        let mut mobile = App::new(64, 35, tx).unwrap();
+        let mobile_frame = render("mobile closed", &mut mobile);
+        mobile.open_switcher();
+        let navigator_frame = render("mobile navigator", &mut mobile);
+
+        println!(
+            "mobile/desktop: {:.3}x, navigator/desktop: {:.3}x",
+            mobile_frame.as_secs_f64() / desktop_frame.as_secs_f64(),
+            navigator_frame.as_secs_f64() / desktop_frame.as_secs_f64(),
+        );
     }
 
     #[test]
@@ -2055,13 +2192,18 @@ mod tests {
             "the last reference block (Mouse) is reachable:\n{bottom}"
         );
         // Copy & paste is its own labeled section (just above Mouse), so a user
-        // looking for it finds it — scroll up a little from the bottom.
-        for _ in 0..8 {
+        // looking for it can reach it even when reference row counts change.
+        let mut reference_view = bottom;
+        for _ in 0..app.settings_rows(crate::app::SettingsTab::Keys) {
+            if reference_view.contains("Copy & paste") {
+                break;
+            }
             app.handle_settings_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+            reference_view = screen(&mut app);
         }
         assert!(
-            screen(&mut app).contains("Copy & paste"),
-            "there is a Copy & paste reference block"
+            reference_view.contains("Copy & paste"),
+            "there is a Copy & paste reference block:\n{reference_view}"
         );
 
         // The mouse wheel scrolls the list (moves the selection) without the arrows.

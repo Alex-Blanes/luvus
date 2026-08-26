@@ -40,7 +40,7 @@ mod switcher;
 
 pub use search::{GlobalSearch, SearchFlash};
 
-pub use keys::{key_reference_rows, presets, Cmd, PrefixSpec, KEY_REFERENCE};
+pub use keys::{key_reference_rows, presets, Cmd, PrefixSpec};
 pub use modules::ModuleMenuAction;
 pub use picker::{FolderPicker, PickerHit, Row};
 pub use settings::{
@@ -530,10 +530,9 @@ pub enum WsMenuItem {
     Module(usize),
 }
 
-/// Below this many columns the UI switches to **compact (touch) mode** (docs/18):
-/// one full-screen pane instead of tiling + sidebars, with a `≡` switcher button.
-/// A phone in portrait is ~30–45 cols; landscape and desktops sit well above.
-pub const COMPACT_WIDTH: u16 = 50;
+/// At or below this many columns the UI uses the automatic mobile presentation
+/// (docs/100). The threshold is inclusive and configurable per installation.
+pub const MOBILE_WIDTH: u16 = 64;
 
 /// A destination in the touch **switcher** overlay (docs/18): jump to a pane,
 /// switch nodes, or make a new one. Big tap targets for a phone.
@@ -547,6 +546,11 @@ pub enum SwitcherTarget {
     },
     Workspace(usize),
     NewWorkspace,
+    NewTab,
+    Settings,
+    MissionControl,
+    Version,
+    Exit,
 }
 
 /// One rendered row of the switcher — a section header or a tappable item.
@@ -574,6 +578,7 @@ pub enum SwitcherRow {
     Action {
         target: SwitcherTarget,
         label: String,
+        detail: String,
     },
 }
 
@@ -1160,14 +1165,55 @@ pub struct LinkPress {
     pub at: (u16, u16),
 }
 
-/// A drag text-selection inside a pane. Coordinates are **terminal** cells; the
-/// pane's `content` rect maps them to grid positions for extraction/highlight.
+/// A drag text-selection inside a pane. Screen coordinates keep native file
+/// views aligned with their renderer. Terminal panes additionally store stable
+/// retained-history coordinates, so scrolling the viewport cannot move either
+/// endpoint onto different text.
 #[derive(Clone, Copy)]
 pub struct Selection {
     pub pane: PaneId,
     pub content: Rect,
     pub anchor: (u16, u16),
     pub cursor: (u16, u16),
+    pub retained: Option<RetainedSelection>,
+    /// The active gesture deliberately moved the retained endpoint by wheel.
+    /// Incoming PTY output may also remap retained coordinates, but must never
+    /// turn a stationary click into a copied range.
+    pub scrolled: bool,
+    pub dragging: bool,
+}
+
+/// Mouse-selection endpoints in the same absolute retained-row coordinate
+/// space used by keyboard copy mode (oldest retained row is zero).
+#[derive(Clone, Copy)]
+pub struct RetainedSelection {
+    pub anchor: (usize, usize),
+    pub cursor: (usize, usize),
+}
+
+impl RetainedSelection {
+    pub(crate) fn ordered(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.cursor {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
+
+    pub(crate) fn contains(&self, row: usize, col: usize, width: usize) -> bool {
+        let ((sr, sc), (er, ec)) = self.ordered();
+        if row < sr || row > er {
+            return false;
+        }
+        let middle_left = sc.min(ec);
+        let left = if row == sr { sc } else { middle_left };
+        let right = if row == er {
+            ec
+        } else {
+            width.saturating_sub(1)
+        };
+        col >= left && col <= right
+    }
 }
 
 /// An in-progress pane-divider resize drag (docs/27, RESIZE-2): the split node
@@ -1223,6 +1269,10 @@ impl Selection {
     /// True only when the drag actually moved (so a plain click isn't a copy).
     fn has_range(&self) -> bool {
         self.anchor != self.cursor
+            || (self.scrolled
+                && self
+                    .retained
+                    .is_some_and(|selection| selection.anchor != selection.cursor))
     }
 }
 
@@ -1643,8 +1693,15 @@ pub struct App {
     pub switcher_rects: Vec<(SwitcherTarget, Rect)>,
     /// The scope chips' rects (docs/65), set by the renderer for click-to-switch.
     pub switcher_scope_rects: Vec<(SwitcherScope, Rect)>,
-    /// The `≡` switcher button's rect (compact mode), for tap hit-testing.
+    /// The mobile MENU button's rect, for tap hit-testing.
     pub switcher_button_rect: Option<Rect>,
+    /// Previous/next pane halves of the mobile header's second row. They are
+    /// present only when the active tab contains more than one pane.
+    pub mobile_pane_prev_rect: Option<Rect>,
+    pub mobile_pane_next_rect: Option<Rect>,
+    /// The mobile navigator's explicit CLOSE button. Desktop switcher palettes
+    /// do not set this geometry.
+    pub switcher_close_rect: Option<Rect>,
     /// The global scrollback-search overlay (docs/63). `Some` => it owns input.
     pub search: Option<GlobalSearch>,
     /// A brief highlight of the line a search jump landed on (docs/63).
@@ -1720,8 +1777,6 @@ pub struct App {
     pub dock_drag: Option<(Side, usize)>,
     /// The divider the pointer is over, so it lights up before you grab it.
     pub hover_dock_divider: Option<(Side, usize)>,
-    /// Clickable git-branch text per workspace (opens the git tab — docs/17).
-    pub workspace_branch_rects: Vec<(usize, Rect)>,
     /// Clickable view-selector tabs in the active git tab (Commits/Flow/…).
     pub git_section_rects: Vec<(crate::git::Section, Rect)>,
     /// The filter toggle in the AGENTS header (which filter each segment picks).
@@ -2047,6 +2102,9 @@ impl App {
             switcher_rects: Vec::new(),
             switcher_scope_rects: Vec::new(),
             switcher_button_rect: None,
+            mobile_pane_prev_rect: None,
+            mobile_pane_next_rect: None,
+            switcher_close_rect: None,
             last_active_ws_shown: 0,
             hover: None,
             app_tx,
@@ -2064,7 +2122,6 @@ impl App {
             last_main_area: Rect::ZERO,
             tab_rects: Vec::new(),
             ws_rects: Vec::new(),
-            workspace_branch_rects: Vec::new(),
             git_section_rects: Vec::new(),
             agents_filter_rects: Vec::new(),
             agent_rects: Vec::new(),
@@ -2596,6 +2653,9 @@ impl App {
             switcher_rects: Vec::new(),
             switcher_scope_rects: Vec::new(),
             switcher_button_rect: None,
+            mobile_pane_prev_rect: None,
+            mobile_pane_next_rect: None,
+            switcher_close_rect: None,
             last_active_ws_shown: 0,
             hover: None,
             app_tx,
@@ -2613,7 +2673,6 @@ impl App {
             last_main_area: Rect::ZERO,
             tab_rects: Vec::new(),
             ws_rects: Vec::new(),
-            workspace_branch_rects: Vec::new(),
             git_section_rects: Vec::new(),
             agents_filter_rects: Vec::new(),
             agent_rects: Vec::new(),
@@ -2982,6 +3041,37 @@ impl App {
             .unwrap_or_else(|| self.ws().cwd.clone())
     }
 
+    /// The ordered chain of directories a newly opened tab or split may start
+    /// in: the first that still exists is where it lands, and the rest are
+    /// fallbacks the deferred worker retries if that directory vanishes before
+    /// it forks. By default the chain is the focused pane's live cwd, then the
+    /// workspace root, then `$HOME`, so a new pane starts where the user is
+    /// working; with `layout.new_pane_to_workspace_root` set it starts at the
+    /// workspace root instead. Only existing directories are kept (de-duplicated,
+    /// order preserved), so a deleted workspace root is never handed back as a
+    /// dead cwd; `$HOME` anchors the chain when nothing nearer survives, matching
+    /// the synchronous spawn path's own fallback. Shared by `new_tab` and `split`
+    /// so the two stay aligned.
+    fn spawn_cwds(&self) -> Vec<PathBuf> {
+        let home = crate::platform::home_dir().unwrap_or_default();
+        let root = self.ws().cwd.clone();
+        let ordered = if self.config.layout.new_pane_to_workspace_root {
+            vec![root, home.clone()]
+        } else {
+            vec![self.focused_cwd(), root, home.clone()]
+        };
+        let mut chain: Vec<PathBuf> = Vec::new();
+        for candidate in ordered {
+            if candidate.is_dir() && !chain.contains(&candidate) {
+                chain.push(candidate);
+            }
+        }
+        if chain.is_empty() {
+            chain.push(home);
+        }
+        chain
+    }
+
     // ── mutations ─────────────────────────────────────────────────────────────
 
     fn spawn_into(&mut self, cwd: PathBuf) -> Option<PaneId> {
@@ -3008,9 +3098,28 @@ impl App {
                     "pane.created",
                     serde_json::json!({"pane": id.0.to_string()}),
                 );
+                crate::logging::event(
+                    crate::logging::EventKind::PaneOpen,
+                    &[
+                        crate::logging::Field::PaneId(u64::from(id.0)),
+                        crate::logging::Field::SpawnKind(crate::logging::SpawnKind::Shell),
+                    ],
+                );
                 Some(id)
             }
-            Err(_) => None,
+            Err(_) => {
+                crate::logging::event(
+                    crate::logging::EventKind::PtySpawnFailed,
+                    &[
+                        crate::logging::Field::PaneId(u64::from(id.0)),
+                        crate::logging::Field::SpawnKind(crate::logging::SpawnKind::Shell),
+                        crate::logging::Field::ErrorCode(
+                            crate::logging::SafeId::new("pty").expect("static id is valid"),
+                        ),
+                    ],
+                );
+                None
+            }
         }
     }
 
@@ -3019,7 +3128,7 @@ impl App {
     /// Used only where synchronous failure reporting is not required — the
     /// sync `spawn_into` keeps `workspace.open`'s "shell failed to start"
     /// contract.
-    fn spawn_into_deferred(&mut self, cwd: PathBuf) -> Option<PaneId> {
+    fn spawn_into_deferred(&mut self, cwd: PathBuf, fallback_cwds: &[PathBuf]) -> Option<PaneId> {
         let id = PaneId::alloc();
         let shell = crate::platform::resolve_shell(&self.config.shell);
         let history_budget_bytes = self.config.scrollback_bytes();
@@ -3028,6 +3137,7 @@ impl App {
             80,
             24,
             cwd,
+            fallback_cwds,
             self.app_tx.clone(),
             &shell,
             history_budget_bytes,
@@ -3089,15 +3199,42 @@ impl App {
                     "pane.created",
                     serde_json::json!({"pane": id.0.to_string()}),
                 );
+                crate::logging::event(
+                    crate::logging::EventKind::PaneOpen,
+                    &[
+                        crate::logging::Field::PaneId(u64::from(id.0)),
+                        crate::logging::Field::SpawnKind(crate::logging::SpawnKind::Resume),
+                    ],
+                );
                 Some(id)
             }
-            Err(_) => None,
+            Err(_) => {
+                crate::logging::event(
+                    crate::logging::EventKind::PtySpawnFailed,
+                    &[
+                        crate::logging::Field::PaneId(u64::from(id.0)),
+                        crate::logging::Field::SpawnKind(crate::logging::SpawnKind::Resume),
+                        crate::logging::Field::ErrorCode(
+                            crate::logging::SafeId::new("pty").expect("static id is valid"),
+                        ),
+                    ],
+                );
+                None
+            }
         }
     }
 
     fn split(&mut self, axis: Axis) {
-        let cwd = self.focused_cwd();
-        if let Some(id) = self.spawn_into_deferred(cwd) {
+        // Resolve the candidate chain up front (focused pane → workspace root →
+        // $HOME, existing only) and hand the primary plus its fallbacks to the
+        // deferred worker. If the primary is deleted in the race window before
+        // the fork, the worker retries the fallbacks instead of spawning a dead
+        // pane; the chain is never empty, so the `else` here is unreachable.
+        let cwds = self.spawn_cwds();
+        let Some((cwd, fallback_cwds)) = cwds.split_first() else {
+            return;
+        };
+        if let Some(id) = self.spawn_into_deferred(cwd.clone(), fallback_cwds) {
             self.layout_mut().split_focused(axis, id);
         }
     }
@@ -3221,14 +3358,27 @@ impl App {
     }
 
     fn new_tab(&mut self) {
-        // A new tab opens at the workspace's **static** folder (not wherever the
-        // current pane has `cd`'d), matching the static-workspace model.
-        let cwd = self.ws().cwd.clone();
+        // A new tab starts where the user is: the first existing directory in the
+        // candidate chain (focused pane's cwd → workspace root → $HOME), the same
+        // way `split` and `new_workspace` do, or the workspace root when
+        // `layout.new_pane_to_workspace_root` is set. The synchronous spawn path
+        // falls back to $HOME internally, so the chain's head is enough here. The
+        // workspace root itself stays fixed, so the static-workspace model holds.
+        let Some(cwd) = self.spawn_cwds().into_iter().next() else {
+            return;
+        };
         if let Some(id) = self.spawn_into(cwd) {
             let ws = &mut self.workspaces[self.active_ws];
             ws.tabs.push(Tab::panes(TileLayout::new(id)));
             ws.active_tab = ws.tabs.len() - 1;
             let tab = self.ws().active_tab + 1;
+            crate::logging::event(
+                crate::logging::EventKind::TabOpen,
+                &[
+                    crate::logging::Field::WorkspaceIndex(self.active_ws as u64),
+                    crate::logging::Field::TabIndex((tab - 1) as u64),
+                ],
+            );
             self.emit_event("tab.created", serde_json::json!({"tab": tab.to_string()}));
         }
     }
@@ -3336,6 +3486,10 @@ impl App {
         self.emit_event(
             "workspace.created",
             serde_json::json!({"workspace": ws.to_string()}),
+        );
+        crate::logging::event(
+            crate::logging::EventKind::WorkspaceOpen,
+            &[crate::logging::Field::WorkspaceIndex(ws as u64)],
         );
         true
     }
@@ -4970,17 +5124,24 @@ impl App {
         self.layout_mut().focus_dir(area, dir);
     }
 
-    /// Cycle focus to the next pane in the current tab, in leaf order, wrapping
-    /// at the end (tmux's `o`). A no-op with fewer than two panes.
-    fn focus_next_pane(&mut self) {
+    /// Cycle focus within the current tab's leaf order, wrapping at both ends.
+    /// Used by tmux-style `o` and the mobile header's previous/next halves.
+    fn cycle_pane(&mut self, delta: isize) {
         let leaves = self.layout().leaves();
         if leaves.len() < 2 {
             return;
         }
         let focus = self.layout().focus;
         let idx = leaves.iter().position(|&id| id == focus).unwrap_or(0);
-        let next = leaves[(idx + 1) % leaves.len()];
+        let len = leaves.len() as isize;
+        let next = leaves[((idx as isize + delta) % len + len) as usize % leaves.len()];
         self.layout_mut().focus = next;
+        self.scroll_pane = None;
+        self.mode = Mode::Normal;
+    }
+
+    fn focus_next_pane(&mut self) {
+        self.cycle_pane(1);
     }
 
     // ── pane resize (docs/27) ───────────────────────────────────────────────
@@ -5252,6 +5413,10 @@ impl App {
         if self.copy_mode.is_some_and(|copy| copy.pane == id) {
             self.copy_mode = None; // the pane is gone; there is no viewport to restore
         }
+        crate::logging::event(
+            crate::logging::EventKind::PaneClose,
+            &[crate::logging::Field::PaneId(u64::from(id.0))],
+        );
     }
 
     fn close_pane(&mut self, id: PaneId) {
@@ -5283,9 +5448,22 @@ impl App {
     }
 
     fn close_active_tab(&mut self) {
+        let workspace_index = self.active_ws;
         let ws = &mut self.workspaces[self.active_ws];
+        let tab_index = ws.active_tab;
+        let mut removed = false;
         if ws.active_tab < ws.tabs.len() {
             ws.tabs.remove(ws.active_tab);
+            removed = true;
+        }
+        if removed {
+            crate::logging::event(
+                crate::logging::EventKind::TabClose,
+                &[
+                    crate::logging::Field::WorkspaceIndex(workspace_index as u64),
+                    crate::logging::Field::TabIndex(tab_index as u64),
+                ],
+            );
         }
         if ws.tabs.is_empty() {
             self.close_active_ws();
@@ -5295,6 +5473,8 @@ impl App {
     }
 
     fn close_active_ws(&mut self) {
+        let workspace_index = self.active_ws;
+        let mut removed = false;
         if self.active_ws < self.workspaces.len() {
             let closed_workspace_id = self.workspaces[self.active_ws].id.clone();
             if self.workspaces.len() > 1 {
@@ -5310,6 +5490,15 @@ impl App {
             }
             self.clear_workspace_transients(&closed_workspace_id);
             self.workspaces.remove(self.active_ws);
+            removed = true;
+        }
+        if removed {
+            crate::logging::event(
+                crate::logging::EventKind::WorkspaceClose,
+                &[crate::logging::Field::WorkspaceIndex(
+                    workspace_index as u64,
+                )],
+            );
         }
         if self.workspaces.is_empty() {
             self.all_workspaces_closed();
@@ -5381,6 +5570,10 @@ impl App {
             "workspace.closed",
             serde_json::json!({"workspace": index.to_string()}),
         );
+        crate::logging::event(
+            crate::logging::EventKind::WorkspaceClose,
+            &[crate::logging::Field::WorkspaceIndex(index as u64)],
+        );
     }
 
     /// Dismiss deferred UI actions whose stable target is being removed.
@@ -5399,6 +5592,7 @@ impl App {
 
     /// Close a tab and all its panes (the "X" button / prefix+X).
     fn close_tab(&mut self, index: usize) {
+        let workspace_index = self.active_ws;
         let ids: Vec<PaneId> = {
             let ws = &self.workspaces[self.active_ws];
             if index >= ws.tabs.len() {
@@ -5422,6 +5616,13 @@ impl App {
         self.emit_event(
             "tab.closed",
             serde_json::json!({"tab": (index + 1).to_string()}),
+        );
+        crate::logging::event(
+            crate::logging::EventKind::TabClose,
+            &[
+                crate::logging::Field::WorkspaceIndex(workspace_index as u64),
+                crate::logging::Field::TabIndex(index as u64),
+            ],
         );
     }
 }
@@ -5570,6 +5771,56 @@ mod tests {
     use std::sync::mpsc;
 
     use crate::persist::TEST_ENV_LOCK as ENV_GUARD;
+
+    /// The new-pane cwd resolver hands back the chain of directories that still
+    /// exist, in preference order, and never a directory it has already found
+    /// missing. Regression for `spawn_cwd`'s old `unwrap_or(root)`, which
+    /// returned the workspace root even after it failed the existence check.
+    #[test]
+    fn spawn_cwds_skips_missing_dirs_and_anchors_on_home() {
+        let _env = crate::persist::test_env("spawn-cwds");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+
+        let home = crate::platform::home_dir().expect("the test host has a home directory");
+        let missing = std::env::temp_dir().join(format!("luvus-missing-{}", std::process::id()));
+
+        // Both the workspace root and the focused pane's live cwd point at a
+        // directory that no longer exists.
+        app.workspaces[app.active_ws].cwd = missing.clone();
+        let focus = app.layout().focus;
+        app.panes
+            .get_mut(&focus)
+            .expect("the first pane exists")
+            .cwd = missing.clone();
+
+        let chain = app.spawn_cwds();
+        assert!(
+            !chain.contains(&missing),
+            "a deleted directory is never handed back: {chain:?}"
+        );
+        assert!(
+            chain.iter().all(|dir| dir.is_dir()),
+            "every candidate in the chain still exists: {chain:?}"
+        );
+        assert_eq!(
+            chain.last(),
+            Some(&home),
+            "the chain anchors on $HOME when nothing nearer survives: {chain:?}"
+        );
+
+        // With the opt-out set, an existing workspace root leads the chain and
+        // the focused pane's cwd is not consulted.
+        let root = std::env::temp_dir();
+        app.config.layout.new_pane_to_workspace_root = true;
+        app.workspaces[app.active_ws].cwd = root.clone();
+        let chain = app.spawn_cwds();
+        assert_eq!(
+            chain.first(),
+            Some(&root),
+            "root-first when the opt-out is on: {chain:?}"
+        );
+    }
 
     /// A worktree groups directly under the node it branched from, wherever that
     /// parent sits in the list — not at the worktree's raw creation position.
@@ -6001,6 +6252,9 @@ mod tests {
             content,
             anchor: (4, 1),
             cursor: (6, 3),
+            retained: None,
+            scrolled: false,
+            dragging: false,
         };
         // First row: from the anchor column to the right edge.
         assert!(sel.contains(4, 1));
@@ -6244,6 +6498,9 @@ mod tests {
         use ratatui::Terminal;
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
+        // This test covers the desktop tab strip. Automatic mobile presentation
+        // intentionally replaces it at this width.
+        app.config.layout.mobile_width = 0;
         // Add enough tabs to overflow a narrow tab bar.
         for _ in 0..4 {
             app.handle_event(key(' ', KeyModifiers::CONTROL));
@@ -8032,6 +8289,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clicking_workspace_branch_text_focuses_workspace_without_opening_git() {
+        let _env = crate::persist::test_env("workspace-branch-display-only");
+        use crate::event::AppEvent;
+        use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::Terminal;
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.workspaces[0].name = "target".into();
+        app.workspaces[0].branch = Some("feat/branch".into());
+        assert!(app.create_workspace_at(std::env::current_dir().unwrap().join("src")));
+        assert_ne!(app.active_ws, 0, "the second workspace starts focused");
+
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let row = app
+            .ws_rects
+            .iter()
+            .find(|(index, _)| *index == 0)
+            .map(|(_, rect)| *rect)
+            .expect("the target workspace row is visible");
+        let branch_column = row.x + 6 + crate::ui::display_width("target") as u16;
+
+        app.handle_event(AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: branch_column,
+            row: row.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+
+        assert_eq!(app.active_ws, 0, "the row focuses the target workspace");
+        assert_eq!(app.workspaces[0].tabs.len(), 1, "no Git tab was created");
+        assert!(
+            !app.workspaces[0].tabs[0].is_git(),
+            "the existing terminal tab stays active"
+        );
+    }
+
     /// Stability guard for the whole dock system (docs/29): whatever a dock — a
     /// built-in *or* a user module dock — leaves in the app's click geometry, one
     /// frame where that dock isn't drawn (its sidebar hidden) must zero it, so no
@@ -8055,7 +8353,6 @@ mod tests {
         app.files_area = junk;
         app.file_tree_rects = vec![(0, junk)];
         app.agents_filter_rects = vec![(AgentsFilter::Active, junk)];
-        app.workspace_branch_rects = vec![(0, junk)];
         app.module_dock_rects = vec![("example.buzz".into(), 0, junk)]; // a user module dock
 
         // Hide both sidebars so no dock draws this frame — the worst stale case.
@@ -8070,10 +8367,6 @@ mod tests {
         assert_eq!(app.files_area, Rect::ZERO, "FILES area cleared");
         assert!(app.file_tree_rects.is_empty(), "FILES row rects cleared");
         assert!(app.agents_filter_rects.is_empty(), "AGENTS filter cleared");
-        assert!(
-            app.workspace_branch_rects.is_empty(),
-            "branch rects cleared"
-        );
         assert!(
             app.module_dock_rects.is_empty(),
             "user module dock rects cleared — a stale module dock can't fire"
@@ -10967,6 +11260,93 @@ mod tests {
         send(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
         assert!(app.copy_mode.is_none(), "q cancels copy mode");
         assert_eq!(offset(&app), saved, "cancel restores the prior viewport");
+    }
+
+    #[test]
+    fn keyboard_copy_mode_navigates_and_yanks_wide_cells() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(40, 8, tx).unwrap();
+        let pane = app.layout().focus;
+        app.panes
+            .get(&pane)
+            .expect("pane")
+            .engine
+            .lock()
+            .expect("engine")
+            .advance("\x1b[H\x1b[2J你好，hello.".as_bytes());
+        let mut target_row = None;
+        app.panes
+            .get(&pane)
+            .expect("pane")
+            .for_each_retained_row(&mut |row, _, _, text| {
+                if text == "你好，hello." {
+                    target_row = Some(row);
+                }
+            });
+        let row = target_row.expect("fixture row");
+        app.copy_mode = Some(CopyMode {
+            pane,
+            anchor: (row, 0),
+            cursor: (row, 0),
+            saved_scroll: 0,
+        });
+
+        for _ in 0..3 {
+            app.handle_event(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char('l'),
+                KeyModifiers::NONE,
+            )));
+        }
+        assert_eq!(app.copy_mode.expect("copy mode").cursor, (row, 3));
+        app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+        )));
+
+        assert_eq!(app.pending_clipboard.as_deref(), Some("你好"));
+    }
+
+    #[test]
+    fn keyboard_copy_word_navigation_uses_visual_columns() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(40, 8, tx).unwrap();
+        let pane = app.layout().focus;
+        app.panes
+            .get(&pane)
+            .expect("pane")
+            .engine
+            .lock()
+            .expect("engine")
+            .advance("\x1b[H\x1b[2J你好 world".as_bytes());
+        let mut target_row = None;
+        app.panes
+            .get(&pane)
+            .expect("pane")
+            .for_each_retained_row(&mut |row, _, _, text| {
+                if text == "你好 world" {
+                    target_row = Some(row);
+                }
+            });
+        let row = target_row.expect("fixture row");
+        app.copy_mode = Some(CopyMode {
+            pane,
+            anchor: (row, 0),
+            cursor: (row, 0),
+            saved_scroll: 0,
+        });
+
+        let send = |app: &mut App, character| {
+            app.handle_event(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            )));
+        };
+        send(&mut app, 'w');
+        assert_eq!(app.copy_mode.expect("copy mode").cursor, (row, 5));
+        send(&mut app, 'B');
+        assert_eq!(app.copy_mode.expect("copy mode").cursor, (row, 0));
+        send(&mut app, '$');
+        assert_eq!(app.copy_mode.expect("copy mode").cursor, (row, 9));
     }
 
     #[test]

@@ -92,6 +92,7 @@ pub enum LayoutRow {
     ColGap,
     RowGap,
     Scrollback,
+    MobileWidth,
     PaneTitles,
     PaneTitlePath,
     ResumeWs,
@@ -125,6 +126,9 @@ pub enum GeneralRow {
     AutoUpdate,
     /// Replay each agent's own CLI options on resume (docs/62).
     ResumeFlags,
+    /// Open a new tab/split at the workspace root instead of inheriting the
+    /// focused pane's cwd.
+    NewPaneToWorkspaceRoot,
     /// Show each agent's live session title in the AGENTS sidebar.
     AgentTitle,
     SoundDone,
@@ -154,6 +158,7 @@ impl App {
             GeneralRow::CheckUpdates,
             GeneralRow::AutoUpdate,
             GeneralRow::ResumeFlags,
+            GeneralRow::NewPaneToWorkspaceRoot,
             GeneralRow::AgentTitle,
             GeneralRow::SoundDone,
             GeneralRow::SoundBlocked,
@@ -165,6 +170,8 @@ impl App {
     /// goes), mirroring `dock_section_start` in the Layout tab. Derived from the
     /// row list rather than hard-coded: it was a literal `5`, and every option
     /// added above the divider silently moved the divider onto the wrong row.
+    /// Upstream has since bumped that literal to `6` for the same reason, which
+    /// is the bug arriving on schedule rather than the fix.
     pub fn general_section_start(&self) -> usize {
         self.general_rows()
             .iter()
@@ -179,6 +186,7 @@ impl App {
             LayoutRow::ColGap,
             LayoutRow::RowGap,
             LayoutRow::Scrollback,
+            LayoutRow::MobileWidth,
             LayoutRow::PaneTitles,
             LayoutRow::PaneTitlePath,
             LayoutRow::ResumeWs,
@@ -305,7 +313,7 @@ impl App {
                     return;
                 }
                 let Some(spec) = Self::prefix_spec_from_key(&key) else {
-                    self.show_toast("Use F1-F12 or a Ctrl/Alt chord");
+                    self.show_toast(self.catalog.settings.keys_invalid_prefix);
                     return;
                 };
                 if prefix_candidate.as_deref() == Some(spec.as_str()) {
@@ -321,7 +329,12 @@ impl App {
                     if let Some(ui) = self.settings.as_mut() {
                         ui.prefix_candidate = Some(spec);
                     }
-                    self.show_toast(format!("Press {label} again to confirm"));
+                    self.show_toast(
+                        self.catalog
+                            .settings
+                            .keys_confirm_prefix
+                            .replace("{key}", &label),
+                    );
                 }
                 return;
             }
@@ -436,6 +449,7 @@ impl App {
                     self.layout_rows().get(i),
                     Some(LayoutRow::SidebarWidth)
                         | Some(LayoutRow::RightWidth)
+                        | Some(LayoutRow::MobileWidth)
                         | Some(LayoutRow::DiffContext)
                         | Some(LayoutRow::Dock(_))
                         | Some(LayoutRow::Bar(_))
@@ -824,7 +838,7 @@ impl App {
             )
         });
         if !removable {
-            self.show_toast(format!("Theme {id} is bundled and cannot be removed"));
+            self.show_toast(self.catalog.settings.theme_bundled.replace("{id}", id));
             return;
         }
 
@@ -844,7 +858,7 @@ impl App {
             .insert(id.to_string(), restore);
         let tx = self.app_tx.clone();
         let id = id.to_string();
-        self.show_toast(format!("Removing theme {id}…"));
+        self.show_toast(self.catalog.settings.theme_removing.replace("{id}", &id));
         std::thread::spawn(move || {
             let result = crate::theme::install::uninstall(&id)
                 .map(|_| crate::theme::ThemeRegistry::load())
@@ -866,7 +880,7 @@ impl App {
                 self.settings_theme_remove_rects
                     .retain(|(theme_id, _)| theme_id != &id);
                 self.clamp_settings_cursor();
-                self.show_toast(format!("Removed theme {id}"));
+                self.show_toast(self.catalog.settings.theme_removed.replace("{id}", &id));
             }
             Err(error) => {
                 if let Some((previous_theme, fallback_revision)) = restore {
@@ -874,7 +888,13 @@ impl App {
                         self.apply_theme(&previous_theme);
                     }
                 }
-                self.show_toast(format!("Could not remove {id}: {error}"));
+                self.show_toast(
+                    self.catalog
+                        .settings
+                        .theme_remove_failed
+                        .replace("{id}", &id)
+                        .replace("{error}", &error),
+                );
             }
         }
     }
@@ -958,6 +978,16 @@ impl App {
                 ) as usize;
                 self.config.layout.scrollback_bytes = Some(next);
                 self.apply_history_budget();
+                config::save(&self.config);
+            }
+            LayoutRow::MobileWidth => {
+                let current = self.config.layout.mobile_width;
+                self.config.layout.mobile_width = match (current, delta.cmp(&0)) {
+                    (0, std::cmp::Ordering::Greater) => 24,
+                    (0, _) => 0,
+                    (24, std::cmp::Ordering::Less) => 0,
+                    _ => (current as i32 + 4 * delta).clamp(24, 200) as u16,
+                };
                 config::save(&self.config);
             }
             LayoutRow::PaneTitles => {
@@ -1160,7 +1190,11 @@ impl App {
         config::SHIFT_ENTER_CHOICES
             .iter()
             .find(|(k, _, _)| *k == self.config.layout.shift_enter)
-            .map(|(_, label, _)| label.to_string())
+            .map(|(key, label, _)| match *key {
+                "esc-cr" => format!("ESC CR ({})", self.catalog.settings.shift_default),
+                "lf" => format!("LF ({})", self.catalog.settings.shift_newline),
+                _ => label.to_string(),
+            })
             .unwrap_or_else(|| self.config.layout.shift_enter.clone())
     }
 
@@ -1169,7 +1203,7 @@ impl App {
     pub fn file_open_label(&self) -> String {
         let choice = &self.config.layout.file_open;
         if choice == config::FILE_OPEN_READONLY {
-            return "read-only".to_string();
+            return self.catalog.settings.read_only.to_string();
         }
         self.editors
             .iter()
@@ -1225,6 +1259,11 @@ impl App {
             }
             Some(GeneralRow::ResumeFlags) => {
                 self.config.resume_launch_flags = !self.config.resume_launch_flags;
+                config::save(&self.config);
+            }
+            Some(GeneralRow::NewPaneToWorkspaceRoot) => {
+                self.config.layout.new_pane_to_workspace_root =
+                    !self.config.layout.new_pane_to_workspace_root;
                 config::save(&self.config);
             }
             Some(GeneralRow::AgentTitle) => {
@@ -1364,6 +1403,24 @@ mod tests {
         assert_eq!(right_visible, left_visible + 1);
         assert_eq!(left_width, right_visible + 1);
         assert_eq!(right_width, left_width + 1);
+    }
+
+    #[test]
+    fn mobile_width_setting_can_disable_and_restore_automatic_layout() {
+        let _env = crate::persist::test_env("mobile-width-settings");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        let row = app
+            .layout_rows()
+            .iter()
+            .position(|row| matches!(row, LayoutRow::MobileWidth))
+            .expect("the mobile width row is present");
+
+        app.config.layout.mobile_width = 24;
+        app.adjust_layout(row, -1);
+        assert_eq!(app.config.layout.mobile_width, 0);
+        app.adjust_layout(row, 1);
+        assert_eq!(app.config.layout.mobile_width, 24);
     }
 
     #[test]
@@ -1583,6 +1640,53 @@ mod tests {
         assert!(!old.resume_launch_flags);
     }
 
+    /// The "Open new pane/tab at workspace root" toggle is opt-in: off by
+    /// default (a new tab/split inherits the focused pane's cwd), and flipping
+    /// it in Settings → General persists.
+    #[test]
+    fn new_pane_to_workspace_root_toggle_persists() {
+        let _env = crate::persist::test_env("new-pane-workspace-root");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        assert!(
+            !app.config.layout.new_pane_to_workspace_root,
+            "off by default: a new tab/split inherits the focused pane's cwd"
+        );
+
+        app.open_settings();
+        if let Some(ui) = app.settings.as_mut() {
+            ui.tab = SettingsTab::General;
+        }
+        let row = app
+            .general_rows()
+            .iter()
+            .position(|r| *r == GeneralRow::NewPaneToWorkspaceRoot)
+            .expect("the row is on the General tab");
+        // It sits with the general options, above the Notify divider.
+        assert!(row < app.general_section_start());
+
+        app.adjust_general(row, 1);
+        assert!(
+            app.config.layout.new_pane_to_workspace_root,
+            "the toggle flipped"
+        );
+        assert!(
+            crate::config::load().layout.new_pane_to_workspace_root,
+            "and it was saved"
+        );
+
+        app.adjust_general(row, 1);
+        assert!(
+            !app.config.layout.new_pane_to_workspace_root,
+            "toggles back"
+        );
+
+        // A config written before this field existed loads as off: the inherit
+        // behavior stays the default for an existing user.
+        let old: crate::config::Config = serde_json::from_str("{}").unwrap();
+        assert!(!old.layout.new_pane_to_workspace_root);
+    }
+
     // The General tab is the file-open chooser plus the Notifications section:
     // the two sound toggles (persisted) and a Test row that rings the chime
     // immediately, regardless of the toggles.
@@ -1595,7 +1699,14 @@ mod tests {
         if let Some(ui) = app.settings.as_mut() {
             ui.tab = SettingsTab::General;
         }
-        assert_eq!(app.settings_rows(SettingsTab::General), 10);
+        // Against the row list, not a written-down count: this fork carries one
+        // General setting upstream does not (auto-update) and upstream carries
+        // one this fork did not, so any fixed number is wrong by the next merge.
+        // What has to hold is that the two agree.
+        assert_eq!(
+            app.settings_rows(SettingsTab::General),
+            app.general_rows().len()
+        );
         let rows = app.general_rows();
         assert_eq!(rows[0], GeneralRow::FileOpen, "file-open leads the tab");
 
@@ -1673,6 +1784,113 @@ mod tests {
         // A blank line separates the options from the section header.
         let (res, div) = (res.unwrap(), div.unwrap());
         assert!(div >= res + 2, "a blank gap sits above the section divider");
+    }
+
+    #[test]
+    fn settings_chrome_and_values_follow_the_active_catalog() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        fn screen(app: &mut crate::app::App) -> String {
+            let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::render(frame, app))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect()
+        }
+
+        let _env = crate::persist::test_env("settings-complete-i18n");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(160, 40, tx).unwrap();
+        app.catalog = crate::i18n::by_code("es");
+        app.open_settings();
+
+        app.settings_set_tab(SettingsTab::Keys);
+        let keys = screen(&mut app);
+        assert!(keys.contains("Pulsa el prefijo"));
+        assert!(keys.contains("Modo de comandos"));
+        assert!(keys.contains("Preajuste"));
+        assert!(!keys.contains("Press the prefix"));
+
+        if let Some(ui) = app.settings.as_mut() {
+            ui.cursor = KEYS_HEADER_ROWS + crate::app::Cmd::ALL.len();
+        }
+        let reference = screen(&mut app);
+        assert!(reference.contains("Siempre activos"));
+        assert!(reference.contains("enfocar paneles"));
+        assert!(!reference.contains("Always on"));
+
+        if let Some(ui) = app.settings.as_mut() {
+            ui.cursor =
+                KEYS_HEADER_ROWS + crate::app::Cmd::ALL.len() + crate::app::key_reference_rows()
+                    - 1;
+        }
+        let mouse_reference = screen(&mut app);
+        assert!(mouse_reference.contains("Ratón"));
+        assert!(mouse_reference.contains("clic derecho"));
+        assert!(mouse_reference.contains("tocar panel"));
+        assert!(!mouse_reference.contains("right-click"));
+
+        if let Some(ui) = app.settings.as_mut() {
+            ui.cursor = KEYS_PREFIX_ROW;
+            ui.capturing = true;
+        }
+        app.handle_settings_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|(message, _)| message == "Usa F1-F12 o un atajo Ctrl/Alt"));
+
+        app.settings_set_tab(SettingsTab::General);
+        let general = screen(&mut app);
+        assert!(general.contains("solo lectura"));
+        assert!(general.contains("predeterminado"));
+
+        app.settings_set_tab(SettingsTab::Layout);
+        let diff_layout = app
+            .layout_rows()
+            .iter()
+            .position(|row| matches!(row, LayoutRow::DiffLayout))
+            .unwrap();
+        if let Some(ui) = app.settings.as_mut() {
+            ui.cursor = diff_layout;
+        }
+        let layout = screen(&mut app);
+        assert!(layout.contains("automático"));
+
+        app.settings_set_tab(SettingsTab::Modules);
+        let modules = screen(&mut app);
+        assert!(modules.contains("No hay módulos instalados"));
+    }
+
+    #[test]
+    fn every_language_renders_every_settings_tab() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let _env = crate::persist::test_env("settings-all-languages");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(160, 40, tx).unwrap();
+        app.open_settings();
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+
+        for &code in crate::i18n::LANGS {
+            app.catalog = crate::i18n::by_code(code);
+            for tab in SettingsTab::ALL {
+                app.settings_set_tab(tab);
+                let last = app.settings_rows(tab).saturating_sub(1);
+                if let Some(ui) = app.settings.as_mut() {
+                    ui.cursor = last;
+                }
+                terminal
+                    .draw(|frame| crate::ui::render(frame, &mut app))
+                    .unwrap_or_else(|error| panic!("{code} {tab:?} failed to render: {error}"));
+            }
+        }
     }
 
     /// Notifications is no longer its own tab: General leads the tab strip and

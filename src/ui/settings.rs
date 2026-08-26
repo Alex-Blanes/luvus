@@ -26,6 +26,47 @@ fn format_history_budget(bytes: usize) -> String {
     }
 }
 
+fn diff_layout_label(value: crate::diff::DiffLayoutPreference, app: &App) -> &'static str {
+    match value {
+        crate::diff::DiffLayoutPreference::Auto => app.catalog.settings.diff_auto,
+        crate::diff::DiffLayoutPreference::Split => app.catalog.settings.diff_split,
+        crate::diff::DiffLayoutPreference::Stack => app.catalog.settings.diff_stack,
+    }
+}
+
+fn diff_marker_label(value: crate::diff::DiffMarkerStyle, app: &App) -> &'static str {
+    match value {
+        crate::diff::DiffMarkerStyle::Symbols => app.catalog.settings.diff_symbols,
+        crate::diff::DiffMarkerStyle::Bars => app.catalog.settings.diff_bars,
+        crate::diff::DiffMarkerStyle::Both => app.catalog.settings.diff_both,
+    }
+}
+
+fn diff_color_label(value: crate::diff::DiffColorMode, app: &App) -> &'static str {
+    match value {
+        crate::diff::DiffColorMode::Theme => app.catalog.settings.diff_theme,
+        crate::diff::DiffColorMode::Standard => app.catalog.settings.diff_red_green,
+    }
+}
+
+fn key_reference_label(section: usize, row: usize, app: &App) -> String {
+    let cat = app.catalog.settings;
+    match (section, row) {
+        (0, 5) => cat.key_prefix_twice.replace("{prefix}", cat.keys_prefix),
+        (1, 2) | (2, 2) => format!("{} / b", cat.key_space),
+        (2, 0) | (3, 0) => format!("{}  hjkl", cat.key_arrows),
+        (3, 1) => cat.key_shift_arrow.to_string(),
+        (7, 0) => cat.key_drag.to_string(),
+        (7, 1) => cat.key_shift_drag.to_string(),
+        (8, 0) => cat.key_click.to_string(),
+        (8, 1) => cat.key_right_click.to_string(),
+        (8, 2) => cat.key_wheel.to_string(),
+        (8, 3) => cat.key_drag_divider.to_string(),
+        (8, 4) => cat.key_tap_pane.to_string(),
+        _ => crate::i18n::settings::KEY_REFERENCE_KEYS[section][row].to_string(),
+    }
+}
+
 pub(super) fn draw_settings(
     f: &mut RenderTarget,
     area: Rect,
@@ -46,7 +87,11 @@ pub(super) fn draw_settings(
         .sum();
     let w = (tabs_w + 12).max(54).min(area.width);
     let h = area.height.saturating_sub(2).clamp(16, 30).min(area.height);
-    let modal = centered_rect(area, w, h);
+    let modal = if app.compact {
+        super::mobile::sheets::full_screen(area)
+    } else {
+        centered_rect(area, w, h)
+    };
 
     f.render_widget(Clear, modal);
     let block = Block::new()
@@ -75,36 +120,104 @@ pub(super) fn draw_settings(
         Paragraph::new(Span::styled(" ✕ ", Style::new().fg(t.accent).bold())),
         close,
     );
-    hline(f, inner.x, inner.y + 1, inner.width, t);
+    if inner.height > 1 {
+        hline(f, inner.x, inner.y + 1, inner.width, t);
+    }
+
+    let mut tabs = Vec::new();
+    // A complete settings layout needs room for the title, tabs, separators,
+    // at least one content row, and the footer. Very short phone terminals do
+    // not have that space, so show only the active section instead of creating
+    // tab and rule rectangles beyond the buffer. Keyboard section switching
+    // remains available and a later resize restores the full layout.
+    if inner.height < 9 {
+        if inner.height > 2 && inner.width > 0 {
+            let rect = Rect::new(inner.x, inner.y + 2, inner.width, 1);
+            let label = format!("{} {}", tab.icon(), tab.label(app.catalog));
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    truncate(&label, rect.width as usize),
+                    Style::new().fg(t.crust).bg(t.accent).bold(),
+                ))
+                .alignment(Alignment::Center),
+                rect,
+            );
+            tabs.push((tab, rect));
+        }
+        return SettingsHits {
+            modal,
+            close,
+            tabs,
+            ctls: Vec::new(),
+            theme_remove: Vec::new(),
+            arrows: Vec::new(),
+            layout_scroll,
+        };
+    }
 
     // ── tab toolbar (Mac-style pills) ──
-    let mut tabs = Vec::new();
-    let mut x = inner.x + 1;
     let ty = inner.y + 2;
-    for st in SettingsTab::ALL {
-        let label = format!(" {} {} ", st.icon(), st.label(app.catalog));
-        let cw = display_width(&label) as u16;
-        if x + cw > inner.right() {
-            break;
+    let tab_rows = if app.compact {
+        SettingsTab::ALL.len().div_ceil(3) as u16
+    } else {
+        1
+    };
+    if app.compact {
+        let cell_width = (inner.width / 3).max(1);
+        let grid_width = cell_width.saturating_mul(3);
+        let grid_x = inner.x + inner.width.saturating_sub(grid_width) / 2;
+        for (index, st) in SettingsTab::ALL.into_iter().enumerate() {
+            let row = index / 3;
+            let column = index % 3;
+            let rect = Rect::new(
+                grid_x + column as u16 * cell_width,
+                ty + row as u16,
+                cell_width,
+                1,
+            );
+            let style = if st == tab {
+                Style::new().fg(t.crust).bg(t.accent).bold()
+            } else {
+                Style::new().fg(t.subtext0)
+            };
+            let label = format!("{} {}", st.icon(), st.label(app.catalog));
+            f.render_widget(
+                Paragraph::new(Span::styled(truncate(&label, cell_width as usize), style))
+                    .alignment(Alignment::Center),
+                rect,
+            );
+            tabs.push((st, rect));
         }
-        let style = if st == tab {
-            Style::new().fg(t.crust).bg(t.accent).bold()
-        } else {
-            Style::new().fg(t.subtext0)
-        };
-        let rect = Rect::new(x, ty, cw, 1);
-        f.render_widget(Paragraph::new(Span::styled(label, style)), rect);
-        tabs.push((st, rect));
-        x += cw;
+    } else {
+        let mut x = inner.x + 1;
+        for st in SettingsTab::ALL {
+            let label = format!(" {} {} ", st.icon(), st.label(app.catalog));
+            let cw = display_width(&label) as u16;
+            if x + cw > inner.right() {
+                break;
+            }
+            let style = if st == tab {
+                Style::new().fg(t.crust).bg(t.accent).bold()
+            } else {
+                Style::new().fg(t.subtext0)
+            };
+            let rect = Rect::new(x, ty, cw, 1);
+            f.render_widget(Paragraph::new(Span::styled(label, style)), rect);
+            tabs.push((st, rect));
+            x += cw;
+        }
     }
-    hline(f, inner.x, inner.y + 3, inner.width, t);
+    let tabs_bottom = inner.y + 2 + tab_rows;
+    hline(f, inner.x, tabs_bottom, inner.width, t);
 
     // ── content ──
+    let content_y = tabs_bottom + 1;
+    let content_bottom = inner.bottom().saturating_sub(2);
     let content = Rect::new(
         inner.x,
-        inner.y + 4,
+        content_y,
         inner.width,
-        inner.height.saturating_sub(6),
+        content_bottom.saturating_sub(content_y),
     );
     let (ctls, theme_remove, arrows, layout_scroll) =
         draw_content(f, content, tab, cursor, layout_scroll, app, t);
@@ -237,8 +350,8 @@ fn draw_content(
                 ) && !app.theme_uninstall_pending(&entry.id))
                 .then(|| {
                     let installed = format!("✓ {} ", cat.act_installed);
-                    let action = "· ⏎ remove";
-                    let width = (display_width(&installed) + display_width(action)) as u16;
+                    let action = format!("· ⏎ {}", cat.settings.remove);
+                    let width = (display_width(&installed) + display_width(&action)) as u16;
                     let width = width.min(row.width.saturating_sub(1));
                     let rect = Rect::new(
                         row.right().saturating_sub(width.saturating_add(1)),
@@ -430,6 +543,24 @@ fn draw_content(
                         );
                         ctls.push((i, r));
                     }
+                    LayoutRow::MobileWidth => {
+                        let r = slider_row(
+                            f,
+                            area,
+                            y,
+                            i,
+                            cursor == i,
+                            cat.set_mobile_width,
+                            if l.mobile_width == 0 {
+                                cat.side_off.to_string()
+                            } else {
+                                l.mobile_width.to_string()
+                            },
+                            t,
+                            &mut arrows,
+                        );
+                        ctls.push((i, r));
+                    }
                     LayoutRow::PaneTitles => {
                         ctls.push(ctl_row(
                             f,
@@ -474,7 +605,7 @@ fn draw_content(
                             i,
                             cursor,
                             cat.set_diff_layout,
-                            picker(app.config.layout.diff_layout.as_str(), t),
+                            picker(diff_layout_label(app.config.layout.diff_layout, app), t),
                             t,
                         ));
                     }
@@ -524,7 +655,10 @@ fn draw_content(
                             i,
                             cursor,
                             cat.set_diff_markers,
-                            picker(app.config.layout.diff_marker_style.as_str(), t),
+                            picker(
+                                diff_marker_label(app.config.layout.diff_marker_style, app),
+                                t,
+                            ),
                             t,
                         ));
                     }
@@ -536,7 +670,7 @@ fn draw_content(
                             i,
                             cursor,
                             cat.set_diff_colors,
-                            picker(app.config.layout.diff_color_mode.as_str(), t),
+                            picker(diff_color_label(app.config.layout.diff_color_mode, app), t),
                             t,
                         ));
                     }
@@ -554,8 +688,21 @@ fn draw_content(
                     }
                     #[cfg(windows)]
                     LayoutRow::Shell => {
-                        let shell = crate::platform::shell_label(&app.config.shell);
-                        ctls.push(ctl_row(f, area, y, i, cursor, "Shell", picker(shell, t), t));
+                        let shell = match app.config.shell.as_str() {
+                            "default" => cat.settings.shell_default,
+                            "cmd" => cat.settings.shell_command_prompt,
+                            choice => crate::platform::shell_label(choice),
+                        };
+                        ctls.push(ctl_row(
+                            f,
+                            area,
+                            y,
+                            i,
+                            cursor,
+                            cat.settings.shell,
+                            picker(shell, t),
+                            t,
+                        ));
                     }
                     LayoutRow::LeftVisible => {
                         ctls.push(ctl_row(
@@ -702,6 +849,16 @@ fn draw_content(
                         toggle(app.config.resume_launch_flags, t),
                         t,
                     )),
+                    GeneralRow::NewPaneToWorkspaceRoot => ctls.push(ctl_row(
+                        f,
+                        area,
+                        y,
+                        i,
+                        cursor,
+                        cat.set_new_pane_to_workspace_root,
+                        toggle(app.config.layout.new_pane_to_workspace_root, t),
+                        t,
+                    )),
                     GeneralRow::AgentTitle => ctls.push(ctl_row(
                         f,
                         area,
@@ -755,11 +912,14 @@ fn draw_content(
                     // Installed → clicking removes luvus's hook (not the agent).
                     Line::from(vec![
                         Span::styled(format!("✓ {} ", cat.act_installed), Style::new().fg(t.mint)),
-                        Span::styled("· ⏎ remove", Style::new().fg(t.overlay0)),
+                        Span::styled(
+                            format!("· ⏎ {}", cat.settings.remove),
+                            Style::new().fg(t.overlay0),
+                        ),
                     ])
                 } else {
                     Line::from(Span::styled(
-                        "[ Install ]",
+                        format!("[ {} ]", cat.settings.install),
                         Style::new().fg(t.accent).bold(),
                     ))
                 };
@@ -790,17 +950,15 @@ fn draw_content(
                 .and_then(crate::app::PrefixSpec::parse)
                 .map(|prefix| prefix.label());
             let all = crate::app::Cmd::ALL;
-            let dim = |s: &'static str| Span::styled(s, Style::new().fg(t.overlay0));
-            let acc = |s: &'static str| Span::styled(s, Style::new().fg(t.accent).bold());
             let prefix_label = app.prefix.label();
-            // The preset row's value: the matched preset's label, or "Custom".
+            // The preset row's value: the matched localized label, or Custom.
             let preset_label = app
                 .current_preset()
-                .map(|i| crate::app::presets()[i].label.to_string())
-                .unwrap_or_else(|| "Custom".to_string());
+                .map(|i| crate::app::presets()[i].localized_label(cat).to_string())
+                .unwrap_or_else(|| cat.settings.preset_custom.to_string());
 
             enum KV {
-                Note(Vec<Span<'static>>),
+                Note(String),
                 Heading(&'static str),
                 Blank,
                 // Selectable rows carry their cursor index (`sel`).
@@ -819,50 +977,37 @@ fn draw_content(
                 },
                 Reference {
                     sel: usize,
-                    k: &'static str,
+                    k: String,
                     d: &'static str,
                 },
             }
             // How to use the prefix (the intro block).
             let mut vis: Vec<KV> = vec![
-                KV::Note(vec![
-                    dim("Press the prefix ("),
-                    Span::styled(prefix_label.clone(), Style::new().fg(t.accent).bold()),
-                    dim("), then a key below. Command-key modifiers are optional."),
-                ]),
-                KV::Note(vec![
-                    dim("Move with arrows or "),
-                    acc("h j k l"),
-                    dim(".  "),
-                    Span::styled(
-                        format!("{prefix_label} ?"),
-                        Style::new().fg(t.accent).bold(),
-                    ),
-                    dim(" shows the cheat-sheet."),
-                ]),
-                KV::Note(vec![
-                    dim("Select a row, "),
-                    acc("⏎"),
-                    dim(" rebinds it, "),
-                    acc("⌫"),
-                    dim(" resets it, "),
-                    acc("esc"),
-                    dim(" cancels."),
-                ]),
+                KV::Note(
+                    cat.settings
+                        .keys_intro_prefix
+                        .replace("{prefix}", &prefix_label),
+                ),
+                KV::Note(
+                    cat.settings
+                        .keys_intro_move
+                        .replace("{prefix}", &prefix_label),
+                ),
+                KV::Note(cat.settings.keys_intro_edit.to_string()),
                 KV::Blank,
             ];
             // The two command-mode rows: the prefix chord and the preset chooser
             // (docs/64), selectable at rows 0 and 1 (before the commands).
-            vis.push(KV::Heading("Command mode"));
+            vis.push(KV::Heading(cat.settings.keys_command_mode));
             vis.push(KV::Value {
                 sel: crate::app::KEYS_PREFIX_ROW,
-                label: "Prefix",
+                label: cat.settings.keys_prefix,
                 value: prefix_label.clone(),
                 chooser: false,
             });
             vis.push(KV::Value {
                 sel: crate::app::KEYS_PRESET_ROW,
-                label: "Preset",
+                label: cat.settings.keys_preset,
                 value: preset_label,
                 chooser: true,
             });
@@ -871,7 +1016,7 @@ fn draw_content(
             // after the two header rows.
             let mut section = "";
             for (i, cmd) in all.iter().enumerate() {
-                let s = cmd.section();
+                let s = cmd.section(cat);
                 if s != section {
                     if !section.is_empty() {
                         vis.push(KV::Blank);
@@ -887,11 +1032,19 @@ fn draw_content(
             // The read-only reference blocks — selectable indices continue past the
             // commands, so the cursor flows straight from the last command into them.
             let mut sel = crate::app::KEYS_HEADER_ROWS + all.len();
-            for (heading, rows) in crate::app::KEY_REFERENCE {
+            for (section, keys) in crate::i18n::settings::KEY_REFERENCE_KEYS.iter().enumerate() {
                 vis.push(KV::Blank);
-                vis.push(KV::Heading(heading));
-                for (k, d) in *rows {
-                    vis.push(KV::Reference { sel, k, d });
+                vis.push(KV::Heading(cat.settings.key_reference_headings[section]));
+                for (row, (_key, d)) in keys
+                    .iter()
+                    .zip(cat.settings.key_reference_descriptions[section].iter())
+                    .enumerate()
+                {
+                    vis.push(KV::Reference {
+                        sel,
+                        k: key_reference_label(section, row, app),
+                        d,
+                    });
                     sel += 1;
                 }
             }
@@ -940,8 +1093,10 @@ fn draw_content(
                         let txt = if is_sel && capturing {
                             prefix_candidate
                                 .as_ref()
-                                .map(|candidate| format!("press {candidate} again…"))
-                                .unwrap_or_else(|| "press F1-F12 or a Ctrl/Alt chord…".to_string())
+                                .map(|candidate| {
+                                    cat.settings.keys_capture_again.replace("{key}", candidate)
+                                })
+                                .unwrap_or_else(|| cat.settings.keys_capture_prefix.to_string())
                         } else if *chooser {
                             format!("‹ {value} ›")
                         } else {
@@ -962,10 +1117,14 @@ fn draw_content(
                         );
                         ctls.push((*sel, row));
                     }
-                    KV::Note(spans) => {
-                        let mut line = vec![Span::raw("   ")];
-                        line.extend(spans.iter().cloned());
-                        f.render_widget(Paragraph::new(Line::from(line)), row);
+                    KV::Note(text) => {
+                        f.render_widget(
+                            Paragraph::new(Line::from(vec![
+                                Span::raw("   "),
+                                Span::styled(text.clone(), Style::new().fg(t.overlay0)),
+                            ])),
+                            row,
+                        );
                     }
                     KV::Heading(h) => {
                         f.render_widget(
@@ -980,10 +1139,11 @@ fn draw_content(
                         if *sel == cursor {
                             fill_bg(f, row, t.sel_bg);
                         }
+                        let key_pad = " ".repeat(13usize.saturating_sub(display_width(k)));
                         f.render_widget(
                             Paragraph::new(Line::from(vec![
                                 Span::styled(
-                                    format!("   {k:<13} "),
+                                    format!("   {k}{key_pad} "),
                                     Style::new().fg(t.accent).bold(),
                                 ),
                                 Span::styled(*d, Style::new().fg(t.overlay0)),
@@ -1015,7 +1175,7 @@ fn draw_content(
                         // …its bound key on the right, or a prompt while capturing.
                         let key = app.key_for(cmd);
                         let (txt, color) = if is_sel && capturing {
-                            ("press a key…".to_string(), t.coral)
+                            (cat.settings.keys_capture_key.to_string(), t.coral)
                         } else if key.is_empty() {
                             ("—".to_string(), t.overlay0) // unbound
                         } else {
@@ -1039,7 +1199,7 @@ fn draw_content(
             if rows.is_empty() {
                 f.render_widget(
                     Paragraph::new(Span::styled(
-                        "   No modules installed — `luvus module link <dir>`.",
+                        format!("   {}", cat.settings.modules_empty),
                         Style::new().fg(t.overlay0),
                     )),
                     Rect::new(area.x, area.y, area.width, 1),
@@ -1066,9 +1226,9 @@ fn draw_content(
                             };
                             // name + a hint (surface count, or a ⚠ for a load warning)
                             let hint = if m.warning.is_some() {
-                                " ⚠ unavailable".to_string()
+                                format!(" ⚠ {}", cat.settings.module_unavailable)
                             } else {
-                                module_hint(m)
+                                module_hint(m, cat.settings)
                             };
                             f.render_widget(
                                 Paragraph::new(Line::from(vec![
@@ -1167,19 +1327,19 @@ fn keep_visible_scroll(scroll: usize, cursor: usize, viewport: usize, total: usi
 
 /// The one-line summary of what a module contributes, e.g. `· 2 actions · 1 dock`.
 /// Only non-zero surfaces are listed, so a small module stays quiet.
-fn module_hint(m: &crate::module::InstalledModule) -> String {
+fn module_hint(m: &crate::module::InstalledModule, cat: &crate::i18n::settings::Catalog) -> String {
     let man = &m.manifest;
     let parts = [
-        (man.actions.len(), "action"),
-        (man.panes.len(), "pane"),
-        (man.docks.len(), "dock"),
-        (man.settings.len(), "setting"),
+        (man.actions.len(), cat.module_action, cat.module_actions),
+        (man.panes.len(), cat.module_pane, cat.module_panes),
+        (man.docks.len(), cat.module_dock, cat.module_docks),
+        (man.settings.len(), cat.module_setting, cat.module_settings),
     ];
     let mut out = String::new();
-    for (n, name) in parts {
+    for (n, singular, plural) in parts {
         if n > 0 {
-            let plural = if n == 1 { "" } else { "s" };
-            out.push_str(&format!(" · {n} {name}{plural}"));
+            let name = if n == 1 { singular } else { plural };
+            out.push_str(&format!(" · {n} {name}"));
         }
     }
     out
@@ -1229,7 +1389,7 @@ pub(super) fn draw_module_setting_prompt(f: &mut RenderTarget, area: Rect, app: 
     );
     f.render_widget(
         Paragraph::new(Span::styled(
-            " ⏎ save · esc cancel",
+            format!(" {}", app.catalog.settings.module_edit_hint),
             Style::new().fg(t.overlay0),
         )),
         Rect::new(inner.x, inner.y + 2, inner.width, 1),
@@ -1263,7 +1423,7 @@ fn slider_row(
         row,
     );
     // Place "‹ value ›" two cells in from the right edge so positions are exact.
-    let w = format!("‹ {value} ›").chars().count() as u16;
+    let w = display_width(&format!("‹ {value} ›")) as u16;
     let sx = row.right().saturating_sub(2 + w);
     f.render_widget(
         Paragraph::new(Line::from(vec![
@@ -1501,7 +1661,8 @@ fn fill_bg(f: &mut RenderTarget, rect: Rect, color: ratatui::style::Color) {
 
 #[cfg(test)]
 mod tests {
-    use super::keep_visible_scroll;
+    use super::{display_width, keep_visible_scroll, slider_row, Rect, RenderTarget, Theme};
+    use ratatui::buffer::Buffer;
 
     #[test]
     fn layout_scroll_moves_only_when_selection_leaves_the_viewport() {
@@ -1510,5 +1671,40 @@ mod tests {
         assert_eq!(keep_visible_scroll(10, 9, 12, 40), 9);
         assert_eq!(keep_visible_scroll(10, 22, 12, 40), 11);
         assert_eq!(keep_visible_scroll(30, 15, 12, 20), 8);
+    }
+
+    #[test]
+    fn slider_uses_terminal_width_for_cjk_value_and_arrow_targets() {
+        let area = Rect::new(0, 0, 40, 1);
+        let mut buffer = Buffer::empty(area);
+        let mut arrows = Vec::new();
+        let value = "只读";
+        let rendered = format!("‹ {value} ›");
+        let width = display_width(&rendered) as u16;
+        assert!(width > rendered.chars().count() as u16);
+
+        {
+            let mut target = RenderTarget::new(&mut buffer, area);
+            slider_row(
+                &mut target,
+                area,
+                0,
+                3,
+                false,
+                "打开文件方式",
+                value.to_string(),
+                &Theme::noir(),
+                &mut arrows,
+            );
+        }
+
+        let start = area.right().saturating_sub(2 + width);
+        assert_eq!(arrows[0], (3, -1, Rect::new(start, 0, 2, 1)));
+        assert_eq!(
+            arrows[1],
+            (3, 1, Rect::new(start + width.saturating_sub(2), 0, 2, 1))
+        );
+        assert_eq!(buffer[(start, 0)].symbol(), "‹");
+        assert_eq!(buffer[(start + width.saturating_sub(1), 0)].symbol(), "›");
     }
 }
