@@ -206,6 +206,13 @@ pub enum AppEvent {
     /// A newer fork build was downloaded and put in place (the label it will
     /// report once loaded). Only a restart is left to do.
     SelfUpdateInstalled(String),
+    /// A newer fork build was found but could not be installed (the reason).
+    ///
+    /// Worth its own event because the failure used to be swallowed whole: the
+    /// check announced an update, the install returned an error nobody read, and
+    /// the result was indistinguishable from being up to date. Pressing the
+    /// button again did the same nothing.
+    SelfUpdateFailed(String),
     /// Upstream (RizRiyz/luvus) published a release newer than the one this
     /// fork was merged from. Informational: catching up is a merge, not a
     /// download, so there is no action attached.
