@@ -914,22 +914,52 @@ pub fn save(app: &App) {
     let snap = snapshot(app);
     if snap.workspaces.is_empty() {
         let _ = fs::remove_file(session_path());
+        crate::logging::event(
+            crate::logging::EventKind::PersistCleared,
+            &[crate::logging::Field::Reason(crate::logging::Reason::Empty)],
+        );
         return;
     }
     let dir = ensure_session_dir();
     if !dir.is_dir() {
+        log_persist_failure("persist_dir");
         return;
     }
     let Ok(json) = serde_json::to_string_pretty(&snap) else {
+        log_persist_failure("persist_serialize");
         return;
     };
     let path = session_path();
     let tmp = path.with_extension("json.tmp");
-    if let Ok(mut f) = fs::File::create(&tmp) {
-        if f.write_all(json.as_bytes()).is_ok() && f.flush().is_ok() {
-            let _ = fs::rename(&tmp, &path);
-        }
+    let Ok(mut file) = fs::File::create(&tmp) else {
+        log_persist_failure("persist_create");
+        return;
+    };
+    if file.write_all(json.as_bytes()).is_err() {
+        log_persist_failure("persist_write");
+        return;
     }
+    if file.flush().is_err() {
+        log_persist_failure("persist_flush");
+        return;
+    }
+    if fs::rename(&tmp, &path).is_err() {
+        log_persist_failure("persist_rename");
+        return;
+    }
+    crate::logging::event(
+        crate::logging::EventKind::PersistSave,
+        &[crate::logging::Field::Outcome(crate::logging::Outcome::Ok)],
+    );
+}
+
+fn log_persist_failure(error_code: &'static str) {
+    crate::logging::event(
+        crate::logging::EventKind::PersistSaveFailed,
+        &[crate::logging::Field::ErrorCode(
+            crate::logging::SafeId::new(error_code).expect("static id is valid"),
+        )],
+    );
 }
 
 /// Load a saved session, if one exists and parses at a known version.

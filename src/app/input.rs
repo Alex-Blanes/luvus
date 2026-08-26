@@ -4,101 +4,63 @@
 use super::*;
 use crate::files::view_text_w;
 
-/// Last selectable character index on a retained row. Empty rows still expose
-/// one visual cell so vertical navigation and a blank-line selection are stable.
-fn copy_line_end(line: Option<&str>) -> usize {
-    line.map(|line| line.chars().count().saturating_sub(1))
-        .unwrap_or(0)
-}
-
 fn copy_word_forward(
     row_count: usize,
-    mut row_text: impl FnMut(usize) -> Option<String>,
+    mut row_layout: impl FnMut(usize) -> Option<crate::terminal::vt::RetainedRowLayout>,
     mut at: (usize, usize),
 ) -> (usize, usize) {
     while at.0 < row_count {
-        let line = row_text(at.0).unwrap_or_default();
-        let chars: Vec<char> = line.chars().collect();
-        while at.1 < chars.len() && !chars[at.1].is_whitespace() {
+        let Some(layout) = row_layout(at.0) else {
+            at.0 += 1;
+            at.1 = 0;
+            continue;
+        };
+        let last = layout.last_column();
+        while at.1 <= last && !layout.is_whitespace(at.1) {
             at.1 += 1;
         }
-        while at.1 < chars.len() && chars[at.1].is_whitespace() {
+        while at.1 <= last && layout.is_whitespace(at.1) {
             at.1 += 1;
         }
-        if at.1 < chars.len() {
+        if at.1 <= last {
             return at;
         }
         at.0 += 1;
         at.1 = 0;
     }
     let last = row_count.saturating_sub(1);
-    let line = row_text(last);
-    (last, copy_line_end(line.as_deref()))
+    let column = row_layout(last).map_or(0, |layout| layout.last_column());
+    (last, column)
 }
 
 fn copy_word_back(
-    mut row_text: impl FnMut(usize) -> Option<String>,
+    mut row_layout: impl FnMut(usize) -> Option<crate::terminal::vt::RetainedRowLayout>,
     mut at: (usize, usize),
 ) -> (usize, usize) {
     loop {
-        let line = row_text(at.0).unwrap_or_default();
-        let chars: Vec<char> = line.chars().collect();
-        let mut col = at.1.min(chars.len());
-        while col > 0 && chars[col - 1].is_whitespace() {
+        let Some(layout) = row_layout(at.0) else {
+            if at.0 == 0 {
+                return (0, 0);
+            }
+            at.0 -= 1;
+            at.1 = row_layout(at.0).map_or(0, |layout| layout.last_column().saturating_add(1));
+            continue;
+        };
+        let mut col = at.1.min(layout.last_column().saturating_add(1));
+        while col > 0 && layout.is_whitespace(col - 1) {
             col -= 1;
         }
-        while col > 0 && !chars[col - 1].is_whitespace() {
+        while col > 0 && !layout.is_whitespace(col - 1) {
             col -= 1;
         }
-        if col > 0 || !chars.is_empty() {
-            return (at.0, col.min(copy_line_end(Some(&line))));
+        if col > 0 || layout.has_text() {
+            return (at.0, col.min(layout.last_column()));
         }
         if at.0 == 0 {
             return (0, 0);
         }
         at.0 -= 1;
-        let line = row_text(at.0);
-        at.1 = copy_line_end(line.as_deref()).saturating_add(1);
-    }
-}
-
-fn append_selected_row(
-    out: &mut String,
-    appended: &mut bool,
-    line: &str,
-    row: usize,
-    ((start_row, start_col), (end_row, end_col)): ((usize, usize), (usize, usize)),
-) {
-    let chars: Vec<char> = line.chars().collect();
-    // A drag that starts beside the visible text must not grow leftward on
-    // middle rows: that otherwise copies the blank cell between the pane edge
-    // and every list item. Keep the drag's leftmost edge for those rows while
-    // preserving the exact start point on the first row.
-    let middle_left = start_col.min(end_col);
-    let left = if row == start_row {
-        start_col
-    } else {
-        middle_left
-    };
-    let right = if row == end_row {
-        end_col
-    } else {
-        chars.len().saturating_sub(1)
-    };
-    if *appended {
-        out.push('\n');
-    }
-    *appended = true;
-    if left <= right {
-        out.extend(
-            chars
-                .iter()
-                .skip(left)
-                .take(right.saturating_sub(left).saturating_add(1)),
-        );
-    }
-    while out.ends_with(' ') {
-        out.pop();
+        at.1 = row_layout(at.0).map_or(0, |layout| layout.last_column().saturating_add(1));
     }
 }
 
@@ -124,35 +86,6 @@ fn strip_uniform_single_cell_margin(text: String) -> String {
         .map(|line| line.strip_prefix(' ').unwrap_or(line))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Extract a terminal selection from logical rows. Both mouse and keyboard
-/// selection feed this function, keeping clipboard semantics aligned.
-fn extract_rows_selection(
-    rows: &[String],
-    ((start_row, start_col), (end_row, end_col)): ((usize, usize), (usize, usize)),
-) -> Option<String> {
-    if start_row > end_row || start_row >= rows.len() {
-        return None;
-    }
-    let mut out = String::new();
-    let last_row = end_row.min(rows.len().saturating_sub(1));
-    let mut appended = false;
-    for (row, line) in rows
-        .iter()
-        .enumerate()
-        .take(last_row.saturating_add(1))
-        .skip(start_row)
-    {
-        append_selected_row(
-            &mut out,
-            &mut appended,
-            line,
-            row,
-            ((start_row, start_col), (end_row, end_col)),
-        );
-    }
-    finish_selected_text(out)
 }
 
 impl App {
@@ -242,6 +175,13 @@ impl App {
                     pane.cwd = cwd;
                 }
                 self.register_backend_terminal(id);
+                crate::logging::event(
+                    crate::logging::EventKind::PaneOpen,
+                    &[
+                        crate::logging::Field::PaneId(u64::from(id.0)),
+                        crate::logging::Field::SpawnKind(crate::logging::SpawnKind::Deferred),
+                    ],
+                );
                 return true;
             }
             AppEvent::BackendObserve { params, reply } => {
@@ -270,6 +210,10 @@ impl App {
                 reply,
             } => {
                 self.apply_socket_manifests(manifests);
+                crate::logging::event(
+                    crate::logging::EventKind::ManifestReload,
+                    &[crate::logging::Field::Outcome(crate::logging::Outcome::Ok)],
+                );
                 let _ = reply.send(
                     json!({"id":id,"result":{
                         "type":"agent_manifests_reloaded","rules":self.manifests.rule_count()
@@ -303,7 +247,10 @@ impl App {
             AppEvent::SearchHandoffReady { session, result } => {
                 match result {
                     Ok(()) => self.pending_session_switch = Some(session),
-                    Err(error) => self.show_toast(format!("session switch failed: {error}")),
+                    Err(error) => {
+                        log_worker_failed(crate::logging::Worker::Search, "handoff");
+                        self.show_toast(format!("session switch failed: {error}"));
+                    }
                 }
                 return true;
             }
@@ -433,6 +380,13 @@ impl App {
                 true // the pane's screen advanced
             }
             AppEvent::PtyExit(id) => {
+                crate::logging::event(
+                    crate::logging::EventKind::PtyExit,
+                    &[
+                        crate::logging::Field::PaneId(u64::from(id.0)),
+                        crate::logging::Field::ExitClass(crate::logging::ExitClass::Unknown),
+                    ],
+                );
                 self.emit_backend_terminal_event(id, "terminal.exited", json!({}));
                 self.close_pane(id);
                 true
@@ -529,6 +483,9 @@ impl App {
                 out,
                 err,
             } => {
+                if code != Some(0) {
+                    log_worker_failed(crate::logging::Worker::Module, "exit");
+                }
                 self.module_command_finished(log_id, code, out, err);
                 true
             }
@@ -567,18 +524,40 @@ impl App {
                 visible_root,
                 result,
             } => {
+                if result.is_err() {
+                    log_worker_failed(crate::logging::Worker::Diff, "scan");
+                }
                 let changed = self.apply_diff_status(token, visible_root, result);
                 self.finish_pending_diff_api();
                 changed
             }
-            AppEvent::DiffLoaded { id, token, result } => self.apply_diff_loaded(id, token, result),
+            AppEvent::DiffLoaded { id, token, result } => {
+                if result.is_err() {
+                    log_worker_failed(crate::logging::Worker::Diff, "load");
+                }
+                self.apply_diff_loaded(id, token, result)
+            }
             AppEvent::DiffNotesLoaded { review_id, result } => {
+                if result.is_err() {
+                    log_worker_failed(crate::logging::Worker::Diff, "notes");
+                }
                 self.apply_diff_notes_loaded(review_id, result)
             }
-            AppEvent::DiffNoteSaved { note, result } => self.apply_diff_note_saved(note, result),
-            AppEvent::DiffNoteRemoved { id, result } => self.apply_diff_note_removed(id, result),
+            AppEvent::DiffNoteSaved { note, result } => {
+                if result.is_err() {
+                    log_worker_failed(crate::logging::Worker::Diff, "note_save");
+                }
+                self.apply_diff_note_saved(note, result)
+            }
+            AppEvent::DiffNoteRemoved { id, result } => {
+                if result.is_err() {
+                    log_worker_failed(crate::logging::Worker::Diff, "note_remove");
+                }
+                self.apply_diff_note_removed(id, result)
+            }
             AppEvent::DiffProgressSaved { result } => {
                 if let Err(error) = result {
+                    log_worker_failed(crate::logging::Worker::Diff, "progress_save");
                     self.show_toast(format!("review progress not saved: {error}"));
                 }
                 true
@@ -867,6 +846,7 @@ impl App {
                 .iter()
                 .map(|(_, rect)| *rect)
                 .chain(self.switcher_scope_rects.iter().map(|(_, rect)| *rect))
+                .chain(self.switcher_close_rect)
                 .find(|rect| hit(*rect));
         }
 
@@ -892,6 +872,8 @@ impl App {
             .chain(
                 [
                     self.switcher_button_rect,
+                    self.mobile_pane_prev_rect,
+                    self.mobile_pane_next_rect,
                     self.sidebar_toggle_rect,
                     self.right_sidebar_toggle_rect,
                     self.version_rect,
@@ -1184,7 +1166,7 @@ impl App {
             }
             return;
         }
-        // Tapping the compact-mode `≡` button opens the switcher.
+        // Tapping the mobile MENU button opens the full-screen navigator.
         if let (MouseEventKind::Down(MouseButton::Left), Some(r)) =
             (m.kind, self.switcher_button_rect)
         {
@@ -1192,6 +1174,27 @@ impl App {
                 self.open_switcher();
                 return;
             }
+        }
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            let hit = |rect: Rect| {
+                m.column >= rect.x
+                    && m.column < rect.right()
+                    && m.row >= rect.y
+                    && m.row < rect.bottom()
+            };
+            if self.mobile_pane_prev_rect.is_some_and(hit) {
+                self.cycle_pane(-1);
+                return;
+            }
+            if self.mobile_pane_next_rect.is_some_and(hit) {
+                self.cycle_pane(1);
+                return;
+            }
+        }
+        // The complete two-row mobile header is chrome. Only MENU acts; every
+        // other header tap is consumed instead of leaking into a mouse-aware PTY.
+        if self.compact && m.row < self.last_pane_area.y {
+            return;
         }
         // Text-input modals: only the ⏎/esc footer buttons respond to the mouse;
         // any other click is swallowed (the centered modal owns the screen).
@@ -1346,11 +1349,22 @@ impl App {
                 // any old one. Falls through to normal click handling (focus/etc).
                 self.selection = self
                     .pane_content_at(m.column, m.row)
-                    .map(|(pane, content)| Selection {
-                        pane,
-                        content,
-                        anchor: (m.column, m.row),
-                        cursor: (m.column, m.row),
+                    .map(|(pane, content)| {
+                        let retained = self
+                            .retained_selection_point(pane, content, m.column, m.row)
+                            .map(|point| RetainedSelection {
+                                anchor: point,
+                                cursor: point,
+                            });
+                        Selection {
+                            pane,
+                            content,
+                            anchor: (m.column, m.row),
+                            cursor: (m.column, m.row),
+                            retained,
+                            scrolled: false,
+                            dragging: true,
+                        }
                     });
             }
             MouseEventKind::Down(MouseButton::Middle) => {
@@ -1398,13 +1412,7 @@ impl App {
                     }
                     return;
                 }
-                if let Some(sel) = self.selection.as_mut() {
-                    let c = sel.content;
-                    sel.cursor = (
-                        m.column.clamp(c.x, c.right().saturating_sub(1)),
-                        m.row.clamp(c.y, c.bottom().saturating_sub(1)),
-                    );
-                }
+                self.update_mouse_selection_cursor(m.column, m.row);
                 return;
             }
             MouseEventKind::Up(MouseButton::Left) | MouseEventKind::Up(MouseButton::Middle) => {
@@ -1433,6 +1441,10 @@ impl App {
                 if let Some(g) = self.mouse_grab.take() {
                     self.send_grabbed_mouse(g, MouseSeq::Release, m.column, m.row);
                     return;
+                }
+                self.update_mouse_selection_cursor(m.column, m.row);
+                if let Some(selection) = self.selection.as_mut() {
+                    selection.dragging = false;
                 }
                 // A real drag copies its text + flashes a toast; a plain click
                 // clears the (1-cell) selection so nothing stays highlighted.
@@ -1583,19 +1595,33 @@ impl App {
                 // Forwarding the wheel makes the app repaint; that output is the
                 // user scrolling, not the agent working (docs/07).
                 let mut scrolled_the_app = false;
+                let extending_selection = self.selection.is_some_and(|selection| {
+                    selection.pane == id && selection.dragging && selection.retained.is_some()
+                });
+                let mut scrolled_selection = false;
                 if let Some(pane) = self.panes.get(&id) {
                     let mm = pane.mouse_mode();
-                    if mm.report {
+                    if extending_selection && !pane.alt_screen() {
+                        // The selection gesture owns primary-screen scrolling,
+                        // even when the child reports mouse input. Its endpoints
+                        // are retained-history rows, so the original anchor stays
+                        // attached to the same text while the cursor extends.
+                        pane.scroll(-scroll);
+                        set_scroll = Some((pane.scroll_state().0 > 0).then_some(id));
+                        scrolled_selection = true;
+                    } else if mm.report {
                         // The app tracks the mouse (e.g. a TUI agent like Claude
                         // Code on the alternate screen) — forward the wheel so it
                         // scrolls its own transcript, exactly like a real terminal.
                         let base = content.unwrap_or(Rect::new(0, 0, 1, 1));
                         let col = m.column.saturating_sub(base.x) + 1;
                         let row = m.row.saturating_sub(base.y) + 1;
-                        let seq = mouse_wheel_seq(up, col, row, mm.sgr);
-                        for _ in 0..3 {
-                            pane.send(&seq);
-                        }
+                        // Preserve the terminal protocol's one-event/one-report
+                        // boundary. In particular, Windows ConPTY may coalesce
+                        // rapid writes; sending duplicates here can make a TUI
+                        // receive several concatenated SGR reports as one input
+                        // record and reject the entire wheel action.
+                        pane.send(&mouse_wheel_seq(up, col, row, mm.sgr));
                         scrolled_the_app = true;
                     } else if !pane.alt_screen() {
                         // Primary screen with real history: scroll luvus's
@@ -1622,6 +1648,12 @@ impl App {
                 }
                 if let Some(v) = set_scroll {
                     self.scroll_pane = v;
+                }
+                if scrolled_selection {
+                    if let Some(selection) = self.selection.as_mut() {
+                        selection.scrolled = true;
+                    }
+                    self.update_mouse_selection_cursor(m.column, m.row);
                 }
             }
             return;
@@ -1814,16 +1846,6 @@ impl App {
                     let _ = self.module_invoke_dock_action(&action, owner.as_deref(), extra);
                 }
             }
-            return;
-        }
-        // Clicking a workspace's branch opens its git tab (docs/17).
-        if let Some((i, _)) = self
-            .workspace_branch_rects
-            .iter()
-            .find(|(_, rect)| hit(*rect))
-        {
-            let i = *i;
-            self.open_git_tab(i);
             return;
         }
         if let Some((i, _)) = self.ws_rects.iter().find(|(_, rect)| hit(*rect)) {
@@ -2164,22 +2186,11 @@ impl App {
             .status
             .get(&copy.pane)
             .is_some_and(|status| status.agent == "codex");
-        let text = self.panes.get(&copy.pane).and_then(|pane| {
-            let range = copy.ordered();
-            let mut output = String::new();
-            let start_row = (range.0).0;
-            let end_row = (range.1).0;
-            // Hold one engine lock so every selected row comes from the same
-            // terminal snapshot. Rows that disappeared after the selection was
-            // made are skipped instead of discarding the remaining copy.
-            let mut appended = false;
-            pane.for_each_retained_row(&mut |row, _history, _row_count, line| {
-                if (start_row..=end_row).contains(&row) {
-                    append_selected_row(&mut output, &mut appended, line, row, range);
-                }
-            });
-            finish_selected_text(output)
-        });
+        let text = self
+            .panes
+            .get(&copy.pane)
+            .and_then(|pane| pane.retained_selection_text(copy.ordered()))
+            .and_then(finish_selected_text);
         if let Some(text) = text.map(|text| {
             if is_codex {
                 strip_uniform_single_cell_margin(text)
@@ -2232,9 +2243,10 @@ impl App {
         match key.code {
             KeyCode::Left | KeyCode::Char('h') => copy.cursor.1 = copy.cursor.1.saturating_sub(1),
             KeyCode::Right | KeyCode::Char('l') => {
-                copy.cursor.1 = copy.cursor.1.saturating_add(1).min(copy_line_end(
-                    pane.retained_row_text(copy.cursor.0).as_deref(),
-                ));
+                let last = pane
+                    .retained_row_layout(copy.cursor.0)
+                    .map_or(0, |layout| layout.last_column());
+                copy.cursor.1 = copy.cursor.1.saturating_add(1).min(last);
             }
             KeyCode::Up | KeyCode::Char('k') => copy.cursor.0 = copy.cursor.0.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => copy.cursor.0 = (copy.cursor.0 + 1).min(last_row),
@@ -2248,20 +2260,23 @@ impl App {
             KeyCode::End | KeyCode::Char('G') => copy.cursor.0 = last_row,
             KeyCode::Char('0') => copy.cursor.1 = 0,
             KeyCode::Char('$') => {
-                copy.cursor.1 = copy_line_end(pane.retained_row_text(copy.cursor.0).as_deref())
+                copy.cursor.1 = pane
+                    .retained_row_layout(copy.cursor.0)
+                    .map_or(0, |layout| layout.last_column())
             }
             KeyCode::Char('w') => {
                 copy.cursor =
-                    copy_word_forward(row_count, |row| pane.retained_row_text(row), copy.cursor)
+                    copy_word_forward(row_count, |row| pane.retained_row_layout(row), copy.cursor)
             }
             KeyCode::Char('B') => {
-                copy.cursor = copy_word_back(|row| pane.retained_row_text(row), copy.cursor)
+                copy.cursor = copy_word_back(|row| pane.retained_row_layout(row), copy.cursor)
             }
             _ => return true,
         }
-        copy.cursor.1 = copy.cursor.1.min(copy_line_end(
-            pane.retained_row_text(copy.cursor.0).as_deref(),
-        ));
+        copy.cursor.1 = copy.cursor.1.min(
+            pane.retained_row_layout(copy.cursor.0)
+                .map_or(0, |layout| layout.last_column()),
+        );
         self.copy_mode = Some(copy);
         self.reveal_copy_cursor();
         true
@@ -2337,6 +2352,54 @@ impl App {
             .map(|(id, r)| (*id, *r))
     }
 
+    /// Map one visible terminal cell into the pane's retained-history space.
+    /// Native file and diff views intentionally stay in screen coordinates.
+    fn retained_selection_point(
+        &self,
+        pane: PaneId,
+        content: Rect,
+        x: u16,
+        y: u16,
+    ) -> Option<(usize, usize)> {
+        if self.views.contains_key(&pane) {
+            return None;
+        }
+        let pane = self.panes.get(&pane)?;
+        let (visible_top, row_count) = pane.retained_viewport()?;
+        if row_count == 0 {
+            return None;
+        }
+        let row = visible_top
+            .saturating_add(y.saturating_sub(content.y) as usize)
+            .min(row_count.saturating_sub(1));
+        let col = x
+            .saturating_sub(content.x)
+            .min(content.width.saturating_sub(1)) as usize;
+        Some((row, col))
+    }
+
+    /// Move the visible cursor endpoint and, for terminal panes, resolve that
+    /// cell against the viewport *now*. The retained anchor is never rewritten.
+    fn update_mouse_selection_cursor(&mut self, x: u16, y: u16) {
+        let Some(selection) = self.selection else {
+            return;
+        };
+        let content = selection.content;
+        let screen = (
+            x.clamp(content.x, content.right().saturating_sub(1)),
+            y.clamp(content.y, content.bottom().saturating_sub(1)),
+        );
+        let retained = selection.retained.and_then(|_| {
+            self.retained_selection_point(selection.pane, content, screen.0, screen.1)
+        });
+        if let Some(selection) = self.selection.as_mut() {
+            selection.cursor = screen;
+            if let (Some(cursor), Some(retained)) = (retained, selection.retained.as_mut()) {
+                retained.cursor = cursor;
+            }
+        }
+    }
+
     /// Extract the current selection's text from the pane's grid (linear, with
     /// trailing blanks trimmed). `None` for a click without a drag or empty text.
     pub(crate) fn selection_text(&self) -> Option<String> {
@@ -2349,28 +2412,35 @@ impl App {
         if let Some(crate::app::ViewKind::File(v)) = self.views.get(&sel.pane) {
             return crate::files::selection_text(v, sel.content, sel.ordered());
         }
-        let rows = self
-            .panes
-            .get(&sel.pane)?
-            .engine
-            .lock()
-            .ok()?
-            .visible_rows();
+        if let Some(selection) = sel.retained {
+            let range = selection.ordered();
+            let text = self
+                .panes
+                .get(&sel.pane)?
+                .retained_selection_text(range)
+                .and_then(finish_selected_text)?;
+            let is_codex = self
+                .status
+                .get(&sel.pane)
+                .is_some_and(|status| status.agent == "codex");
+            return Some(if range.0 .1 == 0 || is_codex {
+                strip_uniform_single_cell_margin(text)
+            } else {
+                text
+            });
+        }
         let ((sx, sy), (ex, ey)) = sel.ordered();
         let (cx, cy) = (sel.content.x, sel.content.y);
-        let text = extract_rows_selection(
-            &rows,
+        let text = self.panes.get(&sel.pane)?.visible_selection_text((
             (
-                (
-                    (sy as usize).saturating_sub(cy as usize),
-                    (sx as usize).saturating_sub(cx as usize),
-                ),
-                (
-                    (ey as usize).saturating_sub(cy as usize),
-                    (ex as usize).saturating_sub(cx as usize),
-                ),
+                (sy as usize).saturating_sub(cy as usize),
+                (sx as usize).saturating_sub(cx as usize),
             ),
-        )?;
+            (
+                (ey as usize).saturating_sub(cy as usize),
+                (ex as usize).saturating_sub(cx as usize),
+            ),
+        ))?;
         // A drag may begin in the single blank pane cell before uniformly
         // aligned prose. Codex also emits that one-cell transcript gutter even
         // when the drag starts on its first visible character. It remains
@@ -2871,6 +2941,19 @@ impl App {
             Mode::Resize => self.handle_resize_mode_key(key),
         }
     }
+}
+
+fn log_worker_failed(worker: crate::logging::Worker, error_code: &'static str) {
+    let Some(error_code) = crate::logging::SafeId::new(error_code) else {
+        return;
+    };
+    crate::logging::event(
+        crate::logging::EventKind::WorkerFailed,
+        &[
+            crate::logging::Field::Worker(worker),
+            crate::logging::Field::ErrorCode(error_code),
+        ],
+    );
 }
 
 /// Encode one mouse-wheel notch as the bytes a mouse-tracking app expects.
@@ -3571,6 +3654,8 @@ mod tests {
 
     #[test]
     fn sgr_wheel_encodes_button_and_coords() {
+        // Each physical wheel event produces exactly one complete report.
+        // Fullscreen TUIs may reject multiple reports coalesced into one read.
         // Wheel up = button 64, down = 65; coords are 1-based, pane-local.
         assert_eq!(mouse_wheel_seq(true, 5, 3, true), b"\x1b[<64;5;3M".to_vec());
         assert_eq!(
@@ -4230,39 +4315,6 @@ mod link_click_tests {
         assert_eq!(app.pending_open_url.as_deref(), Some(URL));
     }
 
-    /// Copy-mode skips rows that fell out of retention, so the newline
-    /// separator must track appended rows — comparing against the selection's
-    /// start row would make a skipped leading row start the copy with `\n`.
-    #[test]
-    fn skipped_leading_rows_do_not_add_a_leading_newline() {
-        let mut out = String::new();
-        let mut appended = false;
-        let range = ((2, 0), (5, 2));
-        // Rows 2 and 3 were evicted and are skipped; row 4 is appended first.
-        append_selected_row(&mut out, &mut appended, "abc", 4, range);
-        append_selected_row(&mut out, &mut appended, "def", 5, range);
-        assert_eq!(
-            finish_selected_text(out).as_deref(),
-            Some("abc\ndef"),
-            "a skipped first row must not produce a leading newline"
-        );
-    }
-
-    #[test]
-    fn multi_line_copy_keeps_the_drag_left_edge() {
-        // The first column is blank pane-side space before a Markdown list. A
-        // drag beginning on `-` must not add that blank to every middle row.
-        let rows = vec![
-            " - first".to_string(),
-            " - second".to_string(),
-            " - third".to_string(),
-        ];
-        assert_eq!(
-            extract_rows_selection(&rows, ((0, 1), (2, 7))).as_deref(),
-            Some("- first\n- second\n- third")
-        );
-    }
-
     #[test]
     fn mouse_copy_drops_a_uniform_one_cell_pane_margin() {
         assert_eq!(
@@ -4340,6 +4392,283 @@ mod link_click_tests {
     }
 
     #[test]
+    fn mouse_auto_copy_preserves_reverse_wide_character_selection() {
+        let _env = crate::persist::test_env("mouse-copy-wide-unicode");
+        let (mut app, _term, _) = fixture_showing("你好，hello.", 0);
+        let pane = app.layout().focus;
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| *rect)
+            .expect("pane content rect");
+        let (visible_top, row_count) = app
+            .panes
+            .get(&pane)
+            .and_then(|pane| pane.retained_viewport())
+            .expect("retained viewport");
+        let row = (visible_top..row_count)
+            .find(|row| {
+                app.panes
+                    .get(&pane)
+                    .and_then(|pane| pane.retained_row_text(*row))
+                    .as_deref()
+                    == Some("你好，hello.")
+            })
+            .expect("fixture row");
+        let screen_row = content.y + (row - visible_top) as u16;
+        let left = (content.x, screen_row);
+        let right = (content.x + 3, screen_row);
+        app.selection = Some(crate::app::Selection {
+            pane,
+            content,
+            anchor: right,
+            cursor: left,
+            retained: Some(crate::app::RetainedSelection {
+                anchor: (row, 3),
+                cursor: (row, 0),
+            }),
+            scrolled: false,
+            dragging: true,
+        });
+
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            left,
+            KeyModifiers::NONE,
+        ));
+
+        assert_eq!(app.pending_clipboard.as_deref(), Some("你好"));
+    }
+
+    #[test]
+    fn visible_selection_fallback_preserves_wide_characters() {
+        let _env = crate::persist::test_env("mouse-copy-wide-visible-fallback");
+        let (mut app, _term, _) = fixture_showing("你好，hello.", 0);
+        let pane = app.layout().focus;
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| *rect)
+            .expect("pane content rect");
+        let visible_row = {
+            let pane = app.panes.get(&pane).expect("pane");
+            let engine = pane.engine.lock().expect("engine");
+            engine
+                .visible_rows()
+                .iter()
+                .position(|row| row.trim_end() == "你好，hello.")
+                .expect("visible fixture row")
+        };
+        app.selection = Some(crate::app::Selection {
+            pane,
+            content,
+            anchor: (content.x, content.y + visible_row as u16),
+            cursor: (content.x + 3, content.y + visible_row as u16),
+            retained: None,
+            scrolled: false,
+            dragging: false,
+        });
+
+        assert_eq!(app.selection_text().as_deref(), Some("你好"));
+    }
+
+    #[test]
+    fn mouse_selection_anchor_survives_scrollback_while_dragging() {
+        let _env = crate::persist::test_env("mouse-selection-scroll-anchor");
+        let source = (0..100)
+            .map(|line| format!("line-{line:03}\r\n"))
+            .collect::<String>();
+        let (mut app, _term, _) = fixture_showing(&source, 0);
+        let pane = app.layout().focus;
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| *rect)
+            .expect("pane content rect");
+        let start = (
+            content.x + "line-000".len() as u16 - 1,
+            content.bottom().saturating_sub(4),
+        );
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            start,
+            KeyModifiers::NONE,
+        ));
+        let anchor = app
+            .selection
+            .and_then(|selection| selection.retained)
+            .expect("terminal selection uses retained rows")
+            .anchor;
+        let anchor_text = app
+            .panes
+            .get(&pane)
+            .and_then(|pane| pane.retained_row_text(anchor.0))
+            .expect("anchored row")
+            .trim_end()
+            .to_string();
+        assert!(!anchor_text.is_empty(), "fixture anchor contains text");
+
+        // Extend beyond the original viewport. Each wheel event scrolls three
+        // retained rows while the pointer remains part of the active gesture.
+        for _ in 0..8 {
+            app.handle_event(mouse(MouseEventKind::ScrollUp, start, KeyModifiers::NONE));
+        }
+        let end = (content.x, content.y + 1);
+        app.handle_event(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            end,
+            KeyModifiers::NONE,
+        ));
+
+        let retained = app
+            .selection
+            .and_then(|selection| selection.retained)
+            .expect("retained selection after scrolling");
+        assert_eq!(
+            retained.anchor, anchor,
+            "scrolling must never re-anchor the original press"
+        );
+        assert!(
+            retained.cursor.0 < retained.anchor.0,
+            "dragging after wheel scroll extends into older history"
+        );
+        let selected = app.selection_text().expect("selected history text");
+        assert_eq!(
+            selected.lines().last(),
+            Some(anchor_text.as_str()),
+            "the copied range still ends on the row where the drag began"
+        );
+
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            end,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.pending_clipboard.as_deref(), Some(selected.as_str()));
+    }
+
+    #[test]
+    fn stationary_click_stays_empty_when_output_advances_history() {
+        let _env = crate::persist::test_env("mouse-selection-output-drift");
+        let source = (0..100)
+            .map(|line| format!("line-{line:03}\r\n"))
+            .collect::<String>();
+        let (mut app, _term, _) = fixture_showing(&source, 0);
+        let pane = app.layout().focus;
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| *rect)
+            .expect("pane content rect");
+        let at = (content.x + 2, content.bottom().saturating_sub(2));
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert!(app.selection.is_some(), "the press begins a selection");
+        app.panes
+            .get(&pane)
+            .expect("pane")
+            .engine
+            .lock()
+            .expect("terminal engine")
+            .advance(b"incoming-output\r\n");
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+
+        assert!(app.pending_clipboard.is_none());
+        assert!(app.toast.is_none());
+        assert!(app.selection.is_none(), "a plain click leaves no highlight");
+    }
+
+    #[test]
+    fn wheel_alone_can_extend_an_active_selection() {
+        let _env = crate::persist::test_env("mouse-selection-wheel-only");
+        let source = (0..100)
+            .map(|line| format!("line-{line:03}\r\n"))
+            .collect::<String>();
+        let (mut app, _term, _) = fixture_showing(&source, 0);
+        let pane = app.layout().focus;
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| *rect)
+            .expect("pane content rect");
+        let at = (content.x + 2, content.bottom().saturating_sub(4));
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert!(app.selection.is_some(), "the press begins a selection");
+        app.handle_event(mouse(MouseEventKind::ScrollUp, at, KeyModifiers::NONE));
+        let selection = app.selection.expect("active selection");
+        let retained = selection.retained.expect("retained endpoints");
+        assert!(selection.scrolled);
+        assert_ne!(retained.anchor, retained.cursor);
+        let selected = app.selection_text().expect("wheel-extended text");
+
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.pending_clipboard.as_deref(), Some(selected.as_str()));
+    }
+
+    #[test]
+    fn wheel_returning_to_the_anchor_does_not_copy_one_cell() {
+        let _env = crate::persist::test_env("mouse-selection-wheel-return");
+        let source = (0..100)
+            .map(|line| format!("line-{line:03}\r\n"))
+            .collect::<String>();
+        let (mut app, _term, _) = fixture_showing(&source, 0);
+        let pane = app.layout().focus;
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| *rect)
+            .expect("pane content rect");
+        let at = (content.x + 2, content.bottom().saturating_sub(4));
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert!(app.selection.is_some(), "the press begins a selection");
+        app.handle_event(mouse(MouseEventKind::ScrollUp, at, KeyModifiers::NONE));
+        app.handle_event(mouse(MouseEventKind::ScrollDown, at, KeyModifiers::NONE));
+        let retained = app
+            .selection
+            .and_then(|selection| selection.retained)
+            .expect("retained endpoints");
+        assert_eq!(retained.anchor, retained.cursor);
+        assert!(app.selection_text().is_none());
+
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert!(app.pending_clipboard.is_none());
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
     fn codex_copy_drops_its_one_cell_transcript_gutter() {
         let _env = crate::persist::test_env("codex-copy-gutter");
         let (mut app, _term, _) = fixture_showing("  hello\r\n  world", 0);
@@ -4358,6 +4687,9 @@ mod link_click_tests {
             content,
             anchor: (content.x + 1, content.y),
             cursor: (content.x + 6, content.y + 1),
+            retained: None,
+            scrolled: false,
+            dragging: false,
         });
 
         assert_eq!(app.selection_text().as_deref(), Some("hello\nworld"));

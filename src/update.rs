@@ -178,14 +178,26 @@ fn is_newer_build(release: &ForkRelease) -> bool {
 /// package-manager channels can only be reported, not driven: Homebrew and
 /// crates.io serve upstream's luvus, which by definition never carries this
 /// build.
-pub fn run_cli(args: &[String]) -> Result<i32> {
+///
+/// Only the messages this fork shares with upstream are translated. The rest
+/// stay English on purpose: `Context::text` **panics** on a key the CLI catalog
+/// does not carry, so a fork-only line wrapped in it would abort the command for
+/// everyone not running in English. Adding those keys is worth doing; guessing
+/// is not.
+pub fn run_cli(args: &[String], context: crate::i18n::cli::Context) -> Result<i32> {
     let yes = args.iter().any(|a| a == "--yes" || a == "-y");
     let restart = args.iter().any(|a| a == "--restart");
     if args
         .iter()
         .any(|a| !matches!(a.as_str(), "--yes" | "-y" | "--restart"))
     {
-        eprintln!("usage: luvus update [--yes] [--restart]");
+        eprintln!(
+            "{}",
+            crate::i18n::cli::help(
+                "usage: luvus update [--yes] [--restart]",
+                context.language()
+            )
+        );
         return Ok(2);
     }
 
@@ -231,8 +243,13 @@ pub fn run_cli(args: &[String]) -> Result<i32> {
     validate_release_version(&release.version)?;
 
     println!(
-        "Luvus {latest} is available (current: {}).",
-        installed_label()
+        "{}",
+        // Upstream's sentence, this fork's numbers: `CURRENT` is the bare semver
+        // every fork build shares, which cannot tell two of them apart.
+        context.render(
+            "Luvus {latest} is available (current: {current}).",
+            &[("latest", &latest), ("current", &installed_label())],
+        )
     );
     let executable = std::env::current_exe().context("find the running Luvus binary")?;
     let executable = executable.canonicalize().unwrap_or(executable);
@@ -680,10 +697,22 @@ pub fn check_now_reporting(tx: Sender<AppEvent>) {
 /// by Homebrew, Cargo or an OS package is left alone: replacing it behind the
 /// package manager's back is how you end up with an installation neither side
 /// can reason about.
+///
+/// The check's outcome is logged the way upstream logs it. The *install* is not:
+/// there is no event kind for it yet, and inventing one inside a merge is how a
+/// fork ends up fighting the module it just inherited. The failure is not silent
+/// either way — it reaches the user as a toast, which is what was missing.
 fn check_once(tx: &Sender<AppEvent>, url: &str, auto_install: bool) {
-    let Some(release) = fetch_release(url).filter(is_newer_build) else {
+    use crate::logging::{event, EventKind, Field, Outcome};
+
+    let Some(release) = fetch_release(url) else {
+        event(EventKind::UpdateCheck, &[Field::Outcome(Outcome::Error)]);
         return;
     };
+    event(EventKind::UpdateCheck, &[Field::Outcome(Outcome::Ok)]);
+    if !is_newer_build(&release) {
+        return;
+    }
     let _ = tx.send(AppEvent::UpdateAvailable(release.label()));
     if !auto_install {
         return;
@@ -943,8 +972,12 @@ mod tests {
             Some("0.13.0")
         );
         assert!(parse_tag_name(r#"{"message":"Not Found"}"#).is_none());
-        assert!(is_newer("0.13.0", super::CURRENT));
+        // A version this fork will never reach, rather than the next one up:
+        // `"0.13.0"` stood here and quietly became false the moment the fork
+        // merged 0.13.1, testing nothing while still looking like a test.
+        assert!(is_newer("99.0.0", super::CURRENT));
         assert!(!is_newer(super::CURRENT, super::CURRENT));
+        assert!(!is_newer("0.0.1", super::CURRENT));
     }
 
     /// Every `luvus.old*.exe` in `dir`, sorted — the rollbacks an install left.

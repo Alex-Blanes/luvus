@@ -33,7 +33,7 @@ const ogImage = 'https://luvus.dev/og.png';
 // Read `changelog/*.md` from the repo at build time. `?raw` gives the file text;
 // eager so it resolves during the build rather than at runtime.
 const files = import.meta.glob('../../../changelog/*.md', { query: '?raw', import: 'default', eager: true });
-const videoFiles = import.meta.glob('../assets/video/*.mp4', { query: '?url', import: 'default', eager: true });
+const videoFiles = import.meta.glob('../assets/video/**/*.mp4', { query: '?url', import: 'default', eager: true });
 const videos = Object.fromEntries(
   Object.entries(videoFiles).map(([path, url]) => [path.split('/').pop(), url])
 );
@@ -41,6 +41,55 @@ const videos = Object.fromEntries(
 // Website-only release media. The app, release notes, and terminal changelog
 // continue to consume plain `changelog/*.md`; richer demos stay in the site.
 const WEBSITE_RELEASE_MEDIA = {
+  'v0.13.1': {
+    heading: 'See Luvus v0.13.1 in action',
+    intro:
+      'Seven focused demos show the new Mission Control, localization, agent, workspace, folder, and theme workflows.',
+    media: [
+      {
+        file: 'mission-control.mp4',
+        title: 'Supervise every agent from Mission Control',
+        caption:
+          'Review agent state, location, model, tokens, context, and cost across the active workspace or the complete Luvus session.',
+      },
+      {
+        file: 'cli-i18n.mp4',
+        title: 'Use the CLI in your language',
+        caption:
+          'Read help and human-facing command output in any supported language while command syntax and machine-readable output remain stable.',
+      },
+      {
+        file: 'i18n.mp4',
+        title: 'Navigate localized Settings',
+        caption:
+          'Switch the interface language and use translated Settings labels, actions, hints, key references, messages, and values immediately.',
+      },
+      {
+        file: 'grok.mp4',
+        title: 'Fork a Grok Build session',
+        caption:
+          'Create a sibling Grok session from the current context while the original agent keeps running in its existing pane.',
+      },
+      {
+        file: 'cwd-root.mp4',
+        title: 'Open panes from the current directory',
+        caption:
+          'Start new tabs and splits from the focused pane directory, or retain the previous workspace-root behavior through Settings.',
+      },
+      {
+        file: 'showhidden.mp4',
+        title: 'Reveal hidden folders when you need them',
+        caption:
+          'Toggle hidden entries from the folder picker and jump directly to a pasted path before confirming the workspace.',
+      },
+      {
+        file: 'theme.mp4',
+        title: 'Choose new community themes',
+        caption:
+          'Preview and apply the latest community palettes from the same theme workflow used by built-in Luvus themes.',
+      },
+    ],
+  },
   'v0.12.0': {
     heading: 'See Luvus v0.12.0 in action',
     intro:

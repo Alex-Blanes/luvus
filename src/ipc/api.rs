@@ -3,6 +3,7 @@
 //! requests are marshalled onto the single-threaded app loop; `events.subscribe`
 //! streams from a simple broadcast bus. See docs/08.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -638,18 +639,223 @@ pub(crate) fn read_response_frame_with_deadline(
     frame_text(frame, "response")
 }
 
-fn write_response(writer: &mut impl Write, id: &str, response: &str) -> io::Result<()> {
-    RESPONSE_BYTES_OUT.fetch_add(response.len().saturating_add(1) as u64, Ordering::Relaxed);
-    if response.len().saturating_add(1) <= crate::terminal::backend::MAX_FRAME_BYTES {
-        writeln!(writer, "{response}")?;
-    } else {
-        writeln!(
-            writer,
-            "{}",
-            json!({"id":id,"error":{"code":"internal","message":"response exceeded protocol frame limit"}})
-        )?;
+struct ConnectionLogGuard;
+
+impl ConnectionLogGuard {
+    fn new() -> Self {
+        crate::logging::event(crate::logging::EventKind::UhpConnectionOpen, &[]);
+        Self
     }
-    writer.flush()
+}
+
+impl Drop for ConnectionLogGuard {
+    fn drop(&mut self) {
+        finish_abandoned_request_log();
+        crate::logging::event(crate::logging::EventKind::UhpConnectionClose, &[]);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RequestLog {
+    id: Option<crate::logging::SafeId>,
+    method: Option<crate::logging::SafeId>,
+    started: std::time::Instant,
+    subscription: bool,
+}
+
+thread_local! {
+    static REQUEST_LOG: RefCell<Option<RequestLog>> = const { RefCell::new(None) };
+}
+
+fn begin_request_log(id: Option<&str>, method: &str) {
+    let request = RequestLog {
+        id: id.and_then(crate::logging::SafeId::new),
+        method: crate::logging::SafeId::new(method),
+        started: std::time::Instant::now(),
+        subscription: false,
+    };
+    let mut fields = [crate::logging::Field::IdOmitted(false); 3];
+    let mut count = 0;
+    if let Some(id) = request.id {
+        fields[count] = crate::logging::Field::RequestId(id);
+        count += 1;
+    }
+    if let Some(method) = request.method {
+        fields[count] = crate::logging::Field::Method(method);
+        count += 1;
+    }
+    if request.id.is_none() || request.method.is_none() {
+        fields[count] = crate::logging::Field::IdOmitted(true);
+        count += 1;
+    }
+    crate::logging::event(crate::logging::EventKind::UhpRequestStart, &fields[..count]);
+    REQUEST_LOG.with(|slot| *slot.borrow_mut() = Some(request));
+}
+
+fn finish_request_log(response: &str) {
+    let Some(mut request) = REQUEST_LOG.with(|slot| slot.borrow_mut().take()) else {
+        return;
+    };
+    let response = serde_json::from_str::<Value>(response).ok();
+    let is_subscription = response.as_ref().is_some_and(|response| {
+        response.pointer("/result/type").and_then(Value::as_str) == Some("subscription_started")
+    });
+    if is_subscription {
+        let mut fields = [crate::logging::Field::IdOmitted(false); 3];
+        let count = request_id_method_fields(request, &mut fields);
+        crate::logging::event(
+            crate::logging::EventKind::UhpSubscriptionOpen,
+            &fields[..count],
+        );
+        request.subscription = true;
+        REQUEST_LOG.with(|slot| *slot.borrow_mut() = Some(request));
+        return;
+    }
+
+    let error_code = response
+        .as_ref()
+        .and_then(|response| response.pointer("/error/code"))
+        .and_then(Value::as_str)
+        .and_then(crate::logging::SafeId::new);
+    let rejected = error_code.is_some_and(|code| {
+        matches!(
+            code.as_str(),
+            "invalid_request" | "invalid_params" | "forbidden" | "server_busy"
+        )
+    });
+    if rejected {
+        let mut fields = [crate::logging::Field::IdOmitted(false); 5];
+        let mut count = request_id_method_fields(request, &mut fields);
+        if let Some(code) = error_code {
+            fields[count] = crate::logging::Field::ErrorCode(code);
+            count += 1;
+        }
+        fields[count] = crate::logging::Field::DurationMs(
+            request
+                .started
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        );
+        count += 1;
+        crate::logging::event(
+            crate::logging::EventKind::UhpRequestRejected,
+            &fields[..count],
+        );
+        return;
+    }
+    let outcome = if response
+        .as_ref()
+        .is_some_and(|response| response.get("error").is_some())
+    {
+        crate::logging::Outcome::Error
+    } else {
+        crate::logging::Outcome::Ok
+    };
+    let mut fields = [crate::logging::Field::IdOmitted(false); 6];
+    let mut count = request_id_method_fields(request, &mut fields);
+    fields[count] = crate::logging::Field::Outcome(outcome);
+    count += 1;
+    if let Some(code) = error_code {
+        fields[count] = crate::logging::Field::ErrorCode(code);
+        count += 1;
+    }
+    fields[count] = crate::logging::Field::DurationMs(
+        request
+            .started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+    );
+    count += 1;
+    crate::logging::event(
+        crate::logging::EventKind::UhpRequestComplete,
+        &fields[..count],
+    );
+}
+
+fn request_id_method_fields(request: RequestLog, fields: &mut [crate::logging::Field]) -> usize {
+    let mut count = 0;
+    if let Some(id) = request.id {
+        fields[count] = crate::logging::Field::RequestId(id);
+        count += 1;
+    }
+    if let Some(method) = request.method {
+        fields[count] = crate::logging::Field::Method(method);
+        count += 1;
+    }
+    if request.id.is_none() || request.method.is_none() {
+        fields[count] = crate::logging::Field::IdOmitted(true);
+        count += 1;
+    }
+    count
+}
+
+fn finish_subscription_log(reason: crate::logging::Reason) {
+    let Some(request) = REQUEST_LOG.with(|slot| slot.borrow_mut().take()) else {
+        return;
+    };
+    if !request.subscription {
+        return;
+    }
+    let mut fields = [crate::logging::Field::IdOmitted(false); 4];
+    let mut count = request_id_method_fields(request, &mut fields);
+    fields[count] = crate::logging::Field::Reason(reason);
+    count += 1;
+    crate::logging::event(
+        crate::logging::EventKind::UhpSubscriptionClose,
+        &fields[..count],
+    );
+}
+
+fn finish_abandoned_request_log() {
+    let Some(request) = REQUEST_LOG.with(|slot| slot.borrow_mut().take()) else {
+        return;
+    };
+    if request.subscription {
+        let mut fields = [crate::logging::Field::IdOmitted(false); 4];
+        let mut count = request_id_method_fields(request, &mut fields);
+        fields[count] = crate::logging::Field::Reason(crate::logging::Reason::Io);
+        count += 1;
+        crate::logging::event(
+            crate::logging::EventKind::UhpSubscriptionClose,
+            &fields[..count],
+        );
+        return;
+    }
+    let mut fields = [crate::logging::Field::IdOmitted(false); 5];
+    let mut count = request_id_method_fields(request, &mut fields);
+    fields[count] = crate::logging::Field::ErrorCode(
+        crate::logging::SafeId::new("io").expect("static id is valid"),
+    );
+    count += 1;
+    fields[count] = crate::logging::Field::DurationMs(
+        request
+            .started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+    );
+    count += 1;
+    crate::logging::event(
+        crate::logging::EventKind::UhpRequestRejected,
+        &fields[..count],
+    );
+}
+
+fn write_response(writer: &mut impl Write, id: &str, response: &str) -> io::Result<()> {
+    let fallback;
+    let emitted = if response.len().saturating_add(1) <= crate::terminal::backend::MAX_FRAME_BYTES {
+        response
+    } else {
+        fallback = json!({"id":id,"error":{"code":"internal","message":"response exceeded protocol frame limit"}}).to_string();
+        &fallback
+    };
+    RESPONSE_BYTES_OUT.fetch_add(emitted.len().saturating_add(1) as u64, Ordering::Relaxed);
+    writeln!(writer, "{emitted}")?;
+    writer.flush()?;
+    finish_request_log(emitted);
+    Ok(())
 }
 
 fn write_event_frame(writer: &mut impl Write, event: &str) -> io::Result<()> {
@@ -1350,6 +1556,7 @@ fn handle_conn(
     bus: EventBus,
     _permit: ConnectionPermit,
 ) {
+    let _connection_log = ConnectionLogGuard::new();
     let mut writer = stream.clone();
     let initial_frame = read_initial_frame(&mut stream, INITIAL_FRAME_TIMEOUT);
     // Windows implements the initial-frame deadline with PIPE_NOWAIT because
@@ -1410,6 +1617,12 @@ fn handle_conn(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    begin_request_log(
+        raw_id
+            .and_then(Value::as_str)
+            .filter(|raw_id| valid_request_id(raw_id)),
+        &method,
+    );
     if !raw_id.and_then(Value::as_str).is_some_and(valid_request_id) {
         let response = json!({"id":id,"error":{"code":"invalid_request",
             "message":"id must contain 1 to 128 ASCII letters, digits, '.', '_', ':', or '-'"}})
@@ -1842,6 +2055,7 @@ fn handle_conn(
         if let Some(fwd) = fwd {
             let _ = fwd.join(); // its sender just left the bus → the rx loop ends
         }
+        finish_subscription_log(crate::logging::Reason::Eof);
         return;
     }
 
@@ -2172,6 +2386,37 @@ mod tests {
 
         assert_eq!(writer.bytes, b"{\"id\":\"test\",\"result\":{}}\n");
         assert_eq!(writer.flushes, 1);
+    }
+
+    #[test]
+    fn oversized_response_emits_the_bounded_fallback() {
+        let mut writer = FlushProbe::default();
+        let oversized = "x".repeat(crate::terminal::backend::MAX_FRAME_BYTES);
+        write_response(&mut writer, "request-1", &oversized).unwrap();
+
+        let emitted: Value = serde_json::from_slice(&writer.bytes).unwrap();
+        assert_eq!(emitted["id"], "request-1");
+        assert_eq!(emitted["error"]["code"], "internal");
+        assert_eq!(writer.flushes, 1);
+        assert!(writer.bytes.len() < crate::terminal::backend::MAX_FRAME_BYTES);
+    }
+
+    #[test]
+    fn request_log_preserves_missing_and_valid_id_state() {
+        begin_request_log(None, "pane.list");
+        let missing = REQUEST_LOG.with(|slot| slot.borrow_mut().take()).unwrap();
+        assert!(missing.id.is_none());
+        assert_eq!(
+            missing.method.as_ref().map(crate::logging::SafeId::as_str),
+            Some("pane.list")
+        );
+
+        begin_request_log(Some("request-1"), "pane.list");
+        let valid = REQUEST_LOG.with(|slot| slot.borrow_mut().take()).unwrap();
+        assert_eq!(
+            valid.id.as_ref().map(crate::logging::SafeId::as_str),
+            Some("request-1")
+        );
     }
 
     #[test]

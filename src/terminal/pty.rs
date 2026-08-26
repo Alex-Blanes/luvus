@@ -156,6 +156,9 @@ pub struct MouseModes {
 }
 
 pub struct Pane {
+    /// Stable application identity for operational lifecycle events. This is
+    /// never derived from the child command or terminal contents.
+    id: PaneId,
     pub engine: Arc<Mutex<dyn VtEngine>>,
     /// `None` until a deferred spawn's worker stores it (docs/82).
     master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
@@ -349,6 +352,7 @@ impl Pane {
         cols: u16,
         rows: u16,
         cwd: PathBuf,
+        fallback_cwds: &[PathBuf],
         app_tx: Sender<AppEvent>,
         shell: &str,
         history_budget_bytes: usize,
@@ -359,7 +363,7 @@ impl Pane {
             cols,
             rows,
             cwd,
-            &[],
+            fallback_cwds,
             app_tx,
             None,
             cmd,
@@ -516,6 +520,7 @@ impl Pane {
         register_child_reaper(id, child, child_exited.clone(), app_tx);
 
         Ok(Pane {
+            id,
             engine,
             child_pid: Arc::new(AtomicU32::new(child_pid)),
             terminal_runtime: Arc::new(Mutex::new(Some(terminal_runtime))),
@@ -738,6 +743,7 @@ impl Pane {
         drop(worker);
 
         Pane {
+            id,
             engine,
             child_pid,
             terminal_runtime,
@@ -890,7 +896,20 @@ impl Pane {
             .unwrap_or(0)
     }
 
+    /// `(visible_top, retained_rows)` from one terminal snapshot. Mouse
+    /// selection uses this to bind a screen row to retained history without an
+    /// output burst changing the history length between separate reads.
+    pub(crate) fn retained_viewport(&self) -> Option<(usize, usize)> {
+        self.engine.lock().ok().map(|engine| {
+            (
+                engine.history_len().saturating_sub(engine.scroll_offset()),
+                engine.retained_row_count(),
+            )
+        })
+    }
+
     /// Read one retained row without allocating every other row.
+    #[cfg(test)]
     pub fn retained_row_text(&self, index: usize) -> Option<String> {
         self.engine.lock().ok()?.retained_row_text(index)
     }
@@ -904,6 +923,44 @@ impl Pane {
             let row_count = engine.retained_row_count();
             engine.for_each_retained_row(&mut |index, line| f(index, history, row_count, line));
         }
+    }
+
+    /// Extract retained terminal text by grid cell rather than string index.
+    /// This keeps wide glyphs and combining sequences aligned with selection
+    /// highlights.
+    pub fn retained_selection_text(
+        &self,
+        range: ((usize, usize), (usize, usize)),
+    ) -> Option<String> {
+        self.engine.lock().ok()?.retained_selection_text(range)
+    }
+
+    /// Extract a selection expressed in the currently visible viewport. This
+    /// is the fallback when a mouse press could not snapshot retained-history
+    /// coordinates, and still preserves terminal cell semantics for Unicode.
+    pub fn visible_selection_text(
+        &self,
+        ((start_row, start_col), (end_row, end_col)): ((usize, usize), (usize, usize)),
+    ) -> Option<String> {
+        let engine = self.engine.lock().ok()?;
+        let visible_top = engine.history_len().saturating_sub(engine.scroll_offset());
+        let row_count = engine.retained_row_count();
+        let last_row = row_count.checked_sub(1)?;
+        engine.retained_selection_text((
+            (
+                visible_top.saturating_add(start_row).min(last_row),
+                start_col,
+            ),
+            (visible_top.saturating_add(end_row).min(last_row), end_col),
+        ))
+    }
+
+    /// Cell geometry used by keyboard copy-mode navigation.
+    pub fn retained_row_layout(
+        &self,
+        index: usize,
+    ) -> Option<crate::terminal::vt::RetainedRowLayout> {
+        self.engine.lock().ok()?.retained_row_layout(index)
     }
 
     /// Jump the scrollback viewport so the row `offset` lines above the live
@@ -1039,6 +1096,14 @@ impl Pane {
         if let Ok(mut e) = self.engine.lock() {
             e.resize(cols, rows);
         }
+        crate::logging::event(
+            crate::logging::EventKind::PtyResize,
+            &[
+                crate::logging::Field::PaneId(u64::from(self.id.0)),
+                crate::logging::Field::Cols(u64::from(cols)),
+                crate::logging::Field::Rows(u64::from(rows)),
+            ],
+        );
         true
     }
 
@@ -1197,6 +1262,7 @@ mod reap_tests {
             80,
             24,
             std::env::temp_dir(),
+            &[],
             tx,
             "/bin/sh",
             500,
@@ -1293,6 +1359,47 @@ mod reap_tests {
         assert_ne!(pane.child_pid.load(Ordering::SeqCst), 0);
     }
 
+    /// A deferred pane (the split path) whose primary cwd was deleted after it
+    /// was resolved must retry its fallback chain rather than dying. Regression
+    /// for the split that silently disappeared when its cwd vanished in the race
+    /// window before the fork: same shape as the restore-path test above, but
+    /// driven through `spawn_deferred`.
+    #[test]
+    fn deferred_pane_retries_a_fallback_cwd() {
+        let (tx, rx) = mpsc::channel();
+        let id = PaneId::alloc();
+        let fallback = std::env::temp_dir();
+        let missing = fallback.join(format!("luvus-missing-cwd-{}", std::process::id()));
+        let pane = Pane::spawn_deferred(
+            id,
+            80,
+            24,
+            missing,
+            std::slice::from_ref(&fallback),
+            tx,
+            "/bin/sh",
+            500,
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "the fallback PTY never became ready");
+            match rx.recv_timeout(remaining) {
+                Ok(AppEvent::PtyReady { id: ready, cwd }) if ready == id => {
+                    assert_eq!(cwd, fallback);
+                    break;
+                }
+                Ok(AppEvent::PtyExit(exited)) if exited == id => {
+                    panic!("the deferred pane closed instead of using its fallback cwd")
+                }
+                Ok(_) => {}
+                Err(error) => panic!("the fallback PTY never became ready: {error}"),
+            }
+        }
+        assert_ne!(pane.child_pid.load(Ordering::SeqCst), 0);
+    }
+
     /// A resize issued before the deferred fork must still reach the child:
     /// the worker opens the PTY at the latest recorded size (docs/82).
     #[test]
@@ -1303,6 +1410,7 @@ mod reap_tests {
             80,
             24,
             std::env::temp_dir(),
+            &[],
             tx,
             "/bin/sh",
             500,
