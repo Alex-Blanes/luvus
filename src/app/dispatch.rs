@@ -13,6 +13,8 @@ pub(crate) const MAX_AGENT_REPORT_MESSAGE_CHARS: usize = 4096;
 pub(crate) const MAX_AGENT_PROMPT_CHARS: usize = 262_144;
 pub(crate) const MAX_AGENT_START_ARGS: usize = 64;
 const AGENT_PROMPT_QUIET: Duration = Duration::from_millis(1200);
+const DETECTION_INTERVAL: Duration = Duration::from_millis(100);
+const DETECTION_AUDIT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// A parked `wait.output` request (docs/81): reply when the pane's recent
 /// output contains `needle`, or the optional deadline passes.
@@ -33,6 +35,105 @@ mod socket_api_tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let app = App::new(100, 40, tx).unwrap();
         (env, app)
+    }
+
+    #[test]
+    fn quiet_runtime_can_leave_the_fast_detection_cadence() {
+        let (_env, mut app) = app("quiet-runtime-cadence");
+        let now = Instant::now();
+        assert!(app.needs_fast_runtime_tick(now));
+
+        for status in app.status.values_mut() {
+            status.force_detect = false;
+            status.candidate = status.state;
+            status.last_activity = now - ACTIVITY_WINDOW - QUIET_DWELL - Duration::from_secs(1);
+        }
+        assert!(
+            !app.needs_fast_runtime_tick(now),
+            "a quiet fleet without parked deadlines should use the coarse audit"
+        );
+
+        let status = app.status.values_mut().next().unwrap();
+        status.candidate = State::Working;
+        assert!(
+            app.needs_fast_runtime_tick(now),
+            "an in-flight state dwell retains the fast cadence"
+        );
+    }
+
+    #[test]
+    fn detection_considers_changed_panes_between_bounded_audits() {
+        let (_env, mut app) = app("dirty-pane-detection");
+        let pane = app.layout().focus;
+        let start = Instant::now();
+        app.last_detect_at = start - DETECTION_INTERVAL;
+        app.last_detection_audit_at = start;
+        for status in app.status.values_mut() {
+            status.force_detect = false;
+            status.state = State::Idle;
+            status.candidate = State::Idle;
+            status.last_activity = start - Duration::from_secs(60);
+        }
+
+        let considered = app.detection_panes_considered;
+        app.detect_tick(start + DETECTION_INTERVAL);
+        assert_eq!(
+            app.detection_panes_considered, considered,
+            "quiet panes are skipped between fleet audits"
+        );
+
+        assert!(app.handle_event(AppEvent::PtyData(pane)));
+        app.detect_tick(start + 2 * DETECTION_INTERVAL);
+        assert_eq!(
+            app.detection_panes_considered,
+            considered + 1,
+            "PTY invalidation schedules only its pane"
+        );
+    }
+
+    #[test]
+    fn settled_working_pane_waits_for_output_instead_of_polling_forever() {
+        let (_env, mut app) = app("settled-working-cadence");
+        let pane = app.layout().focus;
+        let now = Instant::now();
+        app.last_detect_at = now - DETECTION_INTERVAL;
+        app.last_detection_audit_at = now;
+        let status = app.status.get_mut(&pane).unwrap();
+        status.force_detect = false;
+        status.state = State::Working;
+        status.candidate = State::Working;
+        status.last_activity = now - ACTIVITY_WINDOW - QUIET_DWELL - Duration::from_secs(1);
+
+        let considered = app.detection_panes_considered;
+        app.detect_tick(now);
+        assert_eq!(
+            app.detection_panes_considered, considered,
+            "unchanged working panes do not force a permanent 100 ms poll"
+        );
+
+        assert!(app.handle_event(AppEvent::PtyData(pane)));
+        app.detect_tick(now + DETECTION_INTERVAL);
+        assert_eq!(app.detection_panes_considered, considered + 1);
+    }
+
+    #[test]
+    fn hidden_pty_title_change_is_a_presentation_invalidation() {
+        let (_env, mut app) = app("hidden-title-invalidation");
+        let hidden = app.layout().focus;
+        app.run_cmd(crate::app::keys::Cmd::NewTab);
+        assert!(!app.pane_is_visible(hidden));
+        {
+            let mut engine = app.panes[&hidden].engine.lock().unwrap();
+            engine.advance(b"\x1b]0;Background build\x07");
+        }
+        assert!(app.handle_event(AppEvent::PtyData(hidden)));
+        let now = Instant::now();
+        app.last_detect_at = now - DETECTION_INTERVAL;
+        app.last_detection_audit_at = now;
+        assert!(
+            app.detect_tick(now),
+            "an inactive pane title can change visible tab metadata"
+        );
     }
 
     #[test]
@@ -174,6 +275,61 @@ mod socket_api_tests {
             app.config.mission_pricing.get("new-model"),
             Some(&[1.0, 2.0, 0.5])
         );
+
+        app.agents_scroll = 9;
+        let result = app
+            .dispatch("config.patch", &json!({"patch":{"agents_filter":"active"}}))
+            .unwrap();
+        assert_eq!(result["config"]["agents_filter"], "active");
+        assert_eq!(app.agents_filter, crate::app::AgentsFilter::Active);
+        assert_eq!(app.agents_scroll, 0);
+    }
+
+    #[test]
+    fn config_reload_applies_the_agents_filter_live() {
+        let (_env, mut app) = app("socket-config-agents-reload");
+        app.agents_filter = crate::app::AgentsFilter::Active;
+        app.config.agents_filter = crate::app::AgentsFilter::Active;
+        app.agents_scroll = 8;
+
+        crate::config::save(&crate::config::Config::default());
+        let result = app.dispatch("server.reload_config", &json!({})).unwrap();
+
+        assert_eq!(result["config"]["agents_filter"], "workspace");
+        assert_eq!(app.agents_filter, crate::app::AgentsFilter::Workspace);
+        assert_eq!(app.agents_scroll, 0);
+    }
+
+    #[test]
+    fn config_patch_updates_child_appearance_and_notifies_mode_2031() {
+        let (_env, mut app) = app("socket-theme-appearance");
+        let pane_id = app.layout().focus;
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        let mut engine = crate::terminal::vt::alacritty::AlacrittyEngine::with_appearance(
+            80,
+            24,
+            response_tx,
+            crate::config::SCROLLBACK_BYTES_DEFAULT,
+            crate::terminal::appearance::PaneAppearance::default(),
+        );
+        crate::terminal::vt::VtEngine::advance(&mut engine, b"\x1b[?2031h");
+        app.panes.get_mut(&pane_id).unwrap().engine =
+            std::sync::Arc::new(std::sync::Mutex::new(engine));
+
+        app.dispatch("config.patch", &json!({"patch":{"theme":"gruvbox-light"}}))
+            .unwrap();
+        let recv_bytes = || match response_rx.recv().unwrap() {
+            crate::terminal::pty::InputAction::Bytes(bytes) => bytes,
+            crate::terminal::pty::InputAction::Submit { .. } => panic!("unexpected submit"),
+        };
+        assert_eq!(recv_bytes(), b"\x1b[?997;2n");
+
+        app.panes[&pane_id]
+            .engine
+            .lock()
+            .unwrap()
+            .advance(b"\x1b]11;?\x07");
+        assert_eq!(recv_bytes(), b"\x1b]11;rgb:f2f2/e5e5/bcbc\x07");
     }
 
     #[test]
@@ -221,6 +377,39 @@ mod socket_api_tests {
         assert_eq!(selected["tab"], "2");
         assert_eq!(selected["workspace_id"], workspace_id);
         assert_eq!(selected["tab_id"], first_tab_id);
+    }
+
+    #[test]
+    fn task_start_api_supports_explicit_workspace_mode() {
+        let (_env, mut app) = app("socket-task-workspace");
+        let workspace_id = app.workspaces[0].id.clone();
+        let workspaces_before = app.workspaces.len();
+        let tabs_before = app.workspaces[0].tabs.len();
+        app.orch
+            .add_task("shared".into(), vec![], vec![], None)
+            .unwrap();
+
+        let result = app
+            .dispatch(
+                "task.start",
+                &json!({
+                    "id":"t1",
+                    "mode":"workspace",
+                    "workspace_id":workspace_id
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(result["mode"], "workspace");
+        assert_eq!(result["workspace_id"], workspace_id);
+        assert!(result["worktree"].is_null());
+        assert!(result["branch"].is_null());
+        assert_eq!(app.workspaces.len(), workspaces_before);
+        assert_eq!(app.workspaces[0].tabs.len(), tabs_before + 1);
+        assert_eq!(
+            app.orch.task("t1").unwrap().worker_mode,
+            Some(crate::orch::TaskWorkerMode::Workspace)
+        );
     }
 
     #[test]
@@ -363,6 +552,30 @@ fn blocking_hint(bottom: &str) -> Option<String> {
 }
 
 impl App {
+    /// Whether the server loop must retain its 100 ms runtime cadence.
+    ///
+    /// Quiet panes do not need a 33 ms poll. Fresh output, an in-flight
+    /// classification dwell, an expiring integration lease, or a parked API
+    /// workflow does: these paths have user-visible deadlines and keep the
+    /// existing detection latency until the scheduler can sleep again.
+    pub(crate) fn needs_fast_runtime_tick(&self, now: Instant) -> bool {
+        let detection_active = self.status.values().any(|status| {
+            status.force_detect
+                || status.candidate != status.state
+                || status.agent_report.is_some()
+                || now.saturating_duration_since(status.last_activity)
+                    < ACTIVITY_WINDOW + QUIET_DWELL
+        });
+        detection_active
+            || !self.output_waits.is_empty()
+            || !self.agent_waits.is_empty()
+            || !self.agent_starts.is_empty()
+            || !self.agent_prompts.is_empty()
+            || !self.backend_revision_waits.is_empty()
+            || self.toast.is_some()
+            || self.search_flash.is_some()
+    }
+
     /// Recompute every pane's agent state. Cheap; called a few times a second.
     /// Returns whether anything the sidebar shows changed, so the loop repaints a
     /// silent agent's Working→Done transition even when no other event fires.
@@ -379,10 +592,60 @@ impl App {
         // The file-viewer upkeep rides the same 1s cadence — sub-second freshness
         // buys nothing (a node switch or an on-disk edit showing within a second
         // is fine) and 10x/s stats + allocs would be wasted work on the loop.
-        if now.duration_since(self.last_cwd_at) >= Duration::from_secs(1) {
+        if now.duration_since(self.last_cwd_at) >= Duration::from_secs(1) && !self.cwd_scan_inflight
+        {
             self.last_cwd_at = now;
-            self.refresh_cwds();
             self.remember_session_titles();
+            self.cwd_scan_inflight = true;
+            // Agent identity keeps its independent two-second cadence, but
+            // when its deadline lands on this CWD scan both projections share
+            // one OS process-table snapshot.
+            let include_processes = now.duration_since(self.last_proc_at) >= Duration::from_secs(2)
+                && !self.proc_scan_inflight;
+            if include_processes {
+                self.last_proc_at = now;
+                self.proc_scan_inflight = true;
+            }
+            let panes: Vec<(PaneId, u32)> = self
+                .panes
+                .iter()
+                .filter_map(|(id, p)| {
+                    let pid = p.child_pid.load(std::sync::atomic::Ordering::SeqCst);
+                    (pid != 0).then_some((*id, pid))
+                })
+                .collect();
+            let workspaces: Vec<(String, PathBuf)> = self
+                .workspaces
+                .iter()
+                .map(|ws| (ws.id.clone(), ws.cwd.clone()))
+                .collect();
+            let homes = self.workspace_homes();
+            let tabs = self.renameable_tab_leaves();
+            let tx = self.app_tx.clone();
+            std::thread::spawn(move || {
+                let pids: Vec<u32> = panes.iter().map(|(_, pid)| *pid).collect();
+                let (evidence, processes) =
+                    crate::platform::scan_pane_runtime(&pids, include_processes);
+                let pane_results: Vec<(PaneId, crate::platform::PaneCwdEvidence)> = panes
+                    .into_iter()
+                    .zip(evidence)
+                    .map(|((id, _), ev)| (id, ev))
+                    .collect();
+                let workspace_candidates =
+                    super::cwd::workspace_candidates_from_scan(&pane_results, &tabs, &homes);
+                let branches = workspaces
+                    .into_iter()
+                    .map(|(id, cwd)| (id, super::git_branch(&cwd)))
+                    .collect();
+                let _ = tx.send(AppEvent::CwdScanned {
+                    panes: pane_results,
+                    branches,
+                    workspace_candidates,
+                });
+                if include_processes {
+                    let _ = tx.send(AppEvent::ProcScanned(processes));
+                }
+            });
             // Keep the FILES dock rooted at the active node and its open dirs
             // read (docs/38). Off-loop: this only schedules reads, never blocks.
             self.ensure_file_tree();
@@ -428,61 +691,39 @@ impl App {
                 let _ = tx.send(AppEvent::ProcScanned(found));
             });
         }
-        // Mission Control usage (docs/54, MC-2): read tokens/context/cost from the
-        // agents' on-disk stores on a worker thread, and only while a mission tab is
-        // open — the default session pays nothing. Targets are gathered here (cheap);
-        // the worker does the file IO and posts the fresh cache back.
-        let mission_open = self
-            .workspaces
-            .iter()
-            .any(|w| w.tabs.iter().any(Tab::is_mission));
-        if mission_open
-            && now.duration_since(self.last_usage_at) >= Duration::from_secs(5)
-            && !self.usage_scan_inflight
-        {
-            self.last_usage_at = now;
+        // Mission Control usage is demand-driven. Opening/focusing the dashboard,
+        // changing scope, or pressing/clicking refresh queues one worker scan;
+        // merely retaining a hidden mission tab performs no usage IO.
+        self.sync_mission_usage_visibility();
+        if self.mission_usage_requested && !self.usage_scan_inflight {
+            self.mission_usage_requested = false;
             self.usage_scan_inflight = true;
-            // Targets: every live pane with a session, plus every resumable session
-            // on disk. Keyed by session id (dedup), so a live pane and its resumable
-            // twin share one read (`(agent, cwd, session_id)`).
-            let mut targets: std::collections::HashMap<String, (String, std::path::PathBuf)> =
-                std::collections::HashMap::new();
-            for (id, p) in self.panes.iter() {
-                if let Some(sess) = self.status.get(id).and_then(|s| s.agent_session.as_ref()) {
-                    targets
-                        .entry(sess.session_id.clone())
-                        .or_insert((sess.agent.clone(), p.cwd.clone()));
-                }
-            }
-            for s in self.resumable.iter() {
-                targets
-                    .entry(s.session_id.clone())
-                    .or_insert((s.agent.clone(), s.cwd.clone()));
-            }
+            let targets = self.mission_usage_targets();
             let overrides = self.config.mission_pricing.clone();
-            // Previous scan's results, so an unchanged transcript is reused instead
-            // of re-read+parsed (the heavy part). Cloned once per scan (every 5s,
-            // only while a mission tab is open) — a handful of small entries.
+            // Previous results let an explicit refresh reuse unchanged transcripts:
+            // one stat per idle session, with no read or parse.
             let prev_usage = self.agent_usage.clone();
             let prev_mtimes = self.usage_mtimes.clone();
             let tx = self.app_tx.clone();
             std::thread::spawn(move || {
                 let mut usage = std::collections::HashMap::new();
                 let mut mtimes = std::collections::HashMap::new();
-                for (sid, (agent, cwd)) in targets {
-                    let mtime = crate::agent::session_mtime(&agent, &cwd, &sid);
+                for (key, cwd) in targets {
+                    let mtime = crate::agent::session_mtime(&key.agent, &cwd, &key.session_id);
                     if let Some(mt) = mtime {
-                        mtimes.insert(sid.clone(), mt);
+                        mtimes.insert(key.clone(), mt);
                     }
                     // Unchanged since last scan → reuse the cached figures (one
                     // `stat`, no read/parse).
-                    if mtime.is_some() && prev_mtimes.get(&sid) == mtime.as_ref() {
-                        if let Some(u) = prev_usage.get(&sid) {
-                            usage.insert(sid, u.clone());
+                    if mtime.is_some() && prev_mtimes.get(&key) == mtime.as_ref() {
+                        if let Some(u) = prev_usage.get(&key) {
+                            usage.insert(key, u.clone());
                             continue;
                         }
                     }
-                    if let Some(mut u) = crate::agent::session_usage(&agent, &cwd, &sid) {
+                    if let Some(mut u) =
+                        crate::agent::session_usage(&key.agent, &cwd, &key.session_id)
+                    {
                         // Re-price with any user overrides (MC-5); empty ⇒ unchanged.
                         if !overrides.is_empty() {
                             u.cost = crate::mission::estimate_cost_with(
@@ -493,7 +734,7 @@ impl App {
                                 &overrides,
                             );
                         }
-                        usage.insert(sid, u);
+                        usage.insert(key, u);
                     }
                 }
                 let _ = tx.send(AppEvent::UsageScanned { usage, mtimes });
@@ -502,15 +743,39 @@ impl App {
         // The per-pane classification below locks each pane's VT engine + scans its
         // grid; agent state (blocked/working/done) is human-paced, so ~100ms is
         // plenty — running it at the render frame rate (up to 60fps) just burns CPU.
-        if now.duration_since(self.last_detect_at) < Duration::from_millis(100) {
+        if now.duration_since(self.last_detect_at) < DETECTION_INTERVAL {
             return false;
         }
         self.last_detect_at = now;
         let focus = self.layout().focus;
-        let ids: Vec<PaneId> = self.panes.keys().copied().collect();
+        self.detection_dirty
+            .retain(|id| self.panes.contains_key(id));
+        let full_audit =
+            now.duration_since(self.last_detection_audit_at) >= DETECTION_AUDIT_INTERVAL;
+        if full_audit {
+            self.last_detection_audit_at = now;
+            self.detection_full_fleet_audits = self.detection_full_fleet_audits.saturating_add(1);
+        }
+        let ids: Vec<PaneId> = self
+            .panes
+            .keys()
+            .copied()
+            .filter(|id| {
+                full_audit
+                    || self.detection_dirty.contains(id)
+                    || self.status.get(id).is_some_and(|status| {
+                        status.force_detect
+                            || status.candidate != status.state
+                            || status.agent_report.is_some()
+                            || (status.state == State::Working
+                                && now.saturating_duration_since(status.last_activity)
+                                    < ACTIVITY_WINDOW + QUIET_DWELL)
+                    })
+            })
+            .collect();
         let mut changes: Vec<(PaneId, State, String)> = Vec::new();
         // Panes that just finished a working stretch (Working → Idle/Done) — the
-        // retro "done" chime fires on these, whether or not the pane is focused.
+        // selected completion cue fires whether or not the pane is focused.
         let mut finished: Vec<PaneId> = Vec::new();
         // A newly-detected resumable agent means there's a session worth saving;
         // flag a snapshot so it's captured even if we later crash (no clean exit).
@@ -519,8 +784,22 @@ impl App {
         // the state remains Idle. Keep this separate from `agent_appeared`:
         // non-resumable agents still need a repaint, but not a persisted session.
         let mut visible_identity_changed = false;
+        // OSC title changes can alter tab labels even when their pane is not in
+        // the active tab. Hidden PTY bytes do not schedule presentation, so the
+        // detector must explicitly surface this metadata-only invalidation.
+        let mut presentation_metadata_changed = false;
         let mut expired_reports: Vec<(PaneId, String)> = Vec::new();
         for id in ids {
+            self.detection_panes_considered = self.detection_panes_considered.saturating_add(1);
+            let audit_only = full_audit
+                && !self.detection_dirty.contains(&id)
+                && self.status.get(&id).is_none_or(|status| {
+                    !status.force_detect
+                        && status.candidate == status.state
+                        && status.state != State::Working
+                        && status.agent_report.is_none()
+                });
+            self.detection_dirty.remove(&id);
             let Some(pane) = self.panes.get(&id) else {
                 continue;
             };
@@ -540,15 +819,31 @@ impl App {
                 .status
                 .get(&id)
                 .and_then(|status| status.agent_report.clone());
-            let detection_rows = detect::screen_rows(
-                self.status
-                    .get(&id)
-                    .map(|status| status.agent.as_str())
-                    .unwrap_or(""),
-                self.proc_commands
-                    .get(&id)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
+            let known_agent = self
+                .status
+                .get(&id)
+                .map(|status| {
+                    if self.manifests.is_agent(&status.agent) {
+                        status.agent.clone()
+                    } else {
+                        status
+                            .agent_session
+                            .as_ref()
+                            .map(|session| session.agent.clone())
+                            .unwrap_or_default()
+                    }
+                })
+                .unwrap_or_default();
+            let running_for_detection = self
+                .proc_commands
+                .get(&id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let detection_rows =
+                detect::screen_rows(&known_agent, running_for_detection, &self.manifests);
+            let non_empty_rows = detect::screen_uses_non_empty_rows(
+                &known_agent,
+                running_for_detection,
                 &self.manifests,
             );
             let (last_generation, force_detect) = self
@@ -565,10 +860,15 @@ impl App {
                     Ok(engine) => {
                         let generation = engine.output_generation();
                         if force_detect || last_generation != Some(generation) {
+                            let text = if non_empty_rows {
+                                engine.detection_text_non_empty(detection_rows)
+                            } else {
+                                engine.detection_text(detection_rows)
+                            };
                             Some((
                                 generation,
                                 engine.title().map(Arc::<str>::from),
-                                Arc::<str>::from(engine.detection_text(detection_rows)),
+                                Arc::<str>::from(text),
                             ))
                         } else {
                             None
@@ -579,7 +879,12 @@ impl App {
             };
             if let Some(s) = self.status.get_mut(&id) {
                 if let Some((generation, title, bottom)) = inspected {
+                    if audit_only {
+                        self.detection_audit_recoveries =
+                            self.detection_audit_recoveries.saturating_add(1);
+                    }
                     s.last_detect_generation = Some(generation);
+                    presentation_metadata_changed |= s.detected_title != title;
                     s.detected_title = title;
                     s.detected_bottom = bottom;
                     s.force_detect = false;
@@ -609,20 +914,7 @@ impl App {
             // What this pane is already known to be: the last resolved agent, or
             // the one a hook/disk-discovery bound to it. Keeps identity stable
             // across frames where the agent's UI doesn't show its own name.
-            let known = self
-                .status
-                .get(&id)
-                .map(|s| {
-                    if self.manifests.is_agent(&s.agent) {
-                        s.agent.clone()
-                    } else {
-                        s.agent_session
-                            .as_ref()
-                            .map(|a| a.agent.clone())
-                            .unwrap_or_default()
-                    }
-                })
-                .unwrap_or_default();
+            let known = known_agent;
             // Ground truth for identity, when the last scan could see this pane.
             let running = self
                 .proc_commands
@@ -702,6 +994,7 @@ impl App {
                     || s.agent_report.is_some();
                 s.agent = detected;
                 if agent_changed {
+                    log_agent_identity(id, &s.agent, s.identity_source);
                     visible_identity_changed |= was_visible_agent || is_visible_agent;
                     if crate::agent::is_resumable(&s.agent) {
                         agent_appeared = true;
@@ -730,7 +1023,9 @@ impl App {
                 };
                 if s.state != desired && now.duration_since(s.candidate_since) >= dwell {
                     let was_working = s.state == State::Working;
+                    let previous = s.state;
                     s.state = desired;
+                    log_agent_state(id, &s.agent, previous, desired);
                     // Snapshot what a blocked agent is waiting on **once**, at the
                     // moment it enters Blocked (not every tick), for Mission
                     // Control's "why blocked / answer inline" (docs/54); cleared
@@ -750,9 +1045,23 @@ impl App {
         if agent_appeared {
             self.session_dirty = true;
         }
+        // A state transition needs presentation only when that state has a
+        // rendered consumer: a visible pane, a live AGENTS/Mission row, or an
+        // orchestration board. Quiet shells in inactive tabs still publish API
+        // events below, but no longer force a known-no-change full projection.
+        let state_presentation_changed = changes.iter().any(|(id, _, agent)| {
+            self.pane_is_visible(*id)
+                || self.manifests.is_agent(agent)
+                || self.status.get(id).is_some_and(|status| {
+                    status.agent_session.is_some() || status.agent_report.is_some()
+                })
+                || self.active_is_orch()
+                || self.active_is_mission()
+        });
         // State and visible identity transitions both change the sidebar. Session
         // persistence remains limited to resumable agents via `agent_appeared`.
-        let changed = !changes.is_empty() || visible_identity_changed;
+        let changed =
+            state_presentation_changed || visible_identity_changed || presentation_metadata_changed;
         let (sound_done, sound_blocked) = {
             let n = &self.config.notifications;
             (n.sound_on_done, n.sound_on_blocked)
@@ -784,7 +1093,7 @@ impl App {
                 }),
             );
             self.check_agent_waits(id);
-            // The optional retro chime (off by default). A plain shell going
+            // Optional sound cues (off by default). A plain shell going
             // quiet or blocking is not an agent, so it stays silent either way.
             let is_agent_pane = self.manifests.is_agent(&agent)
                 || self
@@ -795,14 +1104,14 @@ impl App {
             // debounce already absorbs mid-turn pauses, and it rings whether or
             // not the pane is focused (that's the point: you looked away).
             if sound_done && is_agent_pane && finished.contains(&id) {
-                self.pending_sound = true;
+                self.queue_sound(crate::sound::SoundCue::Done);
             }
-            // *Blocked*: the same chime, but armed per pane — a prompt that
+            // *Blocked*: a distinct attention cue, armed per pane — a prompt that
             // flaps while you ignore it rings once, and focusing the pane
             // re-arms it for the next prompt.
             let armed = self.status.get(&id).is_some_and(|s| s.notify_armed);
             if sound_blocked && is_agent_pane && st == State::Blocked && armed {
-                self.pending_sound = true;
+                self.queue_sound(crate::sound::SoundCue::Blocked);
                 if let Some(s) = self.status.get_mut(&id) {
                     s.notify_armed = false;
                 }
@@ -824,19 +1133,16 @@ impl App {
             return self.handle_terminal_backend(req);
         }
         // No node open: most methods reach `layout()`, which would index an empty
-        // `workspaces`. This was written when an empty session only ever existed
-        // for the moment before the app quit; since docs/43 §3.3 a server *stays*
-        // empty after its last node closes, so the methods that open one — the
-        // only way back — must get through, or the server is a brick that only
-        // `server stop` can clear.
+        // `workspaces`. Normal close paths immediately create a neutral home
+        // terminal, but restore or shell startup can still fail. Methods that
+        // recover or inspect that exceptional state must get through.
         // Only methods that are safe with no node: they either take an explicit
         // path or touch no node at all. Notably absent is `workspace.new`, which
         // derives its folder from the focused pane and would fall back to the
         // *server's* cwd — the very thing §3.3 removed.
         const WITHOUT_NODE: &[&str] = &[
             "ping",
-            "socket.capabilities",
-            "runtime.capabilities",
+            "uhp.capabilities",
             "session.snapshot",
             "search.capabilities",
             "server.stop",
@@ -851,6 +1157,8 @@ impl App {
             "workspace.list",
             "node.list",
             "worktree.open",
+            "tab.new",
+            "pane.split",
             "ui.bar.list",
             "ui.bar.push",
             "ui.bar.move",
@@ -865,10 +1173,7 @@ impl App {
             return json!({ "id": req.id, "error": { "code": "no_session", "message": "no active session" } }).to_string();
         }
         let read_only = crate::api::capabilities::is_read_only(&req.method);
-        let revisioned = !matches!(
-            req.method.as_str(),
-            "runtime.capabilities" | "session.snapshot"
-        );
+        let revisioned = !matches!(req.method.as_str(), "uhp.capabilities" | "session.snapshot");
         let mut params = req.params.clone();
         let expected_revision = revisioned
             .then(|| {
@@ -923,11 +1228,18 @@ impl App {
                 "protocol":1,
                 "session": crate::session::display_name()
             })),
-            "socket.capabilities" => {
+            "uhp.capabilities" => {
                 reject_api_fields(p, &[])?;
-                Ok(crate::api::capabilities(crate::ipc::api::current_sequence(
-                    &self.events,
-                )))
+                let mut capabilities =
+                    crate::api::capabilities(crate::ipc::api::current_sequence(&self.events));
+                if let Some(object) = capabilities.as_object_mut() {
+                    object.insert("session".into(), json!(crate::session::display_name()));
+                    object.insert(
+                        "server_generation".into(),
+                        json!(self.backend_server_generation),
+                    );
+                }
+                Ok(capabilities)
             }
             "config.get" => {
                 reject_api_fields(p, &[])?;
@@ -966,32 +1278,6 @@ impl App {
                 self.apply_socket_manifests(manifests);
                 let rules = self.manifests.rule_count();
                 Ok(json!({"type":"agent_manifests_reloaded","rules":rules}))
-            }
-            "runtime.capabilities" => {
-                reject_api_fields(p, &[])?;
-                Ok(json!({
-                "type":"runtime_capabilities",
-                "protocol":{
-                    "name":crate::runtime_api::PROTOCOL_NAME,
-                    "major":crate::runtime_api::PROTOCOL_MAJOR,
-                    "minor":crate::runtime_api::PROTOCOL_MINOR,
-                },
-                "session":crate::session::display_name(),
-                "event_sequence":crate::ipc::api::current_sequence(&self.events),
-                "methods":crate::runtime_api::METHODS,
-                "agent_authorities":["integration_report", "process_tree", "launch_command", "osc_title", "screen_text", "prior_identity", "command_fallback"],
-                "agent_states":["idle", "working", "blocked", "done"],
-                "limits":{
-                    "agent_wait_timeout_s":MAX_AGENT_WAIT.as_secs(),
-                    "agent_prompt_characters":MAX_AGENT_PROMPT_CHARS,
-                    "agent_prompt_quiet_ms":AGENT_PROMPT_QUIET.as_millis(),
-                    "agent_start_arguments":MAX_AGENT_START_ARGS,
-                    "agent_report_ttl_s":MAX_AGENT_REPORT_TTL_S,
-                    "agent_report_message_characters":MAX_AGENT_REPORT_MESSAGE_CHARS,
-                    "agent_waits_per_pane":MAX_AGENT_WAITS_PER_PANE,
-                    "agent_waits_total":MAX_AGENT_WAITS_TOTAL,
-                }
-                }))
             }
             "session.snapshot" => {
                 reject_api_fields(p, &[])?;
@@ -1125,10 +1411,23 @@ impl App {
                     "panes":panes,
                     "detection_extractions": self.detection_extractions,
                     "detection_skips": self.detection_skips,
+                    "detection_performance": {
+                        "panes_considered": self.detection_panes_considered,
+                        "panes_extracted": self.detection_extractions,
+                        "panes_generation_skipped": self.detection_skips,
+                        "full_fleet_audits": self.detection_full_fleet_audits,
+                        "audit_recoveries": self.detection_audit_recoveries,
+                    },
                     "render_performance": crate::ipc::server::performance_snapshot(),
                 }))
             }
             "pane.split" => {
+                if self.workspaces.is_empty() && !self.ensure_workspace_for_terminal() {
+                    return Err((
+                        "spawn_failed".to_string(),
+                        "could not create a terminal in the home directory".to_string(),
+                    ));
+                }
                 let base = self.resolve_pane(p).unwrap_or_else(|| self.layout().focus);
                 self.layout_mut().focus = base;
                 let dir = p
@@ -1339,11 +1638,17 @@ impl App {
                     .iter()
                     .enumerate()
                     .map(|(i, w)| {
+                        let terminal_cwd = self
+                            .workspace_terminal_cwd(i)
+                            .unwrap_or(&w.cwd)
+                            .display()
+                            .to_string();
                         json!({
                             "workspace": i.to_string(),
                             "workspace_id": w.id,
                             "name": w.name,
                             "cwd": w.cwd.display().to_string(),
+                            "terminal_cwd": terminal_cwd,
                             "pinned": w.pinned,
                             "display_position": display_positions[i].to_string(),
                             "active": i == active,
@@ -1486,22 +1791,31 @@ impl App {
                 // explicit `luvus workspace open <path>` omits it and still focuses.
                 let path = crate::platform::user_path(req_str(p, "path")?);
                 let focus = p.get("focus").and_then(|v| v.as_bool()).unwrap_or(true);
-                let before_len = self.workspaces.len();
-                let was = self.active_ws;
-                // Report a failed open instead of answering with the *previously*
-                // active node, which read as success and left the caller (and the
-                // user) looking at the wrong folder.
-                if !self.open_workspace_at(path.clone()) {
-                    return Err((
-                        "spawn_failed".to_string(),
-                        format!(
-                            "couldn't open {} — the shell failed to start there",
-                            path.display()
-                        ),
-                    ));
-                }
-                if !focus && self.workspaces.len() == before_len {
-                    self.active_ws = was;
+                match self
+                    .workspaces
+                    .iter()
+                    .position(|w| crate::platform::same_path(&w.cwd, &path))
+                {
+                    Some(i) => {
+                        self.forget_closed_workspace_path(&path);
+                        if focus {
+                            self.active_ws = i;
+                        }
+                    }
+                    None if !focus && self.automatic_workspace_open_is_suppressed(&path) => {}
+                    // Report a failed open instead of answering with the
+                    // *previously* active node, which read as success and left
+                    // the caller (and the user) looking at the wrong folder.
+                    None if !self.create_workspace_at(path.clone()) => {
+                        return Err((
+                            "spawn_failed".to_string(),
+                            format!(
+                                "couldn't open {} — the shell failed to start there",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    None => {}
                 }
                 Ok(json!({
                     "type":"workspace",
@@ -1603,7 +1917,16 @@ impl App {
                 self.socket_tab(workspace, tab)
             }
             "tab.new" => {
-                self.new_tab();
+                if self.workspaces.is_empty() {
+                    if !self.ensure_workspace_for_terminal() {
+                        return Err((
+                            "spawn_failed".to_string(),
+                            "could not create a terminal in the home directory".to_string(),
+                        ));
+                    }
+                } else {
+                    self.new_tab();
+                }
                 Ok(json!({
                     "type":"tab",
                     "tab": (self.ws().active_tab + 1).to_string()
@@ -2352,6 +2675,7 @@ impl App {
                     "agent.authority_reported",
                     json!({"pane":id.0.to_string(), "source":source, "agent":agent, "status":state_str(state), "sequence":sequence, "ttl_s":ttl_s}),
                 );
+                log_agent_authority(id, agent, crate::logging::Outcome::Ok);
                 if changed {
                     self.emit_event(
                         "pane.agent_status_changed",
@@ -2387,10 +2711,12 @@ impl App {
                 }
                 status.agent_report = None;
                 status.force_detect = true;
+                let agent = status.agent.clone();
                 self.emit_event(
                     "agent.authority_released",
                     json!({"pane":id.0.to_string(), "source":source, "reason":"released"}),
                 );
+                log_agent_authority(id, &agent, crate::logging::Outcome::Ok);
                 Ok(json!({"type":"agent_release", "pane":id.0.to_string()}))
             }
             "agent.wait" => Err((
@@ -3415,6 +3741,14 @@ impl App {
                 self.open_git_tab(i);
                 Ok(json!({"type":"ok","git": self.active_is_git()}))
             }
+            "mission.open" => {
+                let i = self.optional_socket_workspace(p)?.unwrap_or(self.active_ws);
+                if i >= self.workspaces.len() {
+                    return Err(workspace_update_error(i, WorkspaceUpdateError::NotFound));
+                }
+                self.open_mission_control(i);
+                Ok(json!({"type":"ok","mission": self.active_is_mission()}))
+            }
             // ── file viewer (docs/38) ──
             "files.open" => {
                 let raw = p.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -3558,24 +3892,60 @@ impl App {
                 Ok(json!({ "type": "task", "task": task_json(&task) }))
             }
             "task.start" => {
-                // ORCH-3: spawn an isolated worker (worktree + pane) for the task.
                 let id = req_str(p, "id")?.to_string();
-                let (pane, path) =
-                    self.task_start(&id, opt_str(p, "branch"), opt_str(p, "agent"))?;
+                let mode =
+                    task_worker_mode(p, self.orch.task(&id).and_then(|task| task.worker_mode))?;
+                let started = self.task_start(
+                    &id,
+                    opt_str(p, "branch"),
+                    opt_str(p, "agent"),
+                    mode,
+                    opt_str(p, "workspace_id"),
+                )?;
                 let task = self.orch.task(&id).map(task_json).unwrap_or(Value::Null);
                 Ok(json!({
                     "type": "task",
                     "task": task,
-                    "pane": pane.0.to_string(),
-                    "worktree": path.display().to_string(),
+                    "pane": started.pane.0.to_string(),
+                    "mode": started.mode.as_str(),
+                    "workspace_id": started.workspace_id,
+                    "tab_id": started.tab_id,
+                    "cwd": started.cwd.display().to_string(),
+                    "worktree": started.worktree,
+                    "branch": started.branch,
                 }))
             }
             "task.update" => {
                 let id = req_str(p, "id")?.to_string();
-                if let Some(s) = p.get("status").and_then(|v| v.as_str()) {
+                let status = if let Some(s) = p.get("status").and_then(|v| v.as_str()) {
                     let st = crate::orch::TaskStatus::parse(s).ok_or_else(|| {
                         ("bad_request".to_string(), format!("unknown status: {s}"))
                     })?;
+                    if matches!(
+                        st,
+                        crate::orch::TaskStatus::Merging | crate::orch::TaskStatus::Merged
+                    ) {
+                        return Err((
+                            "protected_status".to_string(),
+                            format!("{s} is set only by task.merge"),
+                        ));
+                    }
+                    Some(st)
+                } else {
+                    None
+                };
+                if let Some(current) = self.orch.task(&id).map(|task| task.status) {
+                    if matches!(
+                        current,
+                        crate::orch::TaskStatus::Merging | crate::orch::TaskStatus::Merged
+                    ) {
+                        return Err((
+                            "task_complete".to_string(),
+                            format!("{id} is already {}", current.as_str()),
+                        ));
+                    }
+                }
+                if let Some(st) = status {
                     self.orch.set_status(&id, st).map_err(orch_err)?;
                 }
                 if let Some(o) = p.get("output").and_then(|v| v.as_str()) {
@@ -3600,23 +3970,42 @@ impl App {
                 Ok(json!({ "type": "task", "task": task, "gate_running": gate_running }))
             }
             "task.merge" => {
-                // ORCH-6: integrate the task's branch via the isolated merge gate.
-                let id = req_str(p, "id")?.to_string();
-                self.merge_task(&id)
+                // Socket requests are parked by `handle_task_merge_request` so
+                // Git never runs on the app loop. Reaching direct dispatch is a
+                // programmer error, not a second synchronous implementation.
+                Err((
+                    "async_required".to_string(),
+                    "task.merge must run through the control API".to_string(),
+                ))
             }
             "task.next" => {
-                // ORCH-4 scheduler: hand out the next ready task. `--start` spawns
-                // an isolated worker (ORCH-3); otherwise claim it for this pane.
+                // ORCH-4 scheduler: hand out the next ready task. `--start`
+                // spawns the requested worker mode; otherwise claim it here.
                 match self.orch.next_ready() {
                     None => Ok(json!({ "type": "none", "message": "no ready tasks" })),
                     Some(id) => {
                         if p.get("start").and_then(|v| v.as_bool()).unwrap_or(false) {
-                            let (pane, path) = self.task_start(&id, None, opt_str(p, "agent"))?;
+                            let mode = task_worker_mode(
+                                p,
+                                self.orch.task(&id).and_then(|task| task.worker_mode),
+                            )?;
+                            let started = self.task_start(
+                                &id,
+                                None,
+                                opt_str(p, "agent"),
+                                mode,
+                                opt_str(p, "workspace_id"),
+                            )?;
                             let task = self.orch.task(&id).map(task_json).unwrap_or(Value::Null);
                             Ok(json!({
                                 "type": "task", "task": task,
-                                "pane": pane.0.to_string(),
-                                "worktree": path.display().to_string(),
+                                "pane": started.pane.0.to_string(),
+                                "mode": started.mode.as_str(),
+                                "workspace_id": started.workspace_id,
+                                "tab_id": started.tab_id,
+                                "cwd": started.cwd.display().to_string(),
+                                "worktree": started.worktree,
+                                "branch": started.branch,
                             }))
                         } else {
                             let pane = self.orch_pane(p)?;
@@ -3660,7 +4049,7 @@ impl App {
                 Ok(json!({ "type": "task", "task": task_json(&task), "released_leases": released }))
             }
             "lease.acquire" => {
-                let task = opt_str(p, "task").unwrap_or_default();
+                let task = req_str(p, "task")?.to_string();
                 let pane = self.orch_pane(p)?;
                 let lease = self
                     .orch
@@ -3801,9 +4190,9 @@ impl App {
         json!({
             "type":"session_snapshot",
             "protocol":{
-                "name":crate::runtime_api::PROTOCOL_NAME,
-                "major":crate::runtime_api::PROTOCOL_MAJOR,
-                "minor":crate::runtime_api::PROTOCOL_MINOR,
+                "name":crate::api::PROTOCOL_NAME,
+                "major":crate::api::PROTOCOL_MAJOR,
+                "minor":crate::api::PROTOCOL_MINOR,
             },
             "session":crate::session::display_name(),
             "server_generation":self.backend_server_generation,
@@ -4752,10 +5141,16 @@ impl App {
             .workspaces
             .get(index)
             .ok_or_else(|| workspace_update_error(index, WorkspaceUpdateError::NotFound))?;
+        let terminal_cwd = self
+            .workspace_terminal_cwd(index)
+            .unwrap_or(&workspace.cwd)
+            .display()
+            .to_string();
         Ok(json!({
             "type":"workspace", "workspace":index.to_string(), "workspace_id":workspace.id,
             "name":workspace.name,
             "cwd":workspace.cwd.display().to_string(), "branch":workspace.branch,
+            "terminal_cwd":terminal_cwd,
             "ahead":workspace.git_ahead_behind.map(|value| value.0),
             "behind":workspace.git_ahead_behind.map(|value| value.1),
             "pinned":workspace.pinned, "active":index == self.active_ws,
@@ -4897,20 +5292,18 @@ impl App {
                 format!("theme `{}` is not installed", next.theme),
             ));
         }
-        let mut theme = self.theme_registry.theme_or_default(&next.theme);
-        if self.downsample {
-            theme = theme.to_256();
-        }
+        let theme = self.theme_registry.theme_or_default(&next.theme);
         let sidebars = Sidebars::from_config(&next.sidebars());
         let keymap = keys::build_keymap(&next.keybindings);
         let history_budget = next.scrollback_bytes();
-        self.theme = theme;
+        self.set_effective_theme(&next.theme, theme);
         self.catalog = crate::i18n::by_code(&next.language);
         self.prefix = prefix;
         self.keymap = keymap;
         self.sidebars = sidebars;
         self.file_tree.show_hidden = next.layout.files_show_hidden;
         self.file_tree.scroll = 0;
+        self.apply_agents_filter(next.agents_filter);
         crate::layout::set_gaps(next.layout.col_gap, next.layout.row_gap);
         for pane in self.panes.values() {
             pane.set_history_budget(history_budget);
@@ -5272,6 +5665,25 @@ fn str_array(p: &Value, key: &str) -> Vec<String> {
 /// An orchestration `Reject` → the API `(code, message)` error shape.
 fn orch_err(r: crate::orch::Reject) -> (String, String) {
     (r.code.to_string(), r.message)
+}
+
+fn task_worker_mode(
+    p: &Value,
+    existing: Option<crate::orch::TaskWorkerMode>,
+) -> Result<crate::orch::TaskWorkerMode, (String, String)> {
+    match p.get("mode") {
+        None => Ok(existing.unwrap_or(crate::orch::TaskWorkerMode::Worktree)),
+        Some(Value::String(mode)) => crate::orch::TaskWorkerMode::parse(mode).ok_or_else(|| {
+            (
+                "bad_request".to_string(),
+                "mode must be worktree or workspace".to_string(),
+            )
+        }),
+        Some(_) => Err((
+            "bad_request".to_string(),
+            "mode must be worktree or workspace".to_string(),
+        )),
+    }
 }
 
 /// A `Task` as a JSON value for API results + bus events.
@@ -5657,6 +6069,65 @@ fn state_str(s: State) -> &'static str {
     }
 }
 
+fn log_agent_identity(id: PaneId, agent: &str, source: &str) {
+    let authority = match source {
+        "integration_report" => crate::logging::Authority::Hook,
+        source if source.contains("process") => crate::logging::Authority::Process,
+        "command_fallback" => crate::logging::Authority::None,
+        _ => crate::logging::Authority::Text,
+    };
+    let mut fields = [crate::logging::Field::IdOmitted(false); 4];
+    fields[0] = crate::logging::Field::PaneId(u64::from(id.0));
+    fields[1] = crate::logging::Field::Authority(authority);
+    let count = if let Some(agent) = crate::logging::SafeId::new(agent) {
+        fields[2] = crate::logging::Field::Agent(agent);
+        3
+    } else {
+        fields[2] = crate::logging::Field::IdOmitted(true);
+        3
+    };
+    crate::logging::event(crate::logging::EventKind::AgentIdentity, &fields[..count]);
+}
+
+fn log_agent_state(id: PaneId, agent: &str, from: State, to: State) {
+    fn map(state: State) -> crate::logging::AgentState {
+        match state {
+            State::Blocked => crate::logging::AgentState::Blocked,
+            State::Working => crate::logging::AgentState::Working,
+            State::Done => crate::logging::AgentState::Done,
+            State::Idle | State::Unknown => crate::logging::AgentState::Idle,
+        }
+    }
+
+    let mut fields = [crate::logging::Field::IdOmitted(false); 5];
+    fields[0] = crate::logging::Field::PaneId(u64::from(id.0));
+    fields[1] = crate::logging::Field::FromState(map(from));
+    fields[2] = crate::logging::Field::AgentState(map(to));
+    let count = if let Some(agent) = crate::logging::SafeId::new(agent) {
+        fields[3] = crate::logging::Field::Agent(agent);
+        4
+    } else {
+        fields[3] = crate::logging::Field::IdOmitted(true);
+        4
+    };
+    crate::logging::event(crate::logging::EventKind::AgentState, &fields[..count]);
+}
+
+fn log_agent_authority(id: PaneId, agent: &str, outcome: crate::logging::Outcome) {
+    let mut fields = [crate::logging::Field::IdOmitted(false); 5];
+    fields[0] = crate::logging::Field::PaneId(u64::from(id.0));
+    fields[1] = crate::logging::Field::Authority(crate::logging::Authority::Hook);
+    fields[2] = crate::logging::Field::Outcome(outcome);
+    let count = if let Some(agent) = crate::logging::SafeId::new(agent) {
+        fields[3] = crate::logging::Field::Agent(agent);
+        4
+    } else {
+        fields[3] = crate::logging::Field::IdOmitted(true);
+        4
+    };
+    crate::logging::event(crate::logging::EventKind::AgentAuthority, &fields[..count]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5723,6 +6194,32 @@ mod tests {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn mission_open_targets_a_workspace_and_rejects_missing_ones() {
+        let _env = crate::persist::test_env("mission-open-api");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        let second = std::path::PathBuf::from(std::env::var_os("LUVUS_HOME").unwrap())
+            .join("second-workspace");
+        std::fs::create_dir_all(&second).unwrap();
+        assert!(app.create_workspace_at(second));
+        app.active_ws = 0;
+
+        let opened = app
+            .dispatch("mission.open", &json!({"workspace": "1"}))
+            .expect("existing workspace opens Mission Control");
+        assert_eq!(opened, json!({"type":"ok", "mission":true}));
+        assert_eq!(app.active_ws, 1);
+        assert!(app.active_is_mission());
+
+        let before = (app.active_ws, app.ws().active_tab);
+        let error = app
+            .dispatch("mission.open", &json!({"workspace": "9"}))
+            .expect_err("missing workspace must not change the active view");
+        assert_eq!(error.0, "not_found");
+        assert_eq!((app.active_ws, app.ws().active_tab), before);
     }
 
     #[test]
@@ -6485,7 +6982,7 @@ command = ["true"]
 
         let snapshot = app.dispatch("session.snapshot", &json!({})).unwrap();
         assert_eq!(snapshot["type"], "session_snapshot");
-        assert_eq!(snapshot["protocol"]["name"], "luvus-runtime");
+        assert_eq!(snapshot["protocol"]["name"], "luvus-uhp");
         assert_eq!(
             snapshot["workspaces"][0]["tabs"][0]["panes"][0]["pane_id"],
             pane.0.to_string()
@@ -6677,11 +7174,16 @@ command = ["true"]
         assert_eq!(rows[0]["workspace"], "0", "API order stays stable");
         assert_eq!(rows[1]["name"], "Luvus website");
         assert_eq!(rows[1]["cwd"], a.display().to_string());
+        assert_eq!(rows[1]["terminal_cwd"], a.display().to_string());
         assert_eq!(rows[1]["pinned"], false);
         assert_eq!(rows[1]["display_position"], "2");
         assert_eq!(rows[2]["workspace"], "2");
         assert_eq!(rows[2]["pinned"], true);
         assert_eq!(rows[2]["display_position"], "0");
+        let fetched = app
+            .dispatch("workspace.get", &json!({"workspace": 1}))
+            .expect("workspace get");
+        assert_eq!(fetched["terminal_cwd"], a.display().to_string());
 
         let unpinned = app
             .dispatch("workspace.pin", &json!({"workspace": "2", "pinned": false}))
@@ -7101,6 +7603,15 @@ command = ["true"]
         let listed = app.dispatch("pane.list", &json!({})).expect("pane list");
         assert!(listed["detection_extractions"].as_u64().is_some());
         assert!(listed["detection_skips"].as_u64().is_some());
+        assert!(listed["detection_performance"]["panes_considered"]
+            .as_u64()
+            .is_some());
+        assert!(listed["detection_performance"]["full_fleet_audits"]
+            .as_u64()
+            .is_some());
+        assert!(listed["detection_performance"]["audit_recoveries"]
+            .as_u64()
+            .is_some());
         assert!(listed["render_performance"]["frames_sent"]
             .as_u64()
             .is_some());

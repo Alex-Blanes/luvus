@@ -50,11 +50,15 @@ pub enum Cmd {
     PrevWorkspace,
     NewWorktree,
     OpenGit,
+    OpenDiff,
+    OpenMission,
     OpenBoard,
     OpenSettings,
     ToggleSidebar,
     ToggleRightSidebar,
     ToggleAgents,
+    /// Focus the FILES tree. The historical enum/config id remains stable so
+    /// existing user keymaps keep working after the command's UX is refined.
     ToggleFiles,
     Switcher,
     GlobalSearch,
@@ -87,6 +91,8 @@ impl Cmd {
         Cmd::PrevWorkspace,
         Cmd::NewWorktree,
         Cmd::OpenGit,
+        Cmd::OpenDiff,
+        Cmd::OpenMission,
         Cmd::OpenBoard,
         Cmd::OpenSettings,
         Cmd::ToggleSidebar,
@@ -124,6 +130,8 @@ impl Cmd {
             Cmd::PrevWorkspace => "prev_node",
             Cmd::NewWorktree => "new_worktree",
             Cmd::OpenGit => "open_git",
+            Cmd::OpenDiff => "open_diff",
+            Cmd::OpenMission => "open_mission",
             Cmd::OpenBoard => "open_board",
             Cmd::OpenSettings => "open_settings",
             Cmd::ToggleSidebar => "toggle_sidebar",
@@ -153,8 +161,7 @@ impl Cmd {
             Cmd::ClosePane => cat.cmd_close_pane,
             Cmd::ZoomPane => cat.cmd_zoom_pane,
             Cmd::ResizeMode => cat.cmd_resize_mode,
-            // The Keys tab's section headings are intentionally English too.
-            Cmd::CopyMode => "Copy terminal text",
+            Cmd::CopyMode => cat.settings.keys_copy_terminal_text,
             Cmd::NewTab => cat.cmd_new_tab,
             Cmd::NextTab => cat.cmd_next_tab,
             Cmd::PrevTab => cat.cmd_prev_tab,
@@ -165,6 +172,8 @@ impl Cmd {
             Cmd::PrevWorkspace => cat.cmd_prev_workspace,
             Cmd::NewWorktree => cat.cmd_new_worktree,
             Cmd::OpenGit => cat.cmd_open_git,
+            Cmd::OpenDiff => cat.cmd_open_diff,
+            Cmd::OpenMission => cat.mc_open,
             Cmd::OpenBoard => cat.cmd_open_board,
             Cmd::OpenSettings => cat.cmd_open_settings,
             Cmd::ToggleSidebar => cat.cmd_toggle_sidebar,
@@ -177,11 +186,9 @@ impl Cmd {
         }
     }
 
-    /// Group heading for the Settings → Keys list. `Cmd::ALL` is ordered so each
-    /// group is contiguous; the Keys tab prints this label when it changes. Kept
-    /// English to match the tab's (English) how-to intro; the per-command
-    /// `label()` stays localized.
-    pub fn section(self) -> &'static str {
+    /// Localized group heading for the Settings → Keys list. `Cmd::ALL` is
+    /// ordered so each group is contiguous.
+    pub fn section(self, cat: &crate::i18n::Catalog) -> &'static str {
         match self {
             Cmd::FocusLeft
             | Cmd::FocusDown
@@ -195,22 +202,26 @@ impl Cmd {
             | Cmd::ClosePane
             | Cmd::ZoomPane
             | Cmd::ResizeMode
-            | Cmd::CopyMode => "Panes",
-            Cmd::NewTab | Cmd::NextTab | Cmd::PrevTab | Cmd::RenameTab => "Tabs",
+            | Cmd::CopyMode => cat.settings.keys_sections[0],
+            Cmd::NewTab | Cmd::NextTab | Cmd::PrevTab | Cmd::RenameTab => {
+                cat.settings.keys_sections[1]
+            }
             Cmd::NewWorkspace
             | Cmd::CloseWorkspace
             | Cmd::NextWorkspace
             | Cmd::PrevWorkspace
-            | Cmd::NewWorktree => "Nodes & worktrees",
+            | Cmd::NewWorktree => cat.settings.keys_sections[2],
             Cmd::OpenGit
+            | Cmd::OpenDiff
+            | Cmd::OpenMission
             | Cmd::OpenBoard
             | Cmd::OpenSettings
             | Cmd::ToggleSidebar
             | Cmd::ToggleRightSidebar
             | Cmd::ToggleAgents
             | Cmd::ToggleFiles
-            | Cmd::GlobalSearch => "Views & panels",
-            Cmd::Switcher | Cmd::Detach => "Session",
+            | Cmd::GlobalSearch => cat.settings.keys_sections[3],
+            Cmd::Switcher | Cmd::Detach => cat.settings.keys_sections[4],
         }
     }
 
@@ -241,6 +252,8 @@ impl Cmd {
             Cmd::PrevWorkspace => "W",
             Cmd::NewWorktree => "G",
             Cmd::OpenGit => "g",
+            Cmd::OpenDiff => "i",
+            Cmd::OpenMission => "m",
             Cmd::OpenBoard => "o",
             // `=` opens Settings (`,` now renames the tab, matching tmux). The
             // Menu button is always available too, so this is just the shortcut.
@@ -249,7 +262,7 @@ impl Cmd {
             Cmd::ToggleRightSidebar => "B",
             Cmd::ToggleAgents => "a",
             Cmd::ToggleFiles => "e",
-            Cmd::Switcher => "m",
+            Cmd::Switcher => "M",
             Cmd::GlobalSearch => "/",
             Cmd::Detach => "d",
         }
@@ -279,120 +292,13 @@ impl Cmd {
     }
 }
 
-/// Read-only reference blocks shown below the rebindable commands in Settings →
-/// Keys: the fixed keys and the context-specific shortcuts (scroll mode, the git
-/// tab, the task board, the folder picker, the mouse). Kept in one table so the
-/// count is authoritative for cursor bounds and the renderer just draws it. Each
-/// entry is `(section heading, &[(keys, what it does)])`. English, like the tab's
-/// how-to intro; the rebindable command labels stay localized.
-pub const KEY_REFERENCE: &[(&str, &[(&str, &str)])] = &[
-    (
-        "Always on (not rebindable)",
-        &[
-            ("h j k l", "focus panes (vim aliases)"),
-            ("q", "detach, leave the server running"),
-            ("X", "close pane"),
-            ("-", "split down"),
-            ("⇥ / ⇧⇥", "next / previous tab"),
-            ("prefix ×2", "send the literal configured prefix"),
-        ],
-    ),
-    (
-        "Scroll history  (no prefix)",
-        &[
-            ("Shift+↑", "enter scroll mode on the focused pane"),
-            ("j / k", "line down / up"),
-            ("Space / b", "page down / up"),
-            ("g / G", "top of history / back to live"),
-            ("1–9", "jump through history (1 oldest, 9 newest)"),
-            ("q  esc", "back to live"),
-        ],
-    ),
-    (
-        "Copy mode  (after Copy terminal text)",
-        &[
-            ("arrows  hjkl", "extend the selection by character / line"),
-            ("w / B", "next / previous word"),
-            ("Space / b", "page down / up"),
-            ("v", "reset the selection anchor at the cursor"),
-            ("y  ⏎", "copy and return to live output"),
-            ("q  esc", "cancel and restore the prior viewport"),
-        ],
-    ),
-    (
-        "Resize mode  (after prefix + r)",
-        &[
-            ("arrows  hjkl", "resize the focused pane"),
-            ("Shift+arrow", "bigger step"),
-            ("=  0", "equalize splits"),
-            ("esc", "exit resize mode"),
-        ],
-    ),
-    (
-        "Git tab  (after prefix + g)",
-        &[
-            ("1–6", "Commits Flow Branches PRs Issues Status"),
-            ("⇥ / ⇧⇥", "next / previous view"),
-            ("j / k", "scroll the list"),
-            ("/", "filter the list"),
-            ("d  c", "diff / create a PR"),
-            ("m", "scope: this repo or my work"),
-            ("o", "open on GitHub"),
-            ("r  q", "refresh / close the tab"),
-        ],
-    ),
-    (
-        "Task board  (after prefix + o)",
-        &[
-            ("a", "new task"),
-            ("s  d  m", "start / done / merge"),
-            ("x  D", "release / delete"),
-            ("o  ⏎", "detail / jump to worker pane"),
-            ("j / k", "move the cursor"),
-            ("q", "close the board"),
-        ],
-    ),
-    (
-        "Folder picker  (after prefix + N)",
-        &[
-            ("j / k", "move"),
-            ("→ / ←", "enter folder / go up"),
-            ("⏎", "open the folder as a node"),
-            ("n  w", "new folder / open as a worktree"),
-            ("esc", "cancel"),
-        ],
-    ),
-    (
-        "Copy & paste",
-        &[
-            ("drag", "select text; on release it copies to the clipboard"),
-            (
-                "shift+drag",
-                "select inside a mouse-aware app (e.g. an agent)",
-            ),
-            (
-                "⌘V  Ctrl+⇧V",
-                "your terminal's paste, into the focused pane",
-            ),
-        ],
-    ),
-    (
-        "Mouse",
-        &[
-            ("click", "focus a pane, or hit a row / button"),
-            ("right-click", "context menu: pane, node, agent, tab"),
-            ("wheel", "scroll the pane's history, or a list"),
-            ("drag divider", "resize the split"),
-            ("click branch", "open that node's git tab"),
-            ("tap pane", "zoom it (touch / mobile)"),
-        ],
-    ),
-];
-
 /// Total reference rows (not counting the section headings) — the authoritative
 /// count for the Keys-tab cursor, which steps through commands then these.
 pub fn key_reference_rows() -> usize {
-    KEY_REFERENCE.iter().map(|(_, rows)| rows.len()).sum()
+    crate::i18n::settings::KEY_REFERENCE_KEYS
+        .iter()
+        .map(|rows| rows.len())
+        .sum()
 }
 
 /// Canonical string for a command key after the prefix has been consumed.
@@ -605,6 +511,17 @@ pub struct Preset {
     pub binds: &'static [(&'static str, &'static str)],
 }
 
+impl Preset {
+    pub fn localized_label(&self, cat: &crate::i18n::Catalog) -> &'static str {
+        match self.id {
+            "default" => cat.settings.preset_default,
+            "function" => cat.settings.preset_function,
+            "tmux" => cat.settings.preset_tmux,
+            _ => self.label,
+        }
+    }
+}
+
 /// The built-in presets. `default` restores luvus's own keys; `tmux` matches the
 /// muscle memory of a tmux user (`Ctrl+b` prefix, `%`/`"` splits) - most other
 /// tmux keys (`c`/`n`/`p`/`x`/`z`/`d`) already agree with luvus's defaults.
@@ -766,12 +683,16 @@ impl App {
             Cmd::PrevWorkspace => self.cycle_workspace(-1),
             Cmd::NewWorktree => self.open_worktree_prompt(),
             Cmd::OpenGit => self.open_git_tab_active(),
+            Cmd::OpenDiff => self.focus_diff_list(),
+            Cmd::OpenMission => self.open_mission_control(self.active_ws),
             Cmd::OpenBoard => self.open_orch_board(),
             Cmd::OpenSettings => self.open_settings(),
             Cmd::ToggleSidebar => self.toggle_all_sides(),
             Cmd::ToggleRightSidebar => self.toggle_side(crate::app::Side::Right),
-            Cmd::ToggleAgents => self.agents_filter = self.agents_filter.next(),
-            Cmd::ToggleFiles => self.toggle_files_dock(),
+            Cmd::ToggleAgents => {
+                self.set_agents_filter(self.agents_filter.next());
+            }
+            Cmd::ToggleFiles => self.focus_files_tree(),
             Cmd::Switcher => self.toggle_switcher(),
             Cmd::GlobalSearch => self.toggle_search(),
             Cmd::Detach => self.detach_requested = true,
@@ -829,9 +750,44 @@ mod tests {
         assert_eq!(m.get(","), Some(&Cmd::RenameTab));
         assert_eq!(m.get("="), Some(&Cmd::OpenSettings));
         assert_eq!(m.get("y"), Some(&Cmd::CopyMode));
+        assert_eq!(m.get("i"), Some(&Cmd::OpenDiff));
+        assert_eq!(m.get("m"), Some(&Cmd::OpenMission));
+        assert_eq!(m.get("M"), Some(&Cmd::Switcher));
         // every command is reachable by its default key
         for &c in Cmd::ALL {
             assert!(m.values().any(|v| *v == c), "{c:?} bound");
+        }
+    }
+
+    #[test]
+    fn legacy_switcher_override_does_not_mask_mission() {
+        let mut config = crate::config::Config {
+            version: 1,
+            ..Default::default()
+        };
+        config.keybindings.insert("switcher".into(), "m".into());
+
+        let config = crate::config::normalize_config(config);
+        let map = build_keymap(&config.keybindings);
+        assert_eq!(map.get("m"), Some(&Cmd::OpenMission));
+        assert_eq!(map.get("M"), Some(&Cmd::Switcher));
+    }
+
+    #[test]
+    fn legacy_m_and_uppercase_m_collisions_keep_both_entrypoints_usable() {
+        for occupied in ["m", "M"] {
+            let mut config = crate::config::Config {
+                version: 1,
+                ..Default::default()
+            };
+            config
+                .keybindings
+                .insert("open_git".into(), occupied.into());
+
+            let config = crate::config::normalize_config(config);
+            let map = build_keymap(&config.keybindings);
+            assert_eq!(map.get("m"), Some(&Cmd::OpenMission));
+            assert_eq!(map.get("M"), Some(&Cmd::Switcher));
         }
     }
 
@@ -964,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_question_opens_help_and_any_key_closes() {
+    fn prefix_question_opens_scrollable_help_and_other_keys_close() {
         use crate::event::AppEvent;
         use ratatui::crossterm::event::KeyModifiers;
         let prefix = || AppEvent::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
@@ -976,7 +932,21 @@ mod tests {
         app.handle_event(prefix());
         app.handle_event(ch('?')); // Ctrl+Space ? opens the cheat-sheet
         assert!(app.help_open, "? opened the help overlay");
-        app.handle_event(ch('x')); // any key dismisses it (and is swallowed)
+        app.handle_event(ch('j'));
+        assert!(app.help_open, "navigation keeps the overlay open");
+        assert_eq!(app.help_scroll, 1);
+        app.help_scroll_max = 40;
+        app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::End,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.help_scroll, 40);
+        app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.help_scroll, 39, "up moves away from the bottom");
+        app.handle_event(ch('x')); // a non-navigation key dismisses it (and is swallowed)
         assert!(!app.help_open, "next key closed the overlay");
         // The swallowed key must not have acted (e.g. closed a pane).
         assert_eq!(app.panes.len(), 1);
@@ -1136,6 +1106,39 @@ mod tests {
         assert!(app.tab_rename.is_none());
         app.run_cmd(Cmd::RenameTab);
         assert!(app.tab_rename.is_some(), "rename tab opened the modal");
+    }
+
+    #[test]
+    fn toggle_agents_command_persists_every_filter_choice() {
+        use crate::app::AgentsFilter;
+        let _env = crate::persist::test_env("toggle-agents-command");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        assert_eq!(app.agents_filter, AgentsFilter::Workspace);
+
+        // One full cycle through the header order, persisting each step.
+        for expected in [
+            AgentsFilter::All,
+            AgentsFilter::Active,
+            AgentsFilter::Workspace,
+        ] {
+            app.agents_scroll = 7;
+            app.run_cmd(Cmd::ToggleAgents);
+            assert_eq!(app.agents_filter, expected);
+            assert_eq!(app.agents_scroll, 0);
+            assert_eq!(crate::config::load().agents_filter, expected);
+        }
+    }
+
+    #[test]
+    fn mission_command_opens_the_dashboard_in_the_active_workspace() {
+        let _env = crate::persist::test_env("mission-prefix-command");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+
+        assert!(!app.active_is_mission());
+        app.run_cmd(Cmd::OpenMission);
+        assert!(app.active_is_mission());
     }
 
     #[test]

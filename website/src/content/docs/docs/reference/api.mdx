@@ -1,6 +1,6 @@
 ---
-title: Local API
-description: The JSON control API, covering wire format, methods, and the event stream.
+title: UHP method reference
+description: The complete Universal Harness Protocol 1.0 method surface.
 ---
 
 Everything the CLI does goes over owner-only local IPC speaking
@@ -19,7 +19,7 @@ default full-authority boundary, so methods do not need a session parameter.
 Harnesses can be given an optional short-lived scoped token instead of ambient
 owner authority.
 
-Start with [Automating with the Socket API and UHP](/docs/guides/socket-and-uhp/)
+Start with [Automating with UHP](/docs/guides/uhp/)
 for a practical connection, discovery, authentication, and streaming guide.
 Use `luvus --session <name> <command>` from outside a pane. Inside a pane, keep
 the inherited socket so commands cannot drift to another server. Server-facing
@@ -56,27 +56,28 @@ printf '%s\n' '{"id":"1","method":"ping","params":{}}' | nc -U ~/.luvus/luvus.so
 
 ## Method families
 
-`luvus api socket-schema` prints the complete installed Socket API 1.0
-contract without starting or connecting to a server. `luvus api
-socket-capabilities` queries the selected running server and returns its exact
-method registry, event sequence fence, limits, supported UHP profiles, and
+`luvus uhp schema` prints the complete installed UHP 1.0
+contract without starting or connecting to a server. `luvus uhp
+capabilities` queries the selected running server and returns its exact
+method registry, event sequence fence, identity rules, limits, and
 graphics support. Discover capabilities instead of inferring support from the
 Luvus release number.
 
 | Family | Methods |
 |---|---|
-| discovery / config | `socket.capabilities` · `socket.stats` · `socket.token.create` · `socket.token.list` · `socket.token.revoke` · `config.get` · `config.patch` · `server.reload_config` · `server.agent_manifests` · `server.reload_agent_manifests` |
+| discovery / config | `uhp.capabilities` · `uhp.stats` · `uhp.token.create` · `uhp.token.list` · `uhp.token.revoke` · `config.get` · `config.patch` · `server.reload_config` · `server.agent_manifests` · `server.reload_agent_manifests` |
 | workspaces | `workspace.list` · `workspace.get` · `workspace.open` · `workspace.focus` · `workspace.rename` · `workspace.pin` · `workspace.move` · `workspace.move_block` · `workspace.report_metadata` · `workspace.close` |
 | tabs | `tab.list` · `tab.get` · `tab.new` · `tab.focus` · `tab.move` · `tab.swap` · `tab.rename` · `tab.close` |
-| UHP Runtime profile | `runtime.capabilities` · `session.snapshot` · `agent.start` · `agent.prompt` · `agent.wait` · `events.subscribe` |
+| runtime and agents | `session.snapshot` · `agent.start` · `agent.prompt` · `agent.wait` · `events.subscribe` |
 | panes | `pane.list` · `pane.get` · `pane.current` · `pane.layout` · `pane.neighbor` · `pane.edges` · `pane.split` · `pane.move` · `pane.swap` · `pane.focus` · `pane.focus_direction` · `pane.resize` · `pane.zoom` · `pane.rename` · `pane.run` · `pane.send_input` · `pane.read` · `pane.status` · `pane.processes` · `pane.close` · `attach.pane` |
 | layouts | `layout.export` · `layout.apply` · `layout.set_split_ratio` |
 | agents | `agent.list` · `agent.get` · `agent.explain` · `agent.report` · `agent.release` · `agent.start` · `agent.prompt` · `agent.wait` · `agent.name` · `agent.fork` · `agent.send` · `agent.keys` · `agent.read` · `agent.sessions` · `agent.resume` · `pane.report_session` · `pane.report_event` |
 | search | `search` · `search.capabilities` · `search.query` · `search.activate` |
 | files | `files.tree` · `files.open` · `files.reveal` · `files.refresh` |
 | git | `git.status` · `git.branches` · `git.log` · `git.open` |
+| mission control | `mission.open` |
 | diff | `diff.refresh` · `diff.list` · `diff.open` · `diff.get` · `diff.navigate` · `diff.note.add` · `diff.note.apply` · `diff.note.list` · `diff.note.edit` · `diff.note.resolve` · `diff.note.reopen` · `diff.note.remove` · `diff.note.send` |
-| UHP Terminal profile | `terminal.backend.capabilities` · `terminal.backend.inventory` · `terminal.backend.snapshot` · `terminal.backend.validate` · `terminal.backend.processes` · `terminal.backend.capture` · `terminal.backend.observe` · `terminal.backend.control` · `terminal.backend.type_literal` · `terminal.backend.submit_text` · `terminal.backend.send_key` · `terminal.backend.set_title` · `terminal.backend.notify` · `terminal.backend.create` · `terminal.backend.close` · `terminal.backend.wait_change` · `terminal.backend.wait_output` · `terminal.backend.events.subscribe` |
+| terminal | `terminal.backend.inventory` · `terminal.backend.snapshot` · `terminal.backend.validate` · `terminal.backend.processes` · `terminal.backend.capture` · `terminal.backend.observe` · `terminal.backend.control` · `terminal.backend.type_literal` · `terminal.backend.submit_text` · `terminal.backend.send_key` · `terminal.backend.set_title` · `terminal.backend.notify` · `terminal.backend.create` · `terminal.backend.close` · `terminal.backend.wait_change` · `terminal.backend.wait_output` · `terminal.backend.events.subscribe` |
 | worktrees | `worktree.list` · `worktree.create` · `worktree.open` · `worktree.remove` |
 | orchestration | `task.add` · `task.list` · `task.get` · `task.claim` · `task.next` · `task.start` · `task.heartbeat` · `task.update` · `task.done` · `task.merge` · `task.release` · `lease.acquire` · `lease.list` · `lease.release` |
 | modules | `module.list` · `module.info` · `module.link` · `module.unlink` · `module.enable` · `module.disable` · `module.action.list` · `module.action.invoke` · `module.pane.open` · `module.pane.focus` · `module.pane.close` · `module.config_dir` · `module.settings.list` · `module.settings.get` · `module.settings.set` · `module.log.list` |
@@ -88,12 +89,21 @@ Parameter shapes mirror the CLI flags (`luvus task add --paths x` →
 `$LUVUS_PANE_ID` when available; a raw API request with no pane uses the
 currently focused pane.
 
-The Runtime and `terminal.backend.*` families form the
-[Universal Harness Protocol](/docs/reference/uhp/). The Terminal profile is a
-versioned automation contract and does not
-inherit the focused pane. It requires explicit runtime identity and stricter
+`task.start` and `task.next` with `start: true` accept `mode: "worktree"` or
+`mode: "workspace"`; omitted mode means worktree. Workspace mode may include a
+stable `workspace_id` and creates a dedicated branchless task tab in that
+workspace. `branch` is valid only in worktree mode, and `task.merge` returns
+`merge_unavailable` for a workspace worker.
+
+```json
+{"id":"1","method":"task.start","params":{"id":"t3","mode":"workspace","workspace_id":"workspace_example","agent":"codex"}}
+```
+
+All families belong to the same
+[Universal Harness Protocol](/docs/reference/uhp/). Terminal methods do not
+inherit the focused pane. They require explicit runtime identity and stricter
 framing, limits, and failure evidence. See the detailed
-[UHP Terminal Profile](/docs/reference/terminal-backend/) reference.
+[UHP terminal methods](/docs/reference/terminal-backend/) reference.
 
 ## Topology and layout control
 
@@ -183,7 +193,7 @@ compound methods such as `agent.start`, `agent.prompt`, `workspace.move_block`,
 Create a delegated credential with:
 
 ```json
-→ {"id":"token-1","method":"socket.token.create","params":{"scopes":["read","workspace"],"ttl_s":3600}}
+→ {"id":"token-1","method":"uhp.token.create","params":{"scopes":["read","workspace"],"ttl_s":3600}}
 ```
 
 The secret is returned once. Supported scopes are `read`, `workspace`,
@@ -193,23 +203,23 @@ can be listed by public ID or revoked. They are a least-authority delegation
 tool; Unix socket ownership or the Windows named-pipe DACL remains the security
 boundary.
 
-`socket.stats` exposes bounded operational counters: active/capacity/accepted/
+`uhp.stats` exposes bounded operational counters: active/capacity/accepted/
 rejected connections, initial-frame timeouts, completed requests, byte totals,
 mean request latency, uptime, replay limits, and active terminal streams. Luvus permits at most 80 active
 API connections, waits at most five seconds for the initial frame, and applies
 owner checks before dispatch. These limits prevent silent clients from growing
 threads or memory without bound.
 
-The installed Socket schema embeds the strict UHP Runtime and Terminal profile
-bundles under `profiles`. Live terminal observe/control streams are capped at
+The installed UHP schema embeds strict terminal method and stream components.
+Live terminal observe/control streams are capped at
 eight connections, use a two-frame queue, and are driven by existing coalesced
 output events rather than an idle timer. See the
-[UHP Terminal Profile](/docs/reference/terminal-backend/) for framing and
+[UHP terminal methods](/docs/reference/terminal-backend/) for framing and
 resynchronization rules.
 
 ## Runtime snapshots and agent authority
 
-`runtime.capabilities` negotiates the app-level automation surface and its
+`uhp.capabilities` negotiates the app-level automation surface and its
 limits. `session.snapshot` returns every workspace, tab, terminal pane, native
 view, stable terminal identity, root process, and agent state in one response.
 It includes the current event sequence, so a consumer can subscribe first and
@@ -237,9 +247,8 @@ owner renews with another report or calls `agent.release`. This lets unfamiliar
 agents integrate immediately without weakening process-based fallback detection
 or leaving stale state after an adapter crashes.
 
-The normative runtime schemas and fixtures live under `protocol/runtime/v1` and
-are embedded in packaged binaries. Print that exact installed contract with
-`luvus api runtime-schema`.
+The normative schemas and fixtures live under `protocol/uhp/v1` and are
+embedded in packaged binaries. Print that exact contract with `luvus uhp schema`.
 
 `agent.wait` takes `{pane, status, timeout_s?}` and parks on the server. The
 initial comparison and registration are atomic on the app loop, so it has no
@@ -250,7 +259,7 @@ talks to an older server.
 `agent.start` takes `name`, `kind`, optional `pane` or `anchor`, optional
 `direction`, an `args` string array, and `timeout_s`. Luvus selects or creates
 the pane, queues the launch as one submitted shell action, reserves the unique
-name, and waits for manifest-driven detection without composing separate socket
+name, and waits for manifest-driven detection without composing separate UHP
 requests.
 
 `agent.prompt` takes `target`, `text`, optional `wait` (default `false`),
@@ -327,6 +336,20 @@ output anchors before focusing or opening anything. It is primarily used by
 Luvus during named-session handoff. Invalid or stale targets return a structured
 `invalid_request` error instead of focusing a different object.
 
+## Opening Mission Control
+
+`mission.open` opens Mission Control in the active workspace. Pass a zero-based
+`workspace` index or stable `workspace_id` to open it in another workspace.
+The dashboard is reused when it is already open.
+
+| Method | Params | Result |
+|---|---|---|
+| `mission.open` | `{workspace?}` or `{workspace_id?}` | `{type:"ok", mission:true}` |
+
+The CLI equivalent is `luvus mission open [<workspace>]`. This is a write
+method with the `workspace` authorization scope because it changes the visible
+tab, but it does not start agents or modify repository files.
+
 ## Organizing workspaces
 
 Workspace indices are 0-based positions. Use `workspace_id` when identity must
@@ -346,12 +369,21 @@ on a parent or linked worktree floats that complete worktree group while
 preserving its internal order.
 
 `workspace.list` remains in API-index order. Each row includes `workspace_id`,
-`workspace`, `name`, `cwd`, `pinned`, `display_position`, `active`, and `tabs`.
-Both `workspace` and `display_position` are 0-based; callers can therefore
-target a current position or use the stable ID and separately verify where it
-appears in the sidebar.
+`workspace`, `name`, `cwd`, `terminal_cwd`, `pinned`, `display_position`,
+`active`, and `tabs`. `workspace.get` exposes the same two paths. `cwd` is the
+stable project root. `terminal_cwd` follows the focused pane of the workspace's
+active tab and changes when focus moves to another split. Both
+`workspace` and `display_position` are 0-based; callers can therefore target a
+current position or use the stable ID and separately verify where it appears in
+the sidebar.
 Missing or malformed parameters return `invalid_request`, while an out-of-range
 workspace returns `not_found` without changing state.
+
+After the final project workspace closes, the server and client remain available
+and Luvus immediately creates a neutral workspace with one terminal rooted at
+the user's home directory. Normal tab and pane methods keep working. If a restore
+or shell failure leaves the server truly empty, layout-scoped methods return
+`no_session`; `workspace.open`, `tab.new`, and `pane.split` remain recovery paths.
 
 ## Moving panes and tabs
 
@@ -410,6 +442,17 @@ reading; `history_exact` tells consumers whether that number is exact. With the
 current Alacritty adapter it is a conservative estimate (`false`), because the
 underlying terminal engine limits rows rather than allocation bytes. These
 fields observe state only; they do not grant remote control of a pane viewport.
+
+### Runtime performance counters
+
+The top-level `pane.list` result also includes additive process-lifetime
+`render_performance` and `detection_performance` objects. They expose bounded
+counts for render causes, loop wake sources, client projections, changed and
+unchanged projections, frame backpressure, panes considered and extracted,
+full-fleet audits, and audit recoveries. The counters are intended for local
+performance comparisons and contain no pane text, commands, paths, prompts, or
+client identifiers. Existing `detection_extractions` and `detection_skips`
+remain available for compatibility.
 
 ## Forking an agent session
 
@@ -637,7 +680,7 @@ are never accepted.
 
 Start with the [Luvus Bar guide](/docs/guides/bar/) for installation,
 placement, CLI use, and troubleshooting. This section documents the underlying
-socket contract.
+UHP contract.
 
 | Method | Params | Result |
 |---|---|---|
@@ -718,13 +761,13 @@ Event names: `pane.created` · `pane.closed` · `pane.forked` · `pane.moved` ·
 still spell these `node.created` / `node.closed`) · `tab.created` · `tab.closed` · `tab.moved`
 · `task.added` · `task.claimed` · `task.started` · `task.ready` ·
 `task.gate_running` · `task.gate_passed` · `task.gate_failed` ·
-`task.needs_compaction` · `task.done` · `task.merged` ·
-`task.merge_conflict` · `task.released` · `lease.acquired` ·
+`task.needs_compaction` · `task.done` · `task.merge_started` · `task.merged` ·
+`task.merge_conflict` · `task.merge_failed` · `task.released` · `lease.acquired` ·
 `lease.released`.
 
 `terminal.backend.events.subscribe` uses the same stream framing but filters to
 `terminal.*` events. Its acknowledgment includes the current sequence and queue
-capacity. See the [UHP Terminal profile](/docs/reference/terminal-backend/) for
+capacity. See [UHP terminal methods](/docs/reference/terminal-backend/) for
 subscribe-first snapshot reconciliation.
 
 ## Practical notes

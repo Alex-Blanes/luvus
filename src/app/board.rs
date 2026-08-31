@@ -6,6 +6,18 @@
 //! whole flow is drivable from the UI, not only the `luvus task …` CLI.
 
 use super::*;
+use crate::orch::{TaskStatus, TaskWorkerMode, WorkspaceWorkerBinding};
+
+#[derive(Debug)]
+pub struct TaskStartResult {
+    pub pane: PaneId,
+    pub cwd: std::path::PathBuf,
+    pub mode: TaskWorkerMode,
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub worktree: Option<String>,
+    pub branch: Option<String>,
+}
 
 impl App {
     /// Open (or focus, if already open) the orchestration board in the active
@@ -32,20 +44,19 @@ impl App {
         self.session_dirty = true;
     }
 
-    /// ORCH-3: spawn an **isolated worker** for a task — a git worktree on a fresh
-    /// branch + a pane in it — then claim the task for that pane, mark it Running,
-    /// lease its declared paths, and optionally launch an agent (which gets the
-    /// task briefing as its opening prompt). If the task already has a worktree on
-    /// disk (a restart, a closed pane), that worktree is **reopened** instead of
-    /// creating a second one. Requires a git repo (worktree isolation is the whole
-    /// point); returns the worker pane + worktree path. Explicit (`task start`),
-    /// never automatic — nothing spawns unless asked.
+    /// ORCH-3: spawn a task worker in the requested mode, then claim it, bind its
+    /// declared paths, mark it Running, and optionally launch an agent with the
+    /// task briefing. Worktree mode preserves the isolated branch/workspace
+    /// behavior; workspace mode creates a durable task tab in an existing shared
+    /// checkout. Explicit (`task start`), never automatic.
     pub fn task_start(
         &mut self,
         id: &str,
         branch: Option<String>,
         agent: Option<String>,
-    ) -> Result<(PaneId, std::path::PathBuf), (String, String)> {
+        mode: TaskWorkerMode,
+        workspace_id: Option<String>,
+    ) -> Result<TaskStartResult, (String, String)> {
         let task = self
             .orch
             .task(id)
@@ -57,53 +68,151 @@ impl App {
                 format!("{id} is already started/claimed"),
             ));
         }
+        if matches!(
+            task.status,
+            crate::orch::TaskStatus::Done
+                | crate::orch::TaskStatus::Merging
+                | crate::orch::TaskStatus::Merged
+        ) {
+            return Err((
+                "task_complete".to_string(),
+                format!("{id} is already {}", task.status.as_str()),
+            ));
+        }
         if !self.orch.ready(id) {
             return Err((
                 "deps_unmet".to_string(),
                 format!("{id} has dependencies that aren't done yet"),
             ));
         }
-        // The branch this worker runs on: an explicit `--branch`, else the one
-        // recorded on the task, else `luvus/<id>`.
+        // Refuse conflicting work before creating or reopening a worktree. A
+        // failed start must not leave behind a pane, branch, or partial claim.
+        if !task.paths.is_empty() {
+            self.orch
+                .ensure_task_paths_available(id, &task.paths)
+                .map_err(|r| (r.code.to_string(), r.message))?;
+        }
+        if mode == TaskWorkerMode::Workspace && branch.is_some() {
+            return Err((
+                "invalid_mode_option".to_string(),
+                "--branch is available only in worktree mode".to_string(),
+            ));
+        }
+        if mode == TaskWorkerMode::Worktree && workspace_id.is_some() {
+            return Err((
+                "invalid_mode_option".to_string(),
+                "workspace_id is available only in workspace mode".to_string(),
+            ));
+        }
+        if let Some(existing) = task.worker_mode {
+            if existing != mode {
+                return Err((
+                    "worker_mode_mismatch".to_string(),
+                    format!("{id} is already bound to {} mode", existing.as_str()),
+                ));
+            }
+        }
+
+        let result = match mode {
+            TaskWorkerMode::Worktree => self.start_task_worktree(&task, branch)?,
+            TaskWorkerMode::Workspace => {
+                self.start_task_workspace(&task, workspace_id.as_deref())?
+            }
+        };
+        let pane = result.pane;
+
+        // Claim + lease + record the binding for the worker.
+        // A started worker is *running* — claimed is reserved for the CLI's
+        // claim-without-start, so the board never shows live work as waiting.
+        self.orch
+            .claim(id, pane.0)
+            .map_err(|r| (r.code.to_string(), r.message))?;
+        if !task.paths.is_empty() {
+            if let Err(reject) = self.orch.bind_task_paths(id, pane.0, &task.paths) {
+                // The preflight above makes this unreachable during ordinary
+                // single-writer operation, but keep a failed acquisition from
+                // exposing a running task without its promised lease.
+                let _ = self.orch.release_task(id);
+                self.orch.release_task_leases(id);
+                self.orch.save();
+                return Err((reject.code.to_string(), reject.message));
+            }
+        }
+        let _ = self.orch.set_status(id, crate::orch::TaskStatus::Running);
+        match mode {
+            TaskWorkerMode::Worktree => {
+                self.orch
+                    .bind_worktree(id, result.worktree.clone(), result.branch.clone())
+            }
+            TaskWorkerMode::Workspace => self.orch.bind_workspace(
+                id,
+                WorkspaceWorkerBinding {
+                    workspace_id: result.workspace_id.clone(),
+                    tab_id: result.tab_id.clone(),
+                    root: result.cwd.display().to_string(),
+                },
+            ),
+        }
+        if let Some(cmd) = agent {
+            if let Some(p) = self.panes.get(&pane) {
+                p.send(agent_launch_line(&cmd, &task, mode).as_bytes());
+                p.send(b"\r");
+            }
+        }
+        self.orch.save();
+        self.emit_event(
+            "task.started",
+            serde_json::json!({
+                "id": id,
+                "pane": pane.0.to_string(),
+                "mode": mode.as_str(),
+                "workspace_id": result.workspace_id,
+                "tab_id": result.tab_id,
+                "cwd": result.cwd.display().to_string(),
+                "worktree": result.worktree,
+                "branch": result.branch,
+            }),
+        );
+        Ok(result)
+    }
+
+    fn start_task_worktree(
+        &mut self,
+        task: &crate::orch::Task,
+        branch: Option<String>,
+    ) -> Result<TaskStartResult, (String, String)> {
         let branch = branch
-            .map(|b| b.trim().to_string())
-            .filter(|b| !b.is_empty())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
             .or_else(|| task.branch.clone())
-            .unwrap_or_else(|| format!("luvus/{id}"));
-        // Reuse an existing worktree instead of creating a second one: the one
-        // recorded on the task (a restart, a closed pane), or — when the ledger
-        // was reset but a leftover worktree still has this branch checked out
-        // (git would refuse to create another) — *adopt* that worktree.
+            .unwrap_or_else(|| format!("luvus/{}", task.id));
         let existing = task
             .worktree
             .as_ref()
             .map(std::path::PathBuf::from)
-            .filter(|p| p.exists())
+            .filter(|path| path.exists())
             .or_else(|| {
                 crate::git::local::worktrees(&self.ws().cwd)
                     .ok()
-                    .and_then(|wts| {
-                        wts.into_iter()
-                            .find(|w| {
-                                !w.is_main
-                                    && w.branch.as_deref() == Some(branch.as_str())
-                                    && w.path.exists()
+                    .and_then(|worktrees| {
+                        worktrees
+                            .into_iter()
+                            .find(|worktree| {
+                                !worktree.is_main
+                                    && worktree.branch.as_deref() == Some(branch.as_str())
+                                    && worktree.path.exists()
                             })
-                            .map(|w| w.path)
+                            .map(|worktree| worktree.path)
                     })
             });
         let path = if let Some(path) = existing {
-            // Reopen the worktree: focus its live pane if one is still running
-            // there, otherwise open the folder as a fresh workspace.
             let live = self
                 .panes
                 .iter()
-                .find(|(_, p)| crate::platform::same_path(&p.cwd, &path))
-                .map(|(&pid, _)| pid);
+                .find(|(_, pane)| crate::platform::same_path(&pane.cwd, &path))
+                .map(|(&pane, _)| pane);
             match live {
-                Some(pid) => self.focus_pane_global(pid),
-                // `create_workspace_at` now reports this directly, so the old
-                // "did the active node's cwd change?" probe is gone.
+                Some(pane) => self.focus_pane_global(pane),
                 None if !self.create_workspace_at(path.clone()) => {
                     return Err((
                         "spawn_failed".to_string(),
@@ -118,15 +227,13 @@ impl App {
             if !crate::git::local::is_repo(&repo) {
                 return Err((
                     "not_a_repo".to_string(),
-                    "task start needs a git repo (for worktree isolation) — run it from a repo workspace".to_string(),
+                    "task start needs a git repo in worktree mode — use --mode workspace for the current checkout".to_string(),
                 ));
             }
-            // Create the worktree; `create_worktree` opens it as the active
-            // workspace with a fresh worker pane.
             let path = self
                 .create_worktree(&repo, &branch)
-                .map_err(|e| ("git_error".to_string(), e))?;
-            if self.ws().cwd != path {
+                .map_err(|error| ("git_error".to_string(), error))?;
+            if !crate::platform::same_path(&self.ws().cwd, &path) {
                 return Err((
                     "spawn_failed".to_string(),
                     "worktree created but the worker pane didn't start".to_string(),
@@ -135,55 +242,171 @@ impl App {
             path
         };
         let pane = self.layout().focus;
+        let workspace_id = self.ws().id.clone();
+        let tab_id = self.ws().tabs[self.ws().active_tab].id.clone();
+        Ok(TaskStartResult {
+            pane,
+            cwd: path.clone(),
+            mode: TaskWorkerMode::Worktree,
+            workspace_id,
+            tab_id,
+            worktree: Some(path.display().to_string()),
+            branch: Some(branch),
+        })
+    }
 
-        // Claim + record the binding + lease the declared paths for the worker.
-        // A started worker is *running* — claimed is reserved for the CLI's
-        // claim-without-start, so the board never shows live work as waiting.
-        self.orch
-            .claim(id, pane.0)
-            .map_err(|r| (r.code.to_string(), r.message))?;
-        let _ = self.orch.set_status(id, crate::orch::TaskStatus::Running);
-        self.orch
-            .bind_worktree(id, Some(path.display().to_string()), Some(branch.clone()));
-        if !task.paths.is_empty() {
-            // Best-effort — the worker owns a brand-new worktree, so a lease here
-            // only ever conflicts if another worker already reserved these paths.
-            let _ = self
-                .orch
-                .acquire_lease(pane.0, id.to_string(), task.paths.clone());
-        }
-        if let Some(cmd) = agent {
-            if let Some(p) = self.panes.get(&pane) {
-                p.send(agent_launch_line(&cmd, &task).as_bytes());
-                p.send(b"\r");
+    fn start_task_workspace(
+        &mut self,
+        task: &crate::orch::Task,
+        requested_workspace: Option<&str>,
+    ) -> Result<TaskStartResult, (String, String)> {
+        if let Some(binding) = task.workspace_worker.as_ref() {
+            let binding_matches_request = requested_workspace
+                .map(|requested| requested == binding.workspace_id)
+                .unwrap_or(true);
+            if binding_matches_request {
+                if let Some((workspace, tab)) =
+                    self.workspaces.iter().enumerate().find_map(|(wi, ws)| {
+                        (ws.id == binding.workspace_id).then(|| {
+                            ws.tabs
+                                .iter()
+                                .position(|tab| tab.id == binding.tab_id)
+                                .map(|ti| (wi, ti))
+                        })?
+                    })
+                {
+                    let pane = self.workspaces[workspace].tabs[tab]
+                        .layout
+                        .leaves()
+                        .into_iter()
+                        .find(|pane| self.panes.contains_key(pane));
+                    if let Some(pane) = pane {
+                        self.focus_pane_global(pane);
+                        return Ok(TaskStartResult {
+                            pane,
+                            cwd: self.workspaces[workspace].cwd.clone(),
+                            mode: TaskWorkerMode::Workspace,
+                            workspace_id: self.workspaces[workspace].id.clone(),
+                            tab_id: self.workspaces[workspace].tabs[tab].id.clone(),
+                            worktree: None,
+                            branch: None,
+                        });
+                    }
+                }
             }
         }
-        self.orch.save();
-        self.emit_event(
-            "task.started",
-            serde_json::json!({
-                "id": id,
-                "pane": pane.0.to_string(),
-                "worktree": path.display().to_string(),
-                "branch": branch,
-            }),
-        );
-        Ok((pane, path))
+
+        let target = if let Some(id) = requested_workspace {
+            self.workspaces
+                .iter()
+                .position(|workspace| workspace.id == id)
+                .ok_or_else(|| {
+                    (
+                        "workspace_not_found".to_string(),
+                        format!("workspace id {id} not found"),
+                    )
+                })?
+        } else if let Some(binding) = task.workspace_worker.as_ref() {
+            let existing = self
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == binding.workspace_id)
+                .or_else(|| {
+                    let root = std::path::PathBuf::from(&binding.root);
+                    self.workspaces
+                        .iter()
+                        .position(|workspace| crate::platform::same_path(&workspace.cwd, &root))
+                });
+            if let Some(existing) = existing {
+                existing
+            } else {
+                let root = std::path::PathBuf::from(&binding.root);
+                if !root.is_dir() || !self.create_workspace_at(root.clone()) {
+                    return Err((
+                        "workspace_unavailable".to_string(),
+                        format!("workspace directory is unavailable: {}", root.display()),
+                    ));
+                }
+                self.workspaces
+                    .iter()
+                    .position(|workspace| crate::platform::same_path(&workspace.cwd, &root))
+                    .ok_or_else(|| {
+                        (
+                            "workspace_not_found".to_string(),
+                            "the worker workspace could not be reopened".to_string(),
+                        )
+                    })?
+            }
+        } else {
+            self.active_ws
+        };
+        let root = self
+            .workspaces
+            .get(target)
+            .map(|workspace| workspace.cwd.clone())
+            .ok_or_else(|| {
+                (
+                    "workspace_not_found".to_string(),
+                    "no workspace is available for this worker".to_string(),
+                )
+            })?;
+        if !root.is_dir() {
+            return Err((
+                "workspace_unavailable".to_string(),
+                format!("workspace directory is unavailable: {}", root.display()),
+            ));
+        }
+        let pane = self.spawn_into(root.clone()).ok_or_else(|| {
+            (
+                "spawn_failed".to_string(),
+                "the workspace worker pane didn't start".to_string(),
+            )
+        })?;
+        let mut tab = Tab::panes(TileLayout::new(pane));
+        tab.name = Some(task_tab_name(task));
+        let tab_id = tab.id.clone();
+        self.active_ws = target;
+        let workspace = &mut self.workspaces[target];
+        workspace.tabs.push(tab);
+        workspace.active_tab = workspace.tabs.len() - 1;
+        let workspace_id = workspace.id.clone();
+        self.session_dirty = true;
+        Ok(TaskStartResult {
+            pane,
+            cwd: root,
+            mode: TaskWorkerMode::Workspace,
+            workspace_id,
+            tab_id,
+            worktree: None,
+            branch: None,
+        })
     }
 
     /// Reconcile the ledger's pane bindings with the live panes. Called at
     /// startup: pane ids are reallocated every run, so `orch.json`'s saved
     /// assignees are stale — and can even *collide* with unrelated new panes.
-    /// A worktree-backed task is rebound to the pane actually running in its
-    /// worktree (or detached — it stays Running, the branch persists, `s`
-    /// reopens it); a pure claim with no worktree loses its dead claimer and
-    /// goes back to the queue.
+    /// A durable worktree or workspace worker is rebound to its restored pane
+    /// (or detached while retaining its task binding); a pure claim without a
+    /// durable binding loses its dead claimer and returns to the queue.
     pub fn orch_reconcile(&mut self) {
-        use crate::orch::TaskStatus;
+        use crate::orch::{TaskStatus, TaskWorkerMode};
         let pane_cwds: Vec<(u32, std::path::PathBuf)> = self
             .panes
             .iter()
             .map(|(id, p)| (id.0, p.cwd.clone()))
+            .collect();
+        let workspace_tabs: Vec<(String, String, u32)> = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| {
+                workspace.tabs.iter().filter_map(|tab| {
+                    tab.layout
+                        .leaves()
+                        .into_iter()
+                        .find(|pane| self.panes.contains_key(pane))
+                        .map(|pane| (workspace.id.clone(), tab.id.clone(), pane.0))
+                })
+            })
             .collect();
         let mut changed = false;
         let mut requeued: Vec<String> = Vec::new();
@@ -192,9 +415,35 @@ impl App {
             if t.assignee.is_none() && !active {
                 continue;
             }
-            match t.worktree.as_deref().map(std::path::PathBuf::from) {
-                Some(wt) => {
+            match t
+                .worker_mode
+                .or_else(|| t.worktree.as_ref().map(|_| TaskWorkerMode::Worktree))
+            {
+                Some(TaskWorkerMode::Worktree) => {
+                    let Some(wt) = t.worktree.as_deref().map(std::path::PathBuf::from) else {
+                        t.assignee = None;
+                        if active {
+                            t.status = TaskStatus::Queued;
+                            requeued.push(t.id.clone());
+                        }
+                        changed = true;
+                        continue;
+                    };
                     let live = pane_cwds.iter().find(|(_, c)| *c == wt).map(|(id, _)| *id);
+                    if t.assignee != live {
+                        t.assignee = live;
+                        changed = true;
+                    }
+                }
+                Some(TaskWorkerMode::Workspace) => {
+                    let live = t.workspace_worker.as_ref().and_then(|binding| {
+                        workspace_tabs
+                            .iter()
+                            .find(|(workspace, tab, _)| {
+                                workspace == &binding.workspace_id && tab == &binding.tab_id
+                            })
+                            .map(|(_, _, pane)| *pane)
+                    });
                     if t.assignee != live {
                         t.assignee = live;
                         changed = true;
@@ -212,6 +461,53 @@ impl App {
                 }
             }
         }
+        changed |= self.orch.reconcile_leases();
+        // Older releases could leave a running durable worker without its
+        // declared lease. Rebuild missing leases for live workers. If two old
+        // tasks already overlap, keep the existing holder and visibly block the
+        // unprotected task instead of silently claiming both are safe.
+        let live_workers: Vec<(String, u32, Vec<String>)> = self
+            .orch
+            .tasks
+            .iter()
+            .filter(|task| {
+                (task.worker_mode.is_some() || task.worktree.is_some())
+                    && matches!(
+                        task.status,
+                        TaskStatus::Running
+                            | TaskStatus::Blocked
+                            | TaskStatus::Review
+                            | TaskStatus::Failed
+                    )
+            })
+            .filter_map(|task| {
+                task.assignee
+                    .filter(|_| !task.paths.is_empty())
+                    .map(|pane| (task.id.clone(), pane, task.paths.clone()))
+            })
+            .collect();
+        for (id, pane, paths) in live_workers {
+            match self.orch.bind_task_paths(&id, pane, &paths) {
+                Ok(lease_changed) => changed |= lease_changed,
+                Err(reject) => {
+                    let message = format!("path lease recovery failed: {}", reject.message);
+                    let already_reported =
+                        self.orch.task(&id).and_then(|task| task.outputs.last()) == Some(&message);
+                    if !already_reported {
+                        let _ = self.orch.add_output(&id, message);
+                        changed = true;
+                    }
+                    if self
+                        .orch
+                        .task(&id)
+                        .is_some_and(|task| task.status == TaskStatus::Running)
+                    {
+                        let _ = self.orch.set_status(&id, TaskStatus::Blocked);
+                        changed = true;
+                    }
+                }
+            }
+        }
         if changed {
             self.orch.save();
         }
@@ -221,8 +517,8 @@ impl App {
     }
 
     /// A pane died/closed: detach any task bound to it so the board stays
-    /// truthful. Worktree-backed work stays Running (the branch persists — `s`
-    /// reopens it); a pure claim goes back to the queue.
+    /// truthful. Durable worktree/workspace workers stay Running and can be
+    /// reopened; a pure claim goes back to the queue.
     pub fn orch_unbind_pane(&mut self, pane: u32) {
         use crate::orch::TaskStatus;
         let mut requeued: Vec<String> = Vec::new();
@@ -232,7 +528,9 @@ impl App {
                 continue;
             }
             t.assignee = None;
-            if t.worktree.is_none() && matches!(t.status, TaskStatus::Claimed | TaskStatus::Running)
+            if t.worker_mode.is_none()
+                && t.worktree.is_none()
+                && matches!(t.status, TaskStatus::Claimed | TaskStatus::Running)
             {
                 t.status = TaskStatus::Queued;
                 requeued.push(t.id.clone());
@@ -247,92 +545,192 @@ impl App {
         }
     }
 
-    /// ORCH-6: integrate a finished task's branch into `luvus/integration`, in an
-    /// **isolated integration worktree** (never the user's checkout). A clean merge
-    /// lands on the integration branch; a conflict aborts, blocks the task, and
-    /// reports the clashing files so its agent can resolve them in its own worktree.
-    /// Serialized by the single-writer loop — one integration at a time.
-    pub fn merge_task(&mut self, id: &str) -> Result<serde_json::Value, (String, String)> {
-        use crate::orch::TaskStatus;
+    /// Begin ORCH-6 integration without running Git on the app loop. The durable
+    /// `merging` transition reserves the shared integration branch, while the
+    /// result returns through `AppEvent::TaskMergeFinished` for one-writer apply.
+    pub fn start_task_merge(
+        &mut self,
+        id: &str,
+        reply: Option<(String, std::sync::mpsc::Sender<String>)>,
+    ) -> Result<(), (String, String)> {
         let task = self
             .orch
             .task(id)
             .cloned()
             .ok_or_else(|| ("not_found".to_string(), format!("no such task: {id}")))?;
+        if task.worker_mode == Some(TaskWorkerMode::Workspace) {
+            return Err((
+                "merge_unavailable".to_string(),
+                format!("{id} runs in a shared workspace and has no task branch to merge"),
+            ));
+        }
         let branch = task.branch.clone().ok_or_else(|| {
             (
                 "no_branch".to_string(),
                 format!("{id} has no branch — start a worker first with `task start`"),
             )
         })?;
-        if !matches!(task.status, TaskStatus::Done | TaskStatus::Blocked) {
-            return Err((
-                "not_done".to_string(),
-                format!("{id} isn't done yet (status: {})", task.status.as_str()),
-            ));
-        }
-        // Operate on the task's own worktree repo (any worktree resolves the repo).
+        // Operate on the task's own worktree repo (any worktree resolves the
+        // repository). The active workspace is only a legacy fallback for an
+        // old task record that has a branch but no persisted worktree.
         let repo = task
             .worktree
             .as_ref()
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| self.ws().cwd.clone());
-        if !crate::git::local::is_repo(&repo) {
-            return Err((
-                "not_a_repo".to_string(),
-                "the task's repository is no longer available".to_string(),
-            ));
-        }
-        let base = crate::git::local::default_branch(&repo);
-        let repo_name = crate::git::local::worktrees(&repo)
-            .ok()
-            .and_then(|wts| {
-                wts.into_iter()
-                    .find(|w| w.is_main)
-                    .map(|w| ws_name(&w.path))
-            })
-            .unwrap_or_else(|| ws_name(&repo));
-        let integ_dir = crate::persist::config_dir()
-            .join("worktrees")
-            .join(&repo_name)
-            .join("__integration");
+            .or_else(|| self.workspaces.get(self.active_ws).map(|ws| ws.cwd.clone()))
+            .ok_or_else(|| {
+                (
+                    "not_a_repo".to_string(),
+                    "the task's repository is no longer available".to_string(),
+                )
+            })?;
+        let previous = self
+            .orch
+            .begin_merge(id)
+            .map_err(|reject| (reject.code.to_string(), reject.message))?;
         let integ_branch = "luvus/integration";
+        self.orch.save();
+        self.emit_event(
+            "task.merge_started",
+            serde_json::json!({ "id": id, "branch": branch, "into": integ_branch }),
+        );
+        let job = TaskMergeJob {
+            task: id.to_string(),
+            branch: branch.clone(),
+            previous,
+            repo,
+            integration_root: crate::persist::config_dir().join("worktrees"),
+            integration_branch: integ_branch.to_string(),
+            reply,
+            app_tx: self.app_tx.clone(),
+        };
+        if let Err(message) = spawn_task_merge(job) {
+            let _ = self.orch.finish_merge(id, previous);
+            self.orch.save();
+            self.emit_event(
+                "task.merge_failed",
+                serde_json::json!({ "id": id, "branch": branch, "message": message }),
+            );
+            return Err(("merge_unavailable".to_string(), message));
+        }
+        Ok(())
+    }
 
-        let outcome =
-            crate::git::local::integrate_branch(&repo, &integ_dir, integ_branch, &base, &branch)
-                .map_err(|e| ("merge_error".to_string(), e))?;
-        match outcome {
-            crate::git::local::MergeOutcome::Merged => {
-                let _ = self
-                    .orch
-                    .add_note(id, format!("merged {branch} → {integ_branch}"));
-                self.orch.save();
-                self.emit_event(
-                    "task.merged",
-                    serde_json::json!({ "id": id, "branch": branch, "into": integ_branch }),
-                );
-                Ok(serde_json::json!({
-                    "type": "merge",
-                    "outcome": "merged",
-                    "task": id,
-                    "branch": branch,
-                    "into": integ_branch,
-                }))
+    /// Apply the result of one background integration job. The task must still
+    /// own the `merging` reservation, so stale completions cannot retarget state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn task_merge_finished(
+        &mut self,
+        id: String,
+        branch: String,
+        previous: TaskStatus,
+        integration_branch: String,
+        result: Result<crate::git::local::MergeOutcome, String>,
+        reply: Option<(String, std::sync::mpsc::Sender<String>)>,
+    ) {
+        use crate::git::local::MergeOutcome;
+        use serde_json::json;
+
+        let response = match result {
+            Ok(MergeOutcome::Merged { commit }) => {
+                match self.orch.finish_merge(&id, TaskStatus::Merged) {
+                    Ok(_) => {
+                        let ready = self.orch.newly_ready(&id);
+                        let short = commit.get(..12).unwrap_or(&commit);
+                        let _ = self.orch.add_note(
+                            &id,
+                            format!("merged {branch} into {integration_branch} at {short}"),
+                        );
+                        self.orch.save();
+                        self.emit_event(
+                            "task.merged",
+                            json!({ "id": id, "branch": branch, "into": integration_branch,
+                                "commit": commit }),
+                        );
+                        for ready_id in ready {
+                            self.emit_event("task.ready", json!({ "id": ready_id }));
+                        }
+                        Ok(json!({
+                            "type": "merge",
+                            "outcome": "merged",
+                            "task": id,
+                            "branch": branch,
+                            "into": integration_branch,
+                            "commit": commit,
+                        }))
+                    }
+                    Err(reject) => Err((reject.code.to_string(), reject.message)),
+                }
             }
-            crate::git::local::MergeOutcome::Conflict(files) => {
-                let _ = self.orch.set_status(id, TaskStatus::Blocked);
-                self.orch.save();
-                self.emit_event(
-                    "task.merge_conflict",
-                    serde_json::json!({ "id": id, "branch": branch, "files": files.clone() }),
-                );
-                Ok(serde_json::json!({
-                    "type": "merge",
-                    "outcome": "conflict",
-                    "task": id,
-                    "branch": branch,
-                    "files": files,
-                }))
+            Ok(MergeOutcome::Conflict(files)) => {
+                match self.orch.finish_merge(&id, TaskStatus::Blocked) {
+                    Ok(_) => {
+                        let _ = self
+                            .orch
+                            .add_output(&id, format!("merge conflict: {}", files.join(", ")));
+                        self.orch.save();
+                        self.emit_event(
+                            "task.merge_conflict",
+                            json!({ "id": id, "branch": branch, "files": files.clone() }),
+                        );
+                        Ok(json!({
+                            "type": "merge",
+                            "outcome": "conflict",
+                            "task": id,
+                            "branch": branch,
+                            "files": files,
+                        }))
+                    }
+                    Err(reject) => Err((reject.code.to_string(), reject.message)),
+                }
+            }
+            Err(message) => {
+                let restored = if previous == TaskStatus::Blocked {
+                    TaskStatus::Blocked
+                } else {
+                    TaskStatus::Done
+                };
+                match self.orch.finish_merge(&id, restored) {
+                    Ok(_) => {
+                        let _ = self
+                            .orch
+                            .add_output(&id, format!("merge failed: {message}"));
+                        self.orch.save();
+                        self.emit_event(
+                            "task.merge_failed",
+                            json!({ "id": id, "branch": branch, "message": message }),
+                        );
+                        Err(("merge_error".to_string(), message))
+                    }
+                    Err(reject) => Err((reject.code.to_string(), reject.message)),
+                }
+            }
+        };
+
+        if let Some((request_id, sender)) = reply {
+            let revision = crate::ipc::api::current_sequence(&self.events);
+            let envelope = match response {
+                Ok(mut value) => {
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("revision".to_string(), json!(revision));
+                    }
+                    json!({ "id": request_id, "result": value })
+                }
+                Err((code, message)) => {
+                    json!({ "id": request_id, "error": { "code": code, "message": message } })
+                }
+            };
+            let _ = sender.send(envelope.to_string());
+        } else {
+            match response {
+                Ok(value) => {
+                    let outcome = value
+                        .get("outcome")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("done");
+                    self.show_toast(format!("{id}: merge {outcome}"));
+                }
+                Err((_, message)) => self.show_toast(message),
             }
         }
     }
@@ -347,6 +745,15 @@ impl App {
             .task(id)
             .cloned()
             .ok_or_else(|| ("not_found".to_string(), format!("no such task: {id}")))?;
+        if matches!(
+            task.status,
+            crate::orch::TaskStatus::Merging | crate::orch::TaskStatus::Merged
+        ) {
+            return Err((
+                "task_complete".to_string(),
+                format!("{id} is already {}", task.status.as_str()),
+            ));
+        }
         // ORCH-5 compaction gate: a context-saturated worker must compact (or hand
         // off to a fresh agent) before its work is accepted, so a confused agent
         // doesn't finalize sloppy output.
@@ -371,6 +778,11 @@ impl App {
             .worktree
             .as_ref()
             .map(std::path::PathBuf::from)
+            .or_else(|| {
+                task.workspace_worker
+                    .as_ref()
+                    .map(|binding| std::path::PathBuf::from(&binding.root))
+            })
             .or_else(|| {
                 task.assignee
                     .and_then(|p| self.panes.get(&PaneId(p)).map(|pane| pane.cwd.clone()))
@@ -561,6 +973,171 @@ impl App {
         self.orch.tasks.get(self.orch_cursor).map(|t| t.id.clone())
     }
 
+    /// Select a task by its stable id. Mouse rows and menus use this rather than
+    /// retaining a mutable list index across frames.
+    pub fn orch_select_task(&mut self, id: &str) -> bool {
+        let Some(index) = self.orch.tasks.iter().position(|task| task.id == id) else {
+            return false;
+        };
+        self.orch_cursor = index;
+        true
+    }
+
+    pub fn orch_jump_to_task(&mut self, id: &str) {
+        if self.orch_select_task(id) {
+            self.orch_action_jump();
+        }
+    }
+
+    /// Activate one rendered ORCH control. Task-row double-click timing remains
+    /// in the input layer; everything else routes through the existing board
+    /// actions here.
+    pub fn orch_activate_hit(&mut self, hit: crate::app::OrchHit) {
+        match hit {
+            crate::app::OrchHit::Worker(id) => {
+                if self.orch_select_task(&id) {
+                    self.orch_action_jump();
+                }
+            }
+            crate::app::OrchHit::NewTask => self.open_orch_form(),
+            crate::app::OrchHit::FormField(field) => {
+                if let Some(form) = self.orch_form.as_mut() {
+                    form.field = field.min(crate::app::OrchForm::FIELDS - 1);
+                }
+            }
+            crate::app::OrchHit::FormCreate => self.submit_orch_form(),
+            crate::app::OrchHit::FormCancel => self.orch_form = None,
+            crate::app::OrchHit::FormModal => {}
+            crate::app::OrchHit::StartChoice(cursor) => {
+                if let Some(start) = self.orch_start.as_mut() {
+                    start.cursor = cursor.min(agent_choices().len().saturating_sub(1));
+                    start.step = crate::app::OrchStartStep::Agent;
+                }
+            }
+            crate::app::OrchHit::StartMode(mode) => {
+                if let Some(start) = self.orch_start.as_mut() {
+                    start.mode = mode;
+                    start.step = crate::app::OrchStartStep::Agent;
+                }
+            }
+            crate::app::OrchHit::FlowMode(mode) => self.orch_flow_mode = mode,
+            crate::app::OrchHit::StartCommit => {
+                self.handle_orch_start_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            }
+            crate::app::OrchHit::StartCancel => self.orch_start = None,
+            crate::app::OrchHit::DetailClose => self.orch_detail = None,
+            crate::app::OrchHit::Task(_) => {}
+        }
+    }
+
+    pub fn open_orch_menu(&mut self, id: &str, col: u16, row: u16) {
+        if self.orch_select_task(id) {
+            self.orch_menu = Some(crate::app::OrchMenu {
+                task: id.to_string(),
+                anchor: (col, row),
+                items: Vec::new(),
+            });
+        }
+    }
+
+    pub fn orch_menu_items(&self, id: &str) -> Vec<crate::app::OrchMenuItem> {
+        use crate::app::OrchMenuItem as Item;
+        use crate::orch::TaskStatus;
+
+        let Some(task) = self.orch.task(id) else {
+            return Vec::new();
+        };
+        let mut items = Vec::new();
+        if task.assignee.is_some() {
+            items.push(Item::Jump);
+        } else if !matches!(
+            task.status,
+            TaskStatus::Done | TaskStatus::Merging | TaskStatus::Merged
+        ) {
+            items.push(Item::Start);
+        }
+        items.push(Item::Details);
+        match task.status {
+            TaskStatus::Queued => {}
+            TaskStatus::Claimed | TaskStatus::Running | TaskStatus::Review | TaskStatus::Failed => {
+                items.extend([Item::Done, Item::Release]);
+            }
+            TaskStatus::Blocked => {
+                if task.worker_mode != Some(TaskWorkerMode::Workspace) {
+                    items.push(Item::Merge);
+                }
+                items.push(Item::Release);
+            }
+            TaskStatus::Done if task.worker_mode != Some(TaskWorkerMode::Workspace) => {
+                items.push(Item::Merge)
+            }
+            TaskStatus::Done => {}
+            TaskStatus::Merging | TaskStatus::Merged => {}
+        }
+        items.extend([Item::Divider, Item::CopyId]);
+        if task.worktree.is_some() {
+            items.push(Item::CopyWorktree);
+        }
+        if !matches!(
+            task.status,
+            TaskStatus::Claimed | TaskStatus::Running | TaskStatus::Merging
+        ) {
+            items.extend([Item::Divider, Item::Delete]);
+        }
+        items
+    }
+
+    pub fn orch_menu_click(&mut self, col: u16, row: u16) {
+        let item = self.orch_menu.as_ref().and_then(|menu| {
+            menu.items
+                .iter()
+                .find(|(item, rect)| {
+                    !matches!(item, crate::app::OrchMenuItem::Divider)
+                        && col >= rect.x
+                        && col < rect.right()
+                        && row >= rect.y
+                        && row < rect.bottom()
+                })
+                .map(|(item, _)| *item)
+        });
+        match item {
+            Some(item) => self.orch_menu_action(item),
+            None => self.orch_menu = None,
+        }
+    }
+
+    pub fn orch_menu_action(&mut self, item: crate::app::OrchMenuItem) {
+        use crate::app::OrchMenuItem as Item;
+
+        let Some(id) = self.orch_menu.as_ref().map(|menu| menu.task.clone()) else {
+            return;
+        };
+        self.orch_menu = None;
+        if !self.orch_select_task(&id) {
+            return;
+        }
+        match item {
+            Item::Start => self.orch_action_start(),
+            Item::Jump => self.orch_action_jump(),
+            Item::Details => self.orch_action_detail(),
+            Item::Done => self.orch_action_done(),
+            Item::Merge => self.orch_action_merge(),
+            Item::Release => self.orch_action_release(),
+            Item::CopyId => {
+                self.pending_clipboard = Some(id);
+                self.show_toast(self.catalog.copied);
+            }
+            Item::CopyWorktree => {
+                if let Some(path) = self.orch.task(&id).and_then(|task| task.worktree.clone()) {
+                    self.pending_clipboard = Some(path);
+                    self.show_toast(self.catalog.copied);
+                }
+            }
+            Item::Delete => self.orch_action_delete(),
+            Item::Divider => {}
+        }
+    }
+
     /// Board `s`: open the **start-worker picker** for the selected task, after
     /// pre-flight checks so the picker never opens for an unstartable task.
     fn orch_action_start(&mut self) {
@@ -578,18 +1155,79 @@ impl App {
             self.show_toast(format!("{id}: dependencies aren't done yet"));
             return;
         }
+        let existing_mode = task.worker_mode;
+        let workspace_id = self.ws().id.as_str();
+        let shared_workers = self
+            .orch
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.workspace_worker
+                    .as_ref()
+                    .is_some_and(|binding| binding.workspace_id == workspace_id)
+                    && matches!(
+                        task.status,
+                        TaskStatus::Claimed
+                            | TaskStatus::Running
+                            | TaskStatus::Blocked
+                            | TaskStatus::Review
+                            | TaskStatus::Failed
+                    )
+            })
+            .count();
         self.orch_start = Some(crate::app::OrchStart {
             task: id,
             cursor: self.orch_last_agent.min(agent_choices().len() - 1),
+            step: if existing_mode.is_some() {
+                crate::app::OrchStartStep::Agent
+            } else {
+                crate::app::OrchStartStep::Mode
+            },
+            mode: existing_mode.unwrap_or(TaskWorkerMode::Worktree),
+            shared_workers,
         });
     }
 
     /// Key handling while the start-worker picker is open: `j/k` choose the
     /// agent, `⏎` starts the worker with it, `esc` cancels.
     pub fn handle_orch_start_key(&mut self, key: KeyEvent) {
+        if self
+            .orch_start
+            .as_ref()
+            .is_some_and(|start| start.step == crate::app::OrchStartStep::Mode)
+        {
+            match key.code {
+                KeyCode::Esc => self.orch_start = None,
+                KeyCode::Char('j')
+                | KeyCode::Char('k')
+                | KeyCode::Down
+                | KeyCode::Up
+                | KeyCode::Tab
+                | KeyCode::BackTab => {
+                    if let Some(start) = self.orch_start.as_mut() {
+                        start.mode = match start.mode {
+                            TaskWorkerMode::Worktree => TaskWorkerMode::Workspace,
+                            TaskWorkerMode::Workspace => TaskWorkerMode::Worktree,
+                        };
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(start) = self.orch_start.as_mut() {
+                        start.step = crate::app::OrchStartStep::Agent;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         let n = agent_choices().len();
         match key.code {
             KeyCode::Esc => self.orch_start = None,
+            KeyCode::Backspace => {
+                if let Some(start) = self.orch_start.as_mut() {
+                    start.step = crate::app::OrchStartStep::Mode;
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => {
                 if let Some(s) = self.orch_start.as_mut() {
                     s.cursor = (s.cursor + 1) % n;
@@ -604,7 +1242,7 @@ impl App {
                 if let Some(s) = self.orch_start.take() {
                     self.orch_last_agent = s.cursor;
                     let agent = agent_choices()[s.cursor].1.map(str::to_string);
-                    self.start_worker_from_board(&s.task, agent);
+                    self.start_worker_from_board(&s.task, agent, s.mode);
                 }
             }
             _ => {}
@@ -615,10 +1253,24 @@ impl App {
     /// spawns in the background, a toast confirms it, and `⏎` jumps into it
     /// when wanted — starting five workers is five keypresses, not five
     /// context switches.
-    fn start_worker_from_board(&mut self, id: &str, agent: Option<String>) {
+    fn start_worker_from_board(&mut self, id: &str, agent: Option<String>, mode: TaskWorkerMode) {
         let prev_ws = self.active_ws;
         let prev_tab = self.workspaces[prev_ws].active_tab;
-        match self.task_start(id, None, agent) {
+        let workspace_id = if mode == TaskWorkerMode::Workspace {
+            match self
+                .orch
+                .task(id)
+                .and_then(|task| task.workspace_worker.as_ref())
+                .map(|binding| binding.workspace_id.clone())
+            {
+                Some(id) if self.workspaces.iter().any(|workspace| workspace.id == id) => Some(id),
+                Some(_) => None,
+                None => Some(self.workspaces[prev_ws].id.clone()),
+            }
+        } else {
+            None
+        };
+        match self.task_start(id, None, agent, mode, workspace_id) {
             Ok(_) => {
                 self.active_ws = prev_ws;
                 self.workspaces[prev_ws].active_tab = prev_tab;
@@ -682,11 +1334,8 @@ impl App {
         let Some(id) = self.orch_selected_id() else {
             return;
         };
-        match self.merge_task(&id) {
-            Ok(v) => {
-                let outcome = v.get("outcome").and_then(|o| o.as_str()).unwrap_or("done");
-                self.show_toast(format!("{id}: merge {outcome}"));
-            }
+        match self.start_task_merge(&id, None) {
+            Ok(()) => self.show_toast(format!("{id}: merging…")),
             Err((_, msg)) => self.show_toast(msg),
         }
     }
@@ -710,10 +1359,15 @@ impl App {
     fn orch_action_jump(&mut self) {
         let task = self.orch.tasks.get(self.orch_cursor);
         let pane = task.and_then(|t| t.assignee).map(PaneId);
-        let has_worktree = task.is_some_and(|t| t.worktree.is_some());
+        let durable = task.and_then(|task| task.worker_mode);
         match pane {
             Some(id) if self.panes.contains_key(&id) => self.focus_pane_global(id),
-            _ if has_worktree => self.show_toast("no worker pane — press s to reopen its worktree"),
+            _ if durable == Some(TaskWorkerMode::Worktree) => {
+                self.show_toast("no worker pane — press s to reopen its worktree")
+            }
+            _ if durable == Some(TaskWorkerMode::Workspace) => {
+                self.show_toast("no worker pane — press s to reopen its workspace tab")
+            }
             _ => self.show_toast("no worker pane for this task"),
         }
     }
@@ -729,28 +1383,40 @@ impl App {
     }
 }
 
-/// Agents offered by the board's start-worker picker: (label, launch command).
-/// `None` = plain shell, no agent. Every listed CLI accepts a positional prompt,
-/// so the task briefing rides along as the agent's opening instruction.
+/// Agents offered by the board's start-worker picker: (label, canonical id).
+/// `None` = plain shell, no agent. The built-in registry owns the executable
+/// and any task-prompt arguments, so adding an agent cannot leave this picker
+/// stale.
 pub fn agent_choices() -> &'static [(&'static str, Option<&'static str>)] {
-    &[
-        ("claude", Some("claude")),
-        ("codex", Some("codex")),
-        ("gemini", Some("gemini")),
-        ("opencode", Some("opencode")),
-        ("kimi", Some("kimi")),
-        ("aider", Some("aider")),
-        ("shell", None),
-    ]
+    static CHOICES: std::sync::OnceLock<Vec<(&'static str, Option<&'static str>)>> =
+        std::sync::OnceLock::new();
+    CHOICES.get_or_init(|| {
+        crate::agent::registry::descriptors()
+            .iter()
+            .map(|descriptor| (descriptor.id, Some(descriptor.id)))
+            .chain(std::iter::once(("shell", None)))
+            .collect()
+    })
+}
+
+fn task_tab_name(task: &crate::orch::Task) -> String {
+    let value = format!("{} · {}", task.id, task.title.trim());
+    value.chars().take(crate::app::TAB_NAME_MAX).collect()
 }
 
 /// The briefing a worker agent starts with: what the task is, its boundaries,
 /// its gate, and the contract for reporting back over the socket. One line —
 /// it's typed into the worker's shell as a quoted argument.
-fn task_briefing(task: &crate::orch::Task) -> String {
+fn task_briefing(task: &crate::orch::Task, mode: TaskWorkerMode) -> String {
     let id = &task.id;
+    let location = match mode {
+        TaskWorkerMode::Worktree => "This directory is your isolated git worktree.",
+        TaskWorkerMode::Workspace => {
+            "This is a shared workspace checkout. Preserve unrelated changes and do not assume file isolation."
+        }
+    };
     let mut b = format!(
-        "You are the worker for luvus task {id}: {}. This directory is your isolated git worktree.",
+        "You are the worker for luvus task {id}: {}. {location}",
         task.title
     );
     if !task.paths.is_empty() {
@@ -765,26 +1431,42 @@ fn task_briefing(task: &crate::orch::Task) -> String {
     if let Some(note) = task.notes.last() {
         b.push_str(&format!(" Note from earlier work: {note}."));
     }
+    match mode {
+        TaskWorkerMode::Worktree => b.push_str(&format!(
+            " When finished: commit all changes here, then run `luvus task done {id}`."
+        )),
+        TaskWorkerMode::Workspace => b.push_str(&format!(
+            " When finished, leave the shared checkout intact and run `luvus task done {id}`."
+        )),
+    }
     b.push_str(&format!(
-        " When finished: commit all changes here, then run `luvus task done {id}`. \
-         Report progress with `luvus task update {id} --note <text>` and context usage \
+        " Report progress with `luvus task update {id} --note <text>` and context usage \
          with `luvus task heartbeat {id} --context <0..1>`."
     ));
     b
 }
 
 /// The full line typed into a fresh worker shell to launch `agent` with the
-/// task briefing (and, on Unix, both task-id names during the 0.11 transition).
-fn agent_launch_line(agent: &str, task: &crate::orch::Task) -> String {
-    let brief = shell_quote(&task_briefing(task));
+/// task briefing, with the task id available to Unix workers.
+fn agent_launch_line(agent: &str, task: &crate::orch::Task, mode: TaskWorkerMode) -> String {
+    let brief = shell_quote(&task_briefing(task, mode));
+    let command = agent_task_command(agent);
     if cfg!(windows) {
-        format!("{agent} {brief}")
+        format!("{command} {brief}")
     } else {
-        format!(
-            "LUVUS_TASK_ID={} BOHAY_TASK_ID={} {agent} {brief}",
-            task.id, task.id
-        )
+        format!("LUVUS_TASK_ID={} {command} {brief}", task.id)
     }
+}
+
+fn agent_task_command(agent: &str) -> String {
+    crate::agent::registry::find(agent)
+        .map(|descriptor| {
+            std::iter::once(descriptor.launch_command)
+                .chain(descriptor.task_prompt_args.iter().copied())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_else(|| agent.to_string())
 }
 
 /// Quote `s` as one shell argument: POSIX single-quoting on Unix; on Windows
@@ -796,6 +1478,60 @@ fn shell_quote(s: &str) -> String {
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
     }
+}
+
+struct TaskMergeJob {
+    task: String,
+    branch: String,
+    previous: crate::orch::TaskStatus,
+    repo: std::path::PathBuf,
+    integration_root: std::path::PathBuf,
+    integration_branch: String,
+    reply: Option<(String, std::sync::mpsc::Sender<String>)>,
+    app_tx: std::sync::mpsc::Sender<crate::event::AppEvent>,
+}
+
+/// Resolve repository metadata and run the merge gate away from the app owner.
+/// `begin_merge` permits only one job, so two workers never mutate the shared
+/// integration worktree concurrently.
+fn spawn_task_merge(job: TaskMergeJob) -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("luvus-task-merge".to_string())
+        .spawn(move || {
+            let result = (|| {
+                if !crate::git::local::is_repo(&job.repo) {
+                    return Err("the task's repository is no longer available".to_string());
+                }
+                let base = crate::git::local::default_branch(&job.repo);
+                let repo_name = crate::git::local::worktrees(&job.repo)
+                    .ok()
+                    .and_then(|worktrees| {
+                        worktrees
+                            .into_iter()
+                            .find(|worktree| worktree.is_main)
+                            .map(|worktree| ws_name(&worktree.path))
+                    })
+                    .unwrap_or_else(|| ws_name(&job.repo));
+                let integration_dir = job.integration_root.join(repo_name).join("__integration");
+                crate::git::local::integrate_branch(
+                    &job.repo,
+                    &integration_dir,
+                    &job.integration_branch,
+                    &base,
+                    &job.branch,
+                )
+            })();
+            let _ = job.app_tx.send(crate::event::AppEvent::TaskMergeFinished {
+                task: job.task,
+                branch: job.branch,
+                previous: job.previous,
+                integration_branch: job.integration_branch,
+                result,
+                reply: job.reply,
+            });
+        })
+        .map(|_| ())
+        .map_err(|error| format!("cannot start merge worker: {error}"))
 }
 
 /// Run a task's `gate` shell command async and report the result back to the loop
@@ -932,7 +1668,11 @@ mod tests {
             .add_task("auth".into(), vec!["src/auth/**".into()], vec![], None)
             .unwrap();
 
-        let (pane, path) = app.task_start("t1", None, None).expect("worker starts");
+        let started = app
+            .task_start("t1", None, None, TaskWorkerMode::Worktree, None)
+            .expect("worker starts");
+        let pane = started.pane;
+        let path = started.cwd;
 
         // The worker's worktree is now the active workspace, under our managed dir.
         assert_eq!(app.ws().cwd, path);
@@ -952,11 +1692,221 @@ mod tests {
 
         // Starting again is rejected — it's already claimed.
         assert_eq!(
-            app.task_start("t1", None, None).unwrap_err().0,
+            app.task_start("t1", None, None, TaskWorkerMode::Worktree, None)
+                .unwrap_err()
+                .0,
             "already_claimed"
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn task_start_rejects_a_lease_conflict_before_spawning() {
+        let _env = crate::persist::test_env("orch-start-conflict");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.orch
+            .add_task("owner".into(), vec!["src/**".into()], vec![], None)
+            .unwrap();
+        app.orch
+            .add_task(
+                "conflict".into(),
+                vec!["src/auth/token.rs".into()],
+                vec![],
+                None,
+            )
+            .unwrap();
+        app.orch
+            .acquire_lease(pane.0, "t1".into(), vec!["src/**".into()])
+            .unwrap();
+        let panes_before = app.panes.len();
+        let workspaces_before = app.workspaces.len();
+
+        let err = app
+            .task_start("t2", None, None, TaskWorkerMode::Worktree, None)
+            .unwrap_err();
+
+        assert_eq!(err.0, "lease_conflict");
+        assert_eq!(app.panes.len(), panes_before, "no worker pane was spawned");
+        assert_eq!(
+            app.workspaces.len(),
+            workspaces_before,
+            "no worktree workspace was created"
+        );
+        let task = app.orch.task("t2").unwrap();
+        assert_eq!(task.status, crate::orch::TaskStatus::Queued);
+        assert_eq!(task.assignee, None);
+    }
+
+    #[test]
+    fn task_start_workspace_creates_a_task_tab_without_a_worktree() {
+        let _env = crate::persist::test_env("orch-workspace-worker");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let shared_root = crate::persist::config_dir().join("non-git-project");
+        std::fs::create_dir_all(&shared_root).unwrap();
+        assert!(app.create_workspace_at(shared_root));
+        assert!(!crate::git::local::is_repo(&app.ws().cwd));
+        let workspace_id = app.ws().id.clone();
+        let root = app.ws().cwd.clone();
+        let workspaces_before = app.workspaces.len();
+        let tabs_before = app.ws().tabs.len();
+        app.orch
+            .add_task("shared checkout".into(), vec![], vec![], None)
+            .unwrap();
+
+        let started = app
+            .task_start(
+                "t1",
+                None,
+                None,
+                TaskWorkerMode::Workspace,
+                Some(workspace_id.clone()),
+            )
+            .expect("workspace worker starts");
+
+        assert_eq!(started.mode, TaskWorkerMode::Workspace);
+        assert_eq!(started.workspace_id, workspace_id);
+        assert_eq!(started.cwd, root);
+        assert_eq!(started.worktree, None);
+        assert_eq!(started.branch, None);
+        assert_eq!(app.workspaces.len(), workspaces_before);
+        assert_eq!(app.ws().tabs.len(), tabs_before + 1);
+        assert_eq!(app.ws().tabs.last().unwrap().id, started.tab_id);
+        assert!(app
+            .ws()
+            .tabs
+            .last()
+            .unwrap()
+            .name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("t1 ·")));
+
+        let task = app.orch.task("t1").unwrap();
+        assert_eq!(task.status, TaskStatus::Running);
+        assert_eq!(task.worker_mode, Some(TaskWorkerMode::Workspace));
+        assert_eq!(task.assignee, Some(started.pane.0));
+        assert_eq!(task.worktree, None);
+        assert_eq!(task.branch, None);
+        let binding = task.workspace_worker.as_ref().unwrap();
+        assert_eq!(binding.workspace_id, started.workspace_id);
+        assert_eq!(binding.tab_id, started.tab_id);
+        assert_eq!(binding.root, root.display().to_string());
+        assert_eq!(
+            app.start_task_merge("t1", None).unwrap_err().0,
+            "merge_unavailable"
+        );
+
+        let old_tab = started.tab_id;
+        let task_tab = app.ws().tabs.len() - 1;
+        app.close_tab(task_tab);
+        let detached = app.orch.task("t1").unwrap();
+        assert_eq!(detached.status, TaskStatus::Running);
+        assert_eq!(detached.assignee, None);
+
+        let reopened = app
+            .task_start(
+                "t1",
+                None,
+                None,
+                TaskWorkerMode::Workspace,
+                Some(workspace_id),
+            )
+            .expect("detached workspace worker reopens");
+        assert_ne!(reopened.tab_id, old_tab);
+        assert_eq!(app.orch.task("t1").unwrap().assignee, Some(reopened.pane.0));
+    }
+
+    #[test]
+    fn workspace_restart_honors_an_explicit_different_workspace() {
+        let _env = crate::persist::test_env("orch-workspace-retarget");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let first_root = crate::persist::config_dir().join("workspace-one");
+        let second_root = crate::persist::config_dir().join("workspace-two");
+        std::fs::create_dir_all(&first_root).unwrap();
+        std::fs::create_dir_all(&second_root).unwrap();
+        assert!(app.create_workspace_at(first_root));
+        let first_workspace = app.ws().id.clone();
+        assert!(app.create_workspace_at(second_root));
+        let second_workspace = app.ws().id.clone();
+        app.orch
+            .add_task("move shared worker".into(), vec![], vec![], None)
+            .unwrap();
+
+        let first = app
+            .task_start(
+                "t1",
+                None,
+                None,
+                TaskWorkerMode::Workspace,
+                Some(first_workspace.clone()),
+            )
+            .unwrap();
+        app.orch.release_task("t1").unwrap();
+
+        let restarted = app
+            .task_start(
+                "t1",
+                None,
+                None,
+                TaskWorkerMode::Workspace,
+                Some(second_workspace.clone()),
+            )
+            .unwrap();
+
+        assert_eq!(restarted.workspace_id, second_workspace);
+        assert_ne!(restarted.tab_id, first.tab_id);
+        assert_ne!(restarted.pane, first.pane);
+        let binding = app
+            .orch
+            .task("t1")
+            .unwrap()
+            .workspace_worker
+            .as_ref()
+            .unwrap();
+        assert_eq!(binding.workspace_id, restarted.workspace_id);
+        assert_eq!(binding.tab_id, restarted.tab_id);
+        assert!(app
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == first_workspace)
+            .unwrap()
+            .tabs
+            .iter()
+            .any(|tab| tab.id == first.tab_id));
+    }
+
+    #[test]
+    fn reconcile_rebinds_workspace_workers_by_stable_tab_identity() {
+        let _env = crate::persist::test_env("orch-workspace-reconcile");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let live = app.layout().focus;
+        let workspace_id = app.ws().id.clone();
+        let tab_id = app.ws().tabs[app.ws().active_tab].id.clone();
+        let root = app.ws().cwd.display().to_string();
+        app.orch
+            .add_task("restored".into(), vec![], vec![], None)
+            .unwrap();
+        app.orch.claim("t1", 999).unwrap();
+        app.orch.set_status("t1", TaskStatus::Running).unwrap();
+        app.orch.bind_workspace(
+            "t1",
+            WorkspaceWorkerBinding {
+                workspace_id,
+                tab_id,
+                root,
+            },
+        );
+
+        app.orch_reconcile();
+
+        let task = app.orch.task("t1").unwrap();
+        assert_eq!(task.status, TaskStatus::Running);
+        assert_eq!(task.assignee, Some(live.0));
     }
 
     #[test]
@@ -973,7 +1923,27 @@ mod tests {
         let start = app.orch_start.as_ref().expect("picker opens");
         assert_eq!(start.task, "t1");
 
-        // j/k move the agent cursor; esc cancels without starting anything.
+        assert_eq!(start.step, crate::app::OrchStartStep::Mode);
+        assert_eq!(start.mode, TaskWorkerMode::Worktree);
+
+        // The first step selects the worker location.
+        app.handle_orch_start_key(k('j'));
+        assert_eq!(
+            app.orch_start.as_ref().unwrap().mode,
+            TaskWorkerMode::Workspace
+        );
+        app.handle_orch_start_key(k('k'));
+        assert_eq!(
+            app.orch_start.as_ref().unwrap().mode,
+            TaskWorkerMode::Worktree
+        );
+        app.handle_orch_start_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.orch_start.as_ref().unwrap().step,
+            crate::app::OrchStartStep::Agent
+        );
+
+        // j/k now move the agent cursor; esc cancels without starting anything.
         app.handle_orch_start_key(k('j'));
         assert_eq!(app.orch_start.as_ref().unwrap().cursor, 1);
         app.handle_orch_start_key(k('k'));
@@ -992,6 +1962,38 @@ mod tests {
         app.handle_orch_key(k('j'));
         app.handle_orch_key(k('s'));
         assert!(app.orch_start.is_none(), "deps unmet — toast, no picker");
+    }
+
+    #[test]
+    fn short_start_picker_scrolls_to_every_supported_agent() {
+        let _env = crate::persist::test_env("orchpick-scroll");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 16, tx).unwrap();
+        app.orch.add_task("x".into(), vec![], vec![], None).unwrap();
+        app.open_orch_board();
+        app.handle_orch_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        app.handle_orch_start_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let last = agent_choices().len() - 1;
+        app.orch_start.as_mut().unwrap().cursor = last;
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 16)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(rendered.contains(&format!("{}/{}", last + 1, last + 1)));
+        assert!(rendered.contains("shell only"));
+        assert!(app.orch_hits.iter().any(
+            |(hit, _)| matches!(hit, crate::app::OrchHit::StartChoice(index) if *index == last)
+        ));
     }
 
     #[test]
@@ -1031,6 +2033,7 @@ mod tests {
         let k = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
 
         app.handle_orch_key(k('s'));
+        app.handle_orch_start_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         // Select the "shell" choice (last row) and confirm.
         let last = agent_choices().len() - 1;
         if let Some(s) = app.orch_start.as_mut() {
@@ -1095,7 +2098,10 @@ mod tests {
             .add_task("auth".into(), vec![], vec![], None)
             .unwrap();
 
-        let (_, path) = app.task_start("t1", None, None).expect("start adopts");
+        let path = app
+            .task_start("t1", None, None, TaskWorkerMode::Worktree, None)
+            .expect("start adopts")
+            .cwd;
         assert_eq!(
             path.canonicalize().unwrap(),
             leftover.canonicalize().unwrap(),
@@ -1125,6 +2131,9 @@ mod tests {
             .unwrap();
         app.orch
             .bind_worktree("t1", Some(live_cwd), Some("luvus/t1".into()));
+        app.orch
+            .acquire_lease(9999, "t1".into(), vec!["src/a/**".into()])
+            .unwrap();
         // t2: worktree-backed but its folder has no pane → detached, stays Running.
         app.orch.add_task("b".into(), vec![], vec![], None).unwrap();
         app.orch.claim("t2", 9998).unwrap();
@@ -1136,9 +2145,23 @@ mod tests {
             Some("/nonexistent/worktree".into()),
             Some("luvus/t2".into()),
         );
+        app.orch
+            .acquire_lease(9998, "t2".into(), vec!["src/b/**".into()])
+            .unwrap();
         // t3: a pure claim (no worktree) by a dead pane → back to the queue.
         app.orch.add_task("c".into(), vec![], vec![], None).unwrap();
         app.orch.claim("t3", 9997).unwrap();
+        app.orch
+            .acquire_lease(9997, "t3".into(), vec!["src/c/**".into()])
+            .unwrap();
+        // A malformed persisted lease for a missing task is also discarded.
+        app.orch.leases.push(crate::orch::Lease {
+            id: "orphan".into(),
+            pane: 9996,
+            task: "missing".into(),
+            paths: vec!["src/orphan/**".into()],
+            acquired: 0,
+        });
 
         app.orch_reconcile();
 
@@ -1151,6 +2174,87 @@ mod tests {
         let t3 = app.orch.task("t3").unwrap();
         assert_eq!(t3.assignee, None);
         assert_eq!(t3.status, crate::orch::TaskStatus::Queued, "requeued");
+        assert_eq!(app.orch.leases.len(), 1, "only the live task keeps a lease");
+        assert_eq!(app.orch.leases[0].task, "t1");
+        assert_eq!(
+            app.orch.leases[0].pane, live.0,
+            "the lease follows the task's restored pane id"
+        );
+    }
+
+    #[test]
+    fn reconcile_restores_a_missing_worker_lease() {
+        let _env = crate::persist::test_env("orch-lease-restore");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let live = *app.panes.keys().next().unwrap();
+        let live_cwd = app.panes[&live].cwd.display().to_string();
+        app.orch
+            .add_task("work".into(), vec!["src/**".into()], vec![], None)
+            .unwrap();
+        app.orch.claim("t1", 9999).unwrap();
+        app.orch
+            .set_status("t1", crate::orch::TaskStatus::Running)
+            .unwrap();
+        app.orch
+            .bind_worktree("t1", Some(live_cwd), Some("luvus/t1".into()));
+
+        app.orch_reconcile();
+
+        assert_eq!(app.orch.leases.len(), 1);
+        assert_eq!(app.orch.leases[0].task, "t1");
+        assert_eq!(app.orch.leases[0].pane, live.0);
+        assert_eq!(app.orch.leases[0].paths, vec!["src/**"]);
+    }
+
+    #[test]
+    fn reconcile_blocks_an_unprotected_legacy_overlap() {
+        let _env = crate::persist::test_env("orch-lease-overlap");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let live = *app.panes.keys().next().unwrap();
+        let live_cwd = app.panes[&live].cwd.display().to_string();
+        for (title, path, stale_pane) in
+            [("owner", "src/**", 9999), ("overlap", "src/lib.rs", 9998)]
+        {
+            let task = app
+                .orch
+                .add_task(title.into(), vec![path.into()], vec![], None)
+                .unwrap();
+            app.orch.claim(&task.id, stale_pane).unwrap();
+            app.orch
+                .set_status(&task.id, crate::orch::TaskStatus::Running)
+                .unwrap();
+            app.orch.bind_worktree(
+                &task.id,
+                Some(live_cwd.clone()),
+                Some(format!("luvus/{}", task.id)),
+            );
+        }
+        app.orch
+            .acquire_lease(9999, "t1".into(), vec!["src/**".into()])
+            .unwrap();
+
+        app.orch_reconcile();
+
+        assert_eq!(
+            app.orch.leases.len(),
+            1,
+            "the first holder remains exclusive"
+        );
+        let blocked = app.orch.task("t2").unwrap();
+        assert_eq!(blocked.status, crate::orch::TaskStatus::Blocked);
+        assert!(blocked
+            .outputs
+            .last()
+            .is_some_and(|line| line.contains("path lease recovery failed")));
+
+        app.orch_reconcile();
+        assert_eq!(
+            app.orch.task("t2").unwrap().outputs.len(),
+            1,
+            "repeated startup reconciliation does not duplicate the failure"
+        );
     }
 
     #[test]
@@ -1226,16 +2330,61 @@ mod tests {
                 Some("cargo test auth".into()),
             )
             .unwrap();
-        let line = agent_launch_line("claude", &t);
+        let line = agent_launch_line("claude", &t, TaskWorkerMode::Worktree);
         assert!(!line.contains('\n'), "typed into a shell — one line");
         assert!(line.contains("claude"));
         assert!(line.contains("luvus task done t1"));
         assert!(line.contains("cargo test auth"));
         if !cfg!(windows) {
-            assert!(line.starts_with("LUVUS_TASK_ID=t1 BOHAY_TASK_ID=t1 "));
+            assert!(line.starts_with("LUVUS_TASK_ID=t1 "));
             // The apostrophe in the title survives POSIX single-quoting.
             assert!(line.contains(r"auth'\''s"));
         }
+    }
+
+    #[test]
+    fn agent_task_commands_follow_each_cli_prompt_contract() {
+        let expected = [
+            ("aider", "aider --message"),
+            ("amp", "amp --execute"),
+            ("claude", "claude"),
+            ("codex", "codex"),
+            ("copilot", "copilot --interactive"),
+            ("cursor", "cursor-agent"),
+            ("droid", "droid"),
+            ("fx", "fx ask --prompt-permissions"),
+            ("gemini", "gemini --prompt-interactive"),
+            ("grok", "grok"),
+            ("hermes", "hermes --oneshot"),
+            ("kimi", "kimi --prompt"),
+            ("kiro", "kiro-cli"),
+            ("muse", "muse"),
+            ("omp", "omp"),
+            ("opencode", "opencode --prompt"),
+            ("pi", "pi"),
+            ("qwen", "qwen --prompt-interactive"),
+        ];
+        assert_eq!(expected.len(), crate::agent::registry::descriptors().len());
+        for (agent, command) in expected {
+            assert_eq!(agent_task_command(agent), command, "{agent}");
+        }
+    }
+
+    #[test]
+    fn start_picker_agents_follow_the_builtin_registry() {
+        let choices = agent_choices();
+        let agents = &choices[..choices.len() - 1];
+        assert_eq!(
+            agents.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            crate::agent::registry::descriptors()
+                .iter()
+                .map(|descriptor| descriptor.id)
+                .collect::<Vec<_>>()
+        );
+        assert!(agents.iter().all(|(_, command)| command.is_some()));
+        assert_eq!(choices.last(), Some(&("shell", None)));
+        assert!(choices.contains(&("cursor", Some("cursor"))));
+        assert!(choices.contains(&("kiro", Some("kiro"))));
     }
 
     #[test]
@@ -1367,6 +2516,213 @@ mod tests {
         app.handle_orch_form_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.orch_form.as_ref().is_some_and(|f| f.error.is_some()));
         assert!(app.orch.tasks.is_empty());
+    }
+
+    #[test]
+    fn task_menu_is_state_aware_and_keeps_its_original_task() {
+        let _env = crate::persist::test_env("orch-menu");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.orch
+            .add_task("first".into(), vec![], vec![], None)
+            .unwrap();
+        app.orch
+            .add_task("second".into(), vec![], vec![], None)
+            .unwrap();
+
+        let queued = app.orch_menu_items("t1");
+        assert!(queued.contains(&crate::app::OrchMenuItem::Start));
+        assert!(queued.contains(&crate::app::OrchMenuItem::Details));
+        assert!(queued.contains(&crate::app::OrchMenuItem::Delete));
+        assert!(!queued.contains(&crate::app::OrchMenuItem::Done));
+
+        app.open_orch_menu("t1", 4, 4);
+        app.orch_cursor = 1;
+        app.orch_menu_action(crate::app::OrchMenuItem::CopyId);
+        assert_eq!(app.pending_clipboard.as_deref(), Some("t1"));
+        assert_eq!(app.orch_cursor, 0, "the menu stayed bound to t1");
+    }
+
+    #[test]
+    fn integration_result_persists_a_terminal_state_and_exact_commit() {
+        let _env = crate::persist::test_env("orch-merge-result");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.orch
+            .add_task("merge me".into(), vec![], vec![], None)
+            .unwrap();
+        app.orch
+            .add_task("dependent".into(), vec![], vec!["t1".into()], None)
+            .unwrap();
+        app.orch
+            .bind_worktree("t1", Some("/repo/worktree".into()), Some("luvus/t1".into()));
+        app.orch
+            .set_status("t1", crate::orch::TaskStatus::Done)
+            .unwrap();
+        assert!(!app.orch.ready("t2"));
+        app.orch.begin_merge("t1").unwrap();
+        let commit = "a".repeat(40);
+
+        app.task_merge_finished(
+            "t1".into(),
+            "luvus/t1".into(),
+            crate::orch::TaskStatus::Done,
+            "luvus/integration".into(),
+            Ok(crate::git::local::MergeOutcome::Merged {
+                commit: commit.clone(),
+            }),
+            None,
+        );
+
+        let task = app.orch.task("t1").unwrap();
+        assert_eq!(task.status, crate::orch::TaskStatus::Merged);
+        assert!(app.orch.ready("t2"));
+        assert!(task
+            .notes
+            .last()
+            .is_some_and(|note| note.contains(&commit[..12])));
+        let menu = app.orch_menu_items("t1");
+        assert!(!menu.contains(&crate::app::OrchMenuItem::Merge));
+        assert!(!menu.contains(&crate::app::OrchMenuItem::Release));
+        assert!(menu.contains(&crate::app::OrchMenuItem::Delete));
+    }
+
+    #[test]
+    fn integration_conflict_blocks_and_reports_files_to_api() {
+        let _env = crate::persist::test_env("orch-merge-conflict");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.orch
+            .add_task("conflict".into(), vec![], vec![], None)
+            .unwrap();
+        app.orch
+            .set_status("t1", crate::orch::TaskStatus::Done)
+            .unwrap();
+        app.orch.begin_merge("t1").unwrap();
+        let (reply, response) = std::sync::mpsc::channel();
+
+        app.task_merge_finished(
+            "t1".into(),
+            "luvus/t1".into(),
+            crate::orch::TaskStatus::Done,
+            "luvus/integration".into(),
+            Ok(crate::git::local::MergeOutcome::Conflict(vec![
+                "src/auth.rs".into(),
+            ])),
+            Some(("merge-1".into(), reply)),
+        );
+
+        assert_eq!(
+            app.orch.task("t1").unwrap().status,
+            crate::orch::TaskStatus::Blocked
+        );
+        assert!(app
+            .orch
+            .task("t1")
+            .unwrap()
+            .outputs
+            .last()
+            .is_some_and(|output| output.contains("src/auth.rs")));
+        let response: serde_json::Value = serde_json::from_str(&response.recv().unwrap()).unwrap();
+        assert_eq!(response["result"]["outcome"], "conflict");
+        assert_eq!(response["result"]["files"][0], "src/auth.rs");
+    }
+
+    #[test]
+    fn board_render_exposes_only_visible_stable_controls() {
+        let _env = crate::persist::test_env("orch-hit-geometry");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 32, tx).unwrap();
+        app.orch
+            .add_task("first".into(), vec![], vec![], None)
+            .unwrap();
+        app.open_orch_board();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 32)).unwrap();
+
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        assert!(app
+            .orch_hits
+            .iter()
+            .any(|(hit, _)| matches!(hit, crate::app::OrchHit::NewTask)));
+        assert!(app
+            .orch_hits
+            .iter()
+            .any(|(hit, _)| matches!(hit, crate::app::OrchHit::Task(id) if id == "t1")));
+
+        app.open_orch_form();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        assert!(app
+            .orch_hits
+            .iter()
+            .any(|(hit, _)| matches!(hit, crate::app::OrchHit::FormField(0))));
+        assert!(app
+            .orch_hits
+            .iter()
+            .any(|(hit, _)| matches!(hit, crate::app::OrchHit::FormCreate)));
+        assert!(!app
+            .orch_hits
+            .iter()
+            .any(|(hit, _)| matches!(hit, crate::app::OrchHit::Task(_))));
+    }
+
+    #[test]
+    fn empty_wide_board_uses_the_detail_column_for_the_flow() {
+        let _env = crate::persist::test_env("orch-empty-flow");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(180, 32, tx).unwrap();
+        app.open_orch_board();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 32)).unwrap();
+
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(rendered.contains("FLOW"));
+        assert!(rendered.contains("TASK QUEUE"));
+        assert!(rendered.contains("AGENT A"), "{rendered}");
+        assert!(rendered.contains("AGENT B"));
+        assert!(rendered.contains("WORKTREE A"));
+        assert!(rendered.contains("QUALITY GATE"));
+        assert!(rendered.contains("pass"));
+        assert!(rendered.contains("◆ MERGED"));
+
+        assert!(app.orch_hits.iter().any(|(hit, _)| matches!(
+            hit,
+            crate::app::OrchHit::FlowMode(TaskWorkerMode::Workspace)
+        )));
+        app.orch_flow_mode = TaskWorkerMode::Workspace;
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let workspace_flow: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(workspace_flow.contains("SHARED CHECKOUT"));
+        assert!(workspace_flow.contains("AGENT A"));
+        assert!(workspace_flow.contains("AGENT B"));
+        assert!(workspace_flow.contains("TAB A"));
+        assert!(workspace_flow.contains("TAB B"));
+        assert!(workspace_flow.contains('┌'));
+        assert!(workspace_flow.contains('┴'));
+        assert!(workspace_flow.contains("QUALITY GATE"));
+        assert!(workspace_flow.contains("◆ DONE"));
     }
 
     #[test]

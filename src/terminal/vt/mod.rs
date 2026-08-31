@@ -5,7 +5,105 @@
 
 pub mod alacritty;
 
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
+
 use ratatui::style::{Color, Modifier};
+
+use crate::terminal::appearance::PaneAppearance;
+use crate::terminal::pty::InputAction;
+
+/// Internal continuation marker used by [`VtEngine::visible_rows_aligned`].
+/// A terminal never renders NUL as text, so it can represent the second cell of
+/// a wide glyph without being confused with an actual space between words.
+pub(crate) const ALIGNED_WIDE_CELL: char = '\0';
+
+/// Visible terminal text indexed one character per grid cell, plus the sparse
+/// zero-width components attached to base cells. Keeping the latter separate
+/// preserves column lookup without dropping combining marks, variation
+/// selectors, or ZWJ emoji from copied text.
+pub struct AlignedRows {
+    rows: Vec<String>,
+    zero_width: Vec<(u16, u16, Vec<char>)>,
+}
+
+impl AlignedRows {
+    pub(crate) fn new(row_count: usize) -> Self {
+        Self {
+            rows: vec![String::new(); row_count],
+            zero_width: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_rows(rows: Vec<String>) -> Self {
+        Self {
+            rows,
+            zero_width: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push_cell(
+        &mut self,
+        row: u16,
+        col: u16,
+        character: char,
+        zero_width: Option<&[char]>,
+    ) {
+        self.rows[row as usize].push(character);
+        if let Some(chars) = zero_width.filter(|chars| !chars.is_empty()) {
+            self.zero_width.push((row, col, chars.to_vec()));
+        }
+    }
+
+    pub(crate) fn rows(&self) -> &[String] {
+        &self.rows
+    }
+
+    pub(crate) fn zero_width_at(&self, row: u16, col: u16) -> &[char] {
+        self.zero_width
+            .iter()
+            .find(|(r, c, _)| *r == row && *c == col)
+            .map_or(&[], |(_, _, chars)| chars)
+    }
+}
+
+/// Which terminal engine backs a pane.
+///
+/// One variant today. It exists so that the choice of engine is a named
+/// decision with one home, rather than a concrete type spelled out at each
+/// construction site.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VtEngineKind {
+    #[default]
+    Alacritty,
+}
+
+/// Build the engine backing one pane.
+///
+/// Every pane is constructed through here, so engine selection, and any
+/// validation it later needs, live in one place while the rest of the
+/// application keeps talking only to [`VtEngine`].
+pub(crate) fn create_engine(
+    kind: VtEngineKind,
+    cols: u16,
+    rows: u16,
+    resp_tx: Sender<InputAction>,
+    history_budget_bytes: usize,
+    appearance: PaneAppearance,
+) -> Arc<Mutex<dyn VtEngine>> {
+    match kind {
+        VtEngineKind::Alacritty => {
+            Arc::new(Mutex::new(alacritty::AlacrittyEngine::with_appearance(
+                cols,
+                rows,
+                resp_tx,
+                history_budget_bytes,
+                appearance,
+            )))
+        }
+    }
+}
 
 /// A rendered cell's style, already mapped to ratatui colors/modifiers so the
 /// trait surface stays free of engine-specific types. The cell's *symbol* (its
@@ -54,6 +152,38 @@ pub struct HistoryMetrics {
     pub exact_bytes: bool,
 }
 
+/// Cell geometry for one retained terminal row.
+///
+/// Copy-mode navigation uses this instead of Unicode scalar counts. A terminal
+/// cell is the only stable unit across narrow scripts, double-width glyphs,
+/// combining marks, and emoji sequences.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainedRowLayout {
+    whitespace: Vec<bool>,
+    has_text: bool,
+}
+
+impl RetainedRowLayout {
+    pub(crate) fn new(whitespace: Vec<bool>, has_text: bool) -> Self {
+        Self {
+            whitespace,
+            has_text,
+        }
+    }
+
+    pub(crate) fn last_column(&self) -> usize {
+        self.whitespace.len().saturating_sub(1)
+    }
+
+    pub(crate) fn is_whitespace(&self, column: usize) -> bool {
+        self.whitespace.get(column).copied().unwrap_or(true)
+    }
+
+    pub(crate) fn has_text(&self) -> bool {
+        self.has_text
+    }
+}
+
 /// Minimal terminal-emulator surface. Owns the grid + scrollback.
 pub trait VtEngine: Send {
     /// Feed child output. Must never panic on arbitrary bytes.
@@ -87,9 +217,23 @@ pub trait VtEngine: Send {
     /// the user's scroll position.
     fn detection_text(&self, n: u16) -> String;
 
-    /// Every visible row as a plain string (one char per cell, full width,
-    /// untrimmed) — used to copy a mouse text selection.
+    /// Bottom `n` non-empty live-screen rows. Agents with a tall blank footer
+    /// use this without pulling scrollback into state detection.
+    fn detection_text_non_empty(&self, n: u16) -> String {
+        self.detection_text(n)
+    }
+
+    /// Every visible row as normalized plain text. Wide-character spacer cells
+    /// are omitted, so callers must not use string indexes as terminal columns.
     fn visible_rows(&self) -> Vec<String>;
+
+    /// Like [`Self::visible_rows`], but every terminal column contributes exactly
+    /// one `char`. A wide glyph's continuation cell is represented by
+    /// [`ALIGNED_WIDE_CELL`], so callers can preserve both cell coordinates and
+    /// the distinction between a continuation and an actual space. Use this
+    /// (never `visible_rows`) when a screen column must address text — e.g. the
+    /// token under a double-click, or the link under a `Ctrl`-hover.
+    fn visible_rows_aligned(&self) -> AlignedRows;
 
     /// Bounded public capture for harnesses. Implementations serialize only
     /// normalized grid text and SGR styles; raw child control sequences never
@@ -138,11 +282,23 @@ pub trait VtEngine: Send {
 
     /// Read one retained row by oldest-first index without materializing the
     /// entire history.
+    #[cfg(test)]
     fn retained_row_text(&self, index: usize) -> Option<String>;
 
     /// Visit retained rows oldest-first using one reusable line buffer. The
     /// callback must not retain the borrowed text after it returns.
     fn for_each_retained_row(&self, f: &mut dyn FnMut(usize, &str));
+
+    /// Extract an inclusive linear retained-row selection using terminal cell
+    /// coordinates. Implementations must preserve complete wide glyphs and
+    /// zero-width marks, join soft-wrapped display rows, preserve hard line
+    /// breaks, and retain every selected content cell.
+    fn retained_selection_text(&self, range: ((usize, usize), (usize, usize))) -> Option<String>;
+
+    /// Return copy-mode navigation geometry for one retained row. Trailing
+    /// unused cells are omitted, while wide-character spacer cells remain part
+    /// of the layout.
+    fn retained_row_layout(&self, index: usize) -> Option<RetainedRowLayout>;
 
     /// Jump the viewport so the row `offset` lines above the live bottom sits at
     /// the top (clamped to `history_len()`); `0` is live. Lands on a search match
@@ -188,7 +344,34 @@ pub trait VtEngine: Send {
     /// an attachment, and how vim auto-indents pasted code into a staircase.
     fn bracketed_paste(&self) -> bool;
 
+    /// Update the effective pane appearance. Engines that implement DEC mode
+    /// 2031 notify subscribed children from inside this interface.
+    fn set_appearance(&mut self, _appearance: PaneAppearance) {}
+
     /// Dump the visible screen as ANSI so it can be replayed into a fresh
     /// engine on restore (session persistence). Trailing blanks are trimmed.
     fn snapshot_ansi(&self) -> String;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn factory_builds_a_working_default_engine() {
+        let (tx, _rx) = mpsc::channel();
+        let engine = create_engine(
+            VtEngineKind::default(),
+            20,
+            3,
+            tx,
+            64 * 1024,
+            PaneAppearance::default(),
+        );
+        let mut engine = engine.lock().expect("engine lock");
+        engine.advance(b"hi");
+        assert_eq!(engine.visible_rows()[0].trim_end(), "hi");
+        assert_eq!(engine.cursor().x, 2);
+    }
 }

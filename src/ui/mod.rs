@@ -26,6 +26,22 @@ pub struct RenderTarget<'a> {
     buf: &'a mut Buffer,
     area: Rect,
     cursor: Option<(u16, u16)>,
+    cursor_visible: bool,
+    animation_mask: AnimationMask,
+}
+
+/// Allocation-free record of animated surfaces that were actually drawn into a
+/// client projection. The server uses this instead of global agent state, which
+/// avoids repainting when every working indicator is clipped or hidden.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AnimationMask(u8);
+
+impl AnimationMask {
+    const WORKING_SPINNER: u8 = 1 << 0;
+
+    pub fn has_working_spinner(self) -> bool {
+        self.0 & Self::WORKING_SPINNER != 0
+    }
 }
 
 impl<'a> RenderTarget<'a> {
@@ -35,6 +51,8 @@ impl<'a> RenderTarget<'a> {
             buf,
             area,
             cursor: None,
+            cursor_visible: false,
+            animation_mask: AnimationMask::default(),
         }
     }
     pub fn area(&self) -> Rect {
@@ -49,9 +67,26 @@ impl<'a> RenderTarget<'a> {
     pub fn set_cursor_position<P: Into<Position>>(&mut self, position: P) {
         let p = position.into();
         self.cursor = Some((p.x, p.y));
+        self.cursor_visible = true;
+    }
+    pub fn set_cursor_anchor(&mut self, x: u16, y: u16, visible: bool) {
+        self.cursor = Some((x, y));
+        self.cursor_visible = visible;
     }
     pub fn cursor(&self) -> Option<(u16, u16)> {
         self.cursor
+    }
+    pub fn cursor_visible(&self) -> bool {
+        self.cursor_visible
+    }
+
+    /// Mark that this projection contains a live working-state spinner.
+    pub fn mark_working_animation(&mut self) {
+        self.animation_mask.0 |= AnimationMask::WORKING_SPINNER;
+    }
+
+    pub fn animation_mask(&self) -> AnimationMask {
+        self.animation_mask
     }
 }
 
@@ -65,8 +100,10 @@ mod git;
 mod help;
 mod menu;
 mod mission;
+mod mobile;
 mod panes;
 mod picker;
+mod preview;
 mod search;
 mod settings;
 pub(crate) mod sidebar;
@@ -78,17 +115,21 @@ mod tabbar;
 /// `RenderTarget`, render, then copy the resulting cursor back onto the frame.
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let cursor = {
+    let (cursor, visible) = {
         let mut target = RenderTarget {
             buf: f.buffer_mut(),
             area,
             cursor: None,
+            cursor_visible: false,
+            animation_mask: AnimationMask::default(),
         };
         render_into(&mut target, app);
-        target.cursor
+        (target.cursor, target.cursor_visible)
     };
     if let Some(p) = cursor {
-        f.set_cursor_position(p);
+        if visible {
+            f.set_cursor_position(p);
+        }
     }
 }
 
@@ -121,10 +162,15 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     let orch_scroll = app.orch_scroll;
     let orch_detail_scroll = app.orch_detail_scroll;
     let orch_area = app.orch_area;
+    let orch_hits = std::mem::take(&mut app.orch_hits);
     let mission_scroll = app.mission_scroll;
     let mission_area = app.mission_area;
+    let mission_refresh_rect = app.mission_refresh_rect;
     let changelog_scroll = app.changelog_scroll;
     let file_tree_scroll = app.file_tree.scroll;
+    // Popup scroll offsets and geometry are recorded by an ordinary draw, and a
+    // projection renders at its own size — so keep them out of its way.
+    let menu_scroll = std::mem::take(&mut app.menu_scroll);
 
     // Geometry collections are write-only outputs of a render. Move the active
     // client's values aside instead of cloning them on every secondary frame.
@@ -134,7 +180,6 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     let tab_rects = std::mem::take(&mut app.tab_rects);
     let tab_close_rects = std::mem::take(&mut app.tab_close_rects);
     let ws_rects = std::mem::take(&mut app.ws_rects);
-    let workspace_branch_rects = std::mem::take(&mut app.workspace_branch_rects);
     let git_section_rects = std::mem::take(&mut app.git_section_rects);
     let agents_filter_rects = std::mem::take(&mut app.agents_filter_rects);
     let agent_rects = std::mem::take(&mut app.agent_rects);
@@ -144,6 +189,7 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     let diff_row_rects = std::mem::take(&mut app.diff_row_rects);
     let diff_source_rects = std::mem::take(&mut app.diff_source_rects);
     let diff_note_rects = std::mem::take(&mut app.diff_note_rects);
+    let preview_link_rects = std::mem::take(&mut app.preview_link_rects);
     let module_dock_rects = std::mem::take(&mut app.module_dock_rects);
     let sidebar_bars = std::mem::take(&mut app.sidebar_bars);
     let dock_dividers = std::mem::take(&mut app.dock_dividers);
@@ -158,6 +204,8 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     let switcher_rects = std::mem::take(&mut app.switcher_rects);
     let switcher_scope_rects = std::mem::take(&mut app.switcher_scope_rects);
     let mission_rows = std::mem::take(&mut app.mission_rows);
+    let mission_scope_rects = std::mem::take(&mut app.mission_scope_rects);
+    let mission_row_rects = std::mem::take(&mut app.mission_row_rects);
     let bar_hits = std::mem::take(&mut app.bar.hits);
     let bar_overflow_hits = std::mem::take(&mut app.bar.overflow_hits);
     let bar_overflow = app.bar.overflow.clone();
@@ -195,6 +243,10 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
         .diff_menu
         .as_mut()
         .map(|menu| std::mem::take(&mut menu.items));
+    let orch_menu_items = app
+        .orch_menu
+        .as_mut()
+        .map(|menu| std::mem::take(&mut menu.items));
     let dock_menu_rects = app
         .dock_menu
         .as_mut()
@@ -213,6 +265,9 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     let tab_next_rect = app.tab_next_rect;
     let new_ws_rect = app.new_ws_rect;
     let switcher_button_rect = app.switcher_button_rect;
+    let mobile_pane_prev_rect = app.mobile_pane_prev_rect;
+    let mobile_pane_next_rect = app.mobile_pane_next_rect;
+    let switcher_close_rect = app.switcher_close_rect;
     let settings_modal_rect = app.settings_modal_rect;
     let settings_close_rect = app.settings_close_rect;
     let changelog_modal_rect = app.changelog_modal_rect;
@@ -246,17 +301,19 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     app.orch_scroll = orch_scroll;
     app.orch_detail_scroll = orch_detail_scroll;
     app.orch_area = orch_area;
+    app.orch_hits = orch_hits;
     app.mission_scroll = mission_scroll;
     app.mission_area = mission_area;
+    app.mission_refresh_rect = mission_refresh_rect;
     app.changelog_scroll = changelog_scroll;
     app.file_tree.scroll = file_tree_scroll;
+    app.menu_scroll = menu_scroll;
     app.pane_rects = pane_rects;
     app.pane_content_rects = pane_content_rects;
     app.pane_title_rects = pane_title_rects;
     app.tab_rects = tab_rects;
     app.tab_close_rects = tab_close_rects;
     app.ws_rects = ws_rects;
-    app.workspace_branch_rects = workspace_branch_rects;
     app.git_section_rects = git_section_rects;
     app.agents_filter_rects = agents_filter_rects;
     app.agent_rects = agent_rects;
@@ -266,6 +323,7 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     app.diff_row_rects = diff_row_rects;
     app.diff_source_rects = diff_source_rects;
     app.diff_note_rects = diff_note_rects;
+    app.preview_link_rects = preview_link_rects;
     app.module_dock_rects = module_dock_rects;
     app.sidebar_bars = sidebar_bars;
     app.dock_dividers = dock_dividers;
@@ -280,6 +338,8 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     app.switcher_rects = switcher_rects;
     app.switcher_scope_rects = switcher_scope_rects;
     app.mission_rows = mission_rows;
+    app.mission_scope_rects = mission_scope_rects;
+    app.mission_row_rects = mission_row_rects;
     app.bar.hits = bar_hits;
     app.bar.overflow_hits = bar_overflow_hits;
     app.bar.overflow = bar_overflow;
@@ -312,6 +372,9 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     if let (Some(items), Some(menu)) = (diff_menu_items, app.diff_menu.as_mut()) {
         menu.items = items;
     }
+    if let (Some(items), Some(menu)) = (orch_menu_items, app.orch_menu.as_mut()) {
+        menu.items = items;
+    }
     if let (Some(rects), Some(menu)) = (dock_menu_rects, app.dock_menu.as_mut()) {
         menu.rects = rects;
     }
@@ -328,6 +391,9 @@ pub fn render_projection(f: &mut RenderTarget, app: &mut App) {
     app.tab_next_rect = tab_next_rect;
     app.new_ws_rect = new_ws_rect;
     app.switcher_button_rect = switcher_button_rect;
+    app.mobile_pane_prev_rect = mobile_pane_prev_rect;
+    app.mobile_pane_next_rect = mobile_pane_next_rect;
+    app.switcher_close_rect = switcher_close_rect;
     app.settings_modal_rect = settings_modal_rect;
     app.settings_close_rect = settings_close_rect;
     app.changelog_modal_rect = changelog_modal_rect;
@@ -353,6 +419,11 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     f.render_widget(Block::new().style(Style::new().bg(t.mantle)), area);
     app.bar.hits.clear();
     app.bar.overflow_hits.clear();
+    app.menu_scroll.begin_frame();
+    app.mission_row_rects.clear();
+    app.orch_hits.clear();
+    app.mobile_pane_prev_rect = None;
+    app.mobile_pane_next_rect = None;
 
     // An absurdly small window can't hold the chrome — say so instead of
     // drawing degraded fragments. (Every draw fn is underflow-safe regardless;
@@ -369,29 +440,34 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
         return;
     }
 
-    // No nodes at all (docs/43 §3.3): the last one was closed, so the session is
-    // over and every client has been told to detach. A client can still be
-    // attached for the frame or two before it goes (or attach fresh via
-    // `luvus attach` / `--remote` before opening a folder), and every draw fn
-    // below assumes an active node — `app.ws()` indexes `workspaces[active_ws]`.
-    // One guard here covers the whole tree rather than each call site.
+    // Restore or shell startup can fail before a workspace exists. Keep this
+    // guard before every renderer that indexes `app.ws()`. Normal close paths
+    // immediately create a real home terminal and never use this surface.
     if app.workspaces.is_empty() {
-        let msg = "no folders open — run `luvus` in a folder";
-        let y = area.y + area.height / 2;
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(msg, Style::new().fg(t.overlay1))))
-                .alignment(ratatui::layout::Alignment::Center),
-            Rect::new(area.x, y, area.width, 1),
-        );
+        f.render_widget(Block::new().style(Style::new().bg(t.mantle)), area);
+        app.pane_rects.clear();
+        app.pane_content_rects.clear();
+        app.pane_title_rects.clear();
+        app.tab_rects.clear();
+        app.tab_close_rects.clear();
+        app.ws_rects.clear();
+        app.agent_rects.clear();
+        app.session_rects.clear();
+        app.new_ws_rect = None;
+        app.last_cursor = None;
+        if let Some((text, _)) = &app.toast {
+            draw_toast(f, area, text, &t);
+        }
         return;
     }
 
-    // Compact (touch) mode on a narrow phone screen (docs/18): no sidebars, one
-    // full-screen pane, a `≡` switcher for navigation. A vertical split doesn't
-    // change the width, so decide it from `area.width` here — early enough that
-    // it can also drop the bottom status bar (a dense, keyboard-oriented row that
-    // just eats space on a phone) and give that row back to the content.
-    app.compact = area.width < app.config.layout.compact_width;
+    // Automatic mobile presentation is derived from this client's viewport.
+    // `app.compact` remains a compatibility flag for existing compact renderers,
+    // but it is never persisted and projection rendering restores it afterward.
+    app.compact = matches!(
+        mobile::resolve_profile(area.width, app.config.layout.mobile_width),
+        mobile::MobileProfile::Mobile
+    );
     app.refresh_core_bar_widgets();
     let status_h = if app.compact { 0 } else { 1 };
     let [main, status] =
@@ -438,8 +514,14 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     app.left_seam = sidebar_left.map(|a| Rect::new(a.right().saturating_sub(1), a.y, 1, a.height));
     app.right_seam = sidebar_right.map(|a| Rect::new(a.x, a.y, 1, a.height));
 
-    let [tabbar, pane_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(content);
+    let mobile_layout = app.compact.then(|| mobile::compute_layout(content));
+    let (tabbar, pane_area) = if let Some(layout) = mobile_layout {
+        (layout.header, layout.content)
+    } else {
+        let [tabbar, pane_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(content);
+        (tabbar, pane_area)
+    };
 
     app.last_pane_area = pane_area;
 
@@ -459,7 +541,7 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     let bordered = rects.len() > 1;
     if resize_panes {
         for (id, rect) in &rects {
-            let Some(content) = pane_content(*rect, bordered) else {
+            let Some(content) = pane_content(*rect, bordered, app.compact) else {
                 continue;
             };
             let resized = app
@@ -492,7 +574,6 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     app.dock_dividers.clear();
     app.dock_slots_geom.clear();
     app.agents_filter_rects.clear();
-    app.workspace_branch_rects.clear();
     app.module_dock_rects.clear();
     // The FILES dock's geometry must be zeroed here too, or its row rects go stale
     // when it isn't drawn this frame (its sidebar hidden, or the dock moved/off as
@@ -518,7 +599,14 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
             new_ws_rect = new_ws_rect.or(n);
         }
     }
-    let (tab_rects, tab_close_rects, tab_prev, tab_next) = tabbar::draw_tabbar(f, tabbar, app, &t);
+    let (tab_rects, tab_close_rects, tab_prev, tab_next) = if let Some(layout) = mobile_layout {
+        app.sidebar_toggle_rect = None;
+        app.right_sidebar_toggle_rect = None;
+        mobile::render_header(f, layout, app, &t);
+        (Vec::new(), Vec::new(), None, None)
+    } else {
+        tabbar::draw_tabbar(f, tabbar, app, &t)
+    };
     // Behind the panes, use the (dark) pane background.
     f.render_widget(Block::new().style(Style::new().bg(t.mantle)), pane_area);
     // The focused pane's ✕ close and ⤢ zoom buttons, for mouse hit-testing.
@@ -548,57 +636,60 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     let compact = app.compact;
     let cursor = if app.active_is_orch() {
         app.orch_area = pane_area;
-        // Each task's live worker state (detection) rides along on its row.
-        let live: Vec<Option<board::RowLive>> = app
-            .orch
-            .tasks
-            .iter()
-            .map(|task| {
-                task.assignee
-                    .map(crate::ids::PaneId)
-                    .and_then(|pid| app.status.get(&pid))
-                    .map(|st| board::RowLive {
-                        agent: st.agent.clone(),
-                        state: st.state,
-                    })
-            })
-            .collect();
-        app.orch_scroll = board::render(
+        let rendered = board::render(
             f,
             pane_area,
             &app.orch,
-            &live,
             app.orch_scroll,
             app.orch_cursor,
+            app.orch_flow_mode,
             compact,
+            app.hover,
             cat,
             &t,
         );
+        app.orch_scroll = rendered.scroll;
+        app.orch_hits = rendered.hits;
         None
     } else if app.active_is_mission() {
         // Mission Control (docs/54): rows are precomputed from `App` first (so the
-        // render borrows nothing mutable), stashed for click/⏎ hit-testing, then
+        // render borrows nothing mutable), stashed for keyboard activation, then
         // drawn; the scroll offset is written back.
         app.mission_area = pane_area;
         let rows = app.build_mission_rows();
-        app.mission_scroll = mission::render(
+        let rendered = mission::render(
             f,
             pane_area,
             &rows,
             app.mission_scroll,
             app.mission_cursor,
+            app.mission_scope,
+            app.mission_usage_refreshing(),
             app.mission_burn,
             app.config.mission_budget,
             compact,
             cat,
             &t,
         );
+        app.mission_scroll = rendered.scroll;
+        app.mission_scope_rects = rendered.scope_rects;
+        app.mission_refresh_rect = rendered.refresh_rect;
+        app.mission_row_rects = rendered.row_rects;
         app.mission_rows = rows;
         None
     } else if let Some(g) = app.active_git_mut() {
         git_section_rects = git::render(f, pane_area, g, compact, cat, &t);
         None
     } else {
+        let preview_rects: Vec<(PaneId, Rect)> = rects
+            .iter()
+            .filter_map(|(id, rect)| {
+                pane_content(*rect, bordered, app.compact).map(|content| (*id, content))
+            })
+            .collect();
+        if resize_panes {
+            app.ensure_preview_layouts(&preview_rects);
+        }
         let cursor = panes::draw_panes(f, &rects, bordered, app, &t);
         // Draw all pane borders in one overlay pass (manual cell-by-cell), then
         // the dot+path+close titles ON each top border row.
@@ -620,7 +711,7 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
         } else {
             rects
                 .iter()
-                .filter_map(|(id, r)| pane_content(*r, bordered).map(|c| (*id, c)))
+                .filter_map(|(id, r)| pane_content(*r, bordered, app.compact).map(|c| (*id, c)))
                 .collect()
         };
     status::draw_status(f, status, app, &t);
@@ -659,7 +750,7 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     let picker_open = app.picker.is_some();
     let mut picker_rects = Vec::new();
     if let Some(p) = &app.picker {
-        picker_rects = picker::draw_picker(f, area, p, cat, &t);
+        picker_rects = picker::draw_picker(f, area, p, app.compact, cat, &t);
     }
     app.picker_rects = picker_rects;
 
@@ -728,10 +819,13 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     }
     // The FILES-dock context menu + its create/rename/delete modals (docs/38).
     if app.file_menu.is_some() {
-        menu::draw_file_menu(f, area, app, &t);
+        menu::draw_file_menu(f, area, app, cat, &t);
     }
     if app.diff_menu.is_some() {
         menu::draw_diff_menu(f, area, app, &t);
+    }
+    if app.orch_menu.is_some() {
+        menu::draw_orch_menu(f, area, app, cat, &t);
     }
     // A module dock row's own context menu (docs/52).
     if app.dock_menu.is_some() {
@@ -755,11 +849,15 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     }
     // Worktree-delete confirm (docs/18 WT): reuses the delete modal, worded for a
     // worktree since it also removes the git worktree, not just a folder.
-    if let Some(path) = app
+    let worktree_path = app
         .worktree_delete
-        .and_then(|i| app.workspaces.get(i))
-        .map(|w| w.cwd.clone())
-    {
+        .as_deref()
+        .and_then(|id| app.workspaces.iter().find(|workspace| workspace.id == id))
+        .map(|w| w.cwd.clone());
+    if app.worktree_delete.is_some() && worktree_path.is_none() {
+        app.worktree_delete = None;
+    }
+    if let Some(path) = worktree_path {
         let (c, x) = files::draw_delete_confirm(
             f,
             area,
@@ -773,11 +871,11 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     }
     // The board's new-task form (docs/22 ORCH-7).
     if let Some(form) = &app.orch_form {
-        board::draw_form(f, area, form, cat, &t);
+        app.orch_hits = board::draw_form(f, area, form, cat, &t);
     }
     // The board's start-worker picker and task detail overlay.
     if let Some(start) = &app.orch_start {
-        board::draw_start(f, area, start, cat, &t);
+        app.orch_hits = board::draw_start(f, area, start, cat, &t);
     }
     if let Some(id) = &app.orch_detail {
         let clamped = app
@@ -786,8 +884,9 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
             .iter()
             .find(|task| &task.id == id)
             .map(|task| board::draw_detail(f, area, task, app.orch_detail_scroll, cat, &t));
-        if let Some(s) = clamped {
-            app.orch_detail_scroll = s;
+        if let Some(rendered) = clamped {
+            app.orch_detail_scroll = rendered.scroll;
+            app.orch_hits = rendered.hits;
         }
     }
     // Mission Control's row-detail overlay and inline answer input (docs/54).
@@ -803,9 +902,16 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     }
     // The touch switcher overlay (docs/18), above the chrome but below a toast.
     if app.switcher {
-        switcher::draw_switcher(f, area, app, &t);
+        if app.compact {
+            mobile::render_navigator(f, area, app, &t);
+        } else {
+            app.switcher_close_rect = None;
+            switcher::draw_switcher(f, area, app, &t);
+        }
     } else {
         app.switcher_rects.clear();
+        app.switcher_scope_rects.clear();
+        app.switcher_close_rect = None;
     }
     // The global scrollback-search overlay (docs/63), above the chrome.
     if app.search.is_some() {
@@ -830,6 +936,7 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
         || app.agent_menu.is_some()
         || app.file_menu.is_some()
         || app.diff_menu.is_some()
+        || app.orch_menu.is_some()
         || app.dock_menu.is_some()
         || app.file_prompt.is_some()
         || app.file_delete.is_some()
@@ -843,10 +950,10 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     } else {
         cursor
     };
-    if let Some(p) = cursor {
-        f.set_cursor_position(p);
+    if let Some((x, y, visible)) = cursor {
+        f.set_cursor_anchor(x, y, visible);
     }
-    app.last_cursor = cursor;
+    app.last_cursor = cursor.map(|(x, y, _)| (x, y));
     app.pane_rects = rects;
     app.tab_rects = tab_rects;
     app.tab_close_rects = tab_close_rects;
@@ -889,11 +996,25 @@ pub(super) const LONE_PANE_HPAD: u16 = 1;
 /// by the modals (Settings / picker) and the git-tab footer. A pair with an
 /// empty label is a bare key (e.g. `j/k`).
 pub(super) fn hint_line(pairs: &[(&str, &str)], t: &Theme) -> Line<'static> {
+    hint_line_with_offsets(pairs, t).0
+}
+
+/// Same rendering as [`hint_line`], plus each pair's start column within the
+/// rendered line (so hitboxes can be aligned to the visible hints without
+/// re-deriving the layout).
+pub(super) fn hint_line_with_offsets(
+    pairs: &[(&str, &str)],
+    t: &Theme,
+) -> (Line<'static>, Vec<u16>) {
     let mut spans = vec![Span::raw(" ")];
+    let mut offsets = Vec::with_capacity(pairs.len());
     for (i, (key, label)) in pairs.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled(" · ", Style::new().fg(t.overlay0)));
         }
+        // Column where this pair's key begins: width of everything before it
+        // (leading pad + separators + earlier pairs).
+        offsets.push(spans.iter().map(|span| span.width() as u16).sum());
         spans.push(Span::styled(
             key.to_string(),
             Style::new().fg(t.accent).bold(),
@@ -905,7 +1026,7 @@ pub(super) fn hint_line(pairs: &[(&str, &str)], t: &Theme) -> Line<'static> {
             ));
         }
     }
-    Line::from(spans)
+    (Line::from(spans), offsets)
 }
 
 /// Display width of `s` in terminal columns (CJK = 2 cells, etc.). Fixed-width
@@ -914,6 +1035,30 @@ pub(super) fn hint_line(pairs: &[(&str, &str)], t: &Theme) -> Line<'static> {
 pub(crate) fn display_width(s: &str) -> usize {
     use unicode_width::UnicodeWidthStr;
     s.width()
+}
+
+/// Shared dashboard panel chrome used by Mission Control and ORCH. Keeping the
+/// border, title, and surface treatment in one place prevents full-tab views
+/// from drifting into separate visual systems.
+pub(super) fn dashboard_block(
+    title: impl Into<String>,
+    t: &Theme,
+    focus: bool,
+) -> ratatui::widgets::Block<'static> {
+    use ratatui::widgets::{Block, BorderType, Borders};
+
+    let border = if focus { t.border_focus } else { t.surface1 };
+    Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::new().fg(border).bg(t.mantle))
+        .title(Span::styled(
+            format!(" {} ", title.into()),
+            Style::new()
+                .fg(if focus { t.accent } else { t.overlay1 })
+                .bold(),
+        ))
+        .style(Style::new().bg(t.mantle))
 }
 
 /// Truncate `s` to at most `max` display columns, ending in a `…` when it does not
@@ -984,9 +1129,12 @@ pub(super) fn lone_pad(width: u16) -> u16 {
 /// The terminal content area: inside the box when bordered (the dot+path+close
 /// live on the top border row as a title), else just below the header row with a
 /// small horizontal pad so it aligns with the tab bar.
-fn pane_content(rect: Rect, bordered: bool) -> Option<Rect> {
+fn pane_content(rect: Rect, bordered: bool, mobile: bool) -> Option<Rect> {
     if bordered {
         return pane_inner(rect, true);
+    }
+    if mobile {
+        return (rect.width > 0 && rect.height > 0).then_some(rect);
     }
     let pad = lone_pad(rect.width);
     let c = Rect::new(
@@ -1089,5 +1237,37 @@ mod bar_projection_tests {
 
         assert_eq!(app.bar.hits, vec![hit]);
         assert_eq!(app.bar.overflow.as_ref().unwrap().rect, expected_popup);
+    }
+
+    #[test]
+    fn mobile_projection_does_not_leak_profile_or_mobile_hits() {
+        let _env = crate::persist::test_env("mobile-projection");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.config.layout.mobile_width = 80;
+        app.open_switcher();
+
+        let desktop_area = Rect::new(0, 0, 120, 40);
+        let mut desktop_buffer = Buffer::empty(desktop_area);
+        let mut desktop = RenderTarget::new(&mut desktop_buffer, desktop_area);
+        render_into(&mut desktop, &mut app);
+        assert!(!app.compact);
+        assert!(app.switcher_close_rect.is_none());
+        let desktop_content = app.pane_content_rects.clone();
+        let focus = app.layout().focus;
+        let pty_size = app.panes[&focus].size();
+
+        let phone_area = Rect::new(0, 0, 79, 35);
+        let mut phone_buffer = Buffer::empty(phone_area);
+        let mut phone = RenderTarget::new(&mut phone_buffer, phone_area);
+        render_projection(&mut phone, &mut app);
+
+        assert!(
+            !app.compact,
+            "passive phone projection cannot replace desktop profile"
+        );
+        assert!(app.switcher_close_rect.is_none());
+        assert_eq!(app.pane_content_rects, desktop_content);
+        assert_eq!(app.panes[&focus].size(), pty_size);
     }
 }

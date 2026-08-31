@@ -5,9 +5,39 @@
 //! working directory — so Claude Code and Copilot resume with zero setup (no
 //! hooks required). The optional `luvus integration install` hook still works
 //! and takes precedence when present (it knows the exact session of a pane).
+//!
+//! Every compiled-in agent owns an immutable descriptor in
+//! `src/agent/<agent>/`; [`registry`] is the single native-capability registry.
+//! Keep agent-specific paths, parsing, commands, and integrations in that
+//! adapter while callers use this facade. See `AGENTS.md` and the public
+//! Adding Agent Support guide before extending the registry.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+
+pub(crate) mod aider;
+pub(crate) mod amp;
+pub(crate) mod claude;
+pub(crate) mod codex;
+pub(crate) mod copilot;
+pub(crate) mod cursor;
+pub(crate) mod droid;
+pub(crate) mod fx;
+pub(crate) mod gemini;
+pub(crate) mod grok;
+pub(crate) mod hermes;
+pub(crate) mod kimi;
+pub(crate) mod kiro;
+pub(crate) mod muse;
+pub(crate) mod omp;
+pub(crate) mod opencode;
+pub(crate) mod pi;
+pub(crate) mod qwen;
+pub(crate) mod registry;
+pub(crate) mod shared;
+pub(crate) mod types;
+mod usage;
+pub use usage::{session_mtime, session_usage};
 
 /// A resumable agent session discovered on disk.
 #[derive(Clone)]
@@ -18,135 +48,10 @@ pub struct SessionInfo {
     pub updated: SystemTime,
 }
 
-/// Zero-config discovery of an agent's sessions from its own on-disk store.
-struct Discovery {
-    /// Root of the agent's session store.
-    base: fn() -> PathBuf,
-    /// Recent sessions (newest first, ≤ `limit`), one per project cwd.
-    recent: fn(&Path, usize) -> Vec<SessionInfo>,
-    /// The newest session id whose project matches `cwd`.
-    latest: fn(&Path, &Path) -> Option<String>,
-    /// Every session id for `cwd`, **newest first** — the ranked form of
-    /// `latest`. Needed when several panes share a folder: each takes the newest
-    /// session not already claimed, instead of all resolving to the same one.
-    /// `None` = no ranked listing, so callers fall back to `latest` alone.
-    list: Option<fn(&Path, &Path) -> Vec<String>>,
-}
-
-/// One agent luvus can resume: how to find its sessions (optional — some agents
-/// have no readable store) and how to build its resume command from a shell-quoted
-/// session id. Adding an agent (docs/23) is one entry here, not scattered edits.
-struct SessionSource {
-    name: &'static str,
-    discover: Option<Discovery>,
-    /// Build the resume command from an already shell-quoted id (`q`).
-    resume: fn(&str) -> String,
-    /// Build the *fork* command from a shell-quoted id: continue the session in a
-    /// NEW, diverging session that inherits the original's full context, leaving
-    /// the original untouched. `None` for agents with no native fork (docs/23).
-    fork: Option<fn(&str) -> String>,
-}
-
-static SOURCES: &[SessionSource] = &[
-    SessionSource {
-        name: "claude",
-        discover: Some(Discovery {
-            base: claude_base,
-            recent: claude_recent,
-            latest: claude_latest,
-            list: Some(claude_list),
-        }),
-        resume: |q| format!("claude --resume {q}\r"),
-        // `--fork-session` resumes the transcript into a fresh session id.
-        fork: Some(|q| format!("claude --resume {q} --fork-session\r")),
-    },
-    SessionSource {
-        name: "copilot",
-        discover: Some(Discovery {
-            base: copilot_base,
-            recent: copilot_recent,
-            latest: copilot_latest,
-            list: None,
-        }),
-        resume: |q| format!("copilot --resume={q}\r"),
-        fork: None,
-    },
-    SessionSource {
-        name: "opencode",
-        discover: Some(Discovery {
-            base: opencode_base,
-            recent: opencode_recent,
-            latest: opencode_latest,
-            list: None,
-        }),
-        resume: |q| format!("opencode --session {q}\r"),
-        fork: None,
-    },
-    SessionSource {
-        name: "codex",
-        discover: Some(Discovery {
-            base: codex_base,
-            recent: codex_recent,
-            latest: codex_latest,
-            list: Some(codex_list),
-        }),
-        resume: |q| format!("codex resume {q}\r"),
-        // `fork` creates a new conversation from the selected rollout while
-        // leaving the source session untouched.
-        fork: Some(|q| format!("codex fork {q}\r")),
-    },
-    SessionSource {
-        name: "kimi",
-        discover: Some(Discovery {
-            base: kimi_base,
-            recent: kimi_recent,
-            latest: kimi_latest,
-            list: None,
-        }),
-        resume: |q| format!("kimi --resume {q}\r"),
-        fork: None,
-    },
-    SessionSource {
-        name: "grok",
-        discover: Some(Discovery {
-            base: grok_base,
-            recent: grok_recent,
-            latest: grok_latest,
-            list: None,
-        }),
-        resume: |q| format!("grok --resume {q}\r"),
-        // Same flag pair as Claude: resume the source transcript into a new id.
-        fork: Some(|q| format!("grok --resume {q} --fork-session\r")),
-    },
-    SessionSource {
-        name: "pi",
-        discover: Some(Discovery {
-            base: pi_base,
-            recent: pi_recent,
-            latest: pi_latest,
-            list: Some(pi_list),
-        }),
-        resume: |q| format!("pi --session {q}\r"),
-        // Pi's session model is a branching tree; `--fork` forks by id (docs/23).
-        fork: Some(|q| format!("pi --fork {q}\r")),
-    },
-    // Resume-only (no readable session store): usable when a hook reports the id.
-    SessionSource {
-        name: "cursor",
-        discover: None,
-        resume: |q| format!("cursor-agent --resume {q}\r"),
-        fork: None,
-    },
-];
-
-/// Resolve an agent name (normalizing known aliases) to its source.
-fn source(agent: &str) -> Option<&'static SessionSource> {
-    let agent = if agent == "cursor-agent" {
-        "cursor"
-    } else {
-        agent
-    };
-    SOURCES.iter().find(|s| s.name == agent)
+/// Resolve an agent name (normalizing known aliases) to its native session
+/// operations.
+fn source(agent: &str) -> Option<&'static types::SessionOperations> {
+    registry::find(agent)?.sessions.as_ref()
 }
 
 /// Agents whose native session luvus knows how to resume.
@@ -159,8 +64,12 @@ pub fn is_resumable(agent: &str) -> bool {
 /// the AGENTS sidebar with sessions you can reopen.
 pub fn recent_sessions(limit: usize) -> Vec<SessionInfo> {
     let mut out = Vec::new();
-    for src in SOURCES {
-        if let Some(d) = &src.discover {
+    for descriptor in registry::descriptors() {
+        if let Some(d) = descriptor
+            .sessions
+            .as_ref()
+            .and_then(|ops| ops.discovery.as_ref())
+        {
             out.extend((d.recent)(&(d.base)(), limit));
         }
     }
@@ -175,84 +84,8 @@ pub fn recent_sessions(limit: usize) -> Vec<SessionInfo> {
 /// from the agent's on-disk store. `None` if there is nothing to resume or the
 /// agent isn't one we can introspect.
 pub fn latest_session(agent: &str, cwd: &Path) -> Option<String> {
-    let d = source(agent)?.discover.as_ref()?;
+    let d = source(agent)?.discovery.as_ref()?;
     (d.latest)(&(d.base)(), cwd)
-}
-
-/// Best-effort token/context/cost usage for an agent's session, read from its own
-/// on-disk transcript (docs/54 §5, MC-2). Only agents whose store records usage
-/// are supported (Claude today); others return `None`, and the dashboard shows
-/// "—". Bounded IO — a single file read — so callers run it off the render loop.
-pub fn session_usage(
-    agent: &str,
-    cwd: &Path,
-    session_id: &str,
-) -> Option<crate::mission::AgentUsage> {
-    match agent {
-        "claude" => claude_session_usage(&claude_base(), cwd, session_id),
-        _ => None,
-    }
-}
-
-/// The last-modified time of a session's transcript, for the usage-scan cache
-/// (docs/54): a cheap `stat` so an unchanged (idle) transcript is skipped instead
-/// of being re-read and re-parsed each scan. `None` if there's no such file.
-pub fn session_mtime(agent: &str, cwd: &Path, session_id: &str) -> Option<SystemTime> {
-    let path = match agent {
-        "claude" => claude_project_dir(&claude_base(), cwd).join(format!("{session_id}.jsonl")),
-        _ => return None,
-    };
-    std::fs::metadata(&path).and_then(|m| m.modified()).ok()
-}
-
-/// Sum a Claude session's `.jsonl` transcript into an [`AgentUsage`]: cumulative
-/// input/output/cache tokens (for cost) and the *latest* turn's input-side total
-/// (for the live context %). Model comes from the newest assistant line. Tolerant
-/// of shape drift — missing fields count as zero and a bad line is skipped.
-fn claude_session_usage(
-    base: &Path,
-    cwd: &Path,
-    session_id: &str,
-) -> Option<crate::mission::AgentUsage> {
-    use crate::mission::{context_frac, estimate_cost, AgentUsage};
-    let path = claude_project_dir(base, cwd).join(format!("{session_id}.jsonl"));
-    let text = std::fs::read_to_string(&path).ok()?;
-    let field = |u: &serde_json::Value, k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-    let mut u = AgentUsage::default();
-    let mut context_tokens = 0u64;
-    for line in text.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let msg = v.get("message");
-        // `usage` lives under `message.usage` (assistant turns) or top-level.
-        if let Some(us) = msg.and_then(|m| m.get("usage")).or_else(|| v.get("usage")) {
-            let cin =
-                field(us, "cache_read_input_tokens") + field(us, "cache_creation_input_tokens");
-            u.tokens_in += field(us, "input_tokens");
-            u.tokens_out += field(us, "output_tokens");
-            u.cache += cin;
-            // The current context ≈ this (latest) turn's whole input side.
-            context_tokens = field(us, "input_tokens") + cin;
-        }
-        if let Some(model) = msg
-            .and_then(|m| m.get("model"))
-            .or_else(|| v.get("model"))
-            .and_then(|x| x.as_str())
-        {
-            if !model.is_empty() {
-                u.model = model.to_string();
-            }
-        }
-    }
-    if u.model.is_empty() && u.total_tokens() == 0 {
-        return None; // nothing usable in this transcript
-    }
-    u.cost = estimate_cost(&u.model, u.tokens_in, u.tokens_out, u.cache);
-    if context_tokens > 0 {
-        u.context = Some(context_frac(&u.model, context_tokens));
-    }
-    Some(u)
 }
 
 /// Every session for `agent` in `cwd`, **newest first**.
@@ -261,7 +94,7 @@ fn claude_session_usage(
 /// session: each takes the newest one not already claimed. Agents without a
 /// ranked listing degrade to just their single newest session.
 pub fn sessions_for(agent: &str, cwd: &Path) -> Vec<String> {
-    let Some(d) = source(agent).and_then(|s| s.discover.as_ref()) else {
+    let Some(d) = source(agent).and_then(|s| s.discovery.as_ref()) else {
         return Vec::new();
     };
     let base = (d.base)();
@@ -291,13 +124,15 @@ fn filter_launch_flags(agent: &str, launch: &[String]) -> Vec<String> {
     const STANDALONE: &[&str] = &["--continue", "--fork-session", "--print", "-p"];
 
     let mut i = 0;
-    // Codex selects a session with positional `resume <id>` / `fork <id>`
-    // subcommands rather than flags, so drop either when it leads the captured
-    // argv. A restored fork must resume its new id, not fork the parent again.
-    if agent == "codex"
+    // Codex and Muse select sessions with positional subcommands rather than
+    // flags. Drop them when they lead captured argv so a restored pane gets
+    // exactly one fresh session selector. A restored Codex fork must resume its
+    // new id, not fork the parent again.
+    if (agent == "codex"
         && launch
             .first()
-            .is_some_and(|s| matches!(s.as_str(), "resume" | "fork"))
+            .is_some_and(|s| matches!(s.as_str(), "resume" | "fork")))
+        || (agent == muse::NAME && launch.first().is_some_and(|s| s == "resume"))
     {
         i = 1;
         if launch.get(1).is_some_and(|v| !v.starts_with('-')) {
@@ -308,6 +143,15 @@ fn filter_launch_flags(agent: &str, launch: &[String]) -> Vec<String> {
     while i < launch.len() {
         let t = launch[i].as_str();
         let head = t.split('=').next().unwrap_or(t);
+        // Hermes accepts an optional name after continue. Neither the selector
+        // nor its value may survive into an exact-id restore.
+        if agent == "hermes" && matches!(head, "--continue" | "-c") {
+            i += 1;
+            if !t.contains('=') && launch.get(i).is_some_and(|value| !value.starts_with('-')) {
+                i += 1;
+            }
+            continue;
+        }
         if t.contains('=') && TAKES_VALUE.contains(&head) {
             i += 1; // glued form, e.g. --resume=<id>
             continue;
@@ -417,797 +261,29 @@ fn home() -> PathBuf {
     crate::platform::home_dir().unwrap_or_default()
 }
 
-fn claude_base() -> PathBuf {
-    if let Some(d) = std::env::var_os("CLAUDE_CONFIG_DIR") {
-        return PathBuf::from(d);
-    }
-    home().join(".claude")
-}
+#[cfg(test)]
+pub(crate) use claude::sessions::project_dir as claude_project_dir;
 
-fn copilot_base() -> PathBuf {
-    home().join(".copilot")
-}
-
-/// opencode's session store (docs/23): `$XDG_DATA_HOME/opencode/storage`, else
-/// `~/.local/share/opencode/storage`, else `~/.opencode/storage` — first existing.
-fn opencode_base() -> PathBuf {
-    let candidates = [
-        std::env::var_os("XDG_DATA_HOME")
-            .map(|d| PathBuf::from(d).join("opencode").join("storage")),
-        Some(
-            home()
-                .join(".local")
-                .join("share")
-                .join("opencode")
-                .join("storage"),
-        ),
-        Some(home().join(".opencode").join("storage")),
-    ];
-    for c in candidates.iter().flatten() {
-        if c.exists() {
-            return c.clone();
-        }
-    }
-    home()
-        .join(".local")
-        .join("share")
-        .join("opencode")
-        .join("storage")
-}
-
-// ── Claude Code ─────────────────────────────────────────────────────────────
-// Conversations live at `<base>/projects/<encoded-cwd>/<session-uuid>.jsonl`,
-// where the cwd is encoded by replacing every character that is not
-// ASCII-alphanumeric with `-`.
-
-pub(crate) fn claude_project_dir(base: &Path, cwd: &Path) -> PathBuf {
-    let enc: String = cwd
-        .to_string_lossy()
-        .chars()
-        // Claude collapses *everything* outside `[A-Za-z0-9]`, not just the
-        // separators: spaces, underscores and non-ASCII letters go too, as its
-        // own directories show (`…\ETLS\JV_CO2_ETL_WSC` → `-ETLS-JV-CO2-ETL-WSC`,
-        // `…\Área Interna` → `--rea-Interna`). Encoding only `/ \ . :` kept the
-        // space, so every project whose path has one — on Windows, most of them
-        // — still missed. The colon matters twice over: leaving it in also makes
-        // `join` treat the component as a *drive-relative* path, so the lookup
-        // silently escaped `base` and landed next to the process working
-        // directory.
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    base.join("projects").join(enc)
-}
-
-/// Newest `.jsonl` in `dir` as `(mtime, path, session-id)`.
-fn newest_jsonl(dir: &Path) -> Option<(SystemTime, PathBuf, String)> {
-    let mut best: Option<(SystemTime, PathBuf, String)> = None;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Some(stem) = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
-            continue;
-        };
-        if best.as_ref().map(|(t, _, _)| mtime > *t).unwrap_or(true) {
-            best = Some((mtime, path, stem));
-        }
-    }
-    best
-}
-
-/// Every session for `cwd`, newest first (file stem = session id).
-fn claude_list(base: &Path, cwd: &Path) -> Vec<String> {
-    let dir = claude_project_dir(base, cwd);
-    let mut found: Vec<(SystemTime, String)> = Vec::new();
-    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let (Some(stem), Ok(mtime)) = (
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .map(str::to_string),
-            entry.metadata().and_then(|m| m.modified()),
-        ) else {
-            continue;
-        };
-        found.push((mtime, stem));
-    }
-    found.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
-    found.into_iter().map(|(_, id)| id).collect()
-}
-
-fn claude_latest(base: &Path, cwd: &Path) -> Option<String> {
-    newest_jsonl(&claude_project_dir(base, cwd)).map(|(_, _, id)| id)
-}
-
-/// The session's working directory, read from the first `"cwd"` field in the
-/// transcript (the dir name is a lossy encoding, so we read the real path).
-fn claude_cwd(jsonl: &Path) -> Option<PathBuf> {
-    use std::io::BufRead;
-    let file = std::fs::File::open(jsonl).ok()?;
-    for line in std::io::BufReader::new(file)
-        .lines()
-        .take(30)
-        .map_while(Result::ok)
-    {
-        if let Some(c) = json_str_field(&line, "cwd") {
-            return Some(PathBuf::from(c));
-        }
-    }
-    None
-}
-
-/// Extract `"<key>":"<value>"` from a JSON line without a full parse.
-fn json_str_field(line: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":\"");
-    let start = line.find(&needle)? + needle.len();
-    let rest = &line[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
-}
-
-/// One session per project, for the most recently active projects. Projects are
-/// ranked by directory mtime (cheap) so we only open the newest few transcripts.
-fn claude_recent(base: &Path, limit: usize) -> Vec<SessionInfo> {
-    let Ok(rd) = std::fs::read_dir(base.join("projects")) else {
-        return Vec::new();
-    };
-    let mut dirs: Vec<(SystemTime, PathBuf)> = rd
-        .flatten()
-        .filter_map(|e| {
-            let md = e.metadata().ok()?;
-            md.is_dir().then(|| Some((md.modified().ok()?, e.path())))?
-        })
-        .collect();
-    dirs.sort_by_key(|d| std::cmp::Reverse(d.0));
-    dirs.truncate(limit);
-    dirs.into_iter()
-        .filter_map(|(_, dir)| {
-            let (updated, path, id) = newest_jsonl(&dir)?;
-            Some(SessionInfo {
-                agent: "claude".to_string(),
-                session_id: id,
-                cwd: claude_cwd(&path)?,
-                updated,
-            })
-        })
-        .collect()
-}
-
-// ── GitHub Copilot CLI ──────────────────────────────────────────────────────
-// Each session is a dir `<base>/session-state/<id>/` whose `workspace.yaml`
-// records the session `id:` and its `cwd:`. Match by cwd, newest wins.
-
-fn copilot_latest(base: &Path, cwd: &Path) -> Option<String> {
-    let dir = base.join("session-state");
-    let want = cwd.to_string_lossy();
-    // Visit sessions newest-first and stop at the first whose cwd matches, so we
-    // don't read every session's metadata.
-    let mut sessions: Vec<(SystemTime, PathBuf)> = std::fs::read_dir(&dir)
-        .ok()?
-        .flatten()
-        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
-        .collect();
-    sessions.sort_by_key(|s| std::cmp::Reverse(s.0));
-    for (_, path) in sessions {
-        let Ok(text) = std::fs::read_to_string(path.join("workspace.yaml")) else {
-            continue;
-        };
-        let (mut id, mut wcwd) = (None, None);
-        for line in text.lines() {
-            if let Some(v) = line.strip_prefix("id:") {
-                id = Some(v.trim().to_string());
-            } else if let Some(v) = line.strip_prefix("cwd:") {
-                wcwd = Some(v.trim().to_string());
-            }
-        }
-        if wcwd.as_deref() == Some(want.as_ref()) {
-            if let Some(id) = id {
-                return Some(id);
-            }
-        }
-    }
-    None
-}
-
-/// One session per project, newest first, capped at `limit`.
-fn copilot_recent(base: &Path, limit: usize) -> Vec<SessionInfo> {
-    let Ok(rd) = std::fs::read_dir(base.join("session-state")) else {
-        return Vec::new();
-    };
-    let mut sessions: Vec<(SystemTime, PathBuf)> = rd
-        .flatten()
-        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
-        .collect();
-    sessions.sort_by_key(|s| std::cmp::Reverse(s.0));
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for (updated, path) in sessions {
-        if out.len() >= limit {
-            break;
-        }
-        let Ok(text) = std::fs::read_to_string(path.join("workspace.yaml")) else {
-            continue;
-        };
-        let (mut id, mut cwd) = (None, None);
-        for line in text.lines() {
-            if let Some(v) = line.strip_prefix("id:") {
-                id = Some(v.trim().to_string());
-            } else if let Some(v) = line.strip_prefix("cwd:") {
-                cwd = Some(PathBuf::from(v.trim()));
-            }
-        }
-        let (Some(id), Some(cwd)) = (id, cwd) else {
-            continue;
-        };
-        if seen.insert(cwd.clone()) {
-            out.push(SessionInfo {
-                agent: "copilot".to_string(),
-                session_id: id,
-                cwd,
-                updated,
-            });
-        }
-    }
-    out
-}
-
-// ── opencode (sst/opencode) ─────────────────────────────────────────────────
-// Sessions live at `<base>/session/<projectID>/<sessionID>.json` (some versions
-// also mirror `<base>/session-metadata/<projectID>/<sessionID>.json`). Each JSON's
-// `directory` field is the folder the session started in; match by cwd, newest
-// wins. The `id`/`directory` fields are stable across the schema; we read the file
-// mtime for recency so we don't depend on the exact `time` shape (docs/23).
-
-/// `(mtime, path)` for every session JSON under `base` — a **stat-only** scan (no
-/// reads). Callers sort by mtime and read only the newest few, so discovery stays
-/// bounded even with a huge session history (it runs every ~4s on the loop).
-fn opencode_session_files(base: &Path) -> Vec<(SystemTime, PathBuf)> {
-    let mut out = Vec::new();
-    for sub in ["session", "session-metadata"] {
-        let Ok(projects) = std::fs::read_dir(base.join(sub)) else {
-            continue;
-        };
-        for proj in projects.flatten() {
-            let Ok(files) = std::fs::read_dir(proj.path()) else {
-                continue;
-            };
-            for f in files.flatten() {
-                let path = f.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                if let Ok(mtime) = f.metadata().and_then(|m| m.modified()) {
-                    out.push((mtime, path));
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Read one session JSON → `(id, directory)`. `None` if unreadable / malformed /
-/// missing either field (tolerant of schema drift).
-fn read_opencode_session(path: &Path) -> Option<(String, PathBuf)> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let id = v.get("id").and_then(|x| x.as_str())?;
-    let dir = v.get("directory").and_then(|x| x.as_str())?;
-    Some((id.to_string(), PathBuf::from(dir)))
-}
-
-fn opencode_recent(base: &Path, limit: usize) -> Vec<SessionInfo> {
-    let mut files = opencode_session_files(base);
-    files.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for (updated, path) in files {
-        if out.len() >= limit {
-            break; // read+parse only up to `limit` distinct projects, newest first
-        }
-        if let Some((id, cwd)) = read_opencode_session(&path) {
-            if seen.insert(cwd.clone()) {
-                out.push(SessionInfo {
-                    agent: "opencode".to_string(),
-                    session_id: id,
-                    cwd,
-                    updated,
-                });
-            }
-        }
-    }
-    out
-}
-
-fn opencode_latest(base: &Path, cwd: &Path) -> Option<String> {
-    let mut files = opencode_session_files(base);
-    files.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
-    // Newest-first; stop at the first session in this directory (no full scan).
-    for (_, path) in files {
-        if let Some((id, dir)) = read_opencode_session(&path) {
-            if dir == cwd {
-                return Some(id);
-            }
-        }
-    }
-    None
-}
-
-// ── OpenAI Codex CLI ────────────────────────────────────────────────────────
-// Transcripts are JSONL "rollout" files under `<base>/sessions/YYYY/MM/DD/
-// rollout-*.jsonl`; the meta (first line) carries the `session_id` and `cwd`.
-// Match by cwd, newest wins. Resume: `codex resume <id>` (docs/23 NI-6).
-
-fn codex_base() -> PathBuf {
-    if let Some(d) = std::env::var_os("CODEX_HOME") {
-        return PathBuf::from(d);
-    }
-    home().join(".codex")
-}
-
-/// `(mtime, path)` for every `rollout-*.jsonl` under `<base>/sessions/` (walked
-/// recursively over the `YYYY/MM/DD` tree). Stat-only — callers read the newest
-/// few so discovery stays bounded on the every-4s scan.
-fn codex_rollout_files(base: &Path) -> Vec<(SystemTime, PathBuf)> {
-    fn walk(dir: &Path, out: &mut Vec<(SystemTime, PathBuf)>, depth: u8) {
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for e in rd.flatten() {
-            let path = e.path();
-            let Ok(ft) = e.file_type() else { continue };
-            if ft.is_dir() {
-                if depth < 4 {
-                    walk(&path, out, depth + 1); // sessions/YYYY/MM/DD
-                }
-            } else if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
-            {
-                if let Ok(mtime) = e.metadata().and_then(|m| m.modified()) {
-                    out.push((mtime, path));
-                }
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(&base.join("sessions"), &mut out, 0);
-    out
-}
-
-/// Read a rollout's `session_id` + `cwd` from its early lines (the meta record).
-/// Tolerant of the exact schema: scans the first few JSON lines for the fields,
-/// nested under `payload` or at the top level.
-fn read_codex_session(path: &Path) -> Option<(String, PathBuf)> {
-    use std::io::BufRead;
-    let file = std::fs::File::open(path).ok()?;
-    for line in std::io::BufReader::new(file)
-        .lines()
-        .take(10)
-        .map_while(Result::ok)
-    {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        // Fields sit at the top level or under a `payload` object.
-        let obj = v.get("payload").unwrap_or(&v);
-        let id = obj
-            .get("id")
-            .or_else(|| obj.get("session_id"))
-            .or_else(|| obj.get("conversation_id"))
-            .and_then(|x| x.as_str());
-        let cwd = obj
-            .get("cwd")
-            .or_else(|| obj.get("workdir"))
-            .and_then(|x| x.as_str());
-        if let (Some(id), Some(cwd)) = (id, cwd) {
-            return Some((id.to_string(), PathBuf::from(cwd)));
-        }
-    }
-    None
-}
-
-fn codex_recent(base: &Path, limit: usize) -> Vec<SessionInfo> {
-    let mut files = codex_rollout_files(base);
-    files.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for (updated, path) in files {
-        if out.len() >= limit {
-            break;
-        }
-        if let Some((id, cwd)) = read_codex_session(&path) {
-            if seen.insert(cwd.clone()) {
-                out.push(SessionInfo {
-                    agent: "codex".to_string(),
-                    session_id: id,
-                    cwd,
-                    updated,
-                });
-            }
-        }
-    }
-    out
-}
-
-fn codex_latest(base: &Path, cwd: &Path) -> Option<String> {
-    let mut files = codex_rollout_files(base);
-    files.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
-    for (_, path) in files {
-        if let Some((id, dir)) = read_codex_session(&path) {
-            if dir == cwd {
-                return Some(id);
-            }
-        }
-    }
-    None
-}
-
-/// Every Codex session for `cwd`, newest **creation** first. Forked Codex panes
-/// share a working directory, so persistence needs the ranked list to keep the
-/// parent and fork attached to different rollouts after a server restart.
-///
-/// Rollout mtimes cannot provide that order: they change throughout a live
-/// conversation and would make two panes trade sessions according to whichever
-/// agent wrote last. Codex's `sessions/YYYY/MM/DD/rollout-<ISO timestamp>-...`
-/// path is creation-ordered and remains stable for the life of the session.
-fn codex_list(base: &Path, cwd: &Path) -> Vec<String> {
-    let mut files = codex_rollout_files(base);
-    files.sort_by(|(_, a), (_, b)| b.cmp(a));
-    files
-        .into_iter()
-        .filter_map(|(_, path)| read_codex_session(&path))
-        .filter(|(_, dir)| dir == cwd)
-        .map(|(id, _)| id)
-        .collect()
-}
-
-// ── Kimi Code CLI ───────────────────────────────────────────────────────────
-// Session data lives at `<base>/sessions/<workDirKey>/<sessionId>/`, and a
-// top-level `session_index.jsonl` records one JSON object per line carrying
-// `sessionId`, `sessionDir`, and `workDir` (docs/23). We read that index —
-// cheap, one file — and match by `workDir`. Newest wins by the index's append
-// order (a session is appended when it starts), and we stat `sessionDir` only
-// for the entries we return, so the every-4s scan stays bounded.
-
-fn kimi_base() -> PathBuf {
-    if let Some(d) = std::env::var_os("KIMI_CODE_HOME") {
-        return PathBuf::from(d);
-    }
-    home().join(".kimi-code")
-}
-
-/// One record from `session_index.jsonl`: `(session_id, work_dir, session_dir)`.
-struct KimiEntry {
-    id: String,
-    work_dir: PathBuf,
-    session_dir: PathBuf,
-}
-
-/// Parse the session index, newest first (the file is append-ordered, so we
-/// reverse it). Tolerates malformed lines and schema drift (missing fields).
-fn kimi_index(base: &Path) -> Vec<KimiEntry> {
-    let Ok(text) = std::fs::read_to_string(base.join("session_index.jsonl")) else {
-        return Vec::new();
-    };
-    let mut out: Vec<KimiEntry> = text
-        .lines()
-        .filter_map(|line| {
-            let v: serde_json::Value = serde_json::from_str(line).ok()?;
-            let id = v.get("sessionId").and_then(|x| x.as_str())?;
-            let work = v.get("workDir").and_then(|x| x.as_str())?;
-            // `sessionDir` may be absolute or relative to the data root.
-            let sdir = v
-                .get("sessionDir")
-                .and_then(|x| x.as_str())
-                .map(PathBuf::from)
-                .map(|p| if p.is_absolute() { p } else { base.join(p) })
-                .unwrap_or_default();
-            Some(KimiEntry {
-                id: id.to_string(),
-                work_dir: PathBuf::from(work),
-                session_dir: sdir,
-            })
-        })
-        .collect();
-    out.reverse(); // last line appended = most recent session
-    out
-}
-
-fn kimi_latest(base: &Path, cwd: &Path) -> Option<String> {
-    kimi_index(base)
-        .into_iter()
-        .find(|e| e.work_dir == cwd)
-        .map(|e| e.id)
-}
-
-fn kimi_recent(base: &Path, limit: usize) -> Vec<SessionInfo> {
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for e in kimi_index(base) {
-        if out.len() >= limit {
-            break; // newest-first; stat only the distinct projects we return
-        }
-        if !seen.insert(e.work_dir.clone()) {
-            continue;
-        }
-        // Recency for cross-agent sorting comes from the session dir's mtime;
-        // fall back to epoch if it's gone (still lists, just sorts last).
-        let updated = std::fs::metadata(&e.session_dir)
-            .and_then(|m| m.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        out.push(SessionInfo {
-            agent: "kimi".to_string(),
-            session_id: e.id,
-            cwd: e.work_dir,
-            updated,
-        });
-    }
-    out
-}
-
-// ── Grok Build (xAI) ─────────────────────────────────────────────────────────
-// Sessions live in a Claude-shaped tree (docs/35): `<base>/sessions/
-// <encoded-cwd>/<session-id>/`, where each session is a *directory* (not a file)
-// holding `updates.jsonl` / `summary.json` / etc. The cwd directory name is
-// `urlencoding::encode(cwd)` for short paths, else a `{slug}-{blake3}` hash with
-// the real path in a sibling `.cwd` file. We never re-encode (that would need
-// blake3) — we scan the cwd dirs and decode each name back to its real path,
-// matching Claude's "read the real cwd" approach. Subagent sessions nest under
-// `<session>/subagents/<id>/` and must not appear as top-level resumable ones.
-
-fn grok_base() -> PathBuf {
-    if let Some(d) = std::env::var_os("GROK_HOME") {
-        return PathBuf::from(d);
-    }
-    home().join(".grok")
-}
-
-/// Percent-decode a URL-encoded string (no `+`-for-space; grok uses `%20`).
-/// Returns `None` on a malformed escape or non-UTF-8 result.
-fn percent_decode(s: &str) -> Option<String> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    let hex = |c: u8| -> Option<u8> {
-        match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(c - b'a' + 10),
-            b'A'..=b'F' => Some(c - b'A' + 10),
-            _ => None,
-        }
-    };
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            out.push(hex(b[i + 1])? * 16 + hex(b[i + 2])?);
-            i += 3;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-/// Resolve a grok cwd-directory back to its real working directory: URL-decode
-/// the name (short paths), else read the `.cwd` file grok writes for hashed
-/// long paths. `None` if neither yields a plausible absolute path.
-fn grok_decode_cwd(cwd_dir: &Path) -> Option<PathBuf> {
-    let name = cwd_dir.file_name()?.to_str()?;
-    if let Some(decoded) = percent_decode(name) {
-        // A real cwd is absolute; the slug-hash form never is, which tells the
-        // two encodings apart (same test grok's own decoder uses).
-        if decoded.starts_with('/') || (cfg!(windows) && decoded.chars().nth(1) == Some(':')) {
-            return Some(PathBuf::from(decoded));
-        }
-    }
-    let cwd = std::fs::read_to_string(cwd_dir.join(".cwd")).ok()?;
-    let cwd = cwd.trim();
-    (!cwd.is_empty()).then(|| PathBuf::from(cwd))
-}
-
-/// The newest session directory inside a grok cwd-dir as `(mtime, session-id)`.
-/// The directory name *is* the session id. Skips the `subagents/` nest and any
-/// non-directory entries (`.cwd`, stray files).
-fn grok_newest_session(cwd_dir: &Path) -> Option<(SystemTime, String)> {
-    let mut best: Option<(SystemTime, String)> = None;
-    for e in std::fs::read_dir(cwd_dir).ok()?.flatten() {
-        if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let Some(id) = e.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if id == "subagents" {
-            continue; // nested child sessions, not top-level resumable
-        }
-        let Ok(mtime) = e.metadata().and_then(|m| m.modified()) else {
-            continue;
-        };
-        if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
-            best = Some((mtime, id));
-        }
-    }
-    best
-}
-
-/// `(mtime, path)` for every cwd-directory under `<base>/sessions/`, stat-only,
-/// so callers read only the newest few (the every-4s scan stays bounded).
-fn grok_cwd_dirs(base: &Path) -> Vec<(SystemTime, PathBuf)> {
-    let Ok(rd) = std::fs::read_dir(base.join("sessions")) else {
-        return Vec::new();
-    };
-    rd.flatten()
-        .filter_map(|e| {
-            let md = e.metadata().ok()?;
-            md.is_dir().then(|| Some((md.modified().ok()?, e.path())))?
-        })
-        .collect()
-}
-
-fn grok_latest(base: &Path, cwd: &Path) -> Option<String> {
-    let mut dirs = grok_cwd_dirs(base);
-    dirs.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
-    // Newest cwd-dir first; stop at the first whose real path matches.
-    for (_, dir) in dirs {
-        if grok_decode_cwd(&dir).as_deref() == Some(cwd) {
-            return grok_newest_session(&dir).map(|(_, id)| id);
-        }
-    }
-    None
-}
-
-fn grok_recent(base: &Path, limit: usize) -> Vec<SessionInfo> {
-    let mut dirs = grok_cwd_dirs(base);
-    dirs.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for (_, dir) in dirs {
-        if out.len() >= limit {
-            break; // newest-first; read only the distinct projects we return
-        }
-        let Some(cwd) = grok_decode_cwd(&dir) else {
-            continue;
-        };
-        if !seen.insert(cwd.clone()) {
-            continue;
-        }
-        if let Some((updated, id)) = grok_newest_session(&dir) {
-            out.push(SessionInfo {
-                agent: "grok".to_string(),
-                session_id: id,
-                cwd,
-                updated,
-            });
-        }
-    }
-    out
-}
-
-// ── Pi (pi.dev, earendil-works) ───────────────────────────────────────────────
-// Sessions are JSONL files under `<base>/<encoded-cwd>/<uuid>.jsonl` (base =
-// `~/.pi/agent/sessions`, overridable via `PI_CODING_AGENT_SESSION_DIR`). The
-// first line is a self-describing header — `{"type":"session","id":"<uuid>",
-// "cwd":"<path>",…}` — so, like codex, we read the real cwd from the file rather
-// than trust the directory encoding. Match by cwd, newest wins. Resume:
-// `pi --session <id>` (the flag accepts a full or partial UUID).
-
-fn pi_base() -> PathBuf {
-    if let Some(d) = std::env::var_os("PI_CODING_AGENT_SESSION_DIR") {
-        return PathBuf::from(d);
-    }
-    home().join(".pi").join("agent").join("sessions")
-}
-
-/// `(mtime, path)` for every `*.jsonl` under `base`, one level of cwd-dirs deep
-/// (plus any at the root, defensively). Stat-only, so callers read only the
-/// newest few and the every-4s scan stays bounded.
-fn pi_session_files(base: &Path) -> Vec<(SystemTime, PathBuf)> {
-    fn collect(dir: &Path, out: &mut Vec<(SystemTime, PathBuf)>) {
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for e in rd.flatten() {
-            let path = e.path();
-            if path.extension().and_then(|x| x.to_str()) == Some("jsonl") {
-                if let Ok(mtime) = e.metadata().and_then(|m| m.modified()) {
-                    out.push((mtime, path));
-                }
-            }
-        }
-    }
-    let mut out = Vec::new();
-    collect(base, &mut out); // stray files at the root
-    if let Ok(rd) = std::fs::read_dir(base) {
-        for e in rd.flatten() {
-            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                collect(&e.path(), &mut out);
-            }
-        }
-    }
-    out
-}
-
-/// Read a session's `id` + `cwd` from its header (the first line carrying both).
-/// `None` if unreadable / malformed / missing either field.
-fn read_pi_session(path: &Path) -> Option<(String, PathBuf)> {
-    use std::io::BufRead;
-    let file = std::fs::File::open(path).ok()?;
-    for line in std::io::BufReader::new(file)
-        .lines()
-        .take(5)
-        .map_while(Result::ok)
-    {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        let id = v.get("id").and_then(|x| x.as_str());
-        let cwd = v.get("cwd").and_then(|x| x.as_str());
-        if let (Some(id), Some(cwd)) = (id, cwd) {
-            return Some((id.to_string(), PathBuf::from(cwd)));
-        }
-    }
-    None
-}
-
-/// Every session for `cwd`, newest first (read from each file's header).
-fn pi_list(base: &Path, cwd: &Path) -> Vec<String> {
-    let mut files = pi_session_files(base);
-    files.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
-    files
-        .into_iter()
-        .filter_map(|(_, path)| read_pi_session(&path))
-        .filter(|(_, dir)| dir == cwd)
-        .map(|(id, _)| id)
-        .collect()
-}
-
-fn pi_latest(base: &Path, cwd: &Path) -> Option<String> {
-    let mut files = pi_session_files(base);
-    files.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
-    for (_, path) in files {
-        if let Some((id, dir)) = read_pi_session(&path) {
-            if dir == cwd {
-                return Some(id);
-            }
-        }
-    }
-    None
-}
-
-fn pi_recent(base: &Path, limit: usize) -> Vec<SessionInfo> {
-    let mut files = pi_session_files(base);
-    files.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for (updated, path) in files {
-        if out.len() >= limit {
-            break; // newest-first; read only the distinct projects we return
-        }
-        if let Some((id, cwd)) = read_pi_session(&path) {
-            if seen.insert(cwd.clone()) {
-                out.push(SessionInfo {
-                    agent: "pi".to_string(),
-                    session_id: id,
-                    cwd,
-                    updated,
-                });
-            }
-        }
-    }
-    out
-}
+#[cfg(test)]
+use claude::{claude_latest, claude_recent};
+#[cfg(test)]
+use codex::{codex_latest, codex_list, codex_recent};
+#[cfg(test)]
+use copilot::{copilot_latest, copilot_recent};
+#[cfg(test)]
+use fx::{fx_latest, fx_recent};
+#[cfg(test)]
+use gemini::gemini_latest;
+#[cfg(test)]
+use grok::{grok_latest, grok_recent, percent_decode};
+#[cfg(test)]
+use kimi::{kimi_latest, kimi_recent};
+#[cfg(test)]
+use opencode::{opencode_latest, opencode_recent};
+#[cfg(test)]
+use pi::{pi_latest, pi_recent};
+#[cfg(test)]
+use qwen::qwen_recent;
 
 #[cfg(test)]
 mod tests {
@@ -1227,57 +303,40 @@ mod tests {
     /// and no Windows project with a space in its path was ever found.
     #[test]
     fn claude_project_dir_encodes_every_non_alphanumeric() {
+        let base = Path::new("claude-store");
         let enc = |cwd: &str| {
-            claude_project_dir(Path::new("/base"), Path::new(cwd))
+            claude_project_dir(base, Path::new(cwd))
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
                 .into_owned()
         };
-        assert_eq!(enc(r"C:\Users\me\proj"), "C--Users-me-proj", "drive colon");
         assert_eq!(
-            enc(r"D:\Users\me\Codigo fuente\Personal"),
-            "D--Users-me-Codigo-fuente-Personal",
+            enc(r"C:\Users\developer\project"),
+            "C--Users-developer-project",
+            "drive colon"
+        );
+        assert_eq!(
+            enc(r"D:\Work\source code\project"),
+            "D--Work-source-code-project",
             "the space too"
         );
         assert_eq!(
-            enc("/home/me/JV_CO2_ETL"),
-            "-home-me-JV-CO2-ETL",
+            enc("/home/developer/data_pipeline"),
+            "-home-developer-data-pipeline",
             "underscore"
         );
-        assert_eq!(enc("/home/me/Área"), "-home-me--rea", "non-ASCII letter");
-    }
-
-    // docs/54 MC-2: sum a Claude transcript's usage into tokens/context/cost.
-    #[test]
-    fn claude_usage_sums_tokens_context_and_cost() {
-        let base = tmp("claude-usage");
-        let cwd = PathBuf::from("/tmp/some/proj");
-        let dir = claude_project_dir(&base, &cwd);
-        fs::create_dir_all(&dir).unwrap();
-        let jsonl = concat!(
-            r#"{"type":"assistant","message":{"model":"claude-opus-4-8","usage":{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":200}}}"#,
-            "\n",
-            r#"{"type":"assistant","message":{"model":"claude-opus-4-8","usage":{"input_tokens":3000,"output_tokens":700,"cache_creation_input_tokens":100}}}"#,
-            "\n",
-            "definitely not json — must be skipped\n",
+        assert_eq!(
+            enc("/workspace/café"),
+            "-workspace-caf-",
+            "non-ASCII letter"
         );
-        fs::write(dir.join("sess-1.jsonl"), jsonl).unwrap();
-
-        let u = claude_session_usage(&base, &cwd, "sess-1").expect("usage read");
-        assert_eq!(u.model, "claude-opus-4-8");
-        assert_eq!(u.tokens_in, 4000, "cumulative input");
-        assert_eq!(u.tokens_out, 1200, "cumulative output");
-        assert_eq!(u.cache, 300, "cache read + creation");
-        // Context ≈ the last turn's input side (3000 + 100) / 200k window.
-        let c = u.context.expect("context");
-        assert!((c - (3100.0 / 200_000.0)).abs() < 1e-4, "context {c}");
-        // Cost estimate (opus): in*15 + out*75 + cache*1.5 per million.
-        let want = (4000.0 * 15.0 + 1200.0 * 75.0 + 300.0 * 1.5) / 1_000_000.0;
-        assert!((u.cost.expect("cost") - want).abs() < 1e-9);
-        let _ = fs::remove_dir_all(&base);
+        assert_eq!(
+            claude_project_dir(base, Path::new(r"C:\Users\developer\project")),
+            base.join("projects").join("C--Users-developer-project"),
+            "a Windows drive path stays inside Claude's configured store"
+        );
     }
-
     #[test]
     fn resume_commands() {
         assert!(resume_command("claude", "abc")
@@ -1293,6 +352,11 @@ mod tests {
         assert!(resume_command("codex", "c1")
             .unwrap()
             .contains("codex resume"));
+        assert_eq!(
+            resume_command("muse", "7de3d84e-31f9-4437-b2f8-0b56db788042").as_deref(),
+            Some("muse resume '7de3d84e-31f9-4437-b2f8-0b56db788042'\r")
+        );
+        assert!(is_resumable("muse"));
         assert!(resume_command("kimi", "k1")
             .unwrap()
             .contains("kimi --resume"));
@@ -1309,10 +373,70 @@ mod tests {
             .unwrap()
             .contains("cursor-agent --resume"));
         assert!(is_resumable("opencode") && is_resumable("cursor-agent"));
-        assert!(!is_resumable("gemini")); // detectable, but no resume path
+        assert_eq!(
+            resume_command("gemini", "g1").as_deref(),
+            Some("gemini --resume 'g1'\r")
+        );
+        assert_eq!(
+            resume_command("qwen", "q1").as_deref(),
+            Some("qwen --resume 'q1'\r")
+        );
+        assert_eq!(
+            resume_command("fx", "f1").as_deref(),
+            Some("fx session resume 'f1'\r")
+        );
+        assert_eq!(
+            resume_command("hermes-agent", "20260830_120000_a1b2c3").as_deref(),
+            Some("hermes --resume '20260830_120000_a1b2c3'\r")
+        );
+        assert!(is_resumable("hermes"));
         assert!(resume_command("unknown", "x").is_none());
         assert!(resume_command("claude", "").is_none()); // empty id
         assert!(resume_command("claude", "a b").is_none()); // unsafe char
+    }
+
+    #[test]
+    fn gemini_style_sessions_are_scoped_by_project_root() {
+        let base = tmp("gemini-session");
+        let project = base.join("tmp/hash-one");
+        fs::create_dir_all(project.join("chats")).unwrap();
+        fs::write(project.join(".project_root"), "/work/app\n").unwrap();
+        fs::write(
+            project.join("chats/session-2026-08-25-gem12345.jsonl"),
+            "{\"sessionId\":\"gem12345-full\"}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            gemini_latest(&base, Path::new("/work/app")).as_deref(),
+            Some("gem12345-full")
+        );
+        assert!(gemini_latest(&base, Path::new("/work/other")).is_none());
+        let recent = qwen_recent(&base, 5);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].agent, "qwen");
+        assert_eq!(recent[0].cwd, Path::new("/work/app"));
+    }
+
+    #[test]
+    fn fx_sessions_use_native_workspace_metadata() {
+        let base = tmp("fx-session");
+        let session = base.join("sessions/fx-1");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(
+            session.join("session.json"),
+            r#"{"id":"fx-1","workspace_root":"/work/app","created_at_ms":1000,"updated_at_ms":2000}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fx_latest(&base, Path::new("/work/app")).as_deref(),
+            Some("fx-1")
+        );
+        let recent = fx_recent(&base, 5);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].session_id, "fx-1");
+        assert_eq!(recent[0].cwd, Path::new("/work/app"));
     }
 
     #[test]
@@ -1550,6 +674,15 @@ mod tests {
             f("codex", &["fork", "sess_9", "--model", "o3"]),
             vec!["--model", "o3"]
         );
+        assert_eq!(
+            f("muse", &["resume", "muse-id", "--reasoning-effort", "high"]),
+            vec!["--reasoning-effort", "high"]
+        );
+        assert_eq!(
+            f("hermes", &["--continue", "old title", "--tui"]),
+            vec!["--tui"],
+            "Hermes drops its optional continue title"
+        );
         // A kept flag keeps its value.
         assert_eq!(
             f("claude", &["--permission-mode", "bypassPermissions"]),
@@ -1649,6 +782,10 @@ mod tests {
         let grok = fork_command("grok", "g1").unwrap();
         assert!(grok.contains("grok --resume") && grok.contains("--fork-session"));
         assert!(can_fork("claude") && can_fork("codex") && can_fork("pi") && can_fork("grok"));
+        assert!(
+            !can_fork("muse"),
+            "Muse has no external native fork entrypoint"
+        );
         // Resume-capable, but no native fork (the copy-then-resume tier is future).
         assert!(!can_fork("copilot"));
         assert!(!can_fork("cursor"));
@@ -1709,6 +846,64 @@ mod tests {
                 .unwrap()
                 .session_id,
             "cccc"
+        );
+    }
+
+    #[test]
+    fn omp_discovers_pi_layout_sessions_and_resumes_with_omp_flag() {
+        // omp ships pi's session layout: <base>/<encoded-cwd>/<uuid>.jsonl with
+        // a self-describing header. Discovery matches by cwd; the resume command
+        // uses `omp --resume` (not pi's `--session`), and omp forks a saved
+        // session with `--fork <session>` (id prefix or path), like pi.
+        let base = tmp("omp");
+        let app = base.join("-work-app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(
+            app.join("dddd.jsonl"),
+            "{\"type\":\"session\",\"id\":\"dddd\",\"cwd\":\"/work/app\"}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            omp::latest(&base, Path::new("/work/app")).as_deref(),
+            Some("dddd")
+        );
+        let recent = omp::recent(&base, 10);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].agent, "omp");
+        assert_eq!(recent[0].session_id, "dddd");
+
+        let cmd = resume_command("omp", "dddd").unwrap();
+        assert!(cmd.contains("omp --resume"), "uses omp's flag: {cmd}");
+        assert!(!cmd.contains("--session"), "pi's flag must not leak");
+        assert!(is_resumable("omp"));
+        assert!(can_fork("omp"), "omp forks saved sessions with --fork");
+        let fork = fork_command("omp", "dddd").unwrap();
+        assert!(fork.contains("omp --fork"), "uses omp's flag: {fork}");
+    }
+
+    #[test]
+    fn omp_reads_sessions_with_a_title_slot_before_the_header() {
+        // Current omp builds prepend a fixed-width 256-byte `type:"title"`
+        // slot line before the session header. The parser must skip it (no
+        // id/cwd keys) and still find the header within the 5-line scan.
+        let base = tmp("omp-title-slot");
+        let app = base.join("-work-app");
+        fs::create_dir_all(&app).unwrap();
+        let title_slot = format!(
+            "{:<255}\n",
+            "{\"type\":\"title\",\"v\":1,\"title\":\"x\",\"pad\":\"\"}"
+        );
+        assert_eq!(title_slot.len(), 256, "the physical slot is 256 bytes");
+        fs::write(
+            app.join("eeee.jsonl"),
+            format!("{title_slot}{{\"type\":\"session\",\"id\":\"eeee\",\"cwd\":\"/work/app\"}}\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            omp::latest(&base, Path::new("/work/app")).as_deref(),
+            Some("eeee")
         );
     }
 

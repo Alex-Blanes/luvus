@@ -36,6 +36,17 @@ pub(super) fn draw_pane_titles(
                     crate::diff::DIFF_GLYPH,
                     format!("DIFF · {}", v.key.display_path()),
                 ),
+                crate::app::ViewKind::Preview(v) => (
+                    "◇",
+                    format!(
+                        "{} · {}",
+                        v.kind.label(),
+                        v.path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    ),
+                ),
             };
             let path_fg = if focused { t.accent } else { t.subtext0 };
             // Plain terminal glyphs only: files use a square, DIFF uses its
@@ -160,6 +171,7 @@ struct PaneRenderContext<'a> {
     app: &'a App,
     diff_source_rects: &'a mut Vec<(PaneId, usize, crate::diff::DiffSide, Rect)>,
     diff_note_rects: &'a mut Vec<(PaneId, String, Rect)>,
+    preview_link_rects: &'a mut Vec<(PaneId, String, Rect)>,
 }
 
 pub(super) fn draw_panes(
@@ -168,16 +180,18 @@ pub(super) fn draw_panes(
     bordered: bool,
     app: &mut App,
     t: &Theme,
-) -> Option<(u16, u16)> {
+) -> Option<(u16, u16, bool)> {
     let focus = app.layout().focus;
     let mut cursor = None;
     let mut diff_source_rects = Vec::new();
     let mut diff_note_rects = Vec::new();
+    let mut preview_link_rects = Vec::new();
     {
         let mut context = PaneRenderContext {
             app,
             diff_source_rects: &mut diff_source_rects,
             diff_note_rects: &mut diff_note_rects,
+            preview_link_rects: &mut preview_link_rects,
         };
         for (id, rect) in rects {
             if let Some(c) = draw_one_pane(f, *rect, *id, *id == focus, bordered, &mut context, t) {
@@ -187,6 +201,7 @@ pub(super) fn draw_panes(
     }
     app.diff_source_rects = diff_source_rects;
     app.diff_note_rects = diff_note_rects;
+    app.preview_link_rects = preview_link_rects;
     cursor
 }
 
@@ -198,15 +213,15 @@ fn draw_one_pane(
     bordered: bool,
     context: &mut PaneRenderContext<'_>,
     t: &Theme,
-) -> Option<(u16, u16)> {
+) -> Option<(u16, u16, bool)> {
     let app = context.app;
     // A view leaf (docs/38 FILE-3) renders natively, not from a PTY.
     if let Some(view) = app.views.get(&id) {
-        let content = pane_content(area, bordered)?;
+        let content = pane_content(area, bordered, app.compact)?;
         match view {
             crate::app::ViewKind::File(v) => {
                 let sel = app.selection.filter(|s| s.pane == id);
-                super::files::draw_file_view(f, content, v, sel.as_ref(), t);
+                super::files::draw_file_view(f, content, v, sel.as_ref(), app.compact, t);
             }
             crate::app::ViewKind::Diff(v) => super::diff::draw_diff_view(
                 f,
@@ -218,22 +233,31 @@ fn draw_one_pane(
                     picker: app.diff_agent_picker.as_ref(),
                     marker_style: app.config.layout.diff_marker_style,
                     color_mode: app.config.layout.diff_color_mode,
+                    mobile: app.compact,
                     source_hits: context.diff_source_rects,
                     note_hits: context.diff_note_rects,
                 },
                 t,
             ),
+            crate::app::ViewKind::Preview(v) => {
+                let sel = app.selection.filter(|selection| selection.pane == id);
+                context.preview_link_rects.extend(
+                    super::preview::draw(f, content, v, sel.as_ref(), app.compact, t)
+                        .into_iter()
+                        .map(|(target, rect)| (id, target, rect)),
+                );
+            }
         }
         return None; // views own no terminal cursor
     }
     let pane = app.panes.get(&id)?;
     let st = pane_state(app, id);
-    let content = pane_content(area, bordered)?;
+    let content = pane_content(area, bordered, app.compact)?;
 
     // A lone pane has no border, so it shows a header bar on its top row.
     // Bordered panes instead get their dot+path+close as a title ON the top
     // border row (see `draw_pane_titles`), so it touches the tab bar.
-    if !bordered {
+    if !bordered && !app.compact {
         // Match the content's horizontal pad so the header bar aligns with the
         // tab bar and the terminal text below it.
         let pad = lone_pad(area.width);
@@ -297,17 +321,27 @@ fn draw_one_pane(
         .filter(|fl| fl.pane == id)
         .map(|fl| (fl.row, fl.scroll));
     let mut scrolled = 0usize;
-    let is_codex = app.status.get(&id).is_some_and(|s| s.agent == "codex");
+    let agent = app.status.get(&id).map(|s| s.agent.as_str()).unwrap_or("");
+    let is_codex = agent == "codex";
     let mut composer_region = None;
     let cursor_pos = match pane.engine.lock() {
         Ok(engine) => {
             let copy_top =
                 copy.map(|_| engine.history_len().saturating_sub(engine.scroll_offset()));
+            let selection_top = sel
+                .and_then(|selection| selection.retained)
+                .map(|_| engine.history_len().saturating_sub(engine.scroll_offset()));
+            let cur = engine.cursor();
+            let scan_pi = agent == "pi";
+            let mut pi_caret: Option<(u16, u16)> = None;
             {
                 let buf = f.buffer_mut();
                 engine.for_each_cell(&mut |row, col, sym, cell| {
                     if row >= content.height || col >= content.width {
                         return;
+                    }
+                    if scan_pi && cell.mods.contains(ratatui::style::Modifier::REVERSED) {
+                        pi_caret = Some(pick_bottom_left_caret(pi_caret, (row, col)));
                     }
                     let x = content.x + col;
                     let y = content.y + row;
@@ -331,7 +365,20 @@ fn draw_one_pane(
                         style = style.bg(conv(cell.bg));
                     }
                     // Highlight the cell if it's inside the mouse selection.
-                    if sel.is_some_and(|s| s.contains(x, y)) {
+                    if sel.is_some_and(|selection| {
+                        selection.retained.map_or_else(
+                            || selection.contains(x, y),
+                            |retained| {
+                                selection_top.is_some_and(|top| {
+                                    retained.contains(
+                                        top.saturating_add(row as usize),
+                                        col as usize,
+                                        content.width as usize,
+                                    )
+                                })
+                            },
+                        )
+                    }) {
                         style = style.bg(t.sel_bg);
                     }
                     if copy.is_some_and(|copy| {
@@ -391,14 +438,12 @@ fn draw_one_pane(
             if is_codex {
                 composer_region = engine.codex_composer_region();
             }
-            let cur = engine.cursor();
-            if focused
-                && copy.is_none()
-                && cur.visible
-                && cur.x < content.width
-                && cur.y < content.height
-            {
-                Some((content.x + cur.x, content.y + cur.y))
+            if focused && copy.is_none() {
+                if let Some((row, col)) = pi_caret {
+                    Some((content.x + col, content.y + row, true))
+                } else {
+                    pane_ime_cursor(content, cur)
+                }
             } else {
                 None
             }
@@ -450,6 +495,38 @@ fn draw_one_pane(
         }
     }
     cursor_pos
+}
+
+/// In-view PTY cell, mapped into the pane. Hidden still returns a park so the
+/// client can CUP after chrome.
+fn pane_ime_cursor(content: Rect, cur: crate::terminal::vt::Cursor) -> Option<(u16, u16, bool)> {
+    if content.width == 0 || content.height == 0 {
+        return None;
+    }
+    if cur.x >= content.width || cur.y >= content.height {
+        return None;
+    }
+    Some((content.x + cur.x, content.y + cur.y, cur.visible))
+}
+
+/// Pi's `CURSOR_MARKER` (`ESC_pi:c BEL`) is stripped in `extractCursorPosition`
+/// before the PTY write, so Luvus never sees a direct marker. Hidden PTY CUP is
+/// often out of view or on the row tail while working. Bottom-most then leftmost
+/// reverse-video cell in this pane is the fake caret (`ESC[7m`). Show the host
+/// cursor there so IME preedit has a block; without this park the hardware
+/// cursor stays on the last painted cell (the `working` spinner).
+fn pick_bottom_left_caret(current: Option<(u16, u16)>, cell: (u16, u16)) -> (u16, u16) {
+    match current {
+        None => cell,
+        Some((row, col)) => {
+            let (r, c) = cell;
+            if r > row || (r == row && c < col) {
+                cell
+            } else {
+                (row, col)
+            }
+        }
+    }
 }
 
 /// Give Codex's input a gently raised, theme-aware surface while retaining all
@@ -510,5 +587,52 @@ mod tests {
         assert_eq!(buf[(10, 2)].bg, t.subtle_composer_surface());
         assert_ne!(buf[(10, 2)].bg, t.mantle);
         assert_ne!(buf[(10, 2)].bg, t.surface0);
+    }
+
+    fn cur(x: u16, y: u16, visible: bool) -> crate::terminal::vt::Cursor {
+        crate::terminal::vt::Cursor { x, y, visible }
+    }
+
+    #[test]
+    fn hidden_in_view_pty_is_parked() {
+        let content = Rect::new(2, 3, 20, 12);
+        assert_eq!(
+            pane_ime_cursor(content, cur(4, 8, false)),
+            Some((6, 11, false))
+        );
+    }
+
+    #[test]
+    fn visible_pty_caret_in_prompt_is_followed() {
+        let content = Rect::new(0, 0, 20, 12);
+        assert_eq!(
+            pane_ime_cursor(content, cur(5, 10, true)),
+            Some((5, 10, true))
+        );
+    }
+
+    #[test]
+    fn in_view_top_row_pty_is_followed() {
+        let content = Rect::new(2, 3, 20, 12);
+        assert_eq!(
+            pane_ime_cursor(content, cur(4, 0, true)),
+            Some((6, 3, true))
+        );
+    }
+
+    #[test]
+    fn out_of_view_pty_yields_none() {
+        let content = Rect::new(0, 0, 20, 12);
+        assert_eq!(pane_ime_cursor(content, cur(20, 0, true)), None);
+        assert_eq!(pane_ime_cursor(content, cur(0, 12, false)), None);
+    }
+
+    #[test]
+    fn pi_caret_prefers_bottom_then_left_reversed_cell() {
+        assert_eq!(pick_bottom_left_caret(None, (3, 9)), (3, 9));
+        assert_eq!(pick_bottom_left_caret(Some((3, 9)), (3, 2)), (3, 2));
+        assert_eq!(pick_bottom_left_caret(Some((3, 2)), (5, 18)), (5, 18));
+        assert_eq!(pick_bottom_left_caret(Some((5, 18)), (5, 4)), (5, 4));
+        assert_eq!(pick_bottom_left_caret(Some((5, 4)), (4, 0)), (5, 4));
     }
 }

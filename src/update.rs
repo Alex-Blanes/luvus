@@ -864,7 +864,7 @@ mod tests {
             Some("0.13.0")
         );
         assert!(parse_tag_name(r#"{"message":"Not Found"}"#).is_none());
-        assert!(is_newer("0.13.0", super::CURRENT));
+        assert!(is_newer("999.0.0", super::CURRENT));
         assert!(!is_newer(super::CURRENT, super::CURRENT));
     }
 

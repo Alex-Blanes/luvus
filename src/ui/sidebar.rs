@@ -56,10 +56,10 @@ fn list_capacity(rows: u16) -> usize {
 }
 
 /// A scrollbar on the sidebar's right edge, shown only when the list overflows
-/// its area. Drawn as a **background fill** (blank cell + coloured `bg`), so it
-/// renders as a solid line in every terminal (no box-drawing glyph to dash on
-/// macOS Terminal.app). A faint full-height track carries a small brighter
-/// thumb sized to the visible fraction of the list.
+/// its area. Thin block glyphs keep the indicator lighter than a full-cell
+/// background strip while remaining terminal-native: a faint one-eighth-cell
+/// track carries a brighter thumb of the same narrow width, sized to the
+/// visible fraction.
 pub(crate) fn draw_scrollbar(
     f: &mut RenderTarget,
     bars: &mut Vec<SidebarBar>,
@@ -86,8 +86,8 @@ pub(crate) fn draw_scrollbar(
     for i in 0..len {
         let on = i >= pos && i < pos + thumb;
         let cell = &mut buf[(track.x, track.y + i as u16)];
-        cell.set_symbol(" ");
-        cell.set_bg(if on { t.overlay1 } else { t.surface1 });
+        cell.set_symbol("▕");
+        cell.set_fg(if on { t.overlay1 } else { t.surface1 });
     }
 }
 
@@ -477,13 +477,13 @@ fn draw_workspaces_dock(
     app.workspaces_scroll = app.workspaces_scroll.min(ntotal.saturating_sub(ncap));
     app.workspaces_area = Rect::new(area.x, nlist_top, area.width, nrows);
     let nscroll = app.workspaces_scroll;
-    app.workspace_branch_rects.clear();
     for (vi, (i, is_member)) in order.into_iter().skip(nscroll).take(ncap).enumerate() {
         let y = nlist_top + vi as u16 * ROW_STRIDE;
         let active = i == app.active_ws;
         ws_rects.push((i, Rect::new(area.x, y, area.width, 2)));
         let st = rollup(app, i);
         let ws = &app.workspaces[i];
+        let terminal_cwd = app.workspace_terminal_cwd(i).unwrap_or(&ws.cwd);
         let name_style = if active {
             Style::new().fg(t.accent).bold()
         } else {
@@ -519,18 +519,8 @@ fn draw_workspaces_dock(
         }
         line1.push(Span::styled(st.dot(), Style::new().fg(st.color(t))));
         line1.push(Span::raw(" "));
-        let name_dw = crate::ui::display_width(&name_disp) as u16;
         line1.push(Span::styled(name_disp, name_style));
         if let Some(b) = &branch_disp {
-            // Record the branch text as a clickable rect (opens the git tab),
-            // positioned by the *displayed* name width so a click still lands.
-            let bx = cx + 2 + indent + name_dw;
-            let bw = 2 + crate::ui::display_width(b) as u16;
-            if bx < area.right() {
-                let bw = bw.min(area.right().saturating_sub(bx));
-                app.workspace_branch_rects
-                    .push((i, Rect::new(bx, y, bw, 1)));
-            }
             line1.push(Span::styled(
                 format!("  {b}"),
                 Style::new().fg(if active { t.green } else { t.overlay0 }),
@@ -546,7 +536,7 @@ fn draw_workspaces_dock(
                 format!(
                     "{}{}",
                     " ".repeat(pad),
-                    short_path(&ws.cwd, cw.saturating_sub(pad as u16))
+                    short_path(terminal_cwd, cw.saturating_sub(pad as u16))
                 ),
                 Style::new().fg(if active { t.subtext0 } else { t.overlay0 }),
             )),
@@ -733,6 +723,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 // A working agent gets a live rotating-circle spinner in the dot
                 // slot; every other state keeps its static dot.
                 let dot = if st == State::Working {
+                    f.mark_working_animation();
                     crate::ui::theme::spinner_frame(app.spinner)
                 } else {
                     st.dot()
@@ -940,7 +931,44 @@ fn header(text: &str, t: &Theme) -> Line<'static> {
 mod tests {
     use super::{bar_offset, list_capacity};
     use crate::app::{App, BarDrag, SidebarBar};
-    use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+    use crate::event::AppEvent;
+    use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, Terminal};
+
+    #[test]
+    fn sidebar_scrollbar_is_thin_and_proportional() {
+        let area = Rect::new(0, 0, 1, 6);
+        let mut buffer = Buffer::empty(area);
+        let theme = crate::ui::theme::by_name("quattro-rally");
+        let mut bars = Vec::new();
+        {
+            let mut target = crate::ui::RenderTarget::new(&mut buffer, area);
+            let bar = SidebarBar {
+                list: BarDrag::Agents,
+                track: area,
+                total: 6,
+                cap: 2,
+            };
+            super::draw_scrollbar(&mut target, &mut bars, bar, 0, &theme);
+        }
+
+        let symbols: Vec<&str> = (0..area.height)
+            .map(|row| buffer.cell((0, row)).expect("scrollbar cell").symbol())
+            .collect();
+        assert_eq!(
+            symbols,
+            vec!["▕", "▕", "▕", "▕", "▕", "▕"],
+            "the proportional thumb and track stay one-eighth of a cell wide"
+        );
+        assert_eq!(buffer.cell((0, 0)).expect("thumb cell").fg, theme.overlay1);
+        assert_eq!(buffer.cell((0, 2)).expect("track cell").fg, theme.surface1);
+        assert!(
+            (0..area.height).all(|row| buffer
+                .cell((0, row))
+                .is_some_and(|cell| cell.style().bg == Some(ratatui::style::Color::Reset))),
+            "the scrollbar must not paint a full-cell background strip"
+        );
+    }
 
     fn buffer_contains(term: &Terminal<TestBackend>, needle: &str) -> bool {
         let buf = term.backend().buffer();
@@ -1191,14 +1219,63 @@ mod tests {
             "All default shows session history"
         );
 
-        // Active: history is hidden when the user explicitly asks for live
-        // agents only.
-        app.agents_filter = crate::app::AgentsFilter::Active;
+        // Clicking Active resets the filtered list and persists the choice.
+        app.agents_scroll = 7;
+        let active = app
+            .agents_filter_rects
+            .iter()
+            .find(|(filter, _)| *filter == crate::app::AgentsFilter::Active)
+            .map(|(_, rect)| *rect)
+            .expect("Active filter target");
+        app.handle_event(AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: active.x,
+            row: active.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(app.agents_filter, crate::app::AgentsFilter::Active);
+        assert_eq!(app.agents_scroll, 0);
+        assert_eq!(
+            crate::config::load().agents_filter,
+            crate::app::AgentsFilter::Active
+        );
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
         assert!(
             !buffer_contains(&term, "resume"),
             "Active hides session history"
         );
+
+        // Clicking the selected choice is a true no-op, including its scroll.
+        app.agents_scroll = 5;
+        app.handle_event(AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: active.x,
+            row: active.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(app.agents_scroll, 5);
+
+        // All follows the same path and restores resumable history.
+        let all = app
+            .agents_filter_rects
+            .iter()
+            .find(|(filter, _)| *filter == crate::app::AgentsFilter::All)
+            .map(|(_, rect)| *rect)
+            .expect("All filter target");
+        app.handle_event(AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: all.x,
+            row: all.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(app.agents_filter, crate::app::AgentsFilter::All);
+        assert_eq!(app.agents_scroll, 0);
+        assert_eq!(
+            crate::config::load().agents_filter,
+            crate::app::AgentsFilter::All
+        );
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(buffer_contains(&term, "resume"));
     }
 
     /// End to end with the mouse: the header row folds its dock, and the rule

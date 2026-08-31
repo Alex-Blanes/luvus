@@ -1,7 +1,7 @@
 //! CLI client (M4): `luvus pane …` / `luvus ping` / `luvus events` connect to
 //! the session socket, send one JSON request, and print the reply. See docs/08.
 
-use std::io::{BufRead, BufReader, IsTerminal, Write};
+use std::io::{BufReader, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -22,10 +22,16 @@ pub fn is_cli(args: &[String]) -> bool {
                 | "bar"
                 | "ui"
                 | "events"
+                // Reserved so the removed, unreleased command family fails as
+                // an unknown command instead of accidentally opening the TUI.
                 | "api"
+                | "logs"
+                | "uhp"
+                | "socket"
                 | "module"
                 | "theme"
                 | "git"
+                | "mission"
                 | "diff"
                 | "files"
                 | "worktree"
@@ -58,6 +64,7 @@ Commands:
   agent        Start, fork, message, inspect, and resume coding agents
   files        Browse and open workspace files
   git          Inspect repository state and open the Git UI
+  mission      Open Mission Control for a workspace
   diff         Review Git diffs, notes, and agent feedback
   worktree     Create, open, list, and remove Git worktrees
   task         Coordinate work across multiple coding agents
@@ -69,11 +76,11 @@ Commands:
   session      List, attach, stop, and delete server sessions
   server       Inspect and manage the selected background server
   integration  Manage agent session-resume integrations
-  skill        Explicitly enable, inspect, update, or remove agent skills
+  skill        Enable, inspect, show, or remove the bundled agent skill
   wait         Wait for pane output or an agent state
   search       Search across pane scrollback
   events       Stream live status changes
-  api          Inspect the automation protocol and live capabilities
+  uhp          Discover and use Universal Harness Protocol 1.0
   attach       Open the TUI focused on one pane
   doctor       Check optional external tools
   update       Reload config, themes, and modules live; install a newer release
@@ -124,7 +131,7 @@ workspaces:
 
 tabs:
   tab list                   list tabs in the current workspace
-  tab new                    new tab
+  tab new                    new tab (creates a workspace if none is open)
   tab focus <n>              focus tab n (1-based)
   tab move <from> <to>       move a tab to an exact position (1-based)
   tab move left|right        move the active tab one position (--tab N targets one)
@@ -134,7 +141,7 @@ tabs:
 
 panes / agents:
   pane list                  list panes and read-only history metrics in the current tab
-  pane split [<id>] [--down] [--no-focus]   split a pane (default: side by side)
+  pane split [<id>] [--down] [--no-focus]   split a pane (default: side by side, creates a workspace if empty)
   pane focus <id>            focus a pane (jumps to its workspace/tab)
   pane move [<id>] (--tab <n> | --new-tab)  move a pane within its workspace
   pane run [<id>] <cmd...>   run a command in a pane
@@ -163,12 +170,10 @@ panes / agents:
   agent release [<pane>] --source <id>   release that integration authority
   agent sessions             list resumable sessions found on disk
   agent resume <id>          reopen a resumable session into a pane
-  skill status [<agent>]      show enabled state, release, path, and integrity
-  skill enable <agent>|--all  opt an agent into the remotely distributed skill
-  skill disable <agent>|--all remove an unmodified managed skill
-  skill update [<agent>]      update enabled agents only (all enabled by default)
-  skill show <agent>          print an installed agent's SKILL.md
-                             <agent> is claude, codex, or opencode
+  skill enable               install the bundled skill in detected agent hosts
+  skill status               show the bundled release and installation details
+  skill disable              remove unchanged Luvus-managed installations
+  skill show                 print the bundled, version-matched SKILL.md
   wait output <id> --match <text> [--timeout <s>]    block until output appears
   wait agent-status <id> --status done|blocked|working|idle [--timeout <s>]
   attach <id>                open the TUI into a single fullscreen pane
@@ -240,6 +245,9 @@ git:
   files reveal <path>        expand the tree to a path
   files refresh              re-read the tree from disk
 
+mission control:
+  mission open [<workspace>]  open Mission Control for a workspace
+
 diff review:
   diff list [--layer staged|worktree|untracked|conflict]   list exact diff layers
   diff open [<path>] [--layer <layer>] [--view auto|split|stack]
@@ -265,10 +273,10 @@ orchestration (multiple agents on one project, docs/22):
   task list                  list all tasks + their status/assignee
   task get <id>              show one task
   task claim <id>            claim a task for this pane (deps must be done)
-  task next [--start] [--agent <cmd>]   claim the next ready task (--start spawns
-                             an isolated worker), for an agent loop draining the queue
-  task start <id> [--branch <b>] [--agent <cmd>]   spawn an isolated worker:
-                             a git worktree + pane, auto-claimed and path-leased
+  task next [--start] [--agent <cmd>] [--mode worktree|workspace]
+                             claim the next ready task (--start creates a worker)
+  task start <id> [--branch <b>] [--agent <cmd>] [--mode worktree|workspace]
+                             start a worker (worktree default; workspace shares checkout)
   task heartbeat <id> --context <0..1>   report context usage (blocks done at >85%)
   task update <id> [--status <s>] [--output <o>] [--note <n>]
   task done <id>             mark done + release its leases
@@ -276,24 +284,21 @@ orchestration (multiple agents on one project, docs/22):
                              (isolated worktree, conflicts block the task)
   task release <id>          return a claimed task to the queue
   task delete <id>           remove a task (release/finish an active one first)
-  lease acquire <glob>... --task <id>   reserve file paths (denied if they overlap)
+  lease acquire <glob>... --task <id>   reserve paths for an unfinished task
+                             (denied if they overlap another task)
   lease release <id>         release a lease
   lease list                 list active path leases
 
 events:
   events                     stream live status changes
 
-api:
-  api schema                 print the installed UHP Terminal JSON Schema bundle
-  api runtime-schema         print the installed UHP Runtime JSON Schema bundle
-  api socket-schema          print the complete installed Socket API schema bundle
-  api capabilities           negotiate and print UHP Terminal capabilities
-  api snapshot               print a fenced UHP Terminal inventory
-  api events                 stream sequenced UHP Terminal events
-  api runtime                print UHP Runtime capabilities and limits
-  api session                print a fenced UHP Runtime session snapshot
-  api socket-capabilities    print live Socket API methods and limits
-  api proxy                  forward one JSON request from stdin to the local server
+universal harness protocol:
+  uhp capabilities          print live methods, contracts, limits, and protocol identity
+  uhp schema                print the complete installed UHP JSON Schema bundle
+  uhp snapshot              print a fenced session snapshot for harness bootstrap
+  uhp events                stream sequenced UHP events
+  uhp access [--control]    expose scoped UHP through a private provider endpoint
+  uhp proxy                 forward one JSON request from stdin to the selected server
 
 sessions:
   session list [--json]      list default and named server sessions
@@ -311,79 +316,115 @@ server:
   server restart             stop + start (load a newly-installed binary)
   server update-manifest     fetch the latest agent-detection rules from luvus.dev
                              (applies live if the server is up; else on next start)
-  integration install|uninstall <claude|copilot|codex|opencode|kimi|grok>
+  integration install|uninstall <claude|copilot|codex|opencode|kimi|grok|hermes|omp>
                              add/remove luvus's session-resume hook (uninstall
                              removes only luvus's hook, never the agent)
 ";
 
 pub fn run(args: &[String]) -> Result<i32> {
+    run_inner(args).map_err(localize_cli_error)
+}
+
+fn localize_cli_error(error: anyhow::Error) -> anyhow::Error {
+    localize_cli_error_with(error, crate::i18n::cli::Context::configured())
+}
+
+fn localize_cli_error_with(
+    error: anyhow::Error,
+    context: crate::i18n::cli::Context,
+) -> anyhow::Error {
+    let message = error.to_string();
+    let localized = crate::i18n::cli::diagnostic(&message, context.language());
+    if localized == message {
+        error
+    } else {
+        anyhow!(localized.into_owned())
+    }
+}
+
+fn run_inner(args: &[String]) -> Result<i32> {
     if args.get(1).map(String::as_str) == Some("help") {
+        let context = crate::i18n::cli::Context::configured();
+        let language = context.language();
         return match args.get(2).map(String::as_str) {
             None => {
-                print!("{USAGE}{HELP_BUG}");
+                print!("{}", crate::i18n::cli::help(USAGE, language));
+                print!("{}", crate::i18n::cli::help(HELP_BUG, language));
                 Ok(0)
             }
             Some("all") if args.len() == 3 => {
-                print!("{DETAILED_USAGE}{HELP_BUG}");
+                print!("{}", crate::i18n::cli::help(DETAILED_USAGE, language));
+                print!("{}", crate::i18n::cli::help(HELP_BUG, language));
                 Ok(0)
             }
             Some(topic) if matches!(args.len(), 3 | 4) => {
                 let command = args.get(3).map(String::as_str);
-                if write_topic_help(std::io::stdout().lock(), topic, command)? {
+                if write_topic_help(std::io::stdout().lock(), topic, command, language)? {
                     Ok(0)
                 } else {
-                    eprintln!("unknown help topic `{topic}`. Run `luvus --help` for the list.");
+                    eprintln!(
+                        "{} `{topic}`. {}",
+                        context.text("unknown help topic"),
+                        context.text("Run `luvus --help` for the list.")
+                    );
                     Ok(2)
                 }
             }
             _ => {
-                eprintln!("usage: luvus help [all|<topic> [command]]");
+                eprintln!(
+                    "{}",
+                    crate::i18n::cli::help("usage: luvus help [all|<topic> [command]]", language,)
+                );
                 Ok(2)
             }
         };
     }
     if let Some((topic, command)) = command_help_request(args) {
-        write_topic_help(std::io::stdout().lock(), topic, command)?;
+        let context = crate::i18n::cli::Context::configured();
+        write_topic_help(std::io::stdout().lock(), topic, command, context.language())?;
+        return Ok(0);
+    }
+    if args.get(1).map(String::as_str) == Some("uhp") && args.len() == 2 {
+        let context = crate::i18n::cli::Context::configured();
+        write_topic_help(
+            std::io::stdout().lock(),
+            args[1].as_str(),
+            None,
+            context.language(),
+        )?;
         return Ok(0);
     }
     if args.get(1).map(String::as_str) == Some("skill") {
-        return skill_cmd(&args[2.min(args.len())..]);
+        return skill_cmd(
+            &args[2.min(args.len())..],
+            crate::i18n::cli::Context::configured(),
+        );
     }
     if args.get(1).map(String::as_str) == Some("session") {
-        return session_cmd(&args[2.min(args.len())..]);
+        return session_cmd(
+            &args[2.min(args.len())..],
+            crate::i18n::cli::Context::configured(),
+        );
     }
     if args.get(1).map(String::as_str) == Some("theme") {
-        return theme_cmd(&args[2.min(args.len())..]);
+        return theme_cmd(
+            &args[2.min(args.len())..],
+            crate::i18n::cli::Context::configured(),
+        );
     }
-    if args.get(1).map(String::as_str) == Some("api")
+    if args.get(1).map(String::as_str) == Some("uhp")
+        && args.get(2).map(String::as_str) == Some("access")
+    {
+        return crate::uhp::run_cli(
+            &args[3.min(args.len())..],
+            crate::i18n::cli::Context::configured(),
+        );
+    }
+    if args.get(1).map(String::as_str) == Some("uhp")
         && args.get(2).map(String::as_str) == Some("schema")
     {
         if args.len() != 3 {
-            return Err(anyhow!("usage: luvus api schema"));
-        }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&crate::terminal::backend::schema_bundle())?
-        );
-        return Ok(0);
-    }
-    if args.get(1).map(String::as_str) == Some("api")
-        && args.get(2).map(String::as_str) == Some("runtime-schema")
-    {
-        if args.len() != 3 {
-            return Err(anyhow!("usage: luvus api runtime-schema"));
-        }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&crate::runtime_api::schema_bundle())?
-        );
-        return Ok(0);
-    }
-    if args.get(1).map(String::as_str) == Some("api")
-        && args.get(2).map(String::as_str) == Some("socket-schema")
-    {
-        if args.len() != 3 {
-            return Err(anyhow!("usage: luvus api socket-schema"));
+            return Err(anyhow!("usage: luvus uhp schema"));
         }
         println!(
             "{}",
@@ -391,13 +432,13 @@ pub fn run(args: &[String]) -> Result<i32> {
         );
         return Ok(0);
     }
-    if args.get(1).map(String::as_str) == Some("api")
+    if args.get(1).map(String::as_str) == Some("uhp")
         && args.get(2).map(String::as_str) == Some("proxy")
     {
         if args.len() != 3 {
-            return Err(anyhow!("usage: luvus api proxy"));
+            return Err(anyhow!("usage: luvus uhp proxy"));
         }
-        return api_proxy();
+        return uhp_proxy();
     }
     // Explicit update requests are local and never require a running server.
     if args.get(1).map(String::as_str) == Some("update") {
@@ -405,20 +446,20 @@ pub fn run(args: &[String]) -> Result<i32> {
     }
     // `doctor` is a local environment check — no server needed.
     if args.get(1).map(String::as_str) == Some("doctor") {
-        return Ok(doctor());
+        return Ok(doctor(crate::i18n::cli::Context::configured()));
     }
     // `module install` clones + builds locally (with a confirm prompt), then
     // registers over the socket — it isn't a plain request/response.
     if args.get(1).map(String::as_str) == Some("module")
         && args.get(2).map(String::as_str) == Some("install")
     {
-        return module_install(args);
+        return module_install(args, crate::i18n::cli::Context::configured());
     }
     // `module search` is a read-only GitHub lookup — no server involved.
     if args.get(1).map(String::as_str) == Some("module")
         && args.get(2).map(String::as_str) == Some("search")
     {
-        return module_search(args);
+        return module_search(args, crate::i18n::cli::Context::configured());
     }
     // `wait` (docs/18 WA-1) is a client-side poll/stream loop, not a one-shot
     // request — it exits 0 on the condition, 2 on timeout.
@@ -439,8 +480,14 @@ pub fn run(args: &[String]) -> Result<i32> {
     }
     let (method, params) = parse(args)?;
     let path = crate::persist::cli_socket_path();
-    let mut stream = crate::ipc::transport::connect(&path)
-        .map_err(|_| anyhow!("no luvus server running (socket: {})", path.display()))?;
+    let mut stream = crate::ipc::transport::connect(&path).map_err(|_| {
+        let context = crate::i18n::cli::Context::configured();
+        anyhow!(
+            "{} (socket: {})",
+            context.text("no luvus server running"),
+            path.display()
+        )
+    })?;
 
     let req = json!({ "id": "1", "method": method, "params": params });
     writeln!(stream, "{req}")?;
@@ -524,6 +571,7 @@ fn help_topic_has_subcommands(topic: &str) -> bool {
             | "agent"
             | "files"
             | "git"
+            | "mission"
             | "diff"
             | "worktree"
             | "task"
@@ -537,16 +585,16 @@ fn help_topic_has_subcommands(topic: &str) -> bool {
             | "integration"
             | "skill"
             | "wait"
-            | "api"
+            | "uhp"
     )
 }
 
 fn normalize_help_topic(topic: &str) -> Option<&str> {
     match topic {
-        "workspace" | "tab" | "pane" | "agent" | "files" | "git" | "worktree" | "task"
-        | "lease" | "module" | "theme" | "bar" | "ui" | "session" | "server" | "integration"
-        | "diff" | "skill" | "wait" | "search" | "events" | "api" | "ping" | "doctor"
-        | "update" | "attach" => Some(topic),
+        "workspace" | "tab" | "pane" | "agent" | "files" | "git" | "mission" | "worktree"
+        | "task" | "lease" | "module" | "theme" | "bar" | "ui" | "session" | "server"
+        | "integration" | "diff" | "skill" | "wait" | "search" | "events" | "uhp" | "ping"
+        | "doctor" | "update" | "attach" => Some(topic),
         "node" => Some("pane"),
         "remote" | "--remote" => Some("remote"),
         _ => None,
@@ -555,12 +603,68 @@ fn normalize_help_topic(topic: &str) -> Option<&str> {
 
 const HELP_BUG: &str = r#"
 \   /
- \_/
-(o_o)
+ \_/    If you are an AI, read this:
+(o_o)   https://luvus.dev/agent-readme.md
 /|_|\
 "#;
 
+const STATUS_BUG: [&str; 4] = [r"\   /", r" \_/", "(o_o)", r"/|_|\"];
+
+/// Render the Luvus bug beside a compact human-facing status card.
+///
+/// This is deliberately separate from JSON/UHP output: lifecycle commands use
+/// it only for their normal terminal output, so scripts keep their existing
+/// machine-readable contracts.
+pub(crate) fn status_card(title: &str, rows: &[(&str, &str)]) -> String {
+    use std::fmt::Write as _;
+
+    let label_width = rows
+        .iter()
+        .map(|(label, _)| unicode_width::UnicodeWidthStr::width(*label))
+        .max()
+        .unwrap_or(0);
+    let line_count = STATUS_BUG.len().max(rows.len() + 1);
+    let mut output = String::new();
+
+    for line in 0..line_count {
+        let bug = STATUS_BUG.get(line).copied().unwrap_or("");
+        let bug = crate::i18n::cli::pad(bug, 5);
+        if line == 0 {
+            let _ = writeln!(output, "{bug}   {title}");
+        } else if let Some((label, value)) = rows.get(line - 1) {
+            if label.is_empty() {
+                let _ = writeln!(output, "{bug}   {value}");
+            } else {
+                let label = crate::i18n::cli::pad(label, label_width);
+                let _ = writeln!(output, "{bug}   {label}  {value}");
+            }
+        } else {
+            let _ = writeln!(output, "{bug}");
+        }
+    }
+    output
+}
+
+pub(crate) fn print_status_card(title: &str, rows: &[(&str, &str)]) {
+    print!("{}", status_card(title, rows));
+}
+
 fn write_topic_help(
+    mut output: impl Write,
+    requested: &str,
+    command: Option<&str>,
+    language: crate::i18n::cli::Language,
+) -> std::io::Result<bool> {
+    let mut english = Vec::new();
+    let recognized = write_topic_help_english(&mut english, requested, command)?;
+    if recognized {
+        let english = String::from_utf8(english).expect("CLI help is UTF-8");
+        output.write_all(crate::i18n::cli::help(&english, language).as_bytes())?;
+    }
+    Ok(recognized)
+}
+
+fn write_topic_help_english(
     mut output: impl Write,
     requested: &str,
     command: Option<&str>,
@@ -599,7 +703,7 @@ fn write_topic_help(
             detailed_section("panes / agents:\n", "\nsearch:\n"),
         ),
         "skill" => (
-            "luvus skill <status|enable|disable|update|show> [agent|--all] [--url URL]",
+            "luvus skill <enable|status|disable|show>",
             detailed_section("panes / agents:\n", "\nsearch:\n"),
         ),
         "wait" => (
@@ -632,7 +736,11 @@ fn write_topic_help(
         ),
         "git" => (
             "luvus git <status|branches|log|open> [args]",
-            detailed_section("git:\n", "\ndiff review:\n"),
+            detailed_section("git:\n", "\nmission control:\n"),
+        ),
+        "mission" => (
+            "luvus mission open [<workspace>]",
+            detailed_section("mission control:\n", "\ndiff review:\n"),
         ),
         "files" => (
             "luvus files <tree|open|reveal|refresh> [args]",
@@ -665,11 +773,11 @@ fn write_topic_help(
         ),
         "events" => (
             "luvus events",
-            detailed_section("events:\n", "\napi:\n"),
+            detailed_section("events:\n", "\nuniversal harness protocol:\n"),
         ),
-        "api" => (
-            "luvus api <schema|runtime-schema|socket-schema|capabilities|snapshot|events|runtime|session|socket-capabilities|proxy>",
-            detailed_section("api:\n", "\nsessions:\n"),
+        "uhp" => (
+            "luvus uhp <capabilities|schema|snapshot|events|access|proxy>",
+            detailed_section("universal harness protocol:\n", "\nsessions:\n"),
         ),
         "remote" => (
             "luvus [--session <name>] --remote <host> [ssh args]",
@@ -778,30 +886,33 @@ fn detailed_section_to_end(start: &str) -> &'static str {
     &DETAILED_USAGE[start..]
 }
 
-fn session_cmd(args: &[String]) -> Result<i32> {
+fn session_cmd(args: &[String], context: crate::i18n::cli::Context) -> Result<i32> {
     match args.first().map(String::as_str) {
-        Some("list") => session_list(&args[1..]),
-        Some("stop") => session_stop(&args[1..]),
-        Some("delete") => session_delete(&args[1..]),
+        Some("list") => session_list(&args[1..], context),
+        Some("stop") => session_stop(&args[1..], context),
+        Some("delete") => session_delete(&args[1..], context),
         Some("attach")
             if matches!(
                 args.get(1).map(String::as_str),
                 Some("help" | "--help" | "-h")
             ) =>
         {
-            write_session_help(std::io::stdout().lock())?;
+            write_session_help(std::io::stdout().lock(), context)?;
             Ok(0)
         }
         Some("attach") => {
-            eprintln!("usage: luvus session attach <name>");
+            eprintln!(
+                "{}",
+                crate::i18n::cli::help("usage: luvus session attach <name>", context.language(),)
+            );
             Ok(2)
         }
         Some("help" | "--help" | "-h") => {
-            write_session_help(std::io::stdout().lock())?;
+            write_session_help(std::io::stdout().lock(), context)?;
             Ok(0)
         }
         _ => {
-            write_session_help(std::io::stderr().lock())?;
+            write_session_help(std::io::stderr().lock(), context)?;
             Ok(2)
         }
     }
@@ -811,22 +922,30 @@ const SESSION_USAGE: &str = "\
 Usage: luvus session <command>
 
 Commands:
-  list [--json]         List default and named sessions
-  attach <name>        Start or attach to a named session
-  stop <name> [--json] Stop a named session and its panes
-  delete <name> [--json] Delete a stopped named session
+  list [--json]           list default and named server sessions
+  attach <name>           start or attach to the named session
+  stop <name> [--json]    stop only the named session and its panes
+  delete <name> [--json]  delete a stopped named session
 ";
 
-fn write_session_help(mut output: impl Write) -> std::io::Result<()> {
-    output.write_all(SESSION_USAGE.as_bytes())?;
-    output.write_all(HELP_BUG.as_bytes())
+fn write_session_help(
+    mut output: impl Write,
+    context: crate::i18n::cli::Context,
+) -> std::io::Result<()> {
+    output.write_all(crate::i18n::cli::help(SESSION_USAGE, context.language()).as_bytes())?;
+    output.write_all(crate::i18n::cli::help(HELP_BUG, context.language()).as_bytes())
 }
 
-fn session_list(args: &[String]) -> Result<i32> {
+fn session_list(args: &[String], context: crate::i18n::cli::Context) -> Result<i32> {
     let json = match args {
         [] => false,
         [flag] if flag == "--json" => true,
-        _ => return Err(anyhow!("usage: luvus session list [--json]")),
+        _ => {
+            return Err(anyhow!(
+                "{}",
+                crate::i18n::cli::help("usage: luvus session list [--json]", context.language(),)
+            ))
+        }
     };
     let sessions = crate::session::list_sessions()?;
     if json {
@@ -836,33 +955,48 @@ fn session_list(args: &[String]) -> Result<i32> {
         );
         return Ok(0);
     }
-    println!("{:<24} {:<10} directory", "name", "status");
+    println!(
+        "{} {}{}",
+        crate::i18n::cli::pad(context.text("name"), 24),
+        crate::i18n::cli::pad(context.text("status"), 10),
+        context.text("directory")
+    );
     for session in sessions {
         println!(
-            "{:<24} {:<10} {}",
-            session.name,
-            if session.running {
-                "running"
-            } else {
-                "stopped"
-            },
+            "{} {}{}",
+            crate::i18n::cli::pad(&session.name, 24),
+            crate::i18n::cli::pad(
+                if session.running {
+                    context.text("running")
+                } else {
+                    context.text("stopped")
+                },
+                10
+            ),
             session.session_dir
         );
     }
     Ok(0)
 }
 
-fn parse_session_name_and_json<'a>(args: &'a [String], usage: &str) -> Result<(&'a str, bool)> {
+fn parse_session_name_and_json<'a>(
+    args: &'a [String],
+    usage: &str,
+    context: crate::i18n::cli::Context,
+) -> Result<(&'a str, bool)> {
     match args {
         [name] => Ok((name, false)),
         [name, flag] if flag == "--json" => Ok((name, true)),
-        _ => Err(anyhow!(usage.to_string())),
+        _ => Err(anyhow!(
+            "{}",
+            crate::i18n::cli::help(usage, context.language())
+        )),
     }
 }
 
-fn session_stop(args: &[String]) -> Result<i32> {
+fn session_stop(args: &[String], context: crate::i18n::cli::Context) -> Result<i32> {
     let (name, json_output) =
-        parse_session_name_and_json(args, "usage: luvus session stop <name> [--json]")?;
+        parse_session_name_and_json(args, "usage: luvus session stop <name> [--json]", context)?;
     let target = match crate::session::parse_target_name(name) {
         Ok(target) => target,
         Err(message) => return session_error("invalid_session_name", &message, json_output),
@@ -875,7 +1009,7 @@ fn session_stop(args: &[String]) -> Result<i32> {
                     serde_json::to_string_pretty(&json!({"stopped": true, "session": session}))?
                 );
             } else {
-                println!("stopped session {}", session.name);
+                println!("{} {}", context.text("stopped session"), session.name);
             }
             Ok(0)
         }
@@ -883,9 +1017,9 @@ fn session_stop(args: &[String]) -> Result<i32> {
     }
 }
 
-fn session_delete(args: &[String]) -> Result<i32> {
+fn session_delete(args: &[String], context: crate::i18n::cli::Context) -> Result<i32> {
     let (name, json_output) =
-        parse_session_name_and_json(args, "usage: luvus session delete <name> [--json]")?;
+        parse_session_name_and_json(args, "usage: luvus session delete <name> [--json]", context)?;
     match crate::session::delete_session(name) {
         Ok(session) => {
             if json_output {
@@ -894,7 +1028,7 @@ fn session_delete(args: &[String]) -> Result<i32> {
                     serde_json::to_string_pretty(&json!({"deleted": true, "session": session}))?
                 );
             } else {
-                println!("deleted session {}", session.name);
+                println!("{} {}", context.text("deleted session"), session.name);
             }
             Ok(0)
         }
@@ -912,7 +1046,7 @@ fn session_error(code: &str, message: &str, json_output: bool) -> Result<i32> {
     Ok(1)
 }
 
-fn theme_cmd(args: &[String]) -> Result<i32> {
+fn theme_cmd(args: &[String], context: crate::i18n::cli::Context) -> Result<i32> {
     let subcommand = args.first().map(String::as_str).unwrap_or("list");
     let json_output = args.iter().any(|arg| arg == "--json");
     match subcommand {
@@ -935,20 +1069,27 @@ fn theme_cmd(args: &[String]) -> Result<i32> {
                         ' '
                     };
                     let source = match &entry.source {
-                        crate::theme::registry::ThemeSource::BuiltIn => "built-in",
-                        crate::theme::registry::ThemeSource::Local { .. } => "local",
-                        crate::theme::registry::ThemeSource::Virtual => "virtual",
+                        crate::theme::registry::ThemeSource::BuiltIn => context.text("built-in"),
+                        crate::theme::registry::ThemeSource::Local { .. } => context.text("local"),
+                        crate::theme::registry::ThemeSource::Virtual => context.text("virtual"),
                     };
                     println!(
-                        "{marker} {:<28} {:<9} {}",
-                        entry.id, source, entry.description
+                        "{marker} {:<28} {}{}",
+                        entry.id,
+                        crate::i18n::cli::pad(source, 9),
+                        entry.description
                     );
                     for warning in &entry.warnings {
-                        println!("    warning: {warning}");
+                        println!("    {}: {warning}", context.text("warning"));
                     }
                 }
                 for problem in registry.problems() {
-                    eprintln!("invalid {}: {}", problem.path, problem.message);
+                    eprintln!(
+                        "{} {}: {}",
+                        context.text("invalid"),
+                        problem.path,
+                        problem.message
+                    );
                 }
             }
             Ok(if registry.problems().is_empty() { 0 } else { 1 })
@@ -971,7 +1112,7 @@ fn theme_cmd(args: &[String]) -> Result<i32> {
             let parent = flag(args, "--extends");
             let path = std::path::PathBuf::from(format!("{id}.toml"));
             crate::theme::install::init(&path, id, parent.as_deref())?;
-            println!("created {}", path.display());
+            println!("{} {}", context.text("created"), path.display());
             Ok(0)
         }
         "validate" => {
@@ -1015,9 +1156,14 @@ fn theme_cmd(args: &[String]) -> Result<i32> {
                     }))?
                 );
             } else {
-                println!("valid theme: {} ({})", file.display_name, file.id);
+                println!(
+                    "{}: {} ({})",
+                    context.text("valid theme"),
+                    file.display_name,
+                    file.id
+                );
                 for warning in warnings {
-                    println!("warning: {warning}");
+                    println!("{}: {warning}", context.text("warning"));
                 }
             }
             Ok(0)
@@ -1046,19 +1192,22 @@ fn theme_cmd(args: &[String]) -> Result<i32> {
             let installed = crate::theme::install::install(source, yes)?;
             let reloaded = reload_theme_server()?;
             println!(
-                "installed {} ({}) from {} to {}{}",
+                "{} {} ({}) {} {} {} {}{}",
+                context.text("installed"),
                 installed.display_name,
                 installed.id,
+                context.text("from"),
                 installed.source,
+                context.text("to"),
                 installed.path.display(),
                 if reloaded {
-                    " and reloaded the selected server"
+                    format!(" {}", context.text("and reloaded the selected server"))
                 } else {
-                    " — start or reload Luvus to use it"
+                    format!(" — {}", context.text("start or reload Luvus to use it"))
                 }
             );
             for warning in installed.warnings {
-                println!("warning: {warning}");
+                println!("{}: {warning}", context.text("warning"));
             }
             Ok(0)
         }
@@ -1069,20 +1218,25 @@ fn theme_cmd(args: &[String]) -> Result<i32> {
                 .ok_or_else(|| anyhow!("usage: luvus theme use <id>"))?;
             reject_theme_extras(args, 2, "usage: luvus theme use <id>")?;
             let registry = crate::theme::ThemeRegistry::load();
-            let entry = registry
-                .get(id)
-                .ok_or_else(|| anyhow!("theme `{id}` is not installed"))?;
+            let entry = registry.get(id).ok_or_else(|| {
+                anyhow!("theme `{id}` {}", context.text("theme is not installed"))
+            })?;
             let selected = entry.id.clone();
             match send_request("theme.use", json!({"id": selected})) {
                 Ok(response) if !is_unknown_method(&response, "theme.use") => {
                     ensure_api_success(&response)?;
-                    println!("using theme {}", entry.id);
+                    println!("{} {}", context.text("using theme"), entry.id);
                 }
                 Ok(_) | Err(_) => {
                     let mut config = crate::config::load();
                     config.theme = selected;
                     crate::config::save(&config);
-                    println!("using theme {} — applies when Luvus starts", entry.id);
+                    println!(
+                        "{} {} — {}",
+                        context.text("using theme"),
+                        entry.id,
+                        context.text("applies when Luvus starts")
+                    );
                 }
             }
             Ok(0)
@@ -1096,12 +1250,13 @@ fn theme_cmd(args: &[String]) -> Result<i32> {
             let path = crate::theme::install::uninstall(id)?;
             let reloaded = reload_theme_server()?;
             println!(
-                "uninstalled {id} ({}){}",
+                "{} {id} ({}){}",
+                context.text("uninstalled"),
                 path.display(),
                 if reloaded {
-                    " and reloaded the selected server"
+                    format!(" {}", context.text("and reloaded the selected server"))
                 } else {
-                    ""
+                    String::new()
                 }
             );
             Ok(0)
@@ -1111,21 +1266,34 @@ fn theme_cmd(args: &[String]) -> Result<i32> {
             let registry = crate::theme::ThemeRegistry::load();
             if !registry.problems().is_empty() {
                 for problem in registry.problems() {
-                    eprintln!("invalid {}: {}", problem.path, problem.message);
+                    eprintln!(
+                        "{} {}: {}",
+                        context.text("invalid"),
+                        problem.path,
+                        problem.message
+                    );
                 }
             }
             if reload_theme_server()? {
-                println!("reloaded {} themes", registry.entries().len());
+                println!(
+                    "{} {} {}",
+                    context.text("reloaded"),
+                    registry.entries().len(),
+                    context.text("themes")
+                );
             } else {
                 println!(
-                    "validated {} themes — start Luvus to load them",
-                    registry.entries().len()
+                    "{} {} {} — {}",
+                    context.text("validated"),
+                    registry.entries().len(),
+                    context.text("themes"),
+                    context.text("start Luvus to load them")
                 );
             }
             Ok(if registry.problems().is_empty() { 0 } else { 1 })
         }
         "help" | "--help" | "-h" => {
-            write_topic_help(std::io::stdout().lock(), "theme", None)?;
+            write_topic_help(std::io::stdout().lock(), "theme", None, context.language())?;
             Ok(0)
         }
         _ => Err(anyhow!(
@@ -1176,7 +1344,7 @@ fn reload_theme_server() -> Result<bool> {
 
 /// `luvus module install owner/repo[/sub] [--ref REF] [--yes]` — clone + build
 /// locally, then register over the socket (or directly if the server is down).
-fn module_install(args: &[String]) -> Result<i32> {
+fn module_install(args: &[String], context: crate::i18n::cli::Context) -> Result<i32> {
     let spec = args
         .get(3)
         .filter(|s| !s.starts_with("--"))
@@ -1198,15 +1366,23 @@ fn module_install(args: &[String]) -> Result<i32> {
             Ok(1)
         }
         Ok(_) => {
-            println!("installed {} ({})", installed.id, installed.source);
+            println!(
+                "{} {} ({})",
+                context.text("installed"),
+                installed.id,
+                installed.source
+            );
             Ok(0)
         }
         Err(_) => {
             // Server down: write the registry directly; it loads on next start.
             register_directly(&installed)?;
             println!(
-                "installed {} ({}) — start luvus to use it",
-                installed.id, installed.source
+                "{} {} ({}) — {}",
+                context.text("installed"),
+                installed.id,
+                installed.source,
+                context.text("start luvus to use it")
             );
             Ok(0)
         }
@@ -1217,7 +1393,7 @@ fn module_install(args: &[String]) -> Result<i32> {
 /// multiplexer needs none of them; this just tells a fresh install (esp. via
 /// `cargo install`, which can't pull in system tools) what each missing tool
 /// would unlock and how to get it. Always exits 0 — nothing here is fatal.
-fn doctor() -> i32 {
+fn doctor(context: crate::i18n::cli::Context) -> i32 {
     use std::process::Command;
     // Run `<cmd> <arg>` and return its first non-empty version line, if it runs.
     let probe = |cmd: &str, arg: &str| -> Option<String> {
@@ -1235,7 +1411,10 @@ fn doctor() -> i32 {
     };
 
     println!("luvus {}\n", env!("CARGO_PKG_VERSION"));
-    println!("  ✓ core    the multiplexer (panes · tabs · agents) needs no external tools\n");
+    println!(
+        "  ✓ core    {}\n",
+        context.text("the multiplexer (panes · tabs · agents) needs no external tools")
+    );
 
     // (name, cmd, version-arg, what it unlocks, required?, install hint)
     let tools = [
@@ -1251,7 +1430,7 @@ fn doctor() -> i32 {
             "gh",
             "gh",
             "--version",
-            "GitHub PRs & issues",
+            context.text("GitHub PRs & issues"),
             false,
             "https://cli.github.com  (brew install gh)",
         ),
@@ -1261,7 +1440,7 @@ fn doctor() -> i32 {
             "-V",
             "luvus --remote",
             false,
-            "preinstalled on macOS/Linux",
+            context.text("preinstalled on macOS/Linux"),
         ),
         (
             "curl",
@@ -1285,11 +1464,27 @@ fn doctor() -> i32 {
                 if required {
                     missing_git = true;
                 }
-                let kind = if required { "needed for" } else { "optional -" };
-                println!("  ✗ {name:<6}not found · {kind} {unlocks}");
+                let kind = if required {
+                    context.text("needed for")
+                } else {
+                    context.text("optional -")
+                };
+                println!(
+                    "  ✗ {name:<6}{} · {kind} {unlocks}",
+                    context.text("not found")
+                );
                 println!("           ↳ {hint}");
             }
         }
+    }
+
+    let log_dir = crate::logging::resolved_dir();
+    println!();
+    println!("  · logs    {}", log_dir.display());
+    if crate::logging::log_dir_writable() {
+        println!("  ✓ logs    {}", context.text("directory writable"));
+    } else {
+        println!("  ✗ logs    {}", context.text("not writable"));
     }
 
     // Whether this terminal can tell Shift+Enter from Enter. Legacy encoding
@@ -1298,27 +1493,41 @@ fn doctor() -> i32 {
     println!();
     match keyboard_protocol_status() {
         KeyProto::InsidePane => {
-            println!("  · keys    run `luvus doctor` outside a luvus pane to test your terminal");
+            println!(
+                "  · keys    {}",
+                context.text("run `luvus doctor` outside a luvus pane to test your terminal")
+            );
         }
         KeyProto::Supported => {
-            println!("  ✓ keys    Shift+Enter works (terminal reports modified keys)");
+            println!(
+                "  ✓ keys    {}",
+                context.text("Shift+Enter works (terminal reports modified keys)")
+            );
         }
         KeyProto::Unsupported => {
             let is_wsl = std::env::var_os("WSL_DISTRO_NAME").is_some()
                 || std::env::var_os("WSL_INTEROP").is_some();
             let in_windows_terminal = std::env::var_os("WT_SESSION").is_some();
             let (detail, action) = unsupported_key_guidance(is_wsl, in_windows_terminal);
-            println!("  ! keys    Shift+Enter isn't distinguishable here · optional");
-            println!("           ↳ {detail}");
-            println!("             {action}");
+            println!(
+                "  ! keys    {}",
+                context.text("Shift+Enter isn't distinguishable here · optional")
+            );
+            println!("           ↳ {}", context.text(detail));
+            println!("             {}", context.text(action));
         }
     }
 
     println!();
     if missing_git {
-        println!("Tip: install `git` to use the git tab & worktrees. Everything else works now.");
+        println!(
+            "{}",
+            context.text(
+                "Tip: install `git` to use the git tab & worktrees. Everything else works now."
+            )
+        );
     } else {
-        println!("All set — you're good to go. ✓");
+        println!("{}", context.text("All set — you're good to go. ✓"));
     }
     0
 }
@@ -1391,7 +1600,7 @@ fn keyboard_protocol_status() -> KeyProto {
 
 /// `luvus module search [<query>]` — list modules published to the
 /// `luvus-module` GitHub topic. Read-only; doesn't need a running server.
-fn module_search(args: &[String]) -> Result<i32> {
+fn module_search(args: &[String], context: crate::i18n::cli::Context) -> Result<i32> {
     let terms: Vec<&str> = args
         .get(3..)
         .unwrap_or(&[])
@@ -1403,8 +1612,14 @@ fn module_search(args: &[String]) -> Result<i32> {
 
     let hits = crate::module::discovery::search(query.as_deref())?;
     if hits.is_empty() {
-        println!("No modules found in the `luvus-module` topic yet.");
-        println!("Publish one by tagging a public repo with the `luvus-module` topic.");
+        println!(
+            "{}",
+            context.text("No modules found in the `luvus-module` topic yet.")
+        );
+        println!(
+            "{}",
+            context.text("Publish one by tagging a public repo with the `luvus-module` topic.")
+        );
         return Ok(0);
     }
     for h in &hits {
@@ -1417,8 +1632,9 @@ fn module_search(args: &[String]) -> Result<i32> {
         }
     }
     println!(
-        "\n{} result(s). Install with:  luvus module install <owner>/<repo>",
-        hits.len()
+        "\n{} {}  luvus module install <owner>/<repo>",
+        hits.len(),
+        context.text("results. Install with:")
     );
     Ok(0)
 }
@@ -1675,221 +1891,130 @@ fn validate_agent_start_options(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn confirm_legacy_all_from(
-    command: &str,
-    interactive: bool,
-    input: &mut impl BufRead,
-    output: &mut impl Write,
-) -> Result<bool> {
-    if !interactive {
-        return Err(anyhow!(
-            "deprecated `skill {command} --all` requires an interactive confirmation; use the explicit per-agent commands instead"
-        ));
-    }
-    write!(
-        output,
-        "Apply `skill {command}` to claude, codex, and opencode? [y/N] "
-    )?;
-    output.flush()?;
-    let mut answer = String::new();
-    input.read_line(&mut answer)?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
-}
-
-fn confirm_legacy_all(command: &str) -> Result<bool> {
-    let stdin = std::io::stdin();
-    let mut input = stdin.lock();
-    let mut output = std::io::stderr().lock();
-    confirm_legacy_all_from(command, stdin.is_terminal(), &mut input, &mut output)
-}
-
-/// Manage explicit, per-agent skill installations. No server is required and
-/// no command here changes agent configuration unless the user names an agent
-/// (or passes `--all`).
-fn skill_cmd(rest: &[String]) -> Result<i32> {
-    use crate::skill::SkillAgent;
-
-    fn agent(value: Option<&String>) -> Result<SkillAgent> {
-        value
-            .filter(|value| !value.starts_with('-'))
-            .ok_or_else(|| anyhow!("an agent is required: claude, codex, or opencode"))?
-            .parse()
-    }
-
-    fn manifest_url(args: &[String]) -> String {
-        flag(args, "--url")
-            .or_else(|| std::env::var("LUVUS_SKILL_MANIFEST_URL").ok())
-            .or_else(|| std::env::var("LUVUS_SKILL_URL").ok())
-            .unwrap_or_else(|| crate::skill::DEFAULT_MANIFEST_URL.to_string())
-    }
-
-    fn print_status(status: crate::skill::SkillStatus) {
-        match status.installed {
-            Some(installed) => println!(
-                "{}\tenabled\t{}\t{}\t{}\t{}",
-                status.agent,
-                installed.release,
-                status
-                    .integrity
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                installed.target.display(),
-                installed.source
-            ),
-            None => println!("{}\tdisabled", status.agent),
+/// Manage the one bundled, version-matched Luvus skill. Host-specific paths are
+/// reported as installation details, never exposed as separate skills.
+fn skill_cmd(rest: &[String], context: crate::i18n::cli::Context) -> Result<i32> {
+    fn no_arguments(rest: &[String], context: crate::i18n::cli::Context) -> Result<()> {
+        if let Some(argument) = rest.get(1) {
+            return Err(anyhow!(
+                "{}; `luvus skill {}` {} ({} `{argument}`)",
+                context.text("agent-specific skill management was removed"),
+                rest[0],
+                context.text("accepts no arguments"),
+                context.text("unexpected")
+            ));
         }
+        Ok(())
     }
 
-    let mut positionals = Vec::new();
-    let mut index = 1;
-    while index < rest.len() {
-        match rest[index].as_str() {
-            "--all" => index += 1,
-            "--url" => {
-                if rest.get(index + 1).is_none() {
-                    return Err(anyhow!("--url requires a manifest URL"));
-                }
-                index += 2;
-            }
-            flag if flag.starts_with('-') => {
-                return Err(anyhow!("unknown skill option `{flag}`"));
-            }
-            _ => {
-                positionals.push(&rest[index]);
-                index += 1;
-            }
-        }
-    }
-    if positionals.len() > 1 {
-        return Err(anyhow!("skill commands accept at most one agent"));
+    fn state_label(
+        state: crate::skill::DestinationState,
+        context: crate::i18n::cli::Context,
+    ) -> &'static str {
+        context.text(state.as_str())
     }
 
-    let all = rest.iter().any(|value| value == "--all");
-    let has_url = rest.iter().any(|value| value == "--url");
+    fn action_label(
+        action: crate::skill::ChangeAction,
+        context: crate::i18n::cli::Context,
+    ) -> &'static str {
+        context.text(action.as_str())
+    }
+
     match rest.first().map(String::as_str) {
         None | Some("status") => {
-            if all || has_url {
-                return Err(anyhow!("`skill status` accepts only an optional agent"));
-            }
-            if let Some(value) = positionals.first() {
-                print_status(crate::skill::status(value.parse()?)?);
+            no_arguments(rest, context)?;
+            let statuses = crate::skill::status()?;
+            let summary = if statuses.iter().any(|status| {
+                matches!(
+                    status.state,
+                    crate::skill::DestinationState::Modified
+                        | crate::skill::DestinationState::Missing
+                        | crate::skill::DestinationState::Outdated
+                )
+            }) {
+                context.text("attention")
+            } else if statuses.iter().any(|status| {
+                matches!(
+                    status.state,
+                    crate::skill::DestinationState::Current
+                        | crate::skill::DestinationState::ExternalCurrent
+                        | crate::skill::DestinationState::External
+                )
+            }) {
+                context.text("enabled")
             } else {
-                for status in crate::skill::statuses()? {
-                    print_status(status);
-                }
-            }
-            Ok(0)
-        }
-        Some("enable" | "install") => {
-            if rest[0] == "install" {
-                eprintln!("warning: `skill install` is deprecated; use `skill enable`");
-            }
-            let agents = if all {
-                SkillAgent::ALL.to_vec()
-            } else {
-                vec![agent(positionals.first().copied())?]
+                context.text("disabled")
             };
-            for installed in crate::skill::enable(&agents, &manifest_url(rest))? {
+            println!(
+                "{}\t{}\t{}",
+                context.text("bundled"),
+                crate::skill::bundled_release(),
+                context.text("available")
+            );
+            println!("{}\t{summary}", context.text("installations"));
+            for status in statuses {
                 println!(
-                    "enabled skill {} at {}",
-                    installed.release,
-                    installed.target.display()
+                    "{}\t{}\t{}\t{}",
+                    status.host,
+                    state_label(status.state, context),
+                    status.managed_release.as_deref().unwrap_or("-"),
+                    status.target.display()
                 );
             }
             Ok(0)
         }
-        Some("disable" | "uninstall") => {
-            if has_url {
-                return Err(anyhow!("`skill disable` does not accept --url"));
+        Some("enable") => {
+            no_arguments(rest, context)?;
+            let mut incomplete = false;
+            for change in crate::skill::enable()? {
+                incomplete |= change.action == crate::skill::ChangeAction::PreservedModified;
+                println!(
+                    "{}\t{}\t{}",
+                    change.host,
+                    action_label(change.action, context),
+                    change.target.display()
+                );
             }
-            if rest[0] == "uninstall" {
-                eprintln!("warning: `skill uninstall` is deprecated; use `skill disable`");
-            }
-            let agents = if all {
-                SkillAgent::ALL.to_vec()
-            } else {
-                vec![agent(positionals.first().copied())?]
-            };
-            for agent in agents {
-                match crate::skill::disable(agent)? {
-                    Some(path) => println!("disabled {agent} skill at {}", path.display()),
-                    None => println!("{agent} skill is already disabled"),
-                }
-            }
-            Ok(0)
+            Ok(if incomplete { 2 } else { 0 })
         }
-        Some("update") => {
-            if all {
-                return Err(anyhow!(
-                    "`skill update` already updates every enabled agent; omit --all"
-                ));
+        Some("disable") => {
+            no_arguments(rest, context)?;
+            let mut incomplete = false;
+            for change in crate::skill::disable()? {
+                incomplete |= change.action == crate::skill::ChangeAction::PreservedModified;
+                println!(
+                    "{}\t{}\t{}",
+                    change.host,
+                    action_label(change.action, context),
+                    change.target.display()
+                );
             }
-            let selected = positionals.first().map(|value| value.parse()).transpose()?;
-            let updated = crate::skill::update(selected, &manifest_url(rest))?;
-            if updated.is_empty() {
-                println!("no agent skills are enabled; nothing to update");
-            } else {
-                for installed in updated {
-                    println!(
-                        "updated skill {} at {}",
-                        installed.release,
-                        installed.target.display()
-                    );
-                }
-            }
-            Ok(0)
+            Ok(if incomplete { 2 } else { 0 })
         }
         Some("show") => {
-            if all || has_url {
-                return Err(anyhow!("`skill show` accepts exactly one agent"));
-            }
-            print!(
-                "{}",
-                crate::skill::show(agent(positionals.first().copied())?)?
-            );
+            no_arguments(rest, context)?;
+            print!("{}", crate::skill::show());
             Ok(0)
         }
-        Some("on" | "off") => {
-            if !all || !positionals.is_empty() || (rest[0] == "off" && has_url) {
-                return Err(anyhow!(
-                    "`skill {}` is deprecated; use `luvus skill {} <agent>`, or pass --all for interactive compatibility",
-                    rest[0],
-                    if rest[0] == "on" { "enable" } else { "disable" }
-                ));
-            }
-            eprintln!(
-                "warning: `skill {}` is deprecated; use `skill {} --all`",
-                rest[0],
-                if rest[0] == "on" { "enable" } else { "disable" }
-            );
-            if !confirm_legacy_all(&rest[0])? {
-                println!("cancelled; no agent skills changed");
-                return Ok(0);
-            }
-            if rest[0] == "on" {
-                for installed in crate::skill::enable(&SkillAgent::ALL, &manifest_url(rest))? {
-                    println!(
-                        "enabled skill {} at {}",
-                        installed.release,
-                        installed.target.display()
-                    );
-                }
+        Some("update") => Err(anyhow!(context.text(
+            "`luvus skill update` was removed; update Luvus, then run `luvus skill enable` to install its version-matched skill"
+        ))),
+        Some("install" | "uninstall" | "on" | "off") => {
+            let replacement = if matches!(rest[0].as_str(), "install" | "on") {
+                "enable"
             } else {
-                for agent in SkillAgent::ALL {
-                    match crate::skill::disable(agent)? {
-                        Some(path) => println!("disabled {agent} skill at {}", path.display()),
-                        None => println!("{agent} skill is already disabled"),
-                    }
-                }
-            }
-            Ok(0)
+                "disable"
+            };
+            Err(anyhow!(context.render(
+                "`luvus skill {command}` was removed; use `luvus skill {replacement}`",
+                &[("command", &rest[0]), ("replacement", replacement)],
+            )))
         }
-        Some(command) => Err(anyhow!(
-            "unknown skill command `{command}`; expected status, enable, disable, update, or show"
-        )),
+        Some(command) => Err(anyhow!(context.render(
+            "unknown skill command `{command}`; expected enable, status, disable, or show",
+            &[("command", command)],
+        ))),
     }
 }
 
@@ -1993,8 +2118,12 @@ fn pane_status(pane: &str) -> Result<Option<String>> {
 /// never missed (it's already buffered on the stream).
 fn wait_status_stream(pane: &str, target: &str, deadline: Option<Instant>) -> Result<i32> {
     let path = crate::persist::cli_socket_path();
-    let stream =
-        crate::ipc::transport::connect(&path).map_err(|_| anyhow!("no luvus server running"))?;
+    let stream = crate::ipc::transport::connect(&path).map_err(|_| {
+        anyhow!(
+            "{}",
+            crate::i18n::cli::Context::configured().text("no luvus server running")
+        )
+    })?;
     let mut writer = stream.clone();
     writeln!(
         writer,
@@ -2052,8 +2181,12 @@ pub fn request_attach(pane: &str) -> Result<()> {
 /// One request/response over the control socket.
 pub(crate) fn send_request(method: &str, params: Value) -> Result<Value> {
     let path = crate::persist::cli_socket_path();
-    let mut stream =
-        crate::ipc::transport::connect(&path).map_err(|_| anyhow!("no luvus server running"))?;
+    let mut stream = crate::ipc::transport::connect(&path).map_err(|_| {
+        anyhow!(
+            "{}",
+            crate::i18n::cli::Context::configured().text("no luvus server running")
+        )
+    })?;
     let req = json!({ "id": "1", "method": method, "params": params });
     writeln!(stream, "{req}")?;
     let mut reader = BufReader::new(stream);
@@ -2065,8 +2198,8 @@ pub(crate) fn send_request(method: &str, params: Value) -> Result<Value> {
 /// sockets or Windows named pipes directly. This is intentionally not a shell
 /// wrapper: it forwards one bounded protocol frame to the selected session and
 /// writes one bounded response. It composes over SSH as
-/// `ssh host luvus api proxy` without opening a network listener.
-fn api_proxy() -> Result<i32> {
+/// `ssh host luvus uhp proxy` without opening a network listener.
+fn uhp_proxy() -> Result<i32> {
     let mut input = std::io::BufReader::new(std::io::stdin().lock());
     let request = crate::ipc::api::read_request_frame(&mut input)
         .map_err(|error| anyhow!("invalid request frame: {error}"))?;
@@ -2262,14 +2395,20 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
     let noun = args.get(1).map(String::as_str).unwrap_or("");
     let verb = args.get(2).map(String::as_str).unwrap_or("");
     let rest = &args[3.min(args.len())..];
-    if noun == "api"
-        && matches!(
-            verb,
-            "capabilities" | "snapshot" | "events" | "runtime" | "session" | "socket-capabilities"
-        )
-        && !rest.is_empty()
-    {
-        return Err(anyhow!("luvus api {verb} does not accept arguments"));
+    if noun == "uhp" {
+        if !rest.is_empty() {
+            return Err(anyhow!(
+                "usage: luvus uhp <capabilities|schema|snapshot|events|access|proxy>"
+            ));
+        }
+        return match verb {
+            "capabilities" => Ok(("uhp.capabilities".into(), json!({}))),
+            "snapshot" => Ok(("session.snapshot".into(), json!({}))),
+            "events" => Ok(("events.subscribe".into(), json!({}))),
+            _ => Err(anyhow!(
+                "usage: luvus uhp <capabilities|schema|snapshot|events|access|proxy>"
+            )),
+        };
     }
 
     // The pane id is the first numeric positional, else $LUVUS_PANE_ID.
@@ -2333,24 +2472,6 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
     Ok(match (noun, verb) {
         ("ping", _) => ("ping".into(), json!({})),
         ("events", _) => ("events.subscribe".into(), json!({})),
-        ("api", "capabilities") => (
-            "terminal.backend.capabilities".into(),
-            json!({"protocol":{
-                "name":crate::terminal::backend::PROTOCOL_NAME,
-                "major":crate::terminal::backend::PROTOCOL_MAJOR,
-                "minor":crate::terminal::backend::PROTOCOL_MINOR,
-            }}),
-        ),
-        ("api", "snapshot") => ("terminal.backend.snapshot".into(), json!({})),
-        ("api", "events") => ("terminal.backend.events.subscribe".into(), json!({})),
-        ("api", "runtime") => ("runtime.capabilities".into(), json!({})),
-        ("api", "session") => ("session.snapshot".into(), json!({})),
-        ("api", "socket-capabilities") => ("socket.capabilities".into(), json!({})),
-        ("api", _) => {
-            return Err(anyhow!(
-                "usage: luvus api schema|runtime-schema|socket-schema|capabilities|snapshot|events|runtime|session|socket-capabilities|proxy"
-            ));
-        }
         // Exact scrollback search remains the default for script compatibility.
         // The universal finder is deliberately opt-in through `--fuzzy`.
         ("search", _) => {
@@ -3415,6 +3536,12 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             ("git.log".into(), Value::Object(obj))
         }
         ("git", "open") => ("git.open".into(), one("workspace", arg0())),
+        ("mission", "open") => ("mission.open".into(), one("workspace", arg0())),
+        ("mission", other) => {
+            return Err(anyhow!(
+                "unknown mission command `{other}`. Try `luvus help mission`."
+            ))
+        }
         ("files", "open") => {
             let mut obj = serde_json::Map::new();
             obj.insert("path".to_string(), json!(arg0().unwrap_or_default()));
@@ -3455,6 +3582,15 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             if let Some(a) = flag(args, "--agent") {
                 obj.insert("agent".into(), json!(a));
             }
+            if let Some(mode) = flag(args, "--mode") {
+                if !matches!(mode.as_str(), "worktree" | "workspace") {
+                    return Err(anyhow!("--mode must be worktree or workspace"));
+                }
+                obj.insert("mode".into(), json!(mode));
+            }
+            if let Some(workspace_id) = flag(args, "--workspace-id") {
+                obj.insert("workspace_id".into(), json!(workspace_id));
+            }
             let pv = pane();
             if !pv.is_null() {
                 obj.insert("pane".into(), pv);
@@ -3481,6 +3617,15 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             }
             if let Some(a) = flag(args, "--agent") {
                 obj.insert("agent".into(), json!(a));
+            }
+            if let Some(mode) = flag(args, "--mode") {
+                if !matches!(mode.as_str(), "worktree" | "workspace") {
+                    return Err(anyhow!("--mode must be worktree or workspace"));
+                }
+                obj.insert("mode".into(), json!(mode));
+            }
+            if let Some(workspace_id) = flag(args, "--workspace-id") {
+                obj.insert("workspace_id".into(), json!(workspace_id));
             }
             ("task.start".into(), Value::Object(obj))
         }
@@ -3587,6 +3732,37 @@ fn parse_setting_value(s: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    #[test]
+    fn status_card_keeps_the_bug_and_rows_aligned() {
+        let card = status_card(
+            "Luvus server",
+            &[("status", "running"), ("session", "default")],
+        );
+        assert_eq!(
+            card,
+            "\\   /   Luvus server\n \\_/    status   running\n(o_o)   session  default\n/|_|\\\n"
+        );
+    }
+
+    #[test]
+    fn cli_error_localization_translates_catalogued_diagnostics_only() {
+        let context = crate::i18n::cli::Context::for_language(crate::i18n::cli::Language::Zh);
+        let localized =
+            localize_cli_error_with(anyhow!("unknown command. Try `luvus --help`."), context);
+        assert_eq!(localized.to_string(), "未知命令。请运行 `luvus --help`。");
+
+        let skill_error = skill_cmd(&["mystery".into()], context).unwrap_err();
+        assert_eq!(
+            skill_error.to_string(),
+            "未知技能命令 `mystery`。应为 enable、status、disable 或 show"
+        );
+
+        let server_message = "remote policy rejected request: permission denied";
+        let unchanged = localize_cli_error_with(anyhow!(server_message), context);
+        assert_eq!(unchanged.to_string(), server_message);
+    }
 
     fn argv(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
@@ -3594,8 +3770,51 @@ mod tests {
 
     fn rendered_topic_help(topic: &str, command: Option<&str>) -> String {
         let mut output = Vec::new();
-        assert!(write_topic_help(&mut output, topic, command).unwrap());
+        assert!(
+            write_topic_help(&mut output, topic, command, crate::i18n::cli::Language::En,).unwrap()
+        );
         String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn complete_help_translates_every_human_line() {
+        let untranslated = DETAILED_USAGE
+            .lines()
+            .filter(|english| {
+                let trimmed = english.trim();
+                let command_without_description = matches!(
+                    trimmed.split_whitespace().next(),
+                    Some(
+                        "agent"
+                            | "wait"
+                            | "search"
+                            | "bar"
+                            | "ui"
+                            | "module"
+                            | "diff"
+                            | "task"
+                            | "integration"
+                    )
+                ) && !trimmed.contains("  ");
+                if trimmed.is_empty()
+                    || trimmed.starts_with("[--limit ")
+                    || trimmed.starts_with("[--placement ")
+                    || trimmed.starts_with("[--end-line ")
+                    || command_without_description
+                    || trimmed.starts_with("session attach <name>")
+                    || trimmed == "(applies live if the server is up; else on next start)"
+                {
+                    false
+                } else {
+                    crate::i18n::cli::help(english, crate::i18n::cli::Language::Zh) == *english
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            untranslated.is_empty(),
+            "untranslated CLI help lines:\n{}",
+            untranslated.join("\n")
+        );
     }
 
     #[test]
@@ -3614,13 +3833,14 @@ mod tests {
             ("ui", "ui"),
             ("module", "module"),
             ("git", "git"),
+            ("mission", "mission"),
             ("files", "files"),
             ("diff", "diff"),
             ("worktree", "worktree"),
             ("task", "task"),
             ("lease", "lease"),
             ("events", "events"),
-            ("api", "api"),
+            ("uhp", "uhp"),
             ("remote", "--remote"),
             ("server", "server"),
             ("integration", "integration"),
@@ -3647,6 +3867,120 @@ mod tests {
                 "{topic} help contains another family: {rows:?}"
             );
         }
+    }
+
+    #[test]
+    fn every_command_family_localizes_in_every_supported_language() {
+        let command_section = USAGE
+            .split_once("Commands:\n")
+            .expect("compact help has a Commands section")
+            .1
+            .split_once("\nExamples:\n")
+            .expect("compact help has an Examples section")
+            .0;
+        let mut topics = command_section
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .collect::<Vec<_>>();
+        // `node` is the retained compatibility alias for `pane`, so it is not
+        // advertised as a separate family but must keep the same localized help.
+        topics.push("node");
+        let languages = [
+            crate::i18n::cli::Language::Es,
+            crate::i18n::cli::Language::Pt,
+            crate::i18n::cli::Language::Fr,
+            crate::i18n::cli::Language::De,
+            crate::i18n::cli::Language::Id,
+            crate::i18n::cli::Language::Zh,
+            crate::i18n::cli::Language::Ja,
+            crate::i18n::cli::Language::Ko,
+        ];
+
+        for topic in topics {
+            assert!(
+                normalize_help_topic(topic).is_some(),
+                "published command family `{topic}` has no help route"
+            );
+            let english = rendered_topic_help(topic, None);
+            for language in languages {
+                let mut output = Vec::new();
+                assert!(write_topic_help(&mut output, topic, None, language).unwrap());
+                let localized = String::from_utf8(output).unwrap();
+                assert_ne!(localized, english, "{topic} stayed English in {language:?}");
+                assert!(localized.contains("luvus"), "{topic} lost canonical syntax");
+                assert!(
+                    localized.contains("https://luvus.dev/agent-readme.md"),
+                    "{topic} changed the agent guide URL"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_help_and_skill_states_use_the_cli_catalog() {
+        for language in [
+            crate::i18n::cli::Language::Es,
+            crate::i18n::cli::Language::Pt,
+            crate::i18n::cli::Language::Fr,
+            crate::i18n::cli::Language::De,
+            crate::i18n::cli::Language::Id,
+            crate::i18n::cli::Language::Zh,
+            crate::i18n::cli::Language::Ja,
+            crate::i18n::cli::Language::Ko,
+        ] {
+            let mut session = Vec::new();
+            assert!(write_topic_help(&mut session, "session", None, language).unwrap());
+            let session = String::from_utf8(session).unwrap();
+            for english in [
+                "list default and named server sessions",
+                "start or attach to the named session",
+                "stop only the named session and its panes",
+                "delete a stopped named session",
+            ] {
+                assert!(
+                    !session.contains(english),
+                    "session help kept `{english}` in {language:?}"
+                );
+            }
+
+            let context = crate::i18n::cli::Context::for_language(language);
+            for state in [
+                crate::skill::DestinationState::Current,
+                crate::skill::DestinationState::Outdated,
+                crate::skill::DestinationState::Missing,
+                crate::skill::DestinationState::Modified,
+                crate::skill::DestinationState::ExternalCurrent,
+                crate::skill::DestinationState::External,
+                crate::skill::DestinationState::Available,
+                crate::skill::DestinationState::NotDetected,
+            ] {
+                assert_ne!(context.text(state.as_str()), state.as_str());
+            }
+            for action in [
+                crate::skill::ChangeAction::Installed,
+                crate::skill::ChangeAction::Refreshed,
+                crate::skill::ChangeAction::Repaired,
+                crate::skill::ChangeAction::Current,
+                crate::skill::ChangeAction::External,
+                crate::skill::ChangeAction::PreservedModified,
+                crate::skill::ChangeAction::Disabled,
+                crate::skill::ChangeAction::AlreadyDisabled,
+            ] {
+                assert_ne!(context.text(action.as_str()), action.as_str());
+            }
+        }
+
+        let mut chinese = Vec::new();
+        assert!(write_topic_help(
+            &mut chinese,
+            "session",
+            None,
+            crate::i18n::cli::Language::Zh
+        )
+        .unwrap());
+        let chinese = String::from_utf8(chinese).unwrap();
+        assert!(chinese.contains("列出默认和命名服务器会话"));
+        assert!(chinese.contains("启动或连接到命名会话"));
     }
 
     #[test]
@@ -3679,40 +4013,37 @@ mod tests {
     }
 
     #[test]
-    fn terminal_backend_api_commands_are_first_class_cli_routes() {
-        assert!(is_cli(&argv("luvus api schema")));
-        let (method, params) = parse(&argv("luvus api capabilities")).unwrap();
-        assert_eq!(method, "terminal.backend.capabilities");
-        assert_eq!(params["protocol"]["major"], 1);
-        assert_eq!(params["protocol"]["minor"], 0);
-        let (method, params) = parse(&argv("luvus api snapshot")).unwrap();
-        assert_eq!(method, "terminal.backend.snapshot");
-        assert_eq!(params, json!({}));
-        let (method, _) = parse(&argv("luvus api events")).unwrap();
-        assert_eq!(method, "terminal.backend.events.subscribe");
+    fn uhp_is_the_single_public_protocol_cli_route() {
+        assert!(is_cli(&argv("luvus uhp capabilities")));
         assert_eq!(
-            parse(&argv("luvus api runtime")).unwrap().0,
-            "runtime.capabilities"
+            parse(&argv("luvus uhp capabilities")).unwrap().0,
+            "uhp.capabilities"
         );
         assert_eq!(
-            parse(&argv("luvus api session")).unwrap().0,
+            parse(&argv("luvus uhp snapshot")).unwrap().0,
             "session.snapshot"
         );
         assert_eq!(
-            parse(&argv("luvus api socket-capabilities")).unwrap().0,
-            "socket.capabilities"
+            parse(&argv("luvus uhp events")).unwrap().0,
+            "events.subscribe"
         );
-        for command in [
-            "capabilities",
-            "snapshot",
-            "events",
-            "runtime",
-            "session",
-            "socket-capabilities",
-        ] {
-            assert!(
-                parse(&argv(&format!("luvus api {command} unexpected"))).is_err(),
-                "api {command} must reject trailing arguments"
+        assert!(parse(&argv("luvus uhp capabilities extra")).is_err());
+        assert_eq!(
+            parse(&argv("luvus socket capabilities"))
+                .unwrap_err()
+                .to_string(),
+            "unknown command. Try `luvus --help`."
+        );
+    }
+
+    #[test]
+    fn unreleased_api_aliases_are_rejected() {
+        for command in ["luvus api schema", "luvus logs server"] {
+            let args = argv(command);
+            assert!(is_cli(&args));
+            assert_eq!(
+                parse(&args).unwrap_err().to_string(),
+                "unknown command. Try `luvus --help`."
             );
         }
     }
@@ -3754,6 +4085,7 @@ mod tests {
             ("luvus pane split --help", Some(("pane", Some("split")))),
             ("luvus module install -h", Some(("module", Some("install")))),
             ("luvus update --help", Some(("update", None))),
+            ("luvus uhp access --help", Some(("uhp", Some("access")))),
         ] {
             let args = argv(raw);
             assert_eq!(command_help_request(&args), expected, "{raw}");
@@ -3764,6 +4096,13 @@ mod tests {
     fn update_is_a_top_level_local_cli_command() {
         assert!(is_cli(&argv("luvus update")));
         assert!(!help_topic_has_subcommands("update"));
+    }
+
+    #[test]
+    fn uhp_help_includes_transport_neutral_access() {
+        let help = rendered_topic_help("uhp", None);
+        assert!(help.contains("uhp access [--control]"));
+        assert!(help.contains("private provider endpoint"));
     }
 
     #[test]
@@ -3788,7 +4127,14 @@ mod tests {
             vec!["uninstall".into(), "x".into(), "extra".into()],
             vec!["reload".into(), "extra".into()],
         ] {
-            assert!(theme_cmd(&invalid).is_err(), "{invalid:?}");
+            assert!(
+                theme_cmd(
+                    &invalid,
+                    crate::i18n::cli::Context::for_language(crate::i18n::cli::Language::En,),
+                )
+                .is_err(),
+                "{invalid:?}"
+            );
         }
     }
 
@@ -4234,9 +4580,22 @@ mod tests {
         assert_eq!(p.get("branch").and_then(|v| v.as_str()), Some("feat"));
         assert_eq!(p.get("agent").and_then(|v| v.as_str()), Some("claude"));
 
+        let (m, p) = parse(&argv(
+            "luvus task start t1 --mode workspace --workspace-id workspace-a --agent codex",
+        ))
+        .unwrap();
+        assert_eq!(m, "task.start");
+        assert_eq!(p.get("mode").and_then(|v| v.as_str()), Some("workspace"));
+        assert_eq!(
+            p.get("workspace_id").and_then(|v| v.as_str()),
+            Some("workspace-a")
+        );
+
         let (m, p) = parse(&argv("luvus task next --start --agent claude")).unwrap();
         assert_eq!(m, "task.next");
         assert_eq!(p.get("start").and_then(|v| v.as_bool()), Some(true));
+
+        assert!(parse(&argv("luvus task start t1 --mode unsafe")).is_err());
 
         let (m, p) = parse(&argv("luvus task heartbeat t1 --context 0.7")).unwrap();
         assert_eq!(m, "task.heartbeat");
@@ -4360,6 +4719,17 @@ mod tests {
     }
 
     #[test]
+    fn maps_mission_control_command() {
+        let (method, params) = parse(&argv("luvus mission open 2")).unwrap();
+        assert_eq!(method, "mission.open");
+        assert_eq!(
+            params.get("workspace").and_then(|value| value.as_str()),
+            Some("2")
+        );
+        assert!(parse(&argv("luvus mission nope")).is_err());
+    }
+
+    #[test]
     fn maps_worktree_commands() {
         let (m, _) = parse(&argv("luvus worktree list")).unwrap();
         assert_eq!(m, "worktree.list");
@@ -4456,46 +4826,70 @@ mod tests {
     }
 
     #[test]
-    fn skill_management_is_opt_in_and_disabled_updates_are_local() {
+    fn integration_help_tracks_the_native_adapter_registry() {
+        let supported = crate::integration::agent_ids()
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(
+            DETAILED_USAGE.contains(&format!("integration install|uninstall <{supported}>")),
+            "integration help must preserve registry order and support"
+        );
+    }
+
+    #[test]
+    fn agent_docs_are_published_and_linked_from_help() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let readme = std::fs::read_to_string(root.join("website/public/agent-readme.md"));
+        let llms = std::fs::read_to_string(root.join("website/public/llms.txt"));
+        let (Ok(readme), Ok(llms)) = (readme, llms) else {
+            return; // published crate / partial checkout
+        };
+        assert!(HELP_BUG.contains("https://luvus.dev/agent-readme.md"));
+        assert!(!HELP_BUG.contains("https://luvus.dev/llms.txt"));
+        assert!(readme.starts_with("# Luvus README for AI agents\n"));
+        assert!(readme.contains("luvus uhp capabilities"));
+        assert!(readme.contains("luvus skill enable"));
+        assert!(readme.contains("User preferences live in `config.json`, not TOML"));
+        assert!(readme.contains("https://luvus.dev/llms.txt as the task router"));
+        assert!(llms.starts_with("# Luvus knowledge map for language models\n"));
+        assert!(llms.contains("https://luvus.dev/docs/reference/api/"));
+    }
+
+    #[test]
+    fn skill_management_exposes_one_bundled_skill() {
         let _env = crate::persist::test_env("cli-skill-opt-in");
-        assert_eq!(skill_cmd(&[]).unwrap(), 0);
-        assert_eq!(skill_cmd(&["update".into()]).unwrap(), 0);
+        let context = crate::i18n::cli::Context::for_language(crate::i18n::cli::Language::En);
+        assert_eq!(skill_cmd(&[], context).unwrap(), 0);
+        assert_eq!(skill_cmd(&["status".into()], context).unwrap(), 0);
+        assert_eq!(skill_cmd(&["show".into()], context).unwrap(), 0);
 
         for args in [
-            vec!["enable".into()],
-            vec!["disable".into()],
-            vec!["show".into()],
+            vec!["enable".into(), "codex".into()],
+            vec!["disable".into(), "--all".into()],
+            vec!["status".into(), "claude".into()],
+            vec!["show".into(), "opencode".into()],
+            vec!["update".into()],
             vec!["update".into(), "codex".into()],
             vec!["on".into()],
+            vec!["install".into()],
         ] {
-            assert!(skill_cmd(&args).is_err(), "{args:?}");
+            assert!(skill_cmd(&args, context).is_err(), "{args:?}");
         }
+    }
 
-        let mut unused_input = std::io::Cursor::new(b"yes\n");
-        let mut output = Vec::new();
-        let error =
-            confirm_legacy_all_from("off", false, &mut unused_input, &mut output).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("requires an interactive confirmation"));
-        assert!(output.is_empty());
-
-        for (answer, expected) in [
-            ("yes\n", true),
-            ("Y\n", true),
-            ("no\n", false),
-            ("\n", false),
-        ] {
-            let mut input = std::io::Cursor::new(answer.as_bytes());
-            let mut output = Vec::new();
-            assert_eq!(
-                confirm_legacy_all_from("off", true, &mut input, &mut output).unwrap(),
-                expected
-            );
-            assert_eq!(
-                String::from_utf8(output).unwrap(),
-                "Apply `skill off` to claude, codex, and opencode? [y/N] "
-            );
+    #[test]
+    fn integration_help_and_docs_name_omp_not_pi() {
+        // The OMP extension installs via `install omp`. Plain Pi is a
+        // different agent with no hook integration, so neither the help text
+        // nor the published CLI reference may advertise `pi` here — and both
+        // must list `omp`.
+        assert!(DETAILED_USAGE.contains("|omp>"));
+        assert!(!DETAILED_USAGE.contains("|pi>"));
+        let page = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("website/src/content/docs/docs/reference/cli.mdx");
+        if let Ok(text) = fs::read_to_string(page) {
+            assert!(text.contains("|omp>"));
+            assert!(!text.contains("|pi>"));
         }
     }
 }

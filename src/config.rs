@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::{SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN};
 
-const CONFIG_VERSION: u32 = 1;
+const CONFIG_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -65,6 +65,12 @@ pub struct Config {
     /// (`--permission-mode bypassPermissions`), so switching it on is deliberate.
     #[serde(default)]
     pub resume_launch_flags: bool,
+    /// What the AGENTS dock lists: the active workspace's agents and sessions,
+    /// everything, or live agents only. A missing value keeps the fork's
+    /// Workspace default. The visible Workspace / All / Active control updates
+    /// this preference.
+    #[serde(default)]
+    pub agents_filter: crate::app::AgentsFilter,
     /// Custom keybindings: command id → key string (overrides the defaults).
     /// An empty value means the command is explicitly unbound.
     #[serde(default)]
@@ -209,12 +215,29 @@ pub struct LayoutConfig {
     /// Resume a session into its own workspace (else a new tab in the current one).
     #[serde(default = "yes", alias = "resume_in_new_node")]
     pub resume_in_new_workspace: bool,
+    /// Open a new tab/split at the workspace root instead of inheriting the
+    /// focused pane's live cwd. Off by default: a new tab/split starts where the
+    /// user is working; turn this on to always reset to the workspace root.
+    #[serde(default)]
+    pub new_pane_to_workspace_root: bool,
     /// Default action when a file is opened from the FILES tree (docs/38):
     /// `"readonly"` (the native viewer) or an editor run-command such as `"vim"`
-    /// / `"emacs -nw"`. A plain click uses this; Shift+click always reads it
-    /// read-only, and the right-click menu picks per file.
+    /// / `"emacs -nw"`. Consulted whenever a file opens in a *tab* — see
+    /// `file_click` for whether a plain click does that; Shift+click always
+    /// reads it read-only, and the right-click menu picks per file.
     #[serde(default = "default_file_open")]
     pub file_open: String,
+    /// What a plain left click on a FILES row does (docs/38): `"preview"` (the
+    /// default) reuses one native read-only preview pane in the active
+    /// workspace, VS Code style; `"tab"` opens a whole tab through
+    /// `layout.file_open`, which is what a click did before this setting
+    /// existed and the only mode that may launch an editor PTY. Deliberately
+    /// separate from `file_open`: that setting answers *which viewer*, this one
+    /// answers *where a click puts it*. Stored as a string rather than an enum
+    /// so a value written by a newer Luvus cannot fail the whole config's
+    /// deserialization — an unrecognized value reads back as the default.
+    #[serde(default = "default_file_click")]
+    pub file_click: String,
     /// Retained scrollback budget per pane. This is the user-facing memory dial:
     /// 10 MiB by default, regardless of how many panes are open. The Alacritty
     /// adapter derives a conservative row limit from it until the Ghostty engine
@@ -248,12 +271,11 @@ pub struct LayoutConfig {
     pub diff_color_mode: crate::diff::DiffColorMode,
     #[serde(default = "yes")]
     pub diff_live_refresh: bool,
-    /// Terminal width (columns) below which the touch/compact layout kicks in
-    /// (docs/18): one zoomed pane, sidebars hidden, the `≡` switcher. Configurable
-    /// because phone terminals in landscape often sit right around the default;
-    /// `0` disables compact mode entirely (the full UI always renders).
-    #[serde(default = "default_compact_width")]
-    pub compact_width: u16,
+    /// Terminal width (columns) at or below which the automatic mobile layout
+    /// kicks in (docs/100). This is resolved independently for each attached
+    /// client's viewport. `0` disables mobile presentation entirely.
+    #[serde(default = "default_mobile_width", alias = "compact_width")]
+    pub mobile_width: u16,
     /// What luvus forwards to a pane for **Shift/Alt+Enter** ("new line, don't
     /// submit"). A keyword from [`SHIFT_ENTER_CHOICES`]; default `esc-cr`
     /// (`ESC CR`, the sequence Claude Code's `/terminal-setup` installs). Exposed
@@ -264,8 +286,8 @@ pub struct LayoutConfig {
     pub shift_enter: String,
 }
 
-fn default_compact_width() -> u16 {
-    crate::app::COMPACT_WIDTH
+fn default_mobile_width() -> u16 {
+    crate::app::MOBILE_WIDTH
 }
 
 fn default_diff_context_lines() -> u16 {
@@ -296,6 +318,10 @@ pub struct SidebarsConfig {
     pub left: SideConfig,
     #[serde(default = "SideConfig::right_default")]
     pub right: SideConfig,
+    /// Last explicit FILES placement, retained while the dock is off so the
+    /// show/hide shortcut restores it to the same side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_side: Option<crate::app::Side>,
 }
 
 /// One sidebar's persisted state: shown/hidden, width, and its ordered dock ids.
@@ -347,6 +373,7 @@ impl SidebarsConfig {
         SidebarsConfig {
             left: SideConfig::left_default(),
             right: SideConfig::right_default(),
+            files_side: None,
         }
     }
     /// Migrate a pre-DOCK config: the default layout at the stored width.
@@ -357,16 +384,33 @@ impl SidebarsConfig {
     }
 }
 
-/// Sound alerts. The retro chime is optional, so both default to **off** —
-/// nothing rings until the user turns it on in Settings → General.
-#[derive(Serialize, Deserialize, Clone, Default)]
+/// Sound alerts. Both events default to **off**, while the existing Retro
+/// completion cue remains the default style for backward compatibility.
+#[derive(Serialize, Deserialize, Clone)]
 pub struct NotifyConfig {
-    /// Play the retro chime when an agent finishes a working stretch.
+    /// The synthesized cue family used by both notification events.
+    #[serde(default = "default_sound_style")]
+    pub sound_style: String,
+    /// Play the selected completion cue when an agent finishes a working stretch.
     #[serde(default)]
     pub sound_on_done: bool,
-    /// Play the same chime when an agent blocks on a permission prompt.
+    /// Play the selected attention cue when an agent blocks on a prompt.
     #[serde(default)]
     pub sound_on_blocked: bool,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            sound_style: default_sound_style(),
+            sound_on_done: false,
+            sound_on_blocked: false,
+        }
+    }
+}
+
+fn default_sound_style() -> String {
+    crate::sound::STYLE_RETRO.to_string()
 }
 
 fn default_theme() -> String {
@@ -382,6 +426,13 @@ fn default_shell_choice() -> String {
 pub const FILE_OPEN_READONLY: &str = "readonly";
 fn default_file_open() -> String {
     FILE_OPEN_READONLY.to_string()
+}
+/// `layout.file_click`: reuse one preview pane for a plain click.
+pub const FILE_CLICK_PREVIEW: &str = "preview";
+/// `layout.file_click`: a plain click opens a whole tab, honoring `file_open`.
+pub const FILE_CLICK_TAB: &str = "tab";
+fn default_file_click() -> String {
+    FILE_CLICK_PREVIEW.to_string()
 }
 fn default_sidebar_width() -> u16 {
     SIDEBAR_WIDTH_DEFAULT
@@ -413,6 +464,7 @@ impl Default for Config {
             check_updates: true,
             auto_update: true,
             resume_launch_flags: false,
+            agents_filter: crate::app::AgentsFilter::default(),
             keybindings: std::collections::HashMap::new(),
             prefix: default_prefix(),
             mission_pricing: std::collections::HashMap::new(),
@@ -432,7 +484,9 @@ impl Default for LayoutConfig {
             pane_title_path: false,
             agent_title: true,
             resume_in_new_workspace: true,
+            new_pane_to_workspace_root: false,
             file_open: default_file_open(),
+            file_click: default_file_click(),
             scrollback_bytes: Some(SCROLLBACK_BYTES_DEFAULT),
             scrollback: default_scrollback(),
             files_show_hidden: true,
@@ -443,7 +497,7 @@ impl Default for LayoutConfig {
             diff_marker_style: crate::diff::DiffMarkerStyle::Symbols,
             diff_color_mode: crate::diff::DiffColorMode::Theme,
             diff_live_refresh: true,
-            compact_width: default_compact_width(),
+            mobile_width: default_mobile_width(),
             shift_enter: default_shift_enter(),
         }
     }
@@ -521,11 +575,22 @@ pub fn load() -> Config {
         .unwrap_or_default()
 }
 
-/// Hydrate an old line-count setting into the new persisted byte budget. The
-/// old default becomes today's 10 MiB default; custom values retain their rough
-/// relative size using the previous measured 5,000 lines at 120 columns ≈ 10
-/// MiB relationship.
+/// Apply versioned config migrations and clamp persisted values. The legacy
+/// scrollback line count becomes a byte budget using the previous measured
+/// 5,000 lines at 120 columns ≈ 10 MiB relationship.
 pub(crate) fn normalize_config(mut cfg: Config) -> Config {
+    // v2 assigns the former Switcher key (`m`) to Mission Control and moves
+    // Switcher to `M`. Old overrides that claim either new default would win
+    // over the defaults and leave an entry point unavailable. Keep only an
+    // override that already agrees with the v2 owner; conflicting commands
+    // return to their own defaults and can be rebound explicitly afterward.
+    if cfg.version < 2 {
+        cfg.keybindings.retain(|command, key| match key.as_str() {
+            "m" => command == "open_mission",
+            "M" => command == "switcher",
+            _ => true,
+        });
+    }
     if cfg.layout.scrollback_bytes.is_none() {
         cfg.layout.scrollback_bytes = Some(legacy_scrollback_bytes(cfg.layout.scrollback));
     }
@@ -533,6 +598,7 @@ pub(crate) fn normalize_config(mut cfg: Config) -> Config {
         .layout
         .diff_context_lines
         .min(crate::diff::MAX_CONTEXT_LINES);
+    cfg.version = cfg.version.max(CONFIG_VERSION);
     cfg
 }
 
@@ -575,10 +641,16 @@ mod tests {
         assert_eq!(c.theme, "quattro-rally");
         assert!(c.layout.show_titles);
         assert_eq!(c.layout.col_gap, 1);
+        assert_eq!(c.layout.mobile_width, crate::app::MOBILE_WIDTH);
         // Empty object → all defaults (forward/back compat).
         let from_empty: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(from_empty.theme, "quattro-rally");
         assert_eq!(from_empty.sidebar_width, SIDEBAR_WIDTH_DEFAULT);
+        assert_eq!(
+            from_empty.agents_filter,
+            crate::app::AgentsFilter::Workspace,
+            "old configs retain the Workspace agents default"
+        );
         assert_eq!(
             from_empty.bars.bottom_right,
             vec![crate::bar::CORE_RUNTIME.to_string()],
@@ -605,12 +677,25 @@ mod tests {
         // An old config written before this field still loads, at the new default.
         let old: Config = serde_json::from_str(r#"{"layout":{"col_gap":1}}"#).unwrap();
         assert_eq!(old.scrollback_bytes(), SCROLLBACK_BYTES_DEFAULT);
+        // Likewise a config written before `file_click`: an existing user gets
+        // the new preview default without their `file_open` choice moving.
+        assert_eq!(old.layout.file_click, FILE_CLICK_PREVIEW);
+        assert_eq!(c.layout.file_click, FILE_CLICK_PREVIEW);
+        let picked: Config = serde_json::from_str(r#"{"layout":{"file_click":"tab"}}"#).unwrap();
+        assert_eq!(picked.layout.file_click, FILE_CLICK_TAB);
         let old_custom: Config = serde_json::from_str(r#"{"layout":{"scrollback":5000}}"#).unwrap();
         assert_eq!(old_custom.scrollback_bytes(), SCROLLBACK_BYTES_DEFAULT);
+        let legacy_mobile: Config =
+            serde_json::from_str(r#"{"layout":{"compact_width":80}}"#).unwrap();
+        assert_eq!(legacy_mobile.layout.mobile_width, 80);
+        let migrated = serde_json::to_string(&legacy_mobile).unwrap();
+        assert!(migrated.contains("\"mobile_width\":80"));
+        assert!(!migrated.contains("compact_width"));
 
         // Sounds are optional and must default to off.
         assert!(!c.notifications.sound_on_done);
         assert!(!c.notifications.sound_on_blocked);
+        assert_eq!(c.notifications.sound_style, crate::sound::STYLE_RETRO);
         let c2 = Config {
             theme: "mono".into(),
             notifications: NotifyConfig {
@@ -624,6 +709,73 @@ mod tests {
         assert_eq!(back.theme, "mono");
         assert!(back.notifications.sound_on_done);
         assert!(!back.notifications.sound_on_blocked);
+        assert_eq!(back.notifications.sound_style, crate::sound::STYLE_RETRO);
+
+        // Configs written before sound styles existed retain the original cue.
+        let old: Config = serde_json::from_str(
+            r#"{"notifications":{"sound_on_done":true,"sound_on_blocked":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(old.notifications.sound_style, crate::sound::STYLE_RETRO);
+    }
+
+    #[test]
+    fn agents_filter_preference_persists_every_choice() {
+        use crate::app::AgentsFilter;
+        let _env = crate::persist::test_env("config-agents-filter");
+        let mut config = Config::default();
+        assert_eq!(config.agents_filter, AgentsFilter::Workspace);
+
+        for filter in [
+            AgentsFilter::All,
+            AgentsFilter::Active,
+            AgentsFilter::Workspace,
+        ] {
+            config.agents_filter = filter;
+            save(&config);
+            assert_eq!(load().agents_filter, filter);
+        }
+    }
+
+    #[test]
+    fn v2_migrates_the_old_switcher_default_without_overriding_new_choices() {
+        let mut old = Config {
+            version: 1,
+            ..Default::default()
+        };
+        old.keybindings.insert("switcher".into(), "m".into());
+        let migrated = normalize_config(old);
+        assert_eq!(migrated.version, 2);
+        assert!(!migrated.keybindings.contains_key("switcher"));
+
+        let mut conflicting = Config {
+            version: 1,
+            ..Default::default()
+        };
+        conflicting
+            .keybindings
+            .insert("open_git".into(), "m".into());
+        conflicting
+            .keybindings
+            .insert("open_board".into(), "M".into());
+        conflicting
+            .keybindings
+            .insert("toggle_files".into(), "u".into());
+        let migrated = normalize_config(conflicting);
+        assert!(!migrated.keybindings.contains_key("open_git"));
+        assert!(!migrated.keybindings.contains_key("open_board"));
+        assert_eq!(
+            migrated.keybindings.get("toggle_files").map(String::as_str),
+            Some("u")
+        );
+
+        let mut current = Config::default();
+        current.keybindings.insert("switcher".into(), "m".into());
+        let current = normalize_config(current);
+        assert_eq!(
+            current.keybindings.get("switcher").map(String::as_str),
+            Some("m")
+        );
     }
 
     #[test]

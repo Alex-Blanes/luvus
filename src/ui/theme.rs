@@ -6,12 +6,6 @@ use ratatui::style::Color;
 
 // ── Theme derivation from terminal colors ───────────────────────────────────
 
-fn luminance(rgb: [u8; 3]) -> f32 {
-    0.2126 * (rgb[0] as f32 / 255.0)
-        + 0.7152 * (rgb[1] as f32 / 255.0)
-        + 0.0722 * (rgb[2] as f32 / 255.0)
-}
-
 fn blend_rgb(a: [u8; 3], b: [u8; 3], t: f32) -> Color {
     let f = |i: usize| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t).clamp(0.0, 255.0) as u8;
     Color::Rgb(f(0), f(1), f(2))
@@ -65,7 +59,7 @@ impl Theme {
 
     pub fn from_terminal(c: &TerminalColors) -> Self {
         let (bg, fg) = (c.bg, c.fg);
-        let is_dark = luminance(bg) < luminance(fg);
+        let is_dark = crate::terminal::appearance::ColorScheme::from_terminal_colors(c).is_dark();
         // palette[8] (bright black) is the terminal designer's chosen "dim/elevated"
         // color — blend toward it for surfaces so the tint matches the scheme.
         let dim = c.palette[8];
@@ -73,9 +67,12 @@ impl Theme {
 
         if is_dark {
             Theme {
-                crust: blend_rgb(bg, [0, 0, 0], 0.15),
-                mantle: blend_rgb(bg, [0, 0, 0], 0.07),
-                surface0: blend_rgb(bg, dim, 0.35),
+                // OSC 11 reports only RGB, not the terminal background's alpha.
+                // Painting that RGB explicitly makes transparent terminals
+                // opaque, so primary surfaces must keep using the default color.
+                crust: Color::Reset,
+                mantle: Color::Reset,
+                surface0: Color::Reset,
                 surface1: blend_rgb(bg, dim, 0.70),
                 subtext0: blend_rgb(bg, fg, 0.62),
                 subtext1: blend_rgb(bg, fg, 0.78),
@@ -86,9 +83,9 @@ impl Theme {
             }
         } else {
             Theme {
-                crust: blend_rgb(bg, [255, 255, 255], 0.40),
-                mantle: blend_rgb(bg, [255, 255, 255], 0.20),
-                surface0: blend_rgb(bg, dim, 0.30),
+                crust: Color::Reset,
+                mantle: Color::Reset,
+                surface0: Color::Reset,
                 surface1: blend_rgb(bg, dim, 0.60),
                 subtext0: blend_rgb(bg, fg, 0.55),
                 subtext1: blend_rgb(bg, fg, 0.70),
@@ -105,7 +102,7 @@ impl Theme {
         Theme {
             crust: Color::Reset,
             mantle: Color::Reset,
-            base: pal(bg),
+            base: Color::Reset,
             surface0: Color::Reset,
             surface1: Color::Reset,
             overlay0: blend_rgb(bg, fg, 0.28),
@@ -939,8 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn from_terminal_does_not_panic() {
-        // Dark terminal.
+    fn from_terminal_preserves_the_default_background() {
         let dark = TerminalColors {
             fg: [0xee, 0xee, 0xee],
             bg: [0x1a, 0x1a, 0x2e],
@@ -949,9 +945,6 @@ mod tests {
                 [0x1a, 0x1a, 0x2e],
             ),
         };
-        let _ = Theme::from_terminal(&dark);
-
-        // Light terminal.
         let light = TerminalColors {
             fg: [0x33, 0x33, 0x33],
             bg: [0xf5, 0xf5, 0xf0],
@@ -960,7 +953,16 @@ mod tests {
                 [0xf5, 0xf5, 0xf0],
             ),
         };
-        let _ = Theme::from_terminal(&light);
+
+        for colors in [&dark, &light] {
+            let theme = Theme::from_terminal(colors);
+            assert_eq!(theme.crust, Color::Reset);
+            assert_eq!(theme.mantle, Color::Reset);
+            assert_eq!(theme.base, Color::Reset);
+            assert_eq!(theme.surface0, Color::Reset);
+            assert_eq!(theme.text, pal(colors.fg));
+            assert_eq!(theme.accent, pal(colors.palette[4]));
+        }
     }
 
     #[test]

@@ -105,6 +105,13 @@ impl TileLayout {
         count(&self.root)
     }
 
+    /// Zero-based visual position of a pane without allocating the full leaf
+    /// list. Mobile chrome uses this on every rendered frame.
+    pub fn leaf_position(&self, id: PaneId) -> Option<usize> {
+        let mut next = 0;
+        find_leaf_position(&self.root, id, &mut next)
+    }
+
     /// Leaves in left-to-right / top-to-bottom order.
     pub fn leaves(&self) -> Vec<PaneId> {
         let mut v = Vec::new();
@@ -340,7 +347,7 @@ impl TileLayout {
         }
     }
 
-    /// Validated ratio mutation for the Socket API. Returns false when `path`
+    /// Validated ratio mutation for UHP. Returns false when `path`
     /// does not identify a split; a failed request never mutates the tree.
     pub fn try_set_ratio(&mut self, area: Rect, path: &[bool], ratio: f32) -> bool {
         if !ratio.is_finite()
@@ -488,6 +495,19 @@ fn contains_leaf(node: &Node, id: PaneId) -> bool {
     match node {
         Node::Leaf(pane) => *pane == id,
         Node::Split { a, b, .. } => contains_leaf(a, id) || contains_leaf(b, id),
+    }
+}
+
+fn find_leaf_position(node: &Node, id: PaneId, next: &mut usize) -> Option<usize> {
+    match node {
+        Node::Leaf(candidate) => {
+            let position = *next;
+            *next += 1;
+            (*candidate == id).then_some(position)
+        }
+        Node::Split { a, b, .. } => {
+            find_leaf_position(a, id, next).or_else(|| find_leaf_position(b, id, next))
+        }
     }
 }
 
@@ -727,6 +747,9 @@ mod tests {
         assert_eq!(l.len(), 2);
         assert!(l.contains(a));
         assert!(l.contains(b));
+        assert_eq!(l.leaf_position(a), Some(0));
+        assert_eq!(l.leaf_position(b), Some(1));
+        assert_eq!(l.leaf_position(PaneId::alloc()), None);
         assert_eq!(l.focus, b);
 
         let area = Rect::new(0, 0, 80, 24);

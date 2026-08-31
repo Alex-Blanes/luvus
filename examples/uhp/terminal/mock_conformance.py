@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Exercise the example consumer against the fixture-driven mock server."""
+
+import pathlib
+import subprocess
+import sys
+import tempfile
+import time
+
+from consumer import inspect_endpoint, request
+
+ROOT = pathlib.Path(__file__).resolve().parents[3]
+
+
+def main():
+    target = ROOT / "target"
+    target.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="terminal-backend-mock-", dir=target) as state:
+        state_path = pathlib.Path(state)
+        state_path.chmod(0o700)
+        socket_path = state_path / "backend.sock"
+        server = subprocess.Popen(
+            [sys.executable, str(ROOT / "examples/uhp/terminal/mock_server.py"), "--socket", str(socket_path), "--requests", "4"],
+            cwd=ROOT,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not socket_path.exists():
+                if server.poll() is not None or time.monotonic() >= deadline:
+                    raise RuntimeError("terminal backend mock did not start")
+                time.sleep(0.01)
+            unknown = request(
+                socket_path,
+                {"id": "invalid-method", "method": "not.a.method", "params": {}},
+            )
+            assert unknown["error"]["code"] == "invalid_request"
+            invalid_params = request(
+                socket_path,
+                {
+                    "id": "invalid-params",
+                    "method": "terminal.backend.inventory",
+                    "params": {"extra": True},
+                },
+            )
+            assert invalid_params["error"]["code"] == "invalid_request"
+            inspected = inspect_endpoint(socket_path, "fixture-mock")
+            assert inspected["capabilities"]["result"]["protocol"] == {
+                "name": "luvus-uhp", "major": 1, "minor": 0
+            }
+            if server.wait(timeout=3) != 0:
+                raise RuntimeError("terminal backend mock failed")
+            print("terminal-backend mock conformance passed")
+        finally:
+            if server.poll() is None:
+                server.terminate()
+                server.wait(timeout=3)
+
+
+if __name__ == "__main__":
+    main()
