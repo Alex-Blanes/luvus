@@ -31,7 +31,11 @@ pub(super) fn draw_changelog(f: &mut RenderTarget, area: Rect, app: &mut App, t:
 
     let w = area.width.saturating_sub(6).clamp(50, 92).min(area.width);
     let h = area.height.saturating_sub(2).clamp(12, 44).min(area.height);
-    let modal = centered_rect(area, w, h);
+    let modal = if app.compact {
+        super::mobile::sheets::full_screen(area)
+    } else {
+        centered_rect(area, w, h)
+    };
     app.changelog_modal_rect = Some(modal);
     f.render_widget(Clear, modal);
     let block = Block::new()
@@ -1002,14 +1006,20 @@ mod tests {
             !app.relaunch_requested,
             "an idle session still waits while the new binary is landing"
         );
-        assert!(app.relaunch_after_install, "the restart is parked, not lost");
+        assert!(
+            app.relaunch_after_install,
+            "the restart is parked, not lost"
+        );
         assert!(app.toast.is_some(), "and the click said why");
 
         // It lands: the parked restart goes without a second click.
         app.handle_event(crate::event::AppEvent::SelfUpdateInstalled(
             "0.12.0 - 0.77".into(),
         ));
-        assert!(app.relaunch_requested, "the parked restart fires on its own");
+        assert!(
+            app.relaunch_requested,
+            "the parked restart fires on its own"
+        );
         assert!(
             !app.relaunch_after_install,
             "and does not stay armed for the next install"

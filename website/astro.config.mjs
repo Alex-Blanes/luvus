@@ -84,11 +84,13 @@ export default defineConfig({
             { label: 'DIFF Review', slug: 'docs/guides/diff' },
             { label: 'Worktrees', slug: 'docs/guides/worktrees' },
             { label: 'Remote Sessions', slug: 'docs/guides/remote' },
+            { label: 'Mobile Sessions', slug: 'docs/guides/mobile' },
             { label: 'Scrollback & Copy', slug: 'docs/guides/scrollback' },
             { label: 'Settings & Theming', slug: 'docs/guides/settings' },
             { label: 'Community Themes', slug: 'docs/guides/themes' },
             { label: 'Scripting luvus', slug: 'docs/guides/scripting' },
-            { label: 'Socket API & UHP', slug: 'docs/guides/socket-and-uhp' },
+            { label: 'Automating with UHP', slug: 'docs/guides/uhp' },
+            { label: 'Remote UHP Access', slug: 'docs/guides/uhp-access' },
           ],
         },
         {
@@ -96,6 +98,7 @@ export default defineConfig({
           items: [
             { label: 'Using Modules', slug: 'docs/extend/using-modules' },
             { label: 'Writing a Module', slug: 'docs/extend/writing-modules' },
+            { label: 'Adding Agent Support', slug: 'docs/extend/adding-agent-support' },
             // The community index is a standalone page, not a docs entry.
             { label: 'Module Index', link: '/modules/', attrs: { target: '_self' } },
           ],
@@ -104,7 +107,7 @@ export default defineConfig({
           label: 'Reference',
           items: [
             { label: 'CLI Commands', slug: 'docs/reference/cli' },
-            { label: 'Socket API', slug: 'docs/reference/api' },
+            { label: 'UHP Methods', slug: 'docs/reference/api' },
             { label: 'Universal Harness Protocol', slug: 'docs/reference/uhp' },
             { label: 'Keybindings', slug: 'docs/reference/keybindings' },
             { label: 'Configuration', slug: 'docs/reference/configuration' },

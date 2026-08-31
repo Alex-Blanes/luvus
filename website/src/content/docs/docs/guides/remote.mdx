@@ -13,6 +13,11 @@ reattaches to) a luvus server *on the remote machine*, and attaches your local
 terminal to it. No port-forwarding, no extra daemon, no config.
 
 - **Requirements:** `ssh` access to the host, and `luvus` installed on it.
+- **Executable discovery:** Luvus first uses the remote non-interactive SSH
+  `PATH`, then checks standard user installation locations such as
+  `~/.local/bin`, `~/.cargo/bin`, and `~/.nix-profile/bin`. This includes the
+  default location selected by the official installer when `/usr/local/bin` is
+  not writable.
 - **Efficient by design:** only changed screen cells cross the wire (a
   keystroke costs ~22 bytes), so it stays responsive on slow links.
 - **Detach semantics** are identical to local: close your laptop, the remote
@@ -24,3 +29,8 @@ terminal to it. No port-forwarding, no extra daemon, no config.
   result in another running remote session reuses the same host and SSH options.
 
 Extra ssh arguments pass through: `luvus --remote host -p 2222 -i ~/.ssh/key`.
+
+On a narrow phone viewport Luvus automatically uses its dedicated mobile
+presentation, with one focused pane and a full-screen navigator. See
+[Mobile Sessions](/docs/guides/mobile/) for Termius sizing and the configurable
+width boundary.

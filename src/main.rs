@@ -8,7 +8,6 @@ mod app;
 mod bar;
 mod changelog;
 mod cli;
-mod compat;
 mod config;
 mod detect;
 mod diff;
@@ -21,22 +20,24 @@ mod integration;
 mod ipc;
 mod layout;
 mod links;
+mod logging;
 mod mission;
 mod module;
 mod orch;
 mod paste;
 mod persist;
 mod platform;
-mod runtime_api;
 mod search;
 mod session;
 mod skill;
+mod sound;
 mod terminal;
 mod theme;
+mod uhp;
 mod ui;
 mod update;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -55,12 +56,16 @@ use ratatui::DefaultTerminal;
 use crate::app::App;
 use crate::event::AppEvent;
 
+const SERVER_CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
+/// A second, longer control-plane probe prevents a transiently busy app loop
+/// from being classified as dead after one ordinary request deadline.
+const SERVER_RECOVERY_TIMEOUT: Duration = Duration::from_secs(4);
+
 fn main() -> Result<()> {
     // Run the whole process at 1ms timer resolution so the event loop's timed
     // waits aren't quantized to Windows' ~15.6ms default (the cause of laggy
     // typing in panes there). No-op on Unix; restored when `main` returns.
     let _timer = platform::high_res_timer();
-    compat::normalize_legacy_environment();
     let raw_args: Vec<String> = std::env::args().collect();
     let args = session::configure_from_args(&raw_args).map_err(anyhow::Error::msg)?;
     match args.get(1).map(String::as_str) {
@@ -84,13 +89,8 @@ fn main() -> Result<()> {
         std::process::exit(cli::run(&args)?);
     }
 
-    // Migration belongs to commands that use the runtime, not informational
-    // output. In particular, `luvus --version` must stay side-effect-free and
-    // must never contaminate stdout/stderr used by installers and scripts.
-    persist::migrate_legacy_state()?;
-    integration::migrate_legacy_integrations();
     // One-time local cleanup of the old default-on skill installation. This
-    // never downloads or installs a skill; it only removes Luvus/Bohay-managed
+    // never downloads or installs a skill; it only removes legacy managed
     // global pointers and exact known auto-installed files.
     let _ = skill::migrate_legacy_installation();
     match args.get(1).map(String::as_str) {
@@ -103,7 +103,9 @@ fn main() -> Result<()> {
         // `attach <id>` (docs/18 WA-2): focus + zoom the pane, then open the TUI
         // straight into that fullscreen terminal.
         Some("attach") => return attach_cmd(&args),
-        Some("integration") => std::process::exit(integration::run(&args)?),
+        Some("integration") => {
+            std::process::exit(integration::run(&args, i18n::cli::Context::configured())?)
+        }
         Some("--local") => return run_local(),
         Some(_) if cli::is_cli(&args) => {
             let code = cli::run(&args)?;
@@ -120,7 +122,7 @@ fn is_backend_discovery_request(args: &[String]) -> bool {
         args,
         [_, session, list, json]
             if session == "session" && list == "list" && json == "--json"
-    ) || matches!(args, [_, api, schema] if api == "api" && matches!(schema.as_str(), "schema" | "runtime-schema" | "socket-schema"))
+    ) || matches!(args, [_, uhp, schema] if uhp == "uhp" && schema == "schema")
 }
 
 /// After `ratatui::init()` (which restores raw mode + alt-screen on panic), also
@@ -197,75 +199,145 @@ pub(crate) fn emit_clipboard(text: &str) {
     let _ = out.flush();
 }
 
-/// Play a short retro "done" jingle when an agent finishes. Runs client-side,
-/// like `emit_notification`. The WAV is synthesized once and cached in the temp
-/// dir, then played with the platform's audio tool in a detached thread so it
-/// never blocks the event loop. A silent no-op if no player is available.
-pub(crate) fn emit_sound() {
-    std::thread::spawn(|| {
-        if let Some(path) = ensure_done_jingle() {
+/// Play a synthesized notification cue. Playback stays client-side so remote
+/// sessions ring where the user is sitting, not on the server host.
+pub(crate) fn emit_sound(signal: sound::SoundSignal) {
+    std::thread::spawn(move || {
+        if let Some(path) = ensure_sound(signal) {
             play_sound_file(&path);
         }
     });
 }
 
-/// Synthesize the jingle WAV to `<tmp>/luvus-done.wav` on first use; return it.
-fn ensure_done_jingle() -> Option<std::path::PathBuf> {
-    let path = std::env::temp_dir().join("luvus-done.wav");
-    if !path.exists() {
-        std::fs::write(&path, synth_done_wav()).ok()?;
-    }
-    Some(path)
-}
-
-/// A tiny 8-bit-style "level up" flourish: four ascending square-wave notes
-/// (C-E-G-C), the last held a beat longer, with short fades so edges don't click.
-fn synth_done_wav() -> Vec<u8> {
-    const SR: u32 = 22_050;
-    let notes = [523.25f32, 659.25, 783.99, 1046.5]; // C5 E5 G5 C6
-    let amp = 0.22f32;
-    let mut samples: Vec<i16> = Vec::new();
-    for (i, &freq) in notes.iter().enumerate() {
-        let base = SR * 90 / 1000; // 90 ms
-        let n = if i + 1 == notes.len() { base * 2 } else { base };
-        let fade = (SR / 200).max(1); // ~5 ms
-        for s in 0..n {
-            let phase = (s as f32 * freq / SR as f32) % 1.0;
-            let sq = if phase < 0.5 { amp } else { -amp };
-            let up = s.min(fade) as f32 / fade as f32;
-            let down = n.saturating_sub(s).min(fade) as f32 / fade as f32;
-            let env = up.min(down);
-            samples.push((sq * env * i16::MAX as f32) as i16);
+/// Synthesize a cue once per machine and reuse its small WAV file thereafter.
+fn ensure_sound(signal: sound::SoundSignal) -> Option<std::path::PathBuf> {
+    let path = sound_cache_dir()?.join(format!(
+        "luvus-sound-v1-{}-{}.wav",
+        signal.style.key(),
+        match signal.cue {
+            sound::SoundCue::Done => "done",
+            sound::SoundCue::Blocked => "blocked",
         }
+    ));
+    let wav = sound::synth_wav(signal);
+    if publish_sound_cache(&path, &wav) {
+        Some(path)
+    } else {
+        None
     }
-    wav_bytes(&samples, SR)
 }
 
-/// Wrap 16-bit mono PCM in a minimal WAV container.
-fn wav_bytes(samples: &[i16], sr: u32) -> Vec<u8> {
-    let data_len = (samples.len() * 2) as u32;
-    let mut v = Vec::with_capacity(44 + data_len as usize);
-    v.extend_from_slice(b"RIFF");
-    v.extend_from_slice(&(36 + data_len).to_le_bytes());
-    v.extend_from_slice(b"WAVE");
-    v.extend_from_slice(b"fmt ");
-    v.extend_from_slice(&16u32.to_le_bytes()); // PCM fmt chunk size
-    v.extend_from_slice(&1u16.to_le_bytes()); // format = PCM
-    v.extend_from_slice(&1u16.to_le_bytes()); // channels = mono
-    v.extend_from_slice(&sr.to_le_bytes()); // sample rate
-    v.extend_from_slice(&(sr * 2).to_le_bytes()); // byte rate
-    v.extend_from_slice(&2u16.to_le_bytes()); // block align
-    v.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
-    v.extend_from_slice(b"data");
-    v.extend_from_slice(&data_len.to_le_bytes());
-    for s in samples {
-        v.extend_from_slice(&s.to_le_bytes());
+/// Return the shared, application-owned directory for synthesized cues.
+///
+/// The user-specific name lets attached clients reuse the cache without
+/// trusting a predictable file placed directly in a system-wide temp folder.
+fn sound_cache_dir() -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    let name = format!("luvus-sound-cache-{}", unsafe { libc::geteuid() });
+    #[cfg(not(unix))]
+    let name = "luvus-sound-cache".to_string();
+
+    let path = std::env::temp_dir().join(name);
+    ensure_private_sound_cache_dir(&path).then_some(path)
+}
+
+/// Create the cache directory privately and reject hostile pre-existing paths.
+fn ensure_private_sound_cache_dir(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+        let created = std::fs::DirBuilder::new().mode(0o700).create(path);
+        if created.is_err_and(|error| error.kind() != std::io::ErrorKind::AlreadyExists) {
+            return false;
+        }
+        let Ok(mut metadata) = std::fs::symlink_metadata(path) else {
+            return false;
+        };
+        if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+            return false;
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            if std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).is_err() {
+                return false;
+            }
+            let Ok(updated) = std::fs::symlink_metadata(path) else {
+                return false;
+            };
+            metadata = updated;
+        }
+        metadata.file_type().is_dir()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.permissions().mode() & 0o077 == 0
     }
-    v
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        let created = std::fs::create_dir(path);
+        if created.is_err_and(|error| error.kind() != std::io::ErrorKind::AlreadyExists) {
+            return false;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return false;
+        };
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_type().is_dir()
+            && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let created = std::fs::create_dir(path);
+        if created.is_err_and(|error| error.kind() != std::io::ErrorKind::AlreadyExists) {
+            return false;
+        }
+        std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+    }
+}
+
+/// Publish a complete WAV atomically. Every process writes a unique staging
+/// file, then renames it into place. Concurrent clients can replace one complete
+/// copy with another on Unix; on Windows the loser validates and reuses the
+/// winner. A partial file is never exposed at the playback path.
+fn publish_sound_cache(path: &Path, wav: &[u8]) -> bool {
+    if std::fs::read(path).is_ok_and(|cached| cached == wav) {
+        return true;
+    }
+
+    static STAGING_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = STAGING_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let staging = path.with_file_name(format!(".{name}.{}.{}.tmp", std::process::id(), id));
+
+    let wrote = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)?;
+        file.write_all(wav)
+    })();
+    if wrote.is_err() {
+        let _ = std::fs::remove_file(&staging);
+        return false;
+    }
+
+    if std::fs::rename(&staging, path).is_ok() {
+        return true;
+    }
+
+    // Windows does not replace an existing destination. Another client may
+    // have won the race, so accept only the exact bytes we intended to publish.
+    let published = std::fs::read(path).is_ok_and(|cached| cached == wav);
+    let _ = std::fs::remove_file(&staging);
+    published
 }
 
 /// Play a WAV with the platform's audio tool (blocking — called in a thread).
 fn play_sound_file(path: &Path) {
+    #[cfg(not(target_os = "windows"))]
     let run = |cmd: &str, args: &[&str]| -> bool {
         platform::no_window(
             Command::new(cmd)
@@ -277,7 +349,9 @@ fn play_sound_file(path: &Path) {
         .status()
         .is_ok()
     };
+    #[cfg(not(target_os = "windows"))]
     let owned = path.to_string_lossy().into_owned();
+    #[cfg(not(target_os = "windows"))]
     let p = owned.as_str();
     #[cfg(target_os = "macos")]
     {
@@ -285,8 +359,20 @@ fn play_sound_file(path: &Path) {
     }
     #[cfg(target_os = "windows")]
     {
-        let script = format!("(New-Object Media.SoundPlayer '{p}').PlaySync()");
-        let _ = run("powershell", &["-NoProfile", "-Command", &script]);
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Media::Audio::{PlaySoundW, SND_FILENAME, SND_NODEFAULT};
+
+        let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // `PlaySoundW` is synchronous, but this function already runs on the
+        // notification thread. Native playback avoids launching a PowerShell
+        // process and therefore cannot flash a console window per sound.
+        unsafe {
+            let _ = PlaySoundW(
+                path.as_ptr(),
+                std::ptr::null_mut(),
+                SND_FILENAME | SND_NODEFAULT,
+            );
+        }
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
@@ -380,7 +466,14 @@ pub(crate) fn window_title() -> String {
 }
 
 /// Run the app monolithically against the real terminal (dev/escape hatch).
+/// `run` reports `(detached, relaunch)`: detaching prints the session card,
+/// while a relaunch has to replace this process (see below).
 fn run_local() -> Result<()> {
+    let _logging = logging::init(logging::Role::Local);
+    logging::event(
+        logging::EventKind::ServerStart,
+        &[logging::Field::Role(logging::Role::Local)],
+    );
     let mut terminal = ratatui::init();
     install_tui_panic_hook();
     let result = run(&mut terminal);
@@ -392,36 +485,23 @@ fn run_local() -> Result<()> {
         DisableBracketedPaste
     );
     ratatui::restore();
+    let (detached, relaunch) = result?;
     // `--local` is its own server, so there is no separate client to bring the
     // session back: this process has to replace itself. The snapshot is already
     // written by `run`, and the successor restores from it.
-    if result? {
+    if relaunch {
         let args: Vec<String> = std::env::args().skip(1).collect();
         return ipc::client::spawn_successor(&args);
+    }
+    if detached {
+        print_detached_status(i18n::cli::Context::configured());
     }
     Ok(())
 }
 
 fn autodetect_and_attach() -> Result<()> {
     let sock = persist::client_socket_path();
-    let fresh = !server_running(&sock);
-    if fresh {
-        spawn_server()?;
-        wait_for_socket(&sock)?;
-    }
-    if !fresh {
-        // An upgraded binary silently attaching to an older running server means
-        // none of the new version shows up — tell the user how to load it (the
-        // brief pause keeps the note readable before the UI takes the screen).
-        let binary = env!("LUVUS_VERSION_LABEL");
-        if let Some(running) = server_version().filter(|running| running != binary) {
-            eprintln!(
-                "luvus v{binary} installed, but the running server is v{running} — \
-                 run `luvus server restart` to load it (your session is saved and restored)."
-            );
-            thread::sleep(Duration::from_millis(2000));
-        }
-    }
+    ensure_server_ready(&sock)?;
     // Always ask the server to open the launch folder. A *fresh* server may have
     // restored a saved session (`restore_or_new`), in which case it never saw
     // this cwd — so this cannot be skipped on the fresh path. Idempotent: if the
@@ -430,13 +510,92 @@ fn autodetect_and_attach() -> Result<()> {
     ipc::client::run(&sock)
 }
 
+fn ensure_server_ready(sock: &Path) -> Result<()> {
+    ensure_server_ready_with_timeouts(sock, SERVER_CONTROL_TIMEOUT, SERVER_RECOVERY_TIMEOUT)
+}
+
+fn ensure_server_ready_with_timeouts(
+    sock: &Path,
+    control_timeout: Duration,
+    recovery_timeout: Duration,
+) -> Result<()> {
+    match ipc::transport::connect_timeout(sock, control_timeout) {
+        Ok(_) => match retry_control_probe(control_timeout, recovery_timeout, |timeout| {
+            server_version_with_timeout(timeout)
+        }) {
+            Ok(running) => report_server_version(running),
+            // Accept threads stay alive after the app loop dies. Connect is not
+            // liveness, but one ordinary timeout is not proof of death either.
+            // Recycle only after the longer confirmation probe also fails.
+            Err(_) => {
+                recycle_unresponsive_server_with_timeouts(sock, control_timeout, recovery_timeout)
+            }
+        },
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+            // A saturated client listener is not proof that the app loop died.
+            // The API ping distinguishes a responsive server that should be
+            // left alone from the mute-listener failure this recovery targets.
+            if server_version_with_timeout(recovery_timeout).is_ok() {
+                return Err(anyhow!(
+                    "luvus client endpoint is busy but the server remains responsive; retry attach"
+                ));
+            }
+            recycle_unresponsive_server_with_timeouts(sock, control_timeout, recovery_timeout)
+        }
+        Err(_) => {
+            spawn_server()?;
+            wait_for_socket(sock)
+        }
+    }
+}
+
+fn recycle_unresponsive_server_with_timeouts(
+    sock: &Path,
+    control_timeout: Duration,
+    recovery_timeout: Duration,
+) -> Result<()> {
+    send_server_stop_with_evidence(
+        control_timeout,
+        recovery_timeout,
+        RecoveryEvidence::ConfirmedUnresponsive,
+    )?;
+    // The old process may still own API or client pipes after stop
+    // returns. Spawning now makes the replacement see those endpoints and
+    // exit, then the old process dies — no server left.
+    wait_for_shutdown(sock)?;
+    spawn_server()?;
+    wait_for_socket(sock)
+}
+
+fn retry_control_probe<T>(
+    control_timeout: Duration,
+    recovery_timeout: Duration,
+    mut probe: impl FnMut(Duration) -> Result<T>,
+) -> Result<T> {
+    probe(control_timeout).or_else(|_| probe(recovery_timeout))
+}
+
+fn report_server_version(running: String) -> Result<()> {
+    let binary = env!("LUVUS_VERSION_LABEL");
+    if running != binary {
+        eprintln!(
+            "luvus v{binary} installed, but the running server is v{running} — \
+             run `luvus server restart` to load it (your session is saved and restored)."
+        );
+        thread::sleep(Duration::from_millis(2000));
+    }
+    Ok(())
+}
+
 /// Ask the running server to open the current directory as a workspace (add +
 /// focus if new). Best-effort — a failure just means no auto-open.
 fn open_cwd_workspace() {
     let Ok(cwd) = std::env::current_dir() else {
         return;
     };
-    let Ok(mut s) = ipc::transport::connect(&persist::socket_path()) else {
+    let Ok(mut s) =
+        ipc::transport::connect_timeout(&persist::socket_path(), SERVER_CONTROL_TIMEOUT)
+    else {
         return;
     };
     // `focus: false` — add the launch folder if it isn't already a workspace, but
@@ -448,8 +607,7 @@ fn open_cwd_workspace() {
         "params": { "path": cwd.display().to_string(), "focus": false },
     });
     let _ = writeln!(s, "{req}");
-    let mut line = String::new();
-    let _ = BufReader::new(s).read_line(&mut line); // wait for the ack before attaching
+    let _ = ipc::api::read_response_frame_with_deadline(&mut s, SERVER_CONTROL_TIMEOUT);
 }
 
 /// Remote bridge role (docs/18 RA-1), run *on the remote host* by ssh. Ensure a
@@ -457,10 +615,7 @@ fn open_cwd_workspace() {
 /// so the `luvus --remote` client on the other end of the ssh pipe drives it.
 fn remote_client_bridge() -> Result<()> {
     let sock = persist::client_socket_path();
-    if !server_running(&sock) {
-        spawn_server()?;
-        wait_for_socket(&sock)?;
-    }
+    ensure_server_ready(&sock)?;
     ipc::client::remote_bridge(&sock)
 }
 
@@ -469,10 +624,7 @@ fn remote_client_bridge() -> Result<()> {
 /// fullscreen terminal. Composes with `--remote` for a remote fullscreen attach.
 fn attach_cmd(args: &[String]) -> Result<()> {
     let sock = persist::client_socket_path();
-    if !server_running(&sock) {
-        spawn_server()?;
-        wait_for_socket(&sock)?;
-    }
+    ensure_server_ready(&sock)?;
     if let Some(id) = args.get(2).filter(|s| s.parse::<u32>().is_ok()) {
         let _ = cli::request_attach(id); // best-effort; still attaches if it fails
     }
@@ -483,20 +635,76 @@ fn attach_cmd(args: &[String]) -> Result<()> {
 /// socket through plain ssh and attach to it locally. No port-forwarding, no
 /// `~/.ssh/config` edits — keepalive options are passed on argv only.
 fn remote_attach(args: &[String]) -> Result<()> {
-    let mut cmd = remote_ssh_command(args)?;
+    let (result, status) = remote_attach_attempt(remote_ssh_command(args)?);
+    if result
+        .as_ref()
+        .is_err_and(ipc::client::is_handshake_io_error)
+        && status.as_ref().and_then(std::process::ExitStatus::code) == Some(127)
+    {
+        let (fallback_result, fallback_status) =
+            remote_attach_attempt(remote_fallback_ssh_command(args)?);
+        if fallback_result
+            .as_ref()
+            .is_err_and(ipc::client::is_handshake_io_error)
+            && fallback_status
+                .as_ref()
+                .and_then(std::process::ExitStatus::code)
+                == Some(127)
+        {
+            let context = i18n::cli::Context::configured();
+            let host = args.get(2).map_or("", String::as_str);
+            return Err(anyhow!(
+                "{}\n{}",
+                context.render(
+                    "Luvus was not found on the remote host {host}.",
+                    &[("host", host)]
+                ),
+                context.text(
+                    "Install Luvus there or place it in PATH or a standard user installation directory."
+                )
+            ));
+        }
+        return fallback_result;
+    }
+    result
+}
+
+fn remote_attach_attempt(mut cmd: Command) -> (Result<()>, Option<std::process::ExitStatus>) {
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()); // stderr inherited so ssh can prompt for auth
     let mut child = cmd
         .spawn()
-        .map_err(|e| anyhow!("failed to launch ssh: {e}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("no ssh stdout"))?;
-    let stdin = child.stdin.take().ok_or_else(|| anyhow!("no ssh stdin"))?;
+        .map_err(|e| anyhow!("failed to launch ssh: {e}"));
+    let Ok(ref mut child) = child else {
+        return (child.map(|_| ()), None);
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let status = child.wait().ok();
+        return (Err(anyhow!("no ssh stdout")), status);
+    };
+    let Some(stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let status = child.wait().ok();
+        return (Err(anyhow!("no ssh stdin")), status);
+    };
     let result = ipc::client::attach(stdout, stdin);
+    let status = wait_for_remote_child(child);
+    (result, status)
+}
+
+fn wait_for_remote_child(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
+    // EOF from the SSH stdout normally means the child is already exiting. Give
+    // it a short bounded window to publish its real status before terminating a
+    // bridge that failed or disconnected without cleaning itself up.
+    for _ in 0..10 {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(_) => break,
+        }
+    }
     let _ = child.kill();
-    let _ = child.wait();
-    result
+    child.wait().ok()
 }
 
 /// Build the remote bridge command separately so session propagation stays
@@ -525,8 +733,55 @@ fn remote_ssh_command(args: &[String]) -> Result<Command> {
     Ok(cmd)
 }
 
+/// Retry path for POSIX remote hosts whose non-interactive SSH PATH omits the
+/// per-user directory selected by the official installer. The ordinary bare
+/// command is always attempted first, preserving existing Windows SSH behavior.
+fn remote_fallback_ssh_command(args: &[String]) -> Result<Command> {
+    let host = args
+        .get(2)
+        .ok_or_else(|| anyhow!("usage: luvus --remote <host> [ssh args]"))?;
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-T")
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=3");
+    for extra in args.iter().skip(3) {
+        cmd.arg(extra);
+    }
+
+    let mut bridge_args = Vec::new();
+    if let Some(name) = session::active_name() {
+        bridge_args.push("--session".to_string());
+        bridge_args.push(name);
+    } else if session::explicit_session_requested() {
+        bridge_args.push("--session".to_string());
+        bridge_args.push(session::DEFAULT_SESSION_NAME.to_string());
+    }
+    bridge_args.push("remote-client-bridge".to_string());
+    let bridge_args = bridge_args
+        .iter()
+        .map(|arg| posix_shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let script = format!(
+        "for luvus_bin in \"$HOME/.local/bin/luvus\" \"$HOME/.cargo/bin/luvus\" \
+         \"$HOME/.nix-profile/bin/luvus\" /usr/local/bin/luvus \
+         /opt/homebrew/bin/luvus /home/linuxbrew/.linuxbrew/bin/luvus; do \
+         if [ -x \"$luvus_bin\" ]; then exec \"$luvus_bin\" {bridge_args}; fi; done; \
+         printf '%s\\n' 'luvus remote: executable not found in common install locations' >&2; \
+         exit 127"
+    );
+    cmd.arg(host).arg(script).stderr(Stdio::inherit());
+    Ok(cmd)
+}
+
+fn posix_shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn server_running(sock: &Path) -> bool {
-    ipc::transport::connect(sock).is_ok()
+    ipc::transport::endpoint_exists(sock, Duration::from_millis(50))
 }
 
 fn spawn_server() -> Result<()> {
@@ -536,7 +791,6 @@ fn spawn_server() -> Result<()> {
         // The selector was already resolved into LUVUS_SESSION. A parent pane's
         // injected API socket must not leak into a newly spawned server.
         .env_remove("LUVUS_SOCKET_PATH")
-        .env_remove("BOHAY_SOCKET_PATH")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -575,16 +829,25 @@ fn wait_for_socket(sock: &Path) -> Result<()> {
 /// Bare `luvus server` (no subcommand) is the internal headless role that
 /// `spawn_server` launches via setsid; users go through the subcommands.
 fn server_cmd(args: &[String]) -> Result<()> {
-    match args.get(2).map(String::as_str) {
-        None => ipc::server::run(), // internal role: run the server in the foreground
-        Some("start") => server_start(),
-        Some("stop") => server_stop(),
-        Some("restart") => server_restart(),
-        Some("status") => server_status(),
-        Some("update-manifest") => update_manifest(),
-        Some(other) => {
-            eprintln!("unknown server command: {other}");
-            eprintln!("usage: luvus server <start|stop|restart|status|update-manifest>");
+    let Some(command) = args.get(2).map(String::as_str) else {
+        return ipc::server::run(); // internal role: run the server in the foreground
+    };
+    let context = i18n::cli::Context::configured();
+    match command {
+        "start" => server_start(context),
+        "stop" => server_stop(context),
+        "restart" => server_restart(context),
+        "status" => server_status(context),
+        "update-manifest" => update_manifest(context),
+        other => {
+            eprintln!("{}: {other}", context.text("unknown server command"));
+            eprintln!(
+                "{}",
+                i18n::cli::help(
+                    "usage: luvus server <start|stop|restart|status|update-manifest>",
+                    context.language(),
+                )
+            );
             std::process::exit(2);
         }
     }
@@ -602,7 +865,7 @@ struct ManifestIndex {
 /// user's own manifests) and apply live if a server is running, else on next
 /// start. The source is `https://luvus.dev/manifests` (override with
 /// `$LUVUS_MANIFEST_URL`, e.g. a `file://` dir for testing).
-fn update_manifest() -> Result<()> {
+fn update_manifest(context: i18n::cli::Context) -> Result<()> {
     let base = std::env::var("LUVUS_MANIFEST_URL")
         .unwrap_or_else(|_| "https://luvus.dev/manifests".to_string());
     let index_url = format!("{base}/index.json");
@@ -623,21 +886,28 @@ fn update_manifest() -> Result<()> {
             || name.contains('\\')
             || name.contains("..");
         if bad {
-            eprintln!("skipping suspicious manifest name: {name}");
+            eprintln!(
+                "{}: {name}",
+                context.text("skipping suspicious manifest name")
+            );
             skipped += 1;
             continue;
         }
         let body = match crate::module::discovery::http_get(&format!("{base}/{name}")) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("skipping {name}: {e}");
+                eprintln!("{} {name}: {e}", context.text("skipping"));
                 skipped += 1;
                 continue;
             }
         };
         // Reject a garbled download before it can land in the managed dir.
         if !crate::detect::manifest_parses(&body) {
-            eprintln!("skipping {name}: not a valid detection manifest");
+            eprintln!(
+                "{} {name}: {}",
+                context.text("skipping"),
+                context.text("not a valid detection manifest")
+            );
             skipped += 1;
             continue;
         }
@@ -646,9 +916,11 @@ fn update_manifest() -> Result<()> {
         written += 1;
     }
     println!(
-        "updated {written} detection manifest(s){} -> {}",
+        "{} {written} {}{} -> {}",
+        context.text("updated"),
+        context.text("detection manifest(s)"),
         if skipped > 0 {
-            format!(", {skipped} skipped")
+            format!(", {skipped} {}", context.text("skipped"))
         } else {
             String::new()
         },
@@ -663,147 +935,332 @@ fn update_manifest() -> Result<()> {
                 .and_then(|r| r.get("rules"))
                 .and_then(|x| x.as_u64())
                 .unwrap_or(0);
-            println!("reloaded into the running server ({n} rules active) - no restart needed");
+            println!(
+                "{} ({n} {}) - {}",
+                context.text("reloaded into the running server"),
+                context.text("rules active"),
+                context.text("no restart needed")
+            );
         }
-        Err(_) => println!("no server running - the update loads on next start"),
+        Err(_) => println!(
+            "{}",
+            context.text("no server running - the update loads on next start")
+        ),
     }
     Ok(())
 }
 
 /// Spawn the detached server if one isn't already up.
-fn server_start() -> Result<()> {
+fn server_start(context: i18n::cli::Context) -> Result<()> {
     let sock = persist::client_socket_path();
     if server_running(&sock) {
-        println!(
-            "luvus server already running (session {})",
-            session::display_name()
-        );
+        print_server_card(context, context.text("running"), None, &sock);
         return Ok(());
     }
     spawn_server()?;
     wait_for_socket(&sock)?;
-    println!("luvus server started (session {})", session::display_name());
+    print_server_card(
+        context,
+        context.text("started"),
+        Some(env!("CARGO_PKG_VERSION")),
+        &sock,
+    );
     Ok(())
 }
 
-fn server_stop() -> Result<()> {
+fn server_stop(context: i18n::cli::Context) -> Result<()> {
     let sock = persist::client_socket_path();
-    if send_server_stop() {
+    if send_server_stop()? {
         // The server acks before it actually exits, so wait for it to release the
         // socket — then `stop` returning means it's really down (and a following
         // `status` reports "not running", not a half-shutdown "running").
-        wait_for_shutdown(&sock);
-        println!("luvus server stopped (session {})", session::display_name());
+        wait_for_shutdown(&sock)?;
+        print_server_card(context, context.text("server stopped"), None, &sock);
     } else {
-        println!("no luvus server running");
+        print_server_card(
+            context,
+            context.text("no luvus server running"),
+            None,
+            &sock,
+        );
     }
     Ok(())
 }
 
 /// Stop (if running), wait for the socket to close, then start a fresh server —
 /// the way to load a newly-installed binary without rebooting a live session.
-fn server_restart() -> Result<()> {
+fn server_restart(context: i18n::cli::Context) -> Result<()> {
     let sock = persist::client_socket_path();
-    if send_server_stop() {
-        wait_for_shutdown(&sock);
+    if send_server_stop()? {
+        wait_for_shutdown(&sock)?;
     }
     spawn_server()?;
     wait_for_socket(&sock)?;
-    println!(
-        "luvus server restarted (session {})",
-        session::display_name()
+    print_server_card(
+        context,
+        context.text("restarted"),
+        Some(env!("CARGO_PKG_VERSION")),
+        &sock,
     );
     Ok(())
 }
 
 /// Poll (bounded) until the server releases its socket, so `stop`/`restart`
 /// return only once the old server is truly gone.
-fn wait_for_shutdown(sock: &Path) {
-    wait_for_server_shutdown(sock)
-}
-
-/// Block until nothing answers on `sock`, or five seconds pass. Shared with the
-/// display client, which has to outlive a server restart and must not race the
-/// old server's exit when it comes back up.
-pub(crate) fn wait_for_server_shutdown(sock: &Path) {
-    for _ in 0..100 {
-        if !server_running(sock) {
-            return;
+fn wait_for_shutdown(_sock: &Path) -> Result<()> {
+    let api = persist::socket_path();
+    let client = persist::client_socket_path();
+    for _ in 0..50 {
+        if !ipc::transport::endpoint_exists(&api, Duration::from_millis(100))
+            && !ipc::transport::endpoint_exists(&client, Duration::from_millis(100))
+        {
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(50));
     }
+    Err(anyhow!(
+        "luvus server did not stop in time; refusing to start a second server"
+    ))
+}
+
+/// Block until nothing answers on the server's endpoints. Shared with the
+/// display client, which has to outlive a server restart and must not race the
+/// old server's exit when it comes back up — there it is best effort: a
+/// successor that finds the socket still held reports that itself.
+pub(crate) fn wait_for_server_shutdown(sock: &Path) {
+    let _ = wait_for_shutdown(sock);
 }
 
 /// Report whether a server is up and, if so, the version it's *running* — which
 /// can differ from this binary when a new install hasn't been restarted yet.
-fn server_status() -> Result<()> {
+fn server_status(context: i18n::cli::Context) -> Result<()> {
     let sock = persist::client_socket_path();
     if !server_running(&sock) {
-        println!(
-            "luvus server: not running (session {})",
-            session::display_name()
-        );
+        print_server_card(context, context.text("not running"), None, &sock);
         return Ok(());
     }
     match server_version() {
-        Some(running) => {
-            println!(
-                "luvus server: running (v{running}, session {})",
-                session::display_name()
-            );
+        Ok(running) => {
+            print_server_card(context, context.text("running"), Some(&running), &sock);
             let binary = env!("LUVUS_VERSION_LABEL");
             if running != binary {
                 println!(
-                    "  note: this binary is v{binary} — run `luvus server restart` to load it"
+                    "  {} v{binary} — {}",
+                    context.text("note: this binary is"),
+                    context.text("run `luvus server restart` to load it")
                 );
             }
         }
-        None => println!(
-            "luvus server: running (session {})",
-            session::display_name()
-        ),
+        Err(error) => {
+            return Err(anyhow!(
+                "luvus {}: {error}",
+                context.text("server is running but did not answer")
+            ));
+        }
     }
     Ok(())
 }
 
-/// Send `server.stop` to a running server; returns whether one answered.
-fn send_server_stop() -> bool {
-    match ipc::transport::connect(&persist::socket_path()) {
-        Ok(mut s) => {
-            let _ = writeln!(s, r#"{{"id":"1","method":"server.stop","params":{{}}}}"#);
-            // Read the ack so the server has processed the request before we return.
-            let mut line = String::new();
-            let _ = BufReader::new(s).read_line(&mut line);
-            true
-        }
-        Err(_) => false,
+fn print_server_card(
+    context: i18n::cli::Context,
+    state: &str,
+    version: Option<&str>,
+    socket: &Path,
+) {
+    let session = session::display_name();
+    let socket = socket.display().to_string();
+    let version = version.map(|value| format!("v{value}"));
+    let mut rows = vec![
+        (context.text("status"), state),
+        (context.text("session"), session.as_str()),
+    ];
+    if let Some(version) = version.as_deref() {
+        rows.push((context.text("version"), version));
     }
+    rows.push((context.text("socket"), socket.as_str()));
+    cli::print_status_card("Luvus server", &rows);
 }
 
-/// Ask the running server its version via `ping`. `None` if unreachable/unparsable.
-fn server_version() -> Option<String> {
-    let mut s = ipc::transport::connect(&persist::socket_path()).ok()?;
-    writeln!(s, r#"{{"id":"1","method":"ping","params":{{}}}}"#).ok()?;
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&line).ok()?;
-    let result = v.get("result")?;
+fn print_detached_status(context: i18n::cli::Context) {
+    let session = session::display_name();
+    let runtime = format!("{} + {}", context.text("server"), context.text("panes"));
+    let rows = [
+        (context.text("status"), context.text("detached")),
+        (context.text("session"), session.as_str()),
+        (runtime.as_str(), context.text("running")),
+    ];
+    cli::print_status_card("Luvus session", &rows);
+}
+
+/// Send `server.stop` to a running server; returns whether one was present.
+fn send_server_stop() -> Result<bool> {
+    send_server_stop_with_timeouts(SERVER_CONTROL_TIMEOUT, SERVER_RECOVERY_TIMEOUT)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RecoveryEvidence {
+    RequireConfirmation,
+    ConfirmedUnresponsive,
+}
+
+fn send_server_stop_with_timeouts(
+    control_timeout: Duration,
+    recovery_timeout: Duration,
+) -> Result<bool> {
+    send_server_stop_with_evidence(
+        control_timeout,
+        recovery_timeout,
+        RecoveryEvidence::RequireConfirmation,
+    )
+}
+
+fn send_server_stop_with_evidence(
+    control_timeout: Duration,
+    recovery_timeout: Duration,
+    evidence: RecoveryEvidence,
+) -> Result<bool> {
+    let client_socket = persist::client_socket_path();
+    let api = persist::socket_path();
+    let (conn, timed_out) = match ipc::transport::connect_timeout(&api, control_timeout) {
+        Ok(conn) => (Some(conn), false),
+        Err(error) => match ipc::transport::connect_timeout(&client_socket, control_timeout) {
+            Ok(conn) => (Some(conn), error.kind() == io::ErrorKind::TimedOut),
+            Err(client_error) if client_error.kind() == io::ErrorKind::TimedOut => (None, true),
+            Err(_) if error.kind() == io::ErrorKind::TimedOut => (None, true),
+            Err(_) => return Ok(false),
+        },
+    };
+    let pid = conn
+        .as_ref()
+        .and_then(|conn| conn.server_pid().ok())
+        .or_else(persist::ServerPidFile::read);
+    drop(conn);
+
+    if timed_out {
+        if evidence == RecoveryEvidence::RequireConfirmation
+            && server_control_request_with_timeout("ping", recovery_timeout).is_ok()
+        {
+            return Err(anyhow!(
+                "luvus endpoint is busy but the server remains responsive; refusing to force-stop"
+            ));
+        }
+        return force_stop_unresponsive(pid, &client_socket);
+    }
+
+    let response = match server_control_request_with_timeout("server.stop", control_timeout) {
+        Ok(response) => response,
+        Err(error) => {
+            // A mute app loop still accepts on dedicated listener threads.
+            // One short probe: if both endpoints are already gone, stop won.
+            // Otherwise reclaim the stoppable process instead of hanging attach.
+            if !ipc::transport::endpoint_exists(&api, Duration::from_millis(50))
+                && !ipc::transport::endpoint_exists(&client_socket, Duration::from_millis(50))
+            {
+                return Ok(true);
+            }
+            // A reachable server may simply have missed the ordinary one-second
+            // acknowledgement deadline under load. Confirm the control plane is
+            // still mute with a longer ping before taking the destructive path.
+            if evidence == RecoveryEvidence::RequireConfirmation
+                && server_control_request_with_timeout("ping", recovery_timeout).is_ok()
+            {
+                return Err(anyhow!(
+                    "luvus server did not acknowledge stop but remains responsive: {error}"
+                ));
+            }
+            if !ipc::transport::endpoint_exists(&api, Duration::from_millis(50))
+                && !ipc::transport::endpoint_exists(&client_socket, Duration::from_millis(50))
+            {
+                return Ok(true);
+            }
+            match force_stop_unresponsive(pid, &client_socket) {
+                Ok(_) => return Ok(true),
+                Err(recovery_error) => {
+                    return Err(anyhow!(
+                        "{error}; force-stop recovery failed: {recovery_error}"
+                    ));
+                }
+            }
+        }
+    };
+    let acknowledged = response
+        .get("result")
+        .and_then(|result| result.get("type"))
+        .and_then(serde_json::Value::as_str)
+        == Some("ok");
+    if !acknowledged {
+        return Err(anyhow!("luvus server returned an invalid stop response"));
+    }
+    Ok(true)
+}
+
+fn force_stop_unresponsive(pid: Option<u32>, sock: &Path) -> Result<bool> {
+    let Some(pid) = pid else {
+        return Err(anyhow!(
+            "luvus server did not answer and no process id is available to force-stop"
+        ));
+    };
+    if !platform::is_stoppable_luvus_pid(pid) {
+        return Err(anyhow!(
+            "luvus server did not answer and pid {pid} is not a stoppable Luvus process"
+        ));
+    }
+    if let Err(error) = platform::force_terminate(pid) {
+        if platform::is_stoppable_luvus_pid(pid) {
+            return Err(anyhow!("failed to force-stop luvus pid {pid}: {error}"));
+        }
+    }
+    wait_for_shutdown(sock)?;
+    Ok(true)
+}
+
+/// Ask the running server its version via `ping`.
+fn server_version() -> Result<String> {
+    server_version_with_timeout(SERVER_CONTROL_TIMEOUT)
+}
+
+fn server_version_with_timeout(timeout: Duration) -> Result<String> {
+    let response = server_control_request_with_timeout("ping", timeout)?;
+    let result = response
+        .get("result")
+        .ok_or_else(|| anyhow!("luvus server returned an invalid ping response"))?;
     // The build label, not the semver: this fork's releases all carry upstream's
-    // `0.12.0`, so comparing versions could never tell yesterday's server from
+    // version, so comparing versions could never tell yesterday's server from
     // today's binary and the "restart to load it" note never fired — you ran the
     // old code with nothing to say so. A server old enough not to send `build`
     // answers with its bare semver, which differs from this binary's label, so it
     // is reported stale too — which it is.
     result
         .get("build")
-        .or_else(|| result.get("version"))?
-        .as_str()
+        .or_else(|| result.get("version"))
+        .and_then(serde_json::Value::as_str)
         .map(String::from)
+        .ok_or_else(|| anyhow!("luvus server returned an invalid ping response"))
 }
 
-/// Returns whether the session asked to restart onto the installed binary, so
-/// the caller can replace this process once the terminal is back to normal.
-fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
+/// Perform one lifecycle request with a bounded response wait. This keeps
+/// `status`, `stop`, and `restart` responsive when a socket exists but the app
+/// loop cannot answer, including through Windows named pipes.
+fn server_control_request_with_timeout(
+    method: &str,
+    timeout: Duration,
+) -> Result<serde_json::Value> {
+    let mut stream = ipc::transport::connect_timeout(&persist::socket_path(), timeout)
+        .map_err(|error| anyhow!("cannot connect to luvus server: {error}"))?;
+    writeln!(stream, r#"{{"id":"1","method":"{method}","params":{{}}}}"#)?;
+    let frame = ipc::api::read_response_frame_with_deadline(&mut stream, timeout)?;
+    let response: serde_json::Value = serde_json::from_str(&frame)
+        .map_err(|error| anyhow!("invalid server control response: {error}"))?;
+    if response.get("id").and_then(serde_json::Value::as_str) != Some("1") {
+        return Err(anyhow!("server control response id does not match request"));
+    }
+    if let Some(error) = response.get("error") {
+        return Err(anyhow!("server rejected control request: {error}"));
+    }
+    Ok(response)
+}
+
+fn run(terminal: &mut DefaultTerminal) -> Result<(bool, bool)> {
     let (tx, rx) = mpsc::channel::<AppEvent>();
 
     let size = terminal.size()?;
@@ -817,7 +1274,9 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
     let startup_lock = ipc::transport::acquire_server_startup_lock(&state_dir)?;
     let sock = persist::socket_path();
     let client_sock = persist::client_socket_path();
-    if ipc::transport::connect(&sock).is_ok() || ipc::transport::connect(&client_sock).is_ok() {
+    if ipc::transport::endpoint_exists(&sock, Duration::from_millis(50))
+        || ipc::transport::endpoint_exists(&client_sock, Duration::from_millis(50))
+    {
         return Err(anyhow!(
             "a Luvus server is already active for {}; use `luvus` to attach to it",
             state_dir.display()
@@ -874,6 +1333,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
     terminal.draw(|f| ui::render(f, &mut app))?;
     let mut last_draw = Instant::now();
     let mut last_save = Instant::now();
+    let mut immediate_save_attempted = false;
     let mut last_spin = Instant::now();
 
     loop {
@@ -897,10 +1357,20 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
             break;
         }
 
-        // Debounced session save.
-        if app.session_dirty && last_save.elapsed() > Duration::from_secs(2) {
-            persist::save(&app);
-            app.session_dirty = false;
+        if !app.persist_session_now {
+            immediate_save_attempted = false;
+        }
+        // Closing the final project bypasses the debounce once. Failed writes
+        // retain both flags and retry at the normal cadence instead of hot-looping.
+        let immediate_save_due = app.persist_session_now && !immediate_save_attempted;
+        let debounced_save_due = app.session_dirty && last_save.elapsed() > Duration::from_secs(2);
+        if immediate_save_due || debounced_save_due {
+            immediate_save_attempted = app.persist_session_now;
+            if persist::save(&app) {
+                app.persist_session_now = false;
+                app.session_dirty = false;
+                immediate_save_attempted = false;
+            }
             last_save = Instant::now();
         }
 
@@ -913,9 +1383,8 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
         for msg in app.pending_notify.drain(..) {
             emit_notification(&msg);
         }
-        if app.pending_sound {
-            app.pending_sound = false;
-            emit_sound();
+        if let Some(signal) = app.pending_sound.take() {
+            emit_sound(signal);
         }
         // Advance the working spinner ~10x/s (the loop redraws every frame).
         if last_spin.elapsed() >= Duration::from_millis(100)
@@ -947,8 +1416,9 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
         app.rearm_pty_notify();
     }
 
+    let detached = app.detach_requested;
     persist::save(&app);
-    Ok(app.relaunch_requested)
+    Ok((detached, app.relaunch_requested))
 }
 
 /// Clean up a just-bound Unix socket before a local startup aborts. The caller
@@ -1009,6 +1479,74 @@ mod tests {
     use ratatui::Terminal;
 
     #[test]
+    fn send_server_stop_reports_absent_when_no_sockets() {
+        let _env = crate::persist::test_env("stop-absent");
+        crate::persist::ensure_session_dir();
+        assert!(!send_server_stop().expect("absent server is not an error"));
+    }
+
+    #[test]
+    fn send_server_stop_fails_closed_when_a_listener_never_replies() {
+        let _env = crate::persist::test_env("stop-mute-accept");
+        crate::persist::ensure_session_dir();
+        let _listener =
+            crate::ipc::transport::bind(&crate::persist::socket_path()).expect("mute API listener");
+        let started = Instant::now();
+        let result =
+            send_server_stop_with_timeouts(Duration::from_millis(40), Duration::from_millis(120));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "mute accept must not hang server stop"
+        );
+        assert!(
+            result.is_err(),
+            "fail closed without a stoppable foreign pid: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_server_ready_fails_closed_when_control_ping_never_replies() {
+        let _env = crate::persist::test_env("ready-mute-accept");
+        crate::persist::ensure_session_dir();
+        let client = crate::persist::client_socket_path();
+        let api = crate::persist::socket_path();
+        let _client_listener = crate::ipc::transport::bind(&client).expect("mute client listener");
+        let _api_listener = crate::ipc::transport::bind(&api).expect("mute API listener");
+        let started = Instant::now();
+        let result = ensure_server_ready_with_timeouts(
+            &client,
+            Duration::from_millis(40),
+            Duration::from_millis(120),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "mute ping must not hang attach"
+        );
+        assert!(
+            result.is_err(),
+            "fail closed rather than attach to a mute loop: {result:?}"
+        );
+    }
+
+    #[test]
+    fn control_probe_retries_with_a_longer_deadline_before_recovery() {
+        let ordinary = Duration::from_millis(25);
+        let recovery = Duration::from_millis(150);
+        let mut attempts = Vec::new();
+        let result = retry_control_probe(ordinary, recovery, |timeout| {
+            attempts.push(timeout);
+            if attempts.len() == 1 {
+                Err(anyhow!("transient timeout"))
+            } else {
+                Ok("0.13.1".to_string())
+            }
+        });
+
+        assert_eq!(result.expect("recovery probe succeeds"), "0.13.1");
+        assert_eq!(attempts, vec![ordinary, recovery]);
+    }
+
+    #[test]
     fn only_exact_json_session_list_uses_discovery_route() {
         let strings = |items: &[&str]| {
             items
@@ -1026,31 +1564,90 @@ mod tests {
             "luvus", "session", "list", "--json", "extra"
         ])));
         assert!(is_backend_discovery_request(&strings(&[
-            "luvus", "api", "schema"
-        ])));
-        assert!(is_backend_discovery_request(&strings(&[
-            "luvus",
-            "api",
-            "runtime-schema"
-        ])));
-        assert!(is_backend_discovery_request(&strings(&[
-            "luvus",
-            "api",
-            "socket-schema"
+            "luvus", "uhp", "schema"
         ])));
     }
 
-    // The synthesized "done" jingle is a well-formed 16-bit mono WAV.
     #[test]
-    fn done_jingle_is_valid_wav() {
-        let w = synth_done_wav();
-        assert_eq!(&w[0..4], b"RIFF");
-        assert_eq!(&w[8..12], b"WAVE");
-        assert_eq!(&w[12..16], b"fmt ");
-        assert_eq!(&w[36..40], b"data");
-        let data_len = u32::from_le_bytes(w[40..44].try_into().unwrap()) as usize;
-        assert_eq!(w.len(), 44 + data_len, "header data length matches payload");
-        assert!(data_len > 0, "non-empty audio");
+    fn concurrent_sound_cache_publication_never_exposes_partial_wav() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("sound-cache-test-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = Arc::new(dir.join("cue.wav"));
+        let wav = Arc::new(crate::sound::synth_wav(crate::sound::SoundSignal {
+            cue: crate::sound::SoundCue::Blocked,
+            style: crate::sound::SoundStyle::Retro,
+        }));
+        let writers_done = Arc::new(AtomicBool::new(false));
+
+        let reader_path = Arc::clone(&path);
+        let reader_wav = Arc::clone(&wav);
+        let reader_done = Arc::clone(&writers_done);
+        let reader = std::thread::spawn(move || {
+            while !reader_done.load(Ordering::Acquire) {
+                if let Ok(bytes) = std::fs::read(reader_path.as_ref()) {
+                    assert_eq!(bytes, *reader_wav, "published WAV is always complete");
+                }
+                std::thread::yield_now();
+            }
+        });
+
+        let writers: Vec<_> = (0..8)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let wav = Arc::clone(&wav);
+                std::thread::spawn(move || assert!(publish_sound_cache(&path, &wav)))
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        writers_done.store(true, Ordering::Release);
+        reader.join().unwrap();
+
+        assert_eq!(std::fs::read(path.as_ref()).unwrap(), *wav);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_file(path.as_ref()).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn sound_cache_uses_a_private_application_directory() {
+        let dir = sound_cache_dir().expect("private sound cache");
+        assert_eq!(dir.parent(), Some(std::env::temp_dir().as_path()));
+        assert_ne!(dir, std::env::temp_dir());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            let metadata = std::fs::symlink_metadata(&dir).expect("sound cache metadata");
+            assert!(metadata.file_type().is_dir());
+            assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+            assert_eq!(metadata.permissions().mode() & 0o077, 0);
+        }
+    }
+
+    #[test]
+    fn sound_cache_rejects_a_non_directory_path() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("sound-cache-file-{}-{nonce}", std::process::id()));
+        std::fs::write(&path, b"not a directory").unwrap();
+        assert!(!ensure_private_sound_cache_dir(&path));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1098,6 +1695,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn remote_bridge_fallback_checks_standard_user_installations() {
+        let _env = crate::persist::test_env("named-session-remote-fallback");
+        let raw = [
+            "luvus",
+            "--session",
+            "api",
+            "--remote",
+            "devbox",
+            "-p",
+            "2222",
+        ]
+        .map(String::from);
+        let args = crate::session::configure_from_args(&raw).unwrap();
+        let command = remote_fallback_ssh_command(&args).unwrap();
+        let actual: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            &actual[..7],
+            [
+                "-T",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-p",
+                "2222",
+            ]
+        );
+        assert_eq!(actual[7], "devbox");
+        let script = &actual[8];
+        assert!(script.contains("\"$HOME/.local/bin/luvus\""));
+        assert!(script.contains("\"$HOME/.cargo/bin/luvus\""));
+        assert!(script.contains("\"$HOME/.nix-profile/bin/luvus\""));
+        assert!(script.contains("/usr/local/bin/luvus"));
+        assert!(script.contains("/opt/homebrew/bin/luvus"));
+        assert!(script.contains("/home/linuxbrew/.linuxbrew/bin/luvus"));
+        assert!(script.contains("'--session' 'api' 'remote-client-bridge'"));
+        assert!(script.ends_with("exit 127"));
+    }
+
+    #[test]
+    fn remote_bridge_shell_arguments_are_single_quoted() {
+        assert_eq!(posix_shell_quote("plain"), "'plain'");
+        assert_eq!(posix_shell_quote("team's"), "'team'\\''s'");
+    }
+
     /// Manual benchmark of the server render hot path (full UI render + in-place
     /// `diff_buffer`) — the per-frame cost during typing. Run with:
     ///   cargo test --release --features dev-tools bench_render_hotpath -- --nocapture
@@ -1121,7 +1767,7 @@ mod tests {
         }
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| ui::render(f, &mut app)).unwrap();
-        let mut last = frame_from_buffer(term.backend().buffer(), None);
+        let mut last = frame_from_buffer(term.backend().buffer(), None, false);
 
         let bench = |label: &str,
                      app: &mut App,
@@ -1265,7 +1911,7 @@ mod tests {
             "    NEW server frame:  {server_frame:>10?}  (render_into owned buf + diff_buffer)"
         );
         // (f) the CLIENT's per-frame cost: re-blit the whole frame via terminal.draw.
-        let frame = frame_from_buffer(&owned, None);
+        let frame = frame_from_buffer(&owned, None, false);
         let mut cterm = Terminal::new(TestBackend::new(w, h)).unwrap();
         let t = std::time::Instant::now();
         for _ in 0..n {
@@ -1290,6 +1936,44 @@ mod tests {
         let client_blit = t.elapsed() / n;
         println!("    CLIENT old re-blit:{client_blit:>10?}  (terminal.draw full frame — REMOVED; client now writes only changed cells)");
         println!();
+    }
+
+    /// Focused docs/100 check: compare forced desktop/mobile frames at the same
+    /// viewport and measure the full-screen navigator separately. It intentionally
+    /// performs no IO and creates no background task.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn bench_mobile_render_hotpath() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let render = |label: &str, app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(64, 35)).unwrap();
+            terminal.draw(|frame| ui::render(frame, app)).unwrap();
+            let frames = 5_000u32;
+            let started = Instant::now();
+            for _ in 0..frames {
+                terminal.draw(|frame| ui::render(frame, app)).unwrap();
+            }
+            let elapsed = started.elapsed();
+            println!("{label:>18}: {:>10?}/frame", elapsed / frames);
+            elapsed / frames
+        };
+
+        let (tx, _rx) = mpsc::channel::<AppEvent>();
+        let mut desktop = App::new(64, 35, tx.clone()).unwrap();
+        desktop.config.layout.mobile_width = 0;
+        let desktop_frame = render("desktop 64x35", &mut desktop);
+
+        let mut mobile = App::new(64, 35, tx).unwrap();
+        let mobile_frame = render("mobile closed", &mut mobile);
+        mobile.open_switcher();
+        let navigator_frame = render("mobile navigator", &mut mobile);
+
+        println!(
+            "mobile/desktop: {:.3}x, navigator/desktop: {:.3}x",
+            mobile_frame.as_secs_f64() / desktop_frame.as_secs_f64(),
+            navigator_frame.as_secs_f64() / desktop_frame.as_secs_f64(),
+        );
     }
 
     #[test]
@@ -1800,16 +2484,18 @@ mod tests {
             text.push_str(cell.symbol());
         }
         assert!(text.contains("ORCHESTRATION"), "board header missing");
+        assert!(text.contains("STATUS"), "task table header missing");
+        assert!(text.contains("▌"), "selected task marker missing");
         assert!(text.contains("Wire the auth module"), "task title missing");
         assert!(text.contains("claimed"), "task status missing");
         assert!(text.contains("LEASES"), "leases section missing");
         assert!(text.contains("◇ orch"), "board tab label missing");
     }
 
-    /// The board's UX layer renders: a Running worker row with its live agent
-    /// state, the start-worker picker, and the task detail overlay.
+    /// The board's UX layer renders: a Running worker row without duplicating
+    /// live agent state, the start-worker picker, and the task detail overlay.
     #[test]
-    fn renders_board_live_state_picker_and_detail() {
+    fn renders_board_worker_binding_picker_and_detail() {
         let _env = crate::persist::test_env("renders-board-live");
         let (tx, _rx) = mpsc::channel::<AppEvent>();
         let mut app = App::new(80, 24, tx).expect("spawn pane");
@@ -1828,37 +2514,57 @@ mod tests {
             .unwrap();
         app.orch
             .bind_worktree("t1", Some("/tmp/wt".into()), Some("luvus/t1".into()));
-        // The worker pane's live detection state rides on the row.
+        // Live agent state belongs to the agent surfaces, not the task's Pane
+        // column. Seed it here to prove the board does not duplicate it.
         if let Some(st) = app.status.get_mut(&pane) {
             st.agent = "claude".into();
             st.state = crate::ui::theme::State::Working;
         }
         app.open_orch_board();
 
-        let render_text = |app: &mut App| {
+        let render_lines = |app: &mut App| {
             let mut terminal = Terminal::new(TestBackend::new(110, 32)).unwrap();
             terminal.draw(|f| ui::render(f, app)).unwrap();
             let buf = terminal.backend().buffer().clone();
-            buf.content().iter().map(|c| c.symbol()).collect::<String>()
+            buf.content()
+                .chunks(110)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
         };
 
-        let text = render_text(&mut app);
-        assert!(text.contains("running"), "started worker shows running");
-        assert!(text.contains("luvus/t1"), "worker branch shown");
-        assert!(text.contains("working"), "live agent state shown");
+        let lines = render_lines(&mut app);
+        let worker_row = lines
+            .iter()
+            .find(|line| line.contains("luvus/t1"))
+            .expect("worker branch shown");
+        assert!(
+            worker_row.contains("running"),
+            "started worker shows running"
+        );
+        assert!(
+            !worker_row.contains("working"),
+            "live agent state stays out of Pane"
+        );
+        assert!(
+            !worker_row.contains("claude"),
+            "agent name stays out of Pane"
+        );
 
         // The start-worker picker draws over the board.
         app.orch_start = Some(crate::app::OrchStart {
             task: "t1".into(),
             cursor: 0,
+            step: crate::app::OrchStartStep::Agent,
+            mode: crate::orch::TaskWorkerMode::Worktree,
+            shared_workers: 0,
         });
-        let text = render_text(&mut app);
+        let text = render_lines(&mut app).join("\n");
         assert!(text.contains("claude"), "picker lists agents");
         app.orch_start = None;
 
         // The detail overlay shows the task's binding.
         app.orch_detail = Some("t1".into());
-        let text = render_text(&mut app);
+        let text = render_lines(&mut app).join("\n");
         assert!(text.contains("/tmp/wt"), "detail shows the worktree");
     }
 
@@ -1951,6 +2657,73 @@ mod tests {
     /// list at the top, and the cursor steps through the commands *and* the
     /// read-only reference blocks, so holding Down eventually reveals every one
     /// (the last is the Mouse block) on a short modal.
+    /// Every copy-mode reference row has to render its description in full. The
+    /// i18n arity check counts rows but cannot see the panel, and the panel's
+    /// description column is exactly what a longer translation runs out of: the
+    /// Indonesian count row was clipped mid-word at 63 characters while English
+    /// fit at 48. Wide cells leave an empty continuation cell, so the comparison
+    /// ignores whitespace rather than pretending CJK reads back cell-for-cell.
+    #[test]
+    fn copy_mode_reference_rows_are_not_clipped_in_any_language() {
+        use ratatui::buffer::Buffer;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::layout::Rect;
+        let flatten = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+        for code in crate::i18n::LANGS {
+            let _env = crate::persist::test_env(&format!("keys-clip-{code}"));
+            let (tx, _rx) = mpsc::channel::<AppEvent>();
+            let mut app = App::new(80, 24, tx).expect("spawn pane");
+            app.catalog = crate::i18n::by_code(code);
+            app.open_settings();
+            app.handle_settings_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+            let render = |app: &mut App| -> String {
+                let area = Rect::new(0, 0, 80, 24);
+                let mut buf = Buffer::empty(area);
+                {
+                    let mut target = ui::RenderTarget::new(&mut buf, area);
+                    ui::render_into(&mut target, app);
+                }
+                let mut out = String::new();
+                for y in 0..area.height {
+                    for x in 0..area.width {
+                        out.push_str(buf[(x, y)].symbol());
+                    }
+                    out.push('\n');
+                }
+                out
+            };
+
+            let rows = app.settings_rows(crate::app::SettingsTab::Keys);
+            for _ in 0..rows {
+                app.handle_settings_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            }
+            let heading = flatten(app.catalog.settings.key_reference_headings[2]);
+            let mut view = render(&mut app);
+            for _ in 0..rows {
+                if flatten(&view).contains(&heading) {
+                    break;
+                }
+                app.handle_settings_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+                view = render(&mut app);
+            }
+            assert!(
+                flatten(&view).contains(&heading),
+                "{code} never scrolled the copy-mode block into view"
+            );
+
+            let keys = crate::i18n::settings::KEY_REFERENCE_KEYS[2];
+            let descs = app.catalog.settings.key_reference_descriptions[2];
+            let seen = flatten(&view);
+            for (key, desc) in keys.iter().zip(descs.iter()) {
+                assert!(
+                    seen.contains(&flatten(desc)),
+                    "{code} clips the {key} row at {} characters:\n{desc}\n{view}",
+                    desc.chars().count()
+                );
+            }
+        }
+    }
+
     #[test]
     fn keys_tab_shows_help_and_scrolls_to_the_reference() {
         use ratatui::buffer::Buffer;
@@ -1991,7 +2764,7 @@ mod tests {
             "the how-to intro is visible at the top:\n{top}"
         );
         assert!(
-            !top.contains("not rebindable"),
+            !top.contains("Always active"),
             "the always-on reference is below the fold before scrolling:\n{top}"
         );
 
@@ -2002,7 +2775,7 @@ mod tests {
         }
         let mid = screen(&mut app);
         assert!(
-            mid.contains("not rebindable") && mid.contains("focus panes"),
+            mid.contains("Always active") && mid.contains("focus panes"),
             "the always-on reference is reachable by cursor:\n{mid}"
         );
 
@@ -2017,13 +2790,36 @@ mod tests {
             "the last reference block (Mouse) is reachable:\n{bottom}"
         );
         // Copy & paste is its own labeled section (just above Mouse), so a user
-        // looking for it finds it — scroll up a little from the bottom.
-        for _ in 0..8 {
+        // looking for it can reach it even when reference row counts change.
+        let mut reference_view = bottom;
+        for _ in 0..app.settings_rows(crate::app::SettingsTab::Keys) {
+            if reference_view.contains("Copy & paste") {
+                break;
+            }
             app.handle_settings_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+            reference_view = screen(&mut app);
         }
         assert!(
-            screen(&mut app).contains("Copy & paste"),
-            "there is a Copy & paste reference block"
+            reference_view.contains("Copy & paste"),
+            "there is a Copy & paste reference block:\n{reference_view}"
+        );
+
+        // Copy mode's motions cannot be rebound, so the Keys tab is the only place
+        // in the app that can teach them. A user who never reads the website has
+        // to be able to find `e`, `^D`/`^U`, and the count prefix right here.
+        let mut copy_view = reference_view;
+        for _ in 0..app.settings_rows(crate::app::SettingsTab::Keys) {
+            if copy_view.contains("w / e / B") {
+                break;
+            }
+            app.handle_settings_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+            copy_view = screen(&mut app);
+        }
+        assert!(
+            copy_view.contains("w / e / B")
+                && copy_view.contains("^D / ^U")
+                && copy_view.contains("12j moves twelve rows"),
+            "copy mode's fixed motions are discoverable in the Keys tab:\n{copy_view}"
         );
 
         // The mouse wheel scrolls the list (moves the selection) without the arrows.

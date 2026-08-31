@@ -5,14 +5,18 @@ use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::{Color as VtColor, Processor};
+use alacritty_terminal::vte::ansi::{Color as VtColor, NamedColor, Processor, Rgb};
 
 use ratatui::style::{Color, Modifier};
 
-use super::{CodexComposerRegion, Cursor, HistoryMetrics, RenderCell, VtEngine};
+use super::{
+    AlignedRows, CodexComposerRegion, Cursor, HistoryMetrics, RenderCell, RetainedRowLayout,
+    VtEngine, ALIGNED_WIDE_CELL,
+};
+use crate::terminal::appearance::PaneAppearance;
 use crate::terminal::backend::{CaptureMode, CaptureResult};
 use crate::terminal::pty::InputAction;
 
@@ -25,6 +29,7 @@ type TitleSlot = Arc<Mutex<Option<String>>>;
 pub struct EventProxy {
     tx: Sender<InputAction>,
     title: TitleSlot,
+    appearance: Arc<Mutex<PaneAppearance>>,
 }
 
 impl EventListener for EventProxy {
@@ -32,6 +37,23 @@ impl EventListener for EventProxy {
         match event {
             Event::PtyWrite(text) => {
                 let _ = self.tx.send(InputAction::Bytes(text.into_bytes()));
+            }
+            Event::ColorRequest(index, format) => {
+                if index == NamedColor::Background as usize {
+                    if let Ok(appearance) = self.appearance.lock() {
+                        let [r, g, b] = appearance.background;
+                        let _ = self
+                            .tx
+                            .send(InputAction::Bytes(format(Rgb { r, g, b }).into_bytes()));
+                    }
+                }
+            }
+            Event::ColorSchemeRequest => {
+                if let Ok(appearance) = self.appearance.lock() {
+                    let _ = self
+                        .tx
+                        .send(InputAction::Bytes(appearance.scheme.dsr().to_vec()));
+                }
             }
             Event::Title(t) => {
                 if let Ok(mut g) = self.title.lock() {
@@ -71,25 +93,46 @@ pub struct AlacrittyEngine {
     term: Term<EventProxy>,
     parser: Processor,
     title: TitleSlot,
+    response_tx: Sender<InputAction>,
+    appearance: Arc<Mutex<PaneAppearance>>,
     history_budget_bytes: usize,
     output_generation: u64,
 }
 
 impl AlacrittyEngine {
+    #[cfg(test)]
     pub fn new(
         cols: u16,
         rows: u16,
         resp_tx: Sender<InputAction>,
         history_budget_bytes: usize,
     ) -> Self {
+        Self::with_appearance(
+            cols,
+            rows,
+            resp_tx,
+            history_budget_bytes,
+            PaneAppearance::default(),
+        )
+    }
+
+    pub(crate) fn with_appearance(
+        cols: u16,
+        rows: u16,
+        resp_tx: Sender<InputAction>,
+        history_budget_bytes: usize,
+        initial_appearance: PaneAppearance,
+    ) -> Self {
         let dims = Dims {
             cols: cols.max(1) as usize,
             rows: rows.max(1) as usize,
         };
         let title: TitleSlot = Arc::new(Mutex::new(None));
+        let appearance = Arc::new(Mutex::new(initial_appearance));
         let proxy = EventProxy {
-            tx: resp_tx,
+            tx: resp_tx.clone(),
             title: title.clone(),
+            appearance: appearance.clone(),
         };
         // Alacritty retains history by rows, not bytes. Derive a conservative
         // capacity from Luvus's per-pane byte budget and current width. The
@@ -104,6 +147,8 @@ impl AlacrittyEngine {
             term,
             parser: Processor::new(),
             title,
+            response_tx: resp_tx,
+            appearance,
             history_budget_bytes,
             output_generation: 0,
         }
@@ -448,6 +493,37 @@ impl VtEngine for AlacrittyEngine {
         out
     }
 
+    fn detection_text_non_empty(&self, n: u16) -> String {
+        let grid = self.term.grid();
+        let rows = grid.screen_lines();
+        let cols = grid.columns();
+        let mut selected = Vec::with_capacity(usize::from(n).min(rows));
+        for r in (0..rows).rev() {
+            let row = &grid[Line(r as i32)];
+            let mut line = String::with_capacity(cols);
+            for c in 0..cols {
+                let cell = &row[Column(c)];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                line.push(if cell.c == '\0' { ' ' } else { cell.c });
+                if let Some(zerowidth) = cell.zerowidth() {
+                    line.extend(zerowidth);
+                }
+            }
+            let line = line.trim_end();
+            if line.is_empty() {
+                continue;
+            }
+            selected.push(line.to_string());
+            if selected.len() == usize::from(n) {
+                break;
+            }
+        }
+        selected.reverse();
+        selected.join("\n")
+    }
+
     fn visible_rows(&self) -> Vec<String> {
         // Same offset shift as `for_each_cell` — these are the rows the user can
         // see, so a selection made while scrolled back must copy the history
@@ -466,6 +542,37 @@ impl VtEngine for AlacrittyEngine {
             }
             let c = indexed.cell.c;
             lines[r as usize].push(if c == '\0' { ' ' } else { c });
+        }
+        lines
+    }
+
+    fn visible_rows_aligned(&self) -> AlignedRows {
+        // Identical to `visible_rows`, except a wide-char spacer cell is kept as
+        // a non-text continuation marker instead of skipped. An actual blank must
+        // remain distinguishable so word lookup does not split a CJK/emoji word
+        // between the glyph and its second terminal cell.
+        let grid = self.term.grid();
+        let rows = grid.screen_lines();
+        let offset = grid.display_offset() as i32;
+        let mut lines = AlignedRows::new(rows);
+        for indexed in grid.display_iter() {
+            let r = indexed.point.line.0 + offset;
+            if r < 0 || r as usize >= rows {
+                continue;
+            }
+            let c = if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                ALIGNED_WIDE_CELL
+            } else if indexed.cell.c == '\0' {
+                ' '
+            } else {
+                indexed.cell.c
+            };
+            let zero_width = if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                None
+            } else {
+                indexed.cell.zerowidth()
+            };
+            lines.push_cell(r as u16, indexed.point.column.0 as u16, c, zero_width);
         }
         lines
     }
@@ -667,6 +774,7 @@ impl VtEngine for AlacrittyEngine {
             .saturating_add(self.term.grid().screen_lines())
     }
 
+    #[cfg(test)]
     fn retained_row_text(&self, index: usize) -> Option<String> {
         let mut output = String::with_capacity(self.term.grid().columns());
         self.write_retained_row(index, &mut output)
@@ -680,6 +788,65 @@ impl VtEngine for AlacrittyEngine {
                 f(index, &output);
             }
         }
+    }
+
+    fn retained_selection_text(
+        &self,
+        ((start_row, start_col), (end_row, end_col)): ((usize, usize), (usize, usize)),
+    ) -> Option<String> {
+        if start_row > end_row {
+            return None;
+        }
+        let last_column = self.term.grid().columns().checked_sub(1)?;
+        let start = Point::new(
+            self.retained_line(start_row)?,
+            Column(start_col.min(last_column)),
+        );
+        let end = Point::new(
+            self.retained_line(end_row)?,
+            Column(end_col.min(last_column)),
+        );
+
+        // Alacritty owns the VT line-wrap metadata. Extract the complete range
+        // once so soft wraps are rejoined while real line breaks are retained.
+        Some(self.term.bounds_to_string(start, end))
+    }
+
+    fn retained_row_layout(&self, index: usize) -> Option<RetainedRowLayout> {
+        let line = self.retained_line(index)?;
+        let grid = self.term.grid();
+        let row = &grid[line];
+        let mut whitespace = Vec::with_capacity(grid.columns());
+        let mut previous_whitespace = true;
+        let mut last_content = None;
+
+        for column in 0..grid.columns() {
+            let cell = &row[Column(column)];
+            let wide_spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER);
+            let leading_spacer = cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER);
+            let cell_whitespace = if wide_spacer {
+                previous_whitespace
+            } else if leading_spacer {
+                false
+            } else {
+                cell.c == '\0' || cell.c.is_whitespace()
+            };
+            whitespace.push(cell_whitespace);
+
+            let has_content = leading_spacer
+                || (!wide_spacer && cell.c != '\0' && cell.c != ' ')
+                || (wide_spacer && last_content == column.checked_sub(1));
+            if has_content {
+                last_content = Some(column);
+            }
+            if !wide_spacer && !leading_spacer {
+                previous_whitespace = cell_whitespace;
+            }
+        }
+
+        let has_text = last_content.is_some();
+        whitespace.truncate(last_content.map_or(1, |column| column + 1));
+        Some(RetainedRowLayout::new(whitespace, has_text))
     }
 
     fn scroll_to(&mut self, offset: usize) {
@@ -726,6 +893,19 @@ impl VtEngine for AlacrittyEngine {
 
     fn bracketed_paste(&self) -> bool {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    fn set_appearance(&mut self, next: PaneAppearance) {
+        let changed = self.appearance.lock().is_ok_and(|mut current| {
+            let changed = *current != next;
+            *current = next;
+            changed
+        });
+        if changed && self.term.mode().contains(TermMode::REPORT_APPEARANCE) {
+            let _ = self
+                .response_tx
+                .send(InputAction::Bytes(next.scheme.dsr().to_vec()));
+        }
     }
 
     fn snapshot_ansi(&self) -> String {
@@ -865,6 +1045,8 @@ mod tests {
     use super::*;
     use std::sync::mpsc::channel;
 
+    use crate::terminal::appearance::ColorScheme;
+
     fn feed_lines(e: &mut AlacrittyEngine, n: usize) {
         for i in 0..n {
             e.advance(format!("line{i}\r\n").as_bytes());
@@ -973,6 +1155,189 @@ mod tests {
         );
         e.advance(b" world");
         assert_eq!(e.output_generation(), 2);
+    }
+
+    #[test]
+    fn retained_selection_preserves_unicode_scripts_and_clusters() {
+        let samples = [
+            "你好，世界",
+            "こんにちは",
+            "안녕하세요",
+            "مرحبا",
+            "שלום",
+            "नमस्ते",
+            "สวัสดี",
+            "cafe\u{301}",
+            "🖥️ coding",
+            "👩‍💻 pair",
+        ];
+
+        for sample in samples {
+            let (tx, _rx) = channel();
+            let mut engine = AlacrittyEngine::new(80, 3, tx, budget_for_rows(80, 20));
+            engine.advance(format!("\x1b[H\x1b[2J{sample}").as_bytes());
+            let row = (0..engine.retained_row_count())
+                .find(|row| engine.retained_row_text(*row).as_deref() == Some(sample))
+                .expect("sample retained row");
+            let layout = engine
+                .retained_row_layout(row)
+                .expect("retained row layout");
+            let selected = engine
+                .retained_selection_text(((row, 0), (row, layout.last_column())))
+                .expect("selected row");
+            assert_eq!(selected, sample, "Unicode selection changed {sample:?}");
+        }
+    }
+
+    #[test]
+    fn retained_selection_uses_visual_columns_for_mixed_cjk_text() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(40, 4, tx, budget_for_rows(40, 20));
+        engine.advance("\x1b[H\x1b[2J你好，hello.\r\nمرحبا world".as_bytes());
+        let first = (0..engine.retained_row_count())
+            .find(|row| engine.retained_row_text(*row).as_deref() == Some("你好，hello."))
+            .expect("first retained row");
+        let second = (0..engine.retained_row_count())
+            .find(|row| engine.retained_row_text(*row).as_deref() == Some("مرحبا world"))
+            .expect("second retained row");
+
+        assert_eq!(
+            engine
+                .retained_selection_text(((first, 0), (first, 3)))
+                .as_deref(),
+            Some("你好")
+        );
+        assert_eq!(
+            engine
+                .retained_selection_text(((first, 1), (first, 2)))
+                .as_deref(),
+            Some("你好"),
+            "starting on a wide spacer still includes its complete glyph"
+        );
+        let second_layout = engine
+            .retained_row_layout(second)
+            .expect("second row layout");
+        assert_eq!(
+            engine
+                .retained_selection_text(((first, 0), (second, second_layout.last_column())))
+                .as_deref(),
+            Some("你好，hello.\nمرحبا world")
+        );
+    }
+
+    #[test]
+    fn retained_selection_uses_linear_cells_across_hard_lines() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(40, 5, tx, budget_for_rows(40, 20));
+        engine.advance(b"\x1b[H\x1b[2J - first\r\n - second\r\n - third");
+        let mut rows = Vec::new();
+        engine.for_each_retained_row(&mut |row, text| {
+            if text.starts_with(" - ") {
+                rows.push(row);
+            }
+        });
+        assert_eq!(rows.len(), 3);
+
+        assert_eq!(
+            engine
+                .retained_selection_text(((rows[0], 1), (rows[2], 7)))
+                .as_deref(),
+            Some("- first\n - second\n - third"),
+            "only the first row starts at the anchor column"
+        );
+    }
+
+    #[test]
+    fn retained_selection_preserves_selected_indentation() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(40, 6, tx, budget_for_rows(40, 20));
+        engine.advance(
+            b"\x1b[H\x1b[2J    first\r\n    second\r\n      nested\r\nprefix chosen\r\nstarts-left",
+        );
+        let mut rows = Vec::new();
+        engine.for_each_retained_row(&mut |row, text| {
+            if !text.is_empty() {
+                rows.push((row, text.to_string()));
+            }
+        });
+
+        let first = rows
+            .iter()
+            .find(|(_, text)| text == "    first")
+            .map(|(row, _)| *row)
+            .expect("indented prose row");
+        assert_eq!(
+            engine
+                .retained_selection_text(((first, 4), (first + 2, 11)))
+                .as_deref(),
+            Some("first\n    second\n      nested"),
+            "selected indentation on continuation rows remains content"
+        );
+
+        let chosen = rows
+            .iter()
+            .find(|(_, text)| text == "prefix chosen")
+            .map(|(row, _)| *row)
+            .expect("mid-line selection row");
+        assert_eq!(
+            engine
+                .retained_selection_text(((chosen, 7), (chosen + 1, 10)))
+                .as_deref(),
+            Some("chosen\nstarts-left"),
+            "text before the anchor disables margin cleanup on following rows"
+        );
+    }
+
+    #[test]
+    fn retained_selection_preserves_wide_whitespace_cells() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(40, 4, tx, budget_for_rows(40, 20));
+        engine.advance("\x1b[H\x1b[2J　first\r\n　second".as_bytes());
+        let mut rows = Vec::new();
+        engine.for_each_retained_row(&mut |row, text| {
+            if text.ends_with("first") || text.ends_with("second") {
+                rows.push(row);
+            }
+        });
+        assert_eq!(rows.len(), 2);
+
+        assert_eq!(
+            engine
+                .retained_selection_text(((rows[0], 2), (rows[1], 7)))
+                .as_deref(),
+            Some("first\n　second")
+        );
+    }
+
+    #[test]
+    fn retained_selection_joins_soft_wraps_and_keeps_hard_breaks() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(5, 4, tx, budget_for_rows(5, 20));
+        engine.advance(b"abcdefghij\r\nnext");
+
+        let mut rows = Vec::new();
+        engine.for_each_retained_row(&mut |row, text| {
+            if !text.is_empty() {
+                rows.push((row, text.to_string()));
+            }
+        });
+        let first = rows
+            .iter()
+            .find(|(_, text)| text == "abcde")
+            .map(|(row, _)| *row)
+            .expect("first soft-wrapped row");
+        let last = rows
+            .iter()
+            .find(|(_, text)| text == "next")
+            .map(|(row, _)| *row)
+            .expect("hard-line row");
+
+        assert_eq!(
+            engine
+                .retained_selection_text(((first, 0), (last, 3)))
+                .as_deref(),
+            Some("abcdefghij\nnext")
+        );
     }
 
     #[test]
@@ -1114,6 +1479,22 @@ mod tests {
     }
 
     #[test]
+    fn non_empty_detection_reaches_prompts_above_blank_footer_rows() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(60, 8, tx, budget_for_rows(60, 2_000));
+        engine.advance(b"Hermes needs your approval\r\nEnter to confirm");
+
+        assert!(
+            engine.detection_text(2).trim().is_empty(),
+            "the ordinary two-row window is the blank terminal footer"
+        );
+        assert_eq!(
+            engine.detection_text_non_empty(2),
+            "Hermes needs your approval\nEnter to confirm"
+        );
+    }
+
+    #[test]
     fn scrollback_offset_moves_clamps_and_resets() {
         let (tx, _rx) = channel();
         let mut e = AlacrittyEngine::new(20, 5, tx, budget_for_rows(20, 2_000)); // 5 visible rows
@@ -1245,6 +1626,20 @@ mod tests {
     }
 
     #[test]
+    fn pi_fullscreen_mouse_modes_are_detected() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(20, 5, tx, budget_for_rows(20, 2_000));
+
+        // Pi fullscreen enters the alternate screen, disables autowrap, and
+        // enables normal, button-motion, focus, and SGR mouse reporting.
+        e.advance(b"\x1b[?1049h\x1b[?7l\x1b[?1000h\x1b[?1002h\x1b[?1004h\x1b[?1006h");
+
+        assert!(e.alt_screen());
+        assert!(e.mouse_report());
+        assert!(e.sgr_mouse());
+    }
+
+    #[test]
     fn codex_composer_region_finds_the_real_default_background_layout() {
         let (tx, _rx) = channel();
         let mut e = AlacrittyEngine::new(40, 8, tx, budget_for_rows(40, 2_000));
@@ -1292,5 +1687,146 @@ mod tests {
         assert!(capture.text.contains("abcdefghij"), "{:?}", capture.text);
         assert!(capture.text.contains("next"), "{:?}", capture.text);
         assert!(capture.lines <= 3);
+    }
+
+    /// Pi alt-screen `doRender`: 2026 + row writes + CUP to fake caret + hide.
+    #[test]
+    fn pi_sync_frame_cursor_follows_final_cup_not_row_tail() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(20, 4, tx, budget_for_rows(20, 20));
+        // Row 0 full of x (last cell col 19). Row 1: "> " + reverse space + pad.
+        // Then CUP to row 1 col 2 (1-based 2;3) and hide — Pi marker after prompt.
+        e.advance(
+            b"\x1b[?2026h\
+\x1b[1;1H\x1b[2Kxxxxxxxxxxxxxxxxxxxx\
+\x1b[2;1H\x1b[2K> \x1b[7m \x1b[27m               \
+\x1b[2;3H\x1b[?25l\
+\x1b[?2026l",
+        );
+        let cur = e.cursor();
+        assert_eq!((cur.x, cur.y), (2, 1), "cursor after complete 2026 frame");
+        assert!(!cur.visible, "Pi default hide");
+
+        let mut reversed = Vec::new();
+        e.for_each_cell(&mut |row, col, _, cell| {
+            if cell.mods.contains(Modifier::REVERSED) {
+                reversed.push((row, col));
+            }
+        });
+        assert_eq!(
+            reversed,
+            vec![(1, 2)],
+            "ESC[7m space at caret, not row tail"
+        );
+    }
+
+    #[test]
+    fn pi_sync_frame_without_closing_esu_does_not_apply_row_writes() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(20, 4, tx, budget_for_rows(20, 20));
+        e.advance(b"\x1b[2;3H\x1b[?25h");
+        let before = e.cursor();
+        e.advance(b"\x1b[?2026h\x1b[1;1H\x1b[2Kxxxxxxxxxxxxxxxxxxxx");
+        let mid = e.cursor();
+        assert_eq!(
+            (mid.x, mid.y),
+            (before.x, before.y),
+            "open 2026 buffers; cursor stays at last committed CUP"
+        );
+    }
+
+    #[test]
+    fn pi_cursor_marker_apc_is_not_a_grid_cell() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(20, 3, tx, budget_for_rows(20, 20));
+        e.advance(b"> \x1b_pi:c\x07\x1b[7m \x1b[27mhi");
+        let text = e.visible_rows().join("");
+        assert!(
+            !text.contains("pi:c"),
+            "APC marker must not become cells: {text:?}"
+        );
+        let mut reversed = Vec::new();
+        e.for_each_cell(&mut |row, col, _, cell| {
+            if cell.mods.contains(Modifier::REVERSED) {
+                reversed.push((row, col, cell.fg));
+            }
+        });
+        assert_eq!(reversed.len(), 1, "one reverse caret: {reversed:?}");
+        assert_eq!(reversed[0].0, 0);
+        assert_eq!(reversed[0].1, 2);
+    }
+
+    fn appearance_engine(
+        background: [u8; 3],
+        scheme: ColorScheme,
+    ) -> (AlacrittyEngine, std::sync::mpsc::Receiver<InputAction>) {
+        let (tx, rx) = channel();
+        let appearance = PaneAppearance { background, scheme };
+        let engine =
+            AlacrittyEngine::with_appearance(40, 5, tx, budget_for_rows(40, 20), appearance);
+        (engine, rx)
+    }
+
+    fn recv_bytes(rx: &std::sync::mpsc::Receiver<InputAction>) -> Vec<u8> {
+        match rx.try_recv() {
+            Ok(InputAction::Bytes(bytes)) => bytes,
+            Ok(InputAction::Submit { .. }) => panic!("expected PTY reply, got submit"),
+            Err(error) => panic!("expected PTY reply: {error}"),
+        }
+    }
+
+    #[test]
+    fn osc11_query_replies_with_theme_background_for_bel_and_st() {
+        let bg = [0x1e, 0x20, 0x30];
+        let (mut engine, rx) = appearance_engine(bg, ColorScheme::Dark);
+        engine.advance(b"\x1b]11;?\x07");
+        let bel = recv_bytes(&rx);
+        assert_eq!(bel, b"\x1b]11;rgb:1e1e/2020/3030\x07");
+        assert_eq!(engine.visible_rows()[0].trim(), "");
+
+        engine.advance(b"\x1b]11;?\x1b\\");
+        let st = recv_bytes(&rx);
+        assert_eq!(st, b"\x1b]11;rgb:1e1e/2020/3030\x1b\\");
+        assert_eq!(engine.visible_rows()[0].trim(), "");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn osc11_set_color_does_not_reply_or_print_the_payload() {
+        let (mut engine, rx) = appearance_engine([0x11, 0x22, 0x33], ColorScheme::Dark);
+        engine.advance(b"\x1b]11;rgb:aa/bb/cc\x07hello");
+        assert!(
+            rx.try_recv().is_err(),
+            "OSC 11 set must not emit a query reply"
+        );
+        assert_eq!(engine.visible_rows()[0].trim_end(), "hello");
+    }
+
+    #[test]
+    fn mode_2031_queries_and_notifications_follow_engine_appearance() {
+        let (mut engine, rx) = appearance_engine([0x1e, 0x20, 0x30], ColorScheme::Dark);
+
+        engine.advance(b"\x1b[?2031$p\x1b[?996n");
+        assert_eq!(recv_bytes(&rx), b"\x1b[?2031;2$y");
+        assert_eq!(recv_bytes(&rx), b"\x1b[?997;1n");
+
+        engine.advance(b"\x1b[?2031h\x1b[?2031$p");
+        assert_eq!(recv_bytes(&rx), b"\x1b[?2031;1$y");
+
+        engine.set_appearance(PaneAppearance {
+            background: [0xf2, 0xe5, 0xbc],
+            scheme: ColorScheme::Light,
+        });
+        assert_eq!(recv_bytes(&rx), b"\x1b[?997;2n");
+        engine.advance(b"\x1b[?996n");
+        assert_eq!(recv_bytes(&rx), b"\x1b[?997;2n");
+
+        engine.advance(b"\x1b[?2031l\x1b[?2031$p");
+        assert_eq!(recv_bytes(&rx), b"\x1b[?2031;2$y");
+        engine.set_appearance(PaneAppearance::default());
+        assert!(rx.try_recv().is_err(), "disabled mode must not notify");
+
+        engine.advance(b"\x1b[?2040$p");
+        assert_eq!(recv_bytes(&rx), b"\x1b[?2040;0$y");
     }
 }

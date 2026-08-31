@@ -15,9 +15,9 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
 use crate::event::AppEvent;
 use crate::ids::PaneId;
+use crate::terminal::appearance::PaneAppearance;
 use crate::terminal::backend::TerminalRuntime;
-use crate::terminal::vt::alacritty::AlacrittyEngine;
-use crate::terminal::vt::VtEngine;
+use crate::terminal::vt::{create_engine, VtEngine, VtEngineKind};
 
 const CHILD_REAPER_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -157,6 +157,9 @@ pub struct MouseModes {
 }
 
 pub struct Pane {
+    /// Stable application identity for operational lifecycle events. This is
+    /// never derived from the child command or terminal contents.
+    id: PaneId,
     pub engine: Arc<Mutex<dyn VtEngine>>,
     /// `None` until a deferred spawn's worker stores it (docs/82).
     master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
@@ -252,6 +255,7 @@ impl Pane {
         initial: Option<&str>,
         shell: &str,
         history_budget_bytes: usize,
+        appearance: PaneAppearance,
     ) -> Result<Pane> {
         let cmd = CommandBuilder::new(shell);
         Self::build(
@@ -265,6 +269,7 @@ impl Pane {
             basename(shell),
             &[],
             history_budget_bytes,
+            appearance,
         )
     }
 
@@ -283,6 +288,7 @@ impl Pane {
         shell: &str,
         argv: &[String],
         history_budget_bytes: usize,
+        appearance: PaneAppearance,
     ) -> Result<Pane> {
         let Some((program, args)) = argv.split_first() else {
             return Err(anyhow::anyhow!("empty shell command"));
@@ -302,6 +308,7 @@ impl Pane {
             basename(shell),
             &[],
             history_budget_bytes,
+            appearance,
         )
     }
 
@@ -317,6 +324,7 @@ impl Pane {
         argv: &[String],
         env: &[(String, String)],
         history_budget_bytes: usize,
+        appearance: PaneAppearance,
     ) -> Result<Pane> {
         let Some((program, args)) = argv.split_first() else {
             return Err(anyhow::anyhow!("empty module command"));
@@ -336,6 +344,7 @@ impl Pane {
             basename(program),
             env,
             history_budget_bytes,
+            appearance,
         )
     }
 
@@ -350,9 +359,11 @@ impl Pane {
         cols: u16,
         rows: u16,
         cwd: PathBuf,
+        fallback_cwds: &[PathBuf],
         app_tx: Sender<AppEvent>,
         shell: &str,
         history_budget_bytes: usize,
+        appearance: PaneAppearance,
     ) -> Pane {
         let cmd = CommandBuilder::new(shell);
         Self::build_deferred(
@@ -360,12 +371,88 @@ impl Pane {
             cols,
             rows,
             cwd,
+            fallback_cwds,
             app_tx,
+            None,
             cmd,
             basename(shell),
             &[],
             history_budget_bytes,
+            appearance,
         )
+    }
+
+    /// Restore an interactive shell pane without making session loading wait
+    /// for the operating system to allocate its PTY. The saved screen is
+    /// replayed before this returns, so clients can render useful content while
+    /// the shell starts in the background.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_restored(
+        id: PaneId,
+        cols: u16,
+        rows: u16,
+        cwd: PathBuf,
+        fallback_cwds: &[PathBuf],
+        app_tx: Sender<AppEvent>,
+        initial: Option<&str>,
+        shell: &str,
+        history_budget_bytes: usize,
+        appearance: PaneAppearance,
+    ) -> Pane {
+        let cmd = CommandBuilder::new(shell);
+        Self::build_deferred(
+            id,
+            cols,
+            rows,
+            cwd,
+            fallback_cwds,
+            app_tx,
+            initial,
+            cmd,
+            basename(shell),
+            &[],
+            history_budget_bytes,
+            appearance,
+        )
+    }
+
+    /// Deferred counterpart to [`Pane::spawn_shell_with`] for restoring a
+    /// PowerShell agent session without blocking server startup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_shell_with_deferred(
+        id: PaneId,
+        cols: u16,
+        rows: u16,
+        cwd: PathBuf,
+        fallback_cwds: &[PathBuf],
+        app_tx: Sender<AppEvent>,
+        initial: Option<&str>,
+        shell: &str,
+        argv: &[String],
+        history_budget_bytes: usize,
+        appearance: PaneAppearance,
+    ) -> Result<Pane> {
+        let Some((program, args)) = argv.split_first() else {
+            return Err(anyhow::anyhow!("empty shell command"));
+        };
+        let mut cmd = CommandBuilder::new(program);
+        for arg in args {
+            cmd.arg(arg);
+        }
+        Ok(Self::build_deferred(
+            id,
+            cols,
+            rows,
+            cwd,
+            fallback_cwds,
+            app_tx,
+            initial,
+            cmd,
+            basename(shell),
+            &[],
+            history_budget_bytes,
+            appearance,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -380,6 +467,7 @@ impl Pane {
         command: String,
         extra_env: &[(String, String)],
         history_budget_bytes: usize,
+        appearance: PaneAppearance,
     ) -> Result<Pane> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -406,12 +494,14 @@ impl Pane {
         // All bytes (user input + terminal responses) funnel through one channel
         // to a single writer thread — keeps ordering correct, needs no mutex.
         let (input_tx, input_rx) = mpsc::channel::<InputAction>();
-        let engine: Arc<Mutex<dyn VtEngine>> = Arc::new(Mutex::new(AlacrittyEngine::new(
+        let engine = create_engine(
+            VtEngineKind::default(),
             cols,
             rows,
             input_tx.clone(),
             history_budget_bytes,
-        )));
+            appearance,
+        );
         // Replay the saved screen so a restored pane shows its prior content.
         if let Some(screen) = initial {
             if let Ok(mut e) = engine.lock() {
@@ -445,6 +535,7 @@ impl Pane {
         register_child_reaper(id, child, child_exited.clone(), app_tx);
 
         Ok(Pane {
+            id,
             engine,
             child_pid: Arc::new(AtomicU32::new(child_pid)),
             terminal_runtime: Arc::new(Mutex::new(Some(terminal_runtime))),
@@ -470,21 +561,31 @@ impl Pane {
         cols: u16,
         rows: u16,
         cwd: PathBuf,
+        fallback_cwds: &[PathBuf],
         app_tx: Sender<AppEvent>,
-        mut cmd: CommandBuilder,
+        initial: Option<&str>,
+        cmd: CommandBuilder,
         command: String,
         extra_env: &[(String, String)],
         history_budget_bytes: usize,
+        appearance: PaneAppearance,
     ) -> Pane {
         // Everything a caller can observe before the child exists: the engine
         // (pane.read, detection, rendering) and the input queue.
         let (input_tx, input_rx) = mpsc::channel::<InputAction>();
-        let engine: Arc<Mutex<dyn VtEngine>> = Arc::new(Mutex::new(AlacrittyEngine::new(
+        let engine = create_engine(
+            VtEngineKind::default(),
             cols,
             rows,
             input_tx.clone(),
             history_budget_bytes,
-        )));
+            appearance,
+        );
+        if let Some(screen) = initial {
+            if let Ok(mut engine) = engine.lock() {
+                engine.advance(screen.as_bytes());
+            }
+        }
 
         // The writer thread starts with the pane and blocks until the spawn
         // worker hands over the PTY writer; bytes sent meanwhile queue in
@@ -536,6 +637,7 @@ impl Pane {
             let tx = app_tx.clone();
             // Owned copies for the 'static worker thread.
             let worker_cwd = cwd.clone();
+            let worker_fallback_cwds = fallback_cwds.to_vec();
             let worker_env = extra_env.to_vec();
             thread::spawn(move || {
                 let fail = || {
@@ -553,14 +655,24 @@ impl Pane {
                     Ok(pair) => pair,
                     Err(_) => return fail(),
                 };
-                apply_pane_env(&mut cmd, id, &worker_cwd, &worker_env);
                 // Closed before the fork: abort without creating the child.
                 if cancelled.load(Ordering::SeqCst) {
                     return;
                 }
-                let mut child = match pair.slave.spawn_command(cmd) {
-                    Ok(child) => child,
-                    Err(_) => return fail(),
+                let mut spawned = None;
+                for candidate in std::iter::once(worker_cwd)
+                    .chain(worker_fallback_cwds)
+                    .filter(|candidate| candidate.is_dir())
+                {
+                    let mut candidate_cmd = cmd.clone();
+                    apply_pane_env(&mut candidate_cmd, id, &candidate, &worker_env);
+                    if let Ok(child) = pair.slave.spawn_command(candidate_cmd) {
+                        spawned = Some((child, candidate));
+                        break;
+                    }
+                }
+                let Some((mut child, spawned_cwd)) = spawned else {
+                    return fail();
                 };
                 let Some(pid) = child.process_id() else {
                     terminate_spawned_child(child.as_mut());
@@ -639,12 +751,16 @@ impl Pane {
                 *terminal_runtime
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime);
-                let _ = ready_tx.send(AppEvent::PtyReady(id));
+                let _ = ready_tx.send(AppEvent::PtyReady {
+                    id,
+                    cwd: spawned_cwd,
+                });
             })
         };
         drop(worker);
 
         Pane {
+            id,
             engine,
             child_pid,
             terminal_runtime,
@@ -673,6 +789,13 @@ impl Pane {
             }
         }
         pending
+    }
+
+    /// Observe whether output is waiting for a coalescing boundary without
+    /// consuming it. The server uses this to arm the 100 ms fallback only while
+    /// a pane actually has pending bytes, instead of waking forever when idle.
+    pub fn has_data_pending(&self) -> bool {
+        self.data_pending.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Clear the pending-output coalescing flag so the reader's next
@@ -790,7 +913,20 @@ impl Pane {
             .unwrap_or(0)
     }
 
+    /// `(visible_top, retained_rows)` from one terminal snapshot. Mouse
+    /// selection uses this to bind a screen row to retained history without an
+    /// output burst changing the history length between separate reads.
+    pub(crate) fn retained_viewport(&self) -> Option<(usize, usize)> {
+        self.engine.lock().ok().map(|engine| {
+            (
+                engine.history_len().saturating_sub(engine.scroll_offset()),
+                engine.retained_row_count(),
+            )
+        })
+    }
+
     /// Read one retained row without allocating every other row.
+    #[cfg(test)]
     pub fn retained_row_text(&self, index: usize) -> Option<String> {
         self.engine.lock().ok()?.retained_row_text(index)
     }
@@ -804,6 +940,44 @@ impl Pane {
             let row_count = engine.retained_row_count();
             engine.for_each_retained_row(&mut |index, line| f(index, history, row_count, line));
         }
+    }
+
+    /// Extract retained terminal text by grid cell rather than string index.
+    /// This keeps wide glyphs and combining sequences aligned with selection
+    /// highlights.
+    pub fn retained_selection_text(
+        &self,
+        range: ((usize, usize), (usize, usize)),
+    ) -> Option<String> {
+        self.engine.lock().ok()?.retained_selection_text(range)
+    }
+
+    /// Extract a selection expressed in the currently visible viewport. This
+    /// is the fallback when a mouse press could not snapshot retained-history
+    /// coordinates, and still preserves terminal cell semantics for Unicode.
+    pub fn visible_selection_text(
+        &self,
+        ((start_row, start_col), (end_row, end_col)): ((usize, usize), (usize, usize)),
+    ) -> Option<String> {
+        let engine = self.engine.lock().ok()?;
+        let visible_top = engine.history_len().saturating_sub(engine.scroll_offset());
+        let row_count = engine.retained_row_count();
+        let last_row = row_count.checked_sub(1)?;
+        engine.retained_selection_text((
+            (
+                visible_top.saturating_add(start_row).min(last_row),
+                start_col,
+            ),
+            (visible_top.saturating_add(end_row).min(last_row), end_col),
+        ))
+    }
+
+    /// Cell geometry used by keyboard copy-mode navigation.
+    pub fn retained_row_layout(
+        &self,
+        index: usize,
+    ) -> Option<crate::terminal::vt::RetainedRowLayout> {
+        self.engine.lock().ok()?.retained_row_layout(index)
     }
 
     /// Jump the scrollback viewport so the row `offset` lines above the live
@@ -939,6 +1113,14 @@ impl Pane {
         if let Ok(mut e) = self.engine.lock() {
             e.resize(cols, rows);
         }
+        crate::logging::event(
+            crate::logging::EventKind::PtyResize,
+            &[
+                crate::logging::Field::PaneId(u64::from(self.id.0)),
+                crate::logging::Field::Cols(u64::from(cols)),
+                crate::logging::Field::Rows(u64::from(rows)),
+            ],
+        );
         true
     }
 
@@ -987,23 +1169,18 @@ fn apply_pane_env(
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("LUVUS_ENV", "1");
-    cmd.env("BOHAY_ENV", "1");
     cmd.env("LUVUS_PANE_ID", id.0.to_string());
-    cmd.env("BOHAY_PANE_ID", id.0.to_string());
     if let Some(sock) = crate::ipc::api::socket_path_env() {
         cmd.env("LUVUS_SOCKET_PATH", &sock);
-        cmd.env("BOHAY_SOCKET_PATH", sock);
     }
     if let Some(name) = crate::session::active_name() {
         cmd.env(crate::session::SESSION_ENV_VAR, &name);
-        cmd.env(crate::session::LEGACY_SESSION_ENV_VAR, name);
     }
     // This session's exact binary, so an agent can use `$LUVUS_BIN_PATH`
     // instead of a `luvus` on PATH that may be an older install with a
     // different CLI (skill/binary skew). Matches the server it talks to.
     if let Ok(exe) = std::env::current_exe() {
         cmd.env("LUVUS_BIN_PATH", &exe);
-        cmd.env("BOHAY_BIN_PATH", exe);
     }
 }
 
@@ -1071,6 +1248,7 @@ mod reap_tests {
             None,
             "/bin/sh",
             500,
+            PaneAppearance::default(),
         )
         .expect("spawn")
     }
@@ -1097,9 +1275,11 @@ mod reap_tests {
             80,
             24,
             std::env::temp_dir(),
+            &[],
             tx,
             "/bin/sh",
             500,
+            PaneAppearance::default(),
         );
         assert_eq!(
             pane.child_pid.load(Ordering::SeqCst),
@@ -1132,6 +1312,111 @@ mod reap_tests {
         );
     }
 
+    #[test]
+    fn restored_deferred_pane_replays_saved_screen_immediately() {
+        let (tx, _rx) = mpsc::channel();
+        let pane = Pane::spawn_restored(
+            PaneId::alloc(),
+            80,
+            24,
+            std::env::temp_dir(),
+            &[],
+            tx,
+            Some("RESTORED-SCREEN\r\n"),
+            "/bin/sh",
+            500,
+            PaneAppearance::default(),
+        );
+        assert!(
+            pane.engine
+                .lock()
+                .unwrap()
+                .detection_text(24)
+                .contains("RESTORED-SCREEN"),
+            "saved content is visible without waiting for the PTY worker"
+        );
+    }
+
+    #[test]
+    fn restored_deferred_pane_retries_a_fallback_cwd() {
+        let (tx, rx) = mpsc::channel();
+        let id = PaneId::alloc();
+        let fallback = std::env::temp_dir();
+        let missing = fallback.join(format!("luvus-missing-cwd-{}", std::process::id()));
+        let pane = Pane::spawn_restored(
+            id,
+            80,
+            24,
+            missing,
+            std::slice::from_ref(&fallback),
+            tx,
+            None,
+            "/bin/sh",
+            500,
+            PaneAppearance::default(),
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "the fallback PTY never became ready");
+            match rx.recv_timeout(remaining) {
+                Ok(AppEvent::PtyReady { id: ready, cwd }) if ready == id => {
+                    assert_eq!(cwd, fallback);
+                    break;
+                }
+                Ok(AppEvent::PtyExit(exited)) if exited == id => {
+                    panic!("the restored pane closed instead of using its fallback cwd")
+                }
+                Ok(_) => {}
+                Err(error) => panic!("the fallback PTY never became ready: {error}"),
+            }
+        }
+        assert_ne!(pane.child_pid.load(Ordering::SeqCst), 0);
+    }
+
+    /// A deferred pane (the split path) whose primary cwd was deleted after it
+    /// was resolved must retry its fallback chain rather than dying. Regression
+    /// for the split that silently disappeared when its cwd vanished in the race
+    /// window before the fork: same shape as the restore-path test above, but
+    /// driven through `spawn_deferred`.
+    #[test]
+    fn deferred_pane_retries_a_fallback_cwd() {
+        let (tx, rx) = mpsc::channel();
+        let id = PaneId::alloc();
+        let fallback = std::env::temp_dir();
+        let missing = fallback.join(format!("luvus-missing-cwd-{}", std::process::id()));
+        let pane = Pane::spawn_deferred(
+            id,
+            80,
+            24,
+            missing,
+            std::slice::from_ref(&fallback),
+            tx,
+            "/bin/sh",
+            500,
+            PaneAppearance::default(),
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "the fallback PTY never became ready");
+            match rx.recv_timeout(remaining) {
+                Ok(AppEvent::PtyReady { id: ready, cwd }) if ready == id => {
+                    assert_eq!(cwd, fallback);
+                    break;
+                }
+                Ok(AppEvent::PtyExit(exited)) if exited == id => {
+                    panic!("the deferred pane closed instead of using its fallback cwd")
+                }
+                Ok(_) => {}
+                Err(error) => panic!("the fallback PTY never became ready: {error}"),
+            }
+        }
+        assert_ne!(pane.child_pid.load(Ordering::SeqCst), 0);
+    }
+
     /// A resize issued before the deferred fork must still reach the child:
     /// the worker opens the PTY at the latest recorded size (docs/82).
     #[test]
@@ -1142,9 +1427,11 @@ mod reap_tests {
             80,
             24,
             std::env::temp_dir(),
+            &[],
             tx,
             "/bin/sh",
             500,
+            PaneAppearance::default(),
         );
         // The spawn has not forked yet: this is the racing resize.
         assert!(pane.resize(132, 40));
@@ -1240,6 +1527,17 @@ mod tests {
             path.as_bytes(),
             "sent bare when it did not, so a plain shell is unaffected"
         );
+    }
+
+    #[test]
+    fn paste_preserves_windows_paths_quotes_and_unicode() {
+        let command = r#".\.venv\Scripts\python.exe .\youtube_folder_uploader.py --folder "E:\Vídeos\Pendientes €""#;
+        assert_eq!(wrap_paste(command, false), command.as_bytes());
+
+        let mut expected = b"\x1b[200~".to_vec();
+        expected.extend_from_slice(command.as_bytes());
+        expected.extend_from_slice(b"\x1b[201~");
+        assert_eq!(wrap_paste(command, true), expected);
     }
 
     #[test]

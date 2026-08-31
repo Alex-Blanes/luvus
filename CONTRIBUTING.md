@@ -3,6 +3,9 @@
 Thanks for helping make Luvus better. Bug fixes, documentation, tests, and new
 features are all welcome.
 
+Unless explicitly stated otherwise, contributions submitted for inclusion in
+Luvus are provided under the Apache License, Version 2.0.
+
 ## Before you start
 
 Small fixes can go directly to a pull request. For a large UI, architecture, or
@@ -61,6 +64,11 @@ because the outer process handles the keys first.
   Keep operating-system code in `platform.rs` behind `cfg` gates when possible.
 - **Update related documentation.** CLI, API, configuration, or visible behavior
   changes should update the matching public documentation.
+- **Keep CLI translations complete.** Command names, flags, JSON, and UHP stay
+  canonical. Add human CLI text to `src/i18n/cli.rs` with all eight language
+  values, preserve placeholders and literal user data, and run the focused CLI
+  localization tests. Do not add a partial English fallback for a registered
+  language.
 
 ## Tests and checks
 
@@ -79,6 +87,19 @@ UI tests render into an off-screen buffer, and many terminal tests exercise real
 PTYs without requiring an interactive terminal. Test visible changes manually,
 measure performance changes before and after, and test platform-specific code on
 the affected platform when available.
+
+## Adding agent support
+
+Use a detection manifest when an agent only needs identity and live-state
+recognition. Built-in session discovery, resume, fork, usage, or lifecycle
+integration belongs in one modular adapter under `src/agent/<agent>/`; do not
+spread new agent-name branches across the UI, CLI, IPC, or Settings.
+
+The [Adding Agent Support](website/src/content/docs/docs/extend/adding-agent-support.mdx)
+guide covers the descriptor fields, scoped interpreter packages, manifests,
+session and integration boundaries, registry entry, documentation parity, and
+required cross-platform tests. Detection must work without installing a skill
+or hook, and optional integrations must preserve unrelated user configuration.
 
 ## Commits
 

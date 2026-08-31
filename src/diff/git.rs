@@ -516,6 +516,7 @@ fn run_git_bytes_truncating(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    crate::platform::no_window(&mut command);
     let mut child = command.spawn().map_err(|e| format!("git not found: {e}"))?;
     let mut stdout = child
         .stdout
@@ -608,8 +609,9 @@ pub fn tree_tint(
     visible_root: &Path,
 ) -> HashMap<PathBuf, crate::git::local::FileStatus> {
     use crate::git::local::FileStatus;
-    let canonical =
-        std::fs::canonicalize(visible_root).unwrap_or_else(|_| visible_root.to_path_buf());
+    let Some(visible_prefix) = visible_repo_prefix(&snapshot.repo_root, visible_root) else {
+        return HashMap::new();
+    };
     let mut map = HashMap::new();
     for changed in &snapshot.files {
         let Some(path) = changed
@@ -623,10 +625,14 @@ pub fn tree_tint(
         let Ok(relative) = path.to_path_buf() else {
             continue;
         };
-        let absolute = snapshot.repo_root.join(relative);
-        if !absolute.starts_with(&canonical) {
+        let Ok(relative) = relative.strip_prefix(&visible_prefix) else {
             continue;
-        }
+        };
+        // FILES indexes paths exactly as the workspace supplied them. Build the
+        // key on that spelling instead of Git's repo-root spelling or a
+        // canonical path (`C:/repo`, `C:\repo`, and `\\?\C:\repo` can all name
+        // the same Windows directory; symlinked roots differ similarly).
+        let absolute = visible_root.join(relative);
         let status = match changed.status {
             DiffFileStatus::Added => FileStatus::Added,
             DiffFileStatus::Deleted => FileStatus::Deleted,
@@ -638,7 +644,7 @@ pub fn tree_tint(
         map.entry(absolute.clone()).or_insert(status);
         let mut current = absolute.parent();
         while let Some(dir) = current {
-            if dir == canonical || !dir.starts_with(&canonical) {
+            if dir == visible_root || !dir.starts_with(visible_root) {
                 break;
             }
             map.entry(dir.to_path_buf()).or_insert(FileStatus::DirDirty);
@@ -646,6 +652,18 @@ pub fn tree_tint(
         }
     }
     map
+}
+
+/// Locate the visible workspace inside the repository using canonical roots,
+/// then return only their relative relationship. Display/map keys are still
+/// built on `visible_root`, preserving the caller's spelling and avoiding
+/// canonicalization of changed paths that may have been deleted.
+fn visible_repo_prefix(repo_root: &Path, visible_root: &Path) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(repo_root)
+        .ok()
+        .zip(std::fs::canonicalize(visible_root).ok())
+        .and_then(|(repo, visible)| visible.strip_prefix(repo).ok().map(PathBuf::from));
+    canonical.or_else(|| visible_root.strip_prefix(repo_root).ok().map(PathBuf::from))
 }
 
 #[cfg(test)]
@@ -728,10 +746,22 @@ mod tests {
 
     impl TestRepo {
         fn new(name: &str) -> Self {
+            let thread = std::thread::current();
+            let thread_name = thread.name().unwrap_or("test");
+            let safe_thread_name: String = thread_name
+                .chars()
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                        ch
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
             let path = std::env::temp_dir().join(format!(
                 "luvus-diff-{name}-{}-{}",
                 std::process::id(),
-                std::thread::current().name().unwrap_or("test")
+                safe_thread_name
             ));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).unwrap();
@@ -814,5 +844,60 @@ mod tests {
         assert_eq!(diff.additions, 2);
         assert_eq!(diff.deletions, 0);
         assert!(!diff.binary);
+    }
+
+    #[test]
+    fn tree_tint_uses_nested_visible_spelling_and_new_rename_path() {
+        let repo = TestRepo::new("tree-tint-nested");
+        std::fs::create_dir_all(repo.0.join("src")).unwrap();
+        std::fs::write(repo.0.join("src/old file.txt"), "old\n").unwrap();
+        std::fs::write(repo.0.join("outside.txt"), "base\n").unwrap();
+        repo.git(&["add", "src/old file.txt", "outside.txt"]);
+        repo.git(&["commit", "-qm", "base"]);
+        repo.git(&["mv", "src/old file.txt", "src/new file.txt"]);
+        std::fs::write(repo.0.join("outside.txt"), "changed\n").unwrap();
+
+        let visible = repo.0.join("src");
+        let snapshot = scan(&visible, 1).unwrap();
+        let tint = tree_tint(&snapshot, &visible);
+
+        assert_eq!(
+            tint.get(&visible.join("new file.txt")).copied(),
+            Some(crate::git::local::FileStatus::Renamed)
+        );
+        assert!(!tint.contains_key(&visible.join("old file.txt")));
+        assert!(!tint.contains_key(&repo.0.join("outside.txt")));
+        assert!(tint.keys().all(|path| path.starts_with(&visible)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_tint_preserves_a_symlinked_visible_root() {
+        use std::os::unix::fs::symlink;
+
+        let repo = TestRepo::new("tree-tint-symlink");
+        std::fs::create_dir_all(repo.0.join("src")).unwrap();
+        std::fs::write(repo.0.join("src/file.txt"), "base\n").unwrap();
+        repo.git(&["add", "src/file.txt"]);
+        repo.git(&["commit", "-qm", "base"]);
+        std::fs::write(repo.0.join("src/file.txt"), "changed\n").unwrap();
+
+        let link = repo.0.with_file_name(format!(
+            "{}-visible",
+            repo.0.file_name().unwrap().to_string_lossy()
+        ));
+        let _ = std::fs::remove_file(&link);
+        symlink(&repo.0, &link).unwrap();
+        let visible = link.join("src");
+        let snapshot = scan(&visible, 1).unwrap();
+        let tint = tree_tint(&snapshot, &visible);
+
+        assert_eq!(
+            tint.get(&visible.join("file.txt")).copied(),
+            Some(crate::git::local::FileStatus::Modified)
+        );
+        assert!(!tint.contains_key(&repo.0.join("src/file.txt")));
+
+        let _ = std::fs::remove_file(link);
     }
 }

@@ -7,7 +7,6 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::app::App;
@@ -15,7 +14,6 @@ use crate::ids::PaneId;
 use crate::layout::LayoutTree;
 
 const SNAPSHOT_VERSION: u32 = 1;
-const LEGACY_MIGRATION_MARKER: &str = ".migrated-from-bohay-0.10";
 
 #[derive(Serialize, Deserialize)]
 pub struct SessionSnapshot {
@@ -27,6 +25,10 @@ pub struct SessionSnapshot {
     /// gone, which the agent's own store cannot tell us.
     #[serde(default)]
     pub session_titles: Vec<(String, String)>,
+    /// Workspace roots the user explicitly closed. Automatic attach-time CWD
+    /// opening must not resurrect them; an explicit open removes the entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub closed_workspace_paths: Vec<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -103,6 +105,17 @@ pub struct PaneSnap {
     /// A native DIFF view specification. Patch content is always re-fetched.
     #[serde(default)]
     pub diff: Option<DiffSnap>,
+    /// An explicit derived document preview. Source is always re-read.
+    #[serde(default)]
+    pub preview: Option<PreviewSnap>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PreviewSnap {
+    pub path: PathBuf,
+    pub kind: crate::files::preview::PreviewKind,
+    #[serde(default)]
+    pub scroll: usize,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -156,9 +169,6 @@ pub(crate) struct TestEnv {
     prev: Option<std::ffi::OsString>,
     prev_session: Option<std::ffi::OsString>,
     prev_socket: Option<std::ffi::OsString>,
-    prev_legacy_home: Option<std::ffi::OsString>,
-    prev_legacy_session: Option<std::ffi::OsString>,
-    prev_legacy_socket: Option<std::ffi::OsString>,
     dir: PathBuf,
 }
 
@@ -177,12 +187,6 @@ impl Drop for TestEnv {
             Some(value) => std::env::set_var("LUVUS_SOCKET_PATH", value),
             None => std::env::remove_var("LUVUS_SOCKET_PATH"),
         }
-        restore_env("BOHAY_HOME", &self.prev_legacy_home);
-        restore_env(
-            crate::session::LEGACY_SESSION_ENV_VAR,
-            &self.prev_legacy_session,
-        );
-        restore_env("BOHAY_SOCKET_PATH", &self.prev_legacy_socket);
         crate::session::clear_explicit_for_test();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -194,35 +198,18 @@ pub(crate) fn test_env(tag: &str) -> TestEnv {
     let prev = std::env::var_os("LUVUS_HOME");
     let prev_session = std::env::var_os(crate::session::SESSION_ENV_VAR);
     let prev_socket = std::env::var_os("LUVUS_SOCKET_PATH");
-    let prev_legacy_home = std::env::var_os("BOHAY_HOME");
-    let prev_legacy_session = std::env::var_os(crate::session::LEGACY_SESSION_ENV_VAR);
-    let prev_legacy_socket = std::env::var_os("BOHAY_SOCKET_PATH");
     let dir = std::env::temp_dir().join(format!("luvus-test-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::env::set_var("LUVUS_HOME", &dir);
     std::env::remove_var(crate::session::SESSION_ENV_VAR);
     std::env::remove_var("LUVUS_SOCKET_PATH");
-    std::env::remove_var("BOHAY_HOME");
-    std::env::remove_var(crate::session::LEGACY_SESSION_ENV_VAR);
-    std::env::remove_var("BOHAY_SOCKET_PATH");
     crate::session::clear_explicit_for_test();
     TestEnv {
         _guard: guard,
         prev,
         prev_session,
         prev_socket,
-        prev_legacy_home,
-        prev_legacy_session,
-        prev_legacy_socket,
         dir,
-    }
-}
-
-#[cfg(test)]
-fn restore_env(key: &str, value: &Option<std::ffi::OsString>) {
-    match value {
-        Some(value) => std::env::set_var(key, value),
-        None => std::env::remove_var(key),
     }
 }
 
@@ -238,183 +225,6 @@ pub fn config_dir() -> PathBuf {
         ".luvus"
     };
     home.join(name)
-}
-
-/// Copy durable 0.10 state into the 0.11 Luvus home on first launch.
-///
-/// Migration is deliberately conservative: explicit/custom homes opt out,
-/// an existing Luvus home is never merged or overwritten, and a reachable
-/// legacy server defers the copy. Runtime sockets, locks, cached skills, and
-/// worktrees are not copied. The Bohay home remains intact for rollback.
-pub fn migrate_legacy_state() -> std::io::Result<()> {
-    if std::env::var_os("LUVUS_HOME").is_some() || std::env::var_os("BOHAY_HOME").is_some() {
-        return Ok(());
-    }
-    let Some(home) = crate::platform::home_dir() else {
-        return Ok(());
-    };
-    let (legacy_name, current_name) = if cfg!(debug_assertions) {
-        (".bohay-dev", ".luvus-dev")
-    } else {
-        (".bohay", ".luvus")
-    };
-    migrate_legacy_state_between(&home.join(legacy_name), &home.join(current_name))
-}
-
-fn migrate_legacy_state_between(
-    legacy: &std::path::Path,
-    current: &std::path::Path,
-) -> std::io::Result<()> {
-    if !legacy_state_recognized(legacy) || current.exists() {
-        return Ok(());
-    }
-    if legacy_server_running(legacy) {
-        eprintln!(
-            "Luvus migration deferred: stop the running Bohay server with `bohay server stop`, then run Luvus again."
-        );
-        return Ok(());
-    }
-
-    let lock_path = current.with_file_name(".luvus-migration.lock");
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_path)?;
-    lock.lock_exclusive()?;
-    // Another process may have completed while this one waited.
-    if current.exists() {
-        return Ok(());
-    }
-
-    let stage = current.with_file_name(format!(
-        ".{}.migrating-{}",
-        current
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("luvus"),
-        std::process::id()
-    ));
-    if stage.exists() {
-        fs::remove_dir_all(&stage)?;
-    }
-    ensure_private_dir(&stage);
-    if let Err(error) = copy_legacy_tree(legacy, &stage, true) {
-        let _ = fs::remove_dir_all(&stage);
-        return Err(error);
-    }
-    rewrite_managed_module_roots(&stage.join("modules.json"), legacy, current)?;
-    fs::write(
-        stage.join(LEGACY_MIGRATION_MARKER),
-        format!("source={}\nversion=0.11.0\n", legacy.display()),
-    )?;
-    fs::rename(&stage, current)?;
-    Ok(())
-}
-
-fn legacy_state_recognized(root: &std::path::Path) -> bool {
-    root.is_dir()
-        && [
-            "config.json",
-            "session.json",
-            "sessions",
-            "orch.json",
-            "modules.json",
-            "modules",
-            "manifests",
-            "worktrees",
-        ]
-        .iter()
-        .any(|name| root.join(name).exists())
-}
-
-fn legacy_server_running(root: &std::path::Path) -> bool {
-    let mut candidates = vec![
-        (root.join("bohay.sock"), "api"),
-        (root.join("bohay-client.sock"), "client"),
-    ];
-    if let Ok(entries) = fs::read_dir(root.join("sessions")) {
-        for entry in entries.flatten().filter(|entry| entry.path().is_dir()) {
-            candidates.push((entry.path().join("bohay.sock"), "api"));
-            candidates.push((entry.path().join("bohay-client.sock"), "client"));
-        }
-    }
-    candidates.into_iter().any(|(logical, role)| {
-        let path = crate::session::legacy_socket_path(logical, role);
-        crate::ipc::transport::connect_legacy(&path).is_ok()
-    })
-}
-
-fn copy_legacy_tree(
-    src: &std::path::Path,
-    dst: &std::path::Path,
-    root: bool,
-) -> std::io::Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name_text = name.to_string_lossy();
-        if (root && matches!(name_text.as_ref(), "worktrees" | "skill"))
-            || matches!(
-                name_text.as_ref(),
-                "bohay.sock" | "bohay-client.sock" | "server.lock"
-            )
-            || name_text.ends_with(".sock")
-            || name_text.ends_with(".lock")
-        {
-            continue;
-        }
-        let source = entry.path();
-        let target = dst.join(&name);
-        let kind = entry.file_type()?;
-        if kind.is_dir() {
-            copy_legacy_tree(&source, &target, false)?;
-        } else if kind.is_file() {
-            fs::copy(source, target)?;
-        }
-        // Symlinks are intentionally skipped. Following a user-controlled link
-        // could copy data from outside the state directory.
-    }
-    Ok(())
-}
-
-fn rewrite_managed_module_roots(
-    registry: &std::path::Path,
-    legacy: &std::path::Path,
-    current: &std::path::Path,
-) -> std::io::Result<()> {
-    let Ok(text) = fs::read_to_string(registry) else {
-        return Ok(());
-    };
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Ok(());
-    };
-    let old_modules = legacy.join("modules").to_string_lossy().to_string();
-    let new_modules = current.join("modules").to_string_lossy().to_string();
-    rewrite_json_prefix(&mut value, &old_modules, &new_modules);
-    let encoded = serde_json::to_vec_pretty(&value).map_err(std::io::Error::other)?;
-    fs::write(registry, encoded)
-}
-
-fn rewrite_json_prefix(value: &mut serde_json::Value, old: &str, new: &str) {
-    match value {
-        serde_json::Value::String(text) if text.starts_with(old) => {
-            *text = format!("{new}{}", &text[old.len()..]);
-        }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                rewrite_json_prefix(value, old, new);
-            }
-        }
-        serde_json::Value::Object(values) => {
-            for value in values.values_mut() {
-                rewrite_json_prefix(value, old, new);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Create the state dir if needed and, on Unix, keep it owner-only (`0700`).
@@ -470,6 +280,69 @@ pub fn log_event(event: &str) {
     let _ = fs::create_dir_all(&dir);
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(file, "{stamp} pid={} {event}", std::process::id());
+    }
+}
+
+/// Records the live server PID so `server stop` can kill an unresponsive process
+/// without waiting on IPC. Dropped on a clean server exit; a crash leaves the
+/// file, and the stopper still checks the PID is a Luvus process we own.
+pub struct ServerPidFile;
+
+impl ServerPidFile {
+    pub fn claim() -> Self {
+        let pid = std::process::id();
+        let mut body = pid.to_string();
+        if let Some(marker) = crate::platform::process_start_marker(pid) {
+            body.push(' ');
+            body.push_str(&marker);
+        }
+        let _ = fs::write(session_dir().join("server.pid"), body);
+        Self
+    }
+
+    pub fn read() -> Option<u32> {
+        let text = fs::read_to_string(session_dir().join("server.pid")).ok()?;
+        let mut parts = text.split_whitespace();
+        let pid: u32 = parts.next()?.parse().ok()?;
+        if let Some(recorded) = parts.next() {
+            let live = crate::platform::process_start_marker(pid)?;
+            if live != recorded {
+                return None;
+            }
+        }
+        Some(pid)
+    }
+}
+
+impl Drop for ServerPidFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(session_dir().join("server.pid"));
+    }
+}
+
+#[cfg(test)]
+mod server_pid_file_tests {
+    use super::*;
+
+    #[test]
+    fn server_pid_file_reads_the_live_process() {
+        let _env = test_env("server-pid-live");
+        ensure_session_dir();
+        let claimed = ServerPidFile::claim();
+        assert_eq!(ServerPidFile::read(), Some(std::process::id()));
+        drop(claimed);
+        assert_eq!(ServerPidFile::read(), None);
+    }
+
+    #[test]
+    fn server_pid_file_rejects_a_mismatched_start_marker() {
+        let _env = test_env("server-pid-mismatch");
+        ensure_session_dir();
+        let claimed = ServerPidFile::claim();
+        let path = session_dir().join("server.pid");
+        fs::write(&path, format!("{} not-a-live-marker", std::process::id())).unwrap();
+        assert_eq!(ServerPidFile::read(), None);
+        drop(claimed);
     }
 }
 
@@ -556,8 +429,8 @@ pub fn manifests_dir() -> PathBuf {
     config_dir().join("manifests")
 }
 
-/// Opt-in skill state, verified package cache, and migration marker. Skill
-/// bodies live in their agent-native locations, never in the Luvus binary.
+/// Opt-in skill ownership state and migration marker. The canonical skill is
+/// bundled in the binary; enabled copies live in agent-native locations.
 pub fn skills_dir() -> PathBuf {
     config_dir().join("skills")
 }
@@ -644,7 +517,7 @@ pub fn cli_socket_path() -> PathBuf {
     if crate::session::explicit_session_requested() {
         return socket_path();
     }
-    match crate::compat::inherited("LUVUS_SOCKET_PATH", "BOHAY_SOCKET_PATH") {
+    match std::env::var_os("LUVUS_SOCKET_PATH") {
         Some(p) if !p.is_empty() => PathBuf::from(p),
         _ => socket_path(),
     }
@@ -755,7 +628,10 @@ fn resolve_pane_sessions(app: &App) -> HashMap<PaneId, Option<(String, String)>>
                 if agent_pane {
                     resolved.push((
                         id.0,
-                        format!("{}:{agent}=none/ambiguous(panes={panes},sessions={found})", id.0),
+                        format!(
+                            "{}:{agent}=none/ambiguous(panes={panes},sessions={found})",
+                            id.0
+                        ),
                     ));
                 }
                 out.insert(id, None);
@@ -867,8 +743,8 @@ pub fn snapshot(app: &App) -> SessionSnapshot {
                     // A file-view leaf (docs/38 FILE-3) is saved by its path and
                     // rebuilt on restore; it has no PTY.
                     if let Some(view) = app.views.get(&id) {
-                        let (file, diff) = match view {
-                            crate::app::ViewKind::File(v) => (Some(v.path.clone()), None),
+                        let (file, diff, preview) = match view {
+                            crate::app::ViewKind::File(v) => (Some(v.path.clone()), None, None),
                             crate::app::ViewKind::Diff(v) => {
                                 let status = app
                                     .diff
@@ -894,8 +770,18 @@ pub fn snapshot(app: &App) -> SessionSnapshot {
                                         context_lines: v.context_lines,
                                         show_line_numbers: v.show_line_numbers,
                                     }),
+                                    None,
                                 )
                             }
+                            crate::app::ViewKind::Preview(v) => (
+                                None,
+                                None,
+                                Some(PreviewSnap {
+                                    path: v.path.clone(),
+                                    kind: v.kind,
+                                    scroll: v.scroll,
+                                }),
+                            ),
                         };
                         return Some((
                             id.0,
@@ -909,6 +795,7 @@ pub fn snapshot(app: &App) -> SessionSnapshot {
                                 module: None,
                                 file,
                                 diff,
+                                preview,
                             },
                         ));
                     }
@@ -962,6 +849,7 @@ pub fn snapshot(app: &App) -> SessionSnapshot {
                                 module,
                                 file: None,
                                 diff: None,
+                                preview: None,
                             },
                         )
                     })
@@ -996,32 +884,69 @@ pub fn snapshot(app: &App) -> SessionSnapshot {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
+        closed_workspace_paths: app.closed_workspace_paths.clone(),
     }
 }
 
-/// Save the app's session atomically. An *empty* session clears the snapshot:
-/// the user deliberately closed everything, and a leftover file would resurrect
-/// those panes (re-running agent resume commands) on the next start.
-pub fn save(app: &App) {
+/// Save the app's session atomically. A truly empty session can only remain after
+/// restore or shell startup failure; clear its stale snapshot so the next start
+/// cannot resurrect panes the user already closed.
+pub fn save(app: &App) -> bool {
     let snap = snapshot(app);
     if snap.workspaces.is_empty() {
-        let _ = fs::remove_file(session_path());
-        return;
+        if let Err(error) = fs::remove_file(session_path()) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                log_persist_failure("persist_clear");
+                return false;
+            }
+        }
+        crate::logging::event(
+            crate::logging::EventKind::PersistCleared,
+            &[crate::logging::Field::Reason(crate::logging::Reason::Empty)],
+        );
+        return true;
     }
     let dir = ensure_session_dir();
     if !dir.is_dir() {
-        return;
+        log_persist_failure("persist_dir");
+        return false;
     }
     let Ok(json) = serde_json::to_string_pretty(&snap) else {
-        return;
+        log_persist_failure("persist_serialize");
+        return false;
     };
     let path = session_path();
     let tmp = path.with_extension("json.tmp");
-    if let Ok(mut f) = fs::File::create(&tmp) {
-        if f.write_all(json.as_bytes()).is_ok() && f.flush().is_ok() {
-            let _ = fs::rename(&tmp, &path);
-        }
+    let Ok(mut file) = fs::File::create(&tmp) else {
+        log_persist_failure("persist_create");
+        return false;
+    };
+    if file.write_all(json.as_bytes()).is_err() {
+        log_persist_failure("persist_write");
+        return false;
     }
+    if file.flush().is_err() {
+        log_persist_failure("persist_flush");
+        return false;
+    }
+    if fs::rename(&tmp, &path).is_err() {
+        log_persist_failure("persist_rename");
+        return false;
+    }
+    crate::logging::event(
+        crate::logging::EventKind::PersistSave,
+        &[crate::logging::Field::Outcome(crate::logging::Outcome::Ok)],
+    );
+    true
+}
+
+fn log_persist_failure(error_code: &'static str) {
+    crate::logging::event(
+        crate::logging::EventKind::PersistSaveFailed,
+        &[crate::logging::Field::ErrorCode(
+            crate::logging::SafeId::new(error_code).expect("static id is valid"),
+        )],
+    );
 }
 
 /// Load a saved session, if one exists and parses at a known version.
@@ -1116,6 +1041,7 @@ mod workspace_dedupe_tests {
             active_ws: 2,
             workspaces: vec![ws(a), ws("/elsewhere"), ws(b)],
             session_titles: Vec::new(),
+            closed_workspace_paths: Vec::new(),
         };
         merge_duplicate_workspaces(&mut snap);
         assert_eq!(snap.workspaces.len(), 2);
@@ -1131,6 +1057,7 @@ mod workspace_dedupe_tests {
             active_ws: 1,
             workspaces: vec![ws("/a"), ws("/b")],
             session_titles: Vec::new(),
+            closed_workspace_paths: Vec::new(),
         };
         merge_duplicate_workspaces(&mut snap);
         assert_eq!(snap.workspaces.len(), 2);
@@ -1165,7 +1092,10 @@ mod restart_log_tests {
             text.contains("server start build=test-build"),
             "got: {text}"
         );
-        let saves: Vec<&str> = text.lines().filter(|l| l.contains("save resolved")).collect();
+        let saves: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("save resolved"))
+            .collect();
         assert_eq!(saves.len(), 1, "the repeat added nothing: {text}");
         // Sorted by pane id, so a line reads in the order the panes were made,
         // and two saves of the same state compare equal.
@@ -1192,6 +1122,17 @@ mod restart_log_tests {
 #[cfg(test)]
 mod diff_snap_schema_tests {
     use super::*;
+
+    #[test]
+    fn older_sessions_default_to_no_closed_workspace_paths() {
+        let snapshot: SessionSnapshot = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "active_ws": 0,
+            "workspaces": [],
+        }))
+        .unwrap();
+        assert!(snapshot.closed_workspace_paths.is_empty());
+    }
 
     #[test]
     fn diff_snapshot_display_state_defaults_without_dropping_the_session() {
@@ -1246,94 +1187,6 @@ mod diff_snap_schema_tests {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::UnixListener;
-
-    #[test]
-    fn legacy_state_migration_is_copy_only_and_skips_runtime_artifacts() {
-        let root = std::env::temp_dir().join(format!("luvus-migration-{}", std::process::id()));
-        let legacy = root.join(".bohay");
-        let current = root.join(".luvus");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(legacy.join("sessions/docs")).unwrap();
-        fs::create_dir_all(legacy.join("worktrees/repo/branch")).unwrap();
-        fs::create_dir_all(legacy.join("modules/git/demo")).unwrap();
-        fs::write(legacy.join("config.toml"), "theme = \"gold\"").unwrap();
-        fs::write(legacy.join("sessions/docs/session.json"), "{}").unwrap();
-        fs::write(legacy.join("bohay.sock"), "stale").unwrap();
-        fs::write(legacy.join("server.lock"), "stale").unwrap();
-        fs::write(legacy.join("worktrees/repo/branch/file"), "user checkout").unwrap();
-        fs::write(legacy.join("modules/git/demo/file"), "module").unwrap();
-        fs::write(
-            legacy.join("modules.json"),
-            format!(
-                r#"{{"modules":[{{"root":"{}/modules/git/demo"}}]}}"#,
-                legacy.display()
-            ),
-        )
-        .unwrap();
-
-        migrate_legacy_state_between(&legacy, &current).unwrap();
-
-        assert_eq!(
-            fs::read_to_string(current.join("config.toml")).unwrap(),
-            "theme = \"gold\""
-        );
-        assert!(current.join("sessions/docs/session.json").is_file());
-        assert!(current.join("modules/git/demo/file").is_file());
-        assert!(!current.join("bohay.sock").exists());
-        assert!(!current.join("server.lock").exists());
-        assert!(!current.join("worktrees").exists());
-        assert!(current.join(LEGACY_MIGRATION_MARKER).is_file());
-        let registry = fs::read_to_string(current.join("modules.json")).unwrap();
-        assert!(registry.contains(&current.join("modules").display().to_string()));
-        assert!(!registry.contains(&legacy.join("modules").display().to_string()));
-        assert!(
-            legacy.join("config.toml").is_file(),
-            "rollback state remains intact"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn legacy_state_never_overwrites_an_existing_luvus_home() {
-        let root =
-            std::env::temp_dir().join(format!("luvus-migration-existing-{}", std::process::id()));
-        let legacy = root.join(".bohay");
-        let current = root.join(".luvus");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&legacy).unwrap();
-        fs::create_dir_all(&current).unwrap();
-        fs::write(legacy.join("config.toml"), "old").unwrap();
-        fs::write(current.join("config.toml"), "new").unwrap();
-        migrate_legacy_state_between(&legacy, &current).unwrap();
-        assert_eq!(
-            fs::read_to_string(current.join("config.toml")).unwrap(),
-            "new"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn migration_detects_a_live_legacy_long_path_alias() {
-        let root = std::env::temp_dir().join(format!(
-            "luvus-legacy-running-{}-{}",
-            std::process::id(),
-            "x".repeat(120)
-        ));
-        let logical = root.join("bohay.sock");
-        let alias = crate::session::legacy_socket_path(logical, "api");
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_file(&alias);
-        fs::create_dir_all(&root).unwrap();
-        fs::create_dir_all(alias.parent().unwrap()).unwrap();
-        let listener = UnixListener::bind(&alias).unwrap();
-
-        assert!(legacy_server_running(&root));
-
-        drop(listener);
-        let _ = fs::remove_file(alias);
-        let _ = fs::remove_dir_all(root);
-    }
 
     /// A CLI in a pane/module targets the injected socket (its own server), not
     /// the home-derived default — so `luvus …` inside a dev pane reaches the dev
@@ -1342,8 +1195,6 @@ mod tests {
     fn cli_socket_path_prefers_the_injected_socket() {
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var_os("LUVUS_SOCKET_PATH");
-        let saved_legacy = std::env::var_os("BOHAY_SOCKET_PATH");
-        std::env::remove_var("BOHAY_SOCKET_PATH");
 
         std::env::set_var("LUVUS_SOCKET_PATH", "/tmp/injected-luvus.sock");
         assert_eq!(cli_socket_path(), PathBuf::from("/tmp/injected-luvus.sock"));
@@ -1359,7 +1210,6 @@ mod tests {
             Some(v) => std::env::set_var("LUVUS_SOCKET_PATH", v),
             None => std::env::remove_var("LUVUS_SOCKET_PATH"),
         }
-        restore_env("BOHAY_SOCKET_PATH", &saved_legacy);
     }
 
     #[test]
@@ -1386,23 +1236,35 @@ mod tests {
     // dir must be owner-only (0700) and each bound socket 0600 — regardless of
     // the process umask (see `ensure_config_dir` / `transport::bind`).
     #[test]
-    fn empty_session_save_clears_the_snapshot() {
-        let _env = test_env("empty-save");
+    fn closing_the_final_project_saves_the_home_terminal_replacement() {
+        let _env = test_env("home-replacement-save");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
-        save(&app);
+        assert!(save(&app));
         assert!(session_path().exists(), "a live session snapshots");
-        // Close the only pane — the session is now deliberately empty, and the
-        // snapshot must go with it, or the next start would resurrect panes the
-        // user closed (re-running agent resume commands).
+        // Close the only pane. The project must not come back, but Luvus remains
+        // usable through one neutral terminal rooted at home.
         let id = app.layout().focus;
         app.handle_event(crate::event::AppEvent::PtyExit(id));
-        assert!(app.workspaces.is_empty());
-        save(&app);
-        assert!(
-            !session_path().exists(),
-            "an empty session clears the snapshot"
-        );
+        let home = crate::platform::home_dir().expect("test host has a home directory");
+        assert_eq!(app.workspaces.len(), 1);
+        assert!(crate::platform::same_path(&app.workspaces[0].cwd, &home));
+        assert!(save(&app));
+        let saved = load().expect("the replacement terminal is persisted");
+        assert_eq!(saved.workspaces.len(), 1);
+        assert!(crate::platform::same_path(&saved.workspaces[0].cwd, &home));
+    }
+
+    #[test]
+    fn save_reports_failure_when_the_atomic_temp_file_cannot_be_created() {
+        let _env = test_env("save-failure");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let app = App::new(80, 24, tx).unwrap();
+        let tmp = session_path().with_extension("json.tmp");
+        fs::create_dir_all(&tmp).unwrap();
+
+        assert!(!save(&app), "the caller must retain its retry state");
+        assert!(tmp.is_dir(), "the failure fixture remains in place");
     }
 
     #[test]
@@ -1416,23 +1278,5 @@ mod tests {
         let _listener = crate::ipc::transport::bind(&sock).unwrap();
         let mode = fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "socket is chmod 0600, got {mode:o}");
-    }
-}
-
-#[cfg(all(test, windows))]
-mod windows_migration_tests {
-    use super::*;
-
-    #[test]
-    fn migration_detects_a_live_legacy_named_pipe() {
-        let root = std::env::temp_dir().join(format!("luvus-legacy-pipe-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let path = root.join("bohay.sock");
-        let _listener = crate::ipc::transport::bind_legacy_for_test(&path).unwrap();
-
-        assert!(legacy_server_running(&root));
-
-        let _ = fs::remove_dir_all(root);
     }
 }
