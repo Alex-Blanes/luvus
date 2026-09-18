@@ -193,26 +193,35 @@ fn fetch_release(url: &str) -> Option<ForkRelease> {
     http_get(url).as_deref().and_then(parse_manifest)
 }
 
-/// A published build is newer only when this binary knows its own build number.
-/// Without one every check would claim an update forever.
-fn is_newer_build(release: &ForkRelease) -> bool {
-    current_build().is_some_and(|build| newer_fork_build(release, CURRENT, build))
-}
-
-/// Upstream's semver first, the fork build number only to break a tie.
+/// Is `release` newer than what is running? Semver first, build number only as
+/// the tiebreaker within one release.
 ///
-/// The build number counts commits since the upstream tag (`build.rs`), so it
-/// starts over at every upstream release: `0.14.2 - 0.76` is newer than
-/// `0.13.1 - 0.79`. Comparing the number alone made the background installer
-/// treat that older release as an update and put it over the newer binary.
-fn newer_fork_build(release: &ForkRelease, version: &str, build: u32) -> bool {
-    if is_newer(&release.version, version) {
+/// The build number counts commits since the `v<version>` tag, so **it resets
+/// every time the fork merges a new upstream release** — the count starts again
+/// from the new tag. Comparing the two numbers alone therefore reads a version
+/// bump as going backwards: at the 0.12.0 → 0.13.1 merge the running build was
+/// 94 and the first build of the newer release was 68, so `68 > 94` was false
+/// and the updater refused that release, and every release after it, until the
+/// fork happened to accumulate 27 more commits. Nothing looked wrong — the label
+/// still built, the check still ran, and it reported being up to date while two
+/// upstream releases behind. The mirror case is worse: after the 0.14.2 merge
+/// the published `0.13.1 - 0.79` outranked the installed `0.14.2 - 0.76`, and
+/// the background installer would have put the older release over it.
+///
+/// A strictly newer semver is enough on its own, even from a binary that has no
+/// build number of its own (a crates.io tarball, a shallow clone). Within one
+/// version the build number is still the only thing that can say "newer", so
+/// there it keeps deciding — and with no number to compare, it stays quiet
+/// rather than claiming an update forever.
+fn is_newer_build(release: &ForkRelease) -> bool {
+    let running = env!("CARGO_PKG_VERSION");
+    if is_newer(&release.version, running) {
         return true;
     }
-    if is_newer(version, &release.version) {
+    if is_newer(running, &release.version) {
         return false;
     }
-    release.build > build
+    current_build().is_some_and(|build| release.build > build)
 }
 
 /// `luvus update`: bring everything as up to date as it can be from inside a
@@ -524,10 +533,7 @@ fn verify_sha256(archive: &Path, checksum_file: &Path) -> Result<()> {
 /// disk immediately; it takes effect the next time luvus starts.
 #[cfg(windows)]
 fn replace_executable(candidate: &Path, destination: &Path) -> Result<()> {
-    let retired = destination.with_extension("old.exe");
-    // A leftover from a previous update, still locked if that build is running.
-    // Failing to clear it is fine; the rename below is what has to succeed.
-    let _ = fs::remove_file(&retired);
+    let retired = retire_path(destination);
     if destination.exists() {
         fs::rename(destination, &retired)
             .with_context(|| format!("move the running {} aside", destination.display()))?;
@@ -537,7 +543,67 @@ fn replace_executable(candidate: &Path, destination: &Path) -> Result<()> {
         let _ = fs::rename(&retired, destination);
         return Err(error).with_context(|| format!("install the new {}", destination.display()));
     }
+    // Only now, with the new binary in place, sweep what *earlier* updates left
+    // behind — never the one just made, which is the rollback. Whatever is still
+    // running keeps its file; the rest go.
+    sweep_retired(destination, &retired);
     Ok(())
+}
+
+/// A free name to move the outgoing binary to, next to it.
+///
+/// Never a fixed `luvus.old.exe`. Windows lets you rename a running image but
+/// not delete one, and `rename` onto an existing path has to delete what is
+/// there — so the moment any earlier build was still running under that one
+/// name, every future update failed at this step. That is not a rare corner:
+/// this fork's restart hands the console over by leaving the old process in
+/// `wait()`, so a previous build running is the normal state after an update.
+///
+/// Ten candidates is plenty — they only survive while their process does.
+#[cfg(windows)]
+fn retire_path(destination: &Path) -> PathBuf {
+    for n in 0..10 {
+        let candidate = destination.with_extension(format!("old{n}.exe"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    // Everything taken means ten live builds, which cannot really happen; fall
+    // back to a stamped name rather than returning a path that must fail.
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    destination.with_extension(format!("old-{stamp}.exe"))
+}
+
+/// Delete the retired binaries of past updates, leaving `keep` — the rollback
+/// this update just made — alone. Each is held open for as long as the build it
+/// belongs to is still running, so a failure here means exactly "that one is
+/// still in use" and is not worth reporting.
+#[cfg(windows)]
+fn sweep_retired(destination: &Path, keep: &Path) {
+    let Some(dir) = destination.parent() else {
+        return;
+    };
+    let Some(stem) = destination.file_stem().and_then(|s| s.to_str()) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // `luvus.old3.exe`, `luvus.old-1756223.exe`, and the `luvus.old.exe` of
+        // every build that predates this scheme.
+        if name.starts_with(&format!("{stem}.old"))
+            && name.ends_with(".exe")
+            && !crate::platform::same_path(&entry.path(), keep)
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -702,11 +768,13 @@ fn check_once(tx: &Sender<AppEvent>, url: &str, auto_install: bool) {
         // Not ours to replace (Homebrew, cargo, an OS package). Nothing failed,
         // and nothing is landing, so there is nothing to say.
         Ok(false) => crate::persist::log_event("update install skipped reason=managed-install"),
-        // A failed install has to be announced. A restart may be parked waiting
-        // for this, and silence would leave the button looking dead.
+        // A failed install has to be announced, with its reason: it used to be
+        // swallowed, and "the install died" looked exactly like "nothing to
+        // install". A restart may also be parked waiting for this, and silence
+        // would leave that button looking dead.
         Err(error) => {
             crate::persist::log_event(&format!("update install failed error={error}"));
-            let _ = tx.send(AppEvent::UpdateChecked(CheckOutcome::Failed));
+            let _ = tx.send(AppEvent::SelfUpdateFailed(format!("{error:#}")));
         }
     }
 }
@@ -928,20 +996,42 @@ mod tests {
         assert!(parse_manifest(r#"{"build":49}"#).is_none());
     }
 
-    /// Build numbers restart at every upstream release, so the published
-    /// `0.13.1 - 0.79` must never read as an update to `0.14.2 - 0.76` — that
-    /// comparison is what would have downgraded this binary in the background.
+    /// The build number restarts from zero at every upstream release the fork
+    /// merges, so across a version bump the newer release carries the *smaller*
+    /// number. Deciding on that number alone stranded the updater: it refused
+    /// the new release, and every release after it, while reporting no update
+    /// available — and the other way round it would install an older release.
     #[test]
-    fn a_newer_upstream_release_outranks_a_higher_build_number() {
+    fn a_newer_release_wins_even_though_its_build_number_is_lower() {
+        let running = env!("CARGO_PKG_VERSION");
         let release = |version: &str, build: u32| ForkRelease {
-            version: version.into(),
+            version: version.to_string(),
             build,
             tag: format!("build-{build}"),
         };
-        assert!(!newer_fork_build(&release("0.13.1", 79), "0.14.2", 76));
-        assert!(newer_fork_build(&release("0.14.2", 77), "0.14.2", 76));
-        assert!(!newer_fork_build(&release("0.14.2", 76), "0.14.2", 76));
-        assert!(newer_fork_build(&release("0.15.0", 3), "0.14.2", 76));
+
+        // The exact shape that stranded it: running 0.12.0 at build 94, the
+        // first build of 0.13.1 counted only 68 commits past its own tag.
+        assert!(
+            is_newer_build(&release("99.0.0", 0)),
+            "a newer release is newer whatever its build number"
+        );
+        assert!(
+            !is_newer_build(&release("0.0.1", u32::MAX)),
+            "an older release never wins on build number alone"
+        );
+
+        // Within one version the build number still decides, as it always did:
+        // every fork release carries upstream's semver, so nothing else can.
+        let Some(build) = super::current_build() else {
+            return; // built without the release tag in reach; nothing to compare
+        };
+        assert!(is_newer_build(&release(running, build + 1)));
+        assert!(
+            !is_newer_build(&release(running, build)),
+            "same is not newer"
+        );
+        assert!(!is_newer_build(&release(running, build.saturating_sub(1))));
     }
 
     /// The upstream probe reads GitHub's release JSON and compares semver — the
@@ -957,10 +1047,23 @@ mod tests {
         assert!(!is_newer(super::CURRENT, super::CURRENT));
     }
 
+    /// Every `luvus.old*.exe` in `dir`, sorted — the rollbacks an install left.
+    #[cfg(windows)]
+    fn retired_files(dir: &std::path::Path) -> Vec<String> {
+        let mut found: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.starts_with("luvus.old"))
+            .collect();
+        found.sort();
+        found
+    }
+
     /// Windows cannot overwrite a running image, so the installer renames the
     /// old binary aside and drops the new one into the freed path. The old one
-    /// has to survive under `.old.exe` — the running process is still reading
-    /// it, and it is the only rollback there is.
+    /// has to survive — the running process is still reading it, and it is the
+    /// only rollback there is — while earlier ones are cleared rather than piling up.
     #[cfg(windows)]
     #[test]
     fn windows_install_moves_the_running_binary_aside() {
@@ -974,8 +1077,10 @@ mod tests {
 
         super::replace_executable(&candidate, &destination).unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), b"new");
+        let retired = retired_files(&dir);
+        assert_eq!(retired.len(), 1, "exactly one rollback: {retired:?}");
         assert_eq!(
-            std::fs::read(dir.join("luvus.old.exe")).unwrap(),
+            std::fs::read(dir.join(&retired[0])).unwrap(),
             b"old",
             "the replaced binary is kept as the rollback"
         );
@@ -984,9 +1089,83 @@ mod tests {
         std::fs::write(&candidate, b"newer").unwrap();
         super::replace_executable(&candidate, &destination).unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), b"newer");
-        assert_eq!(std::fs::read(dir.join("luvus.old.exe")).unwrap(), b"new");
+        let retired = retired_files(&dir);
+        assert_eq!(retired.len(), 1, "still exactly one: {retired:?}");
+        assert_eq!(std::fs::read(dir.join(&retired[0])).unwrap(), b"new");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bug that stranded a real install. A rollback whose build is still
+    /// running cannot be deleted, and `rename` onto an existing path has to
+    /// delete what is there — so reusing one fixed `luvus.old.exe` made every
+    /// later update fail at that step, and the error was swallowed, so the
+    /// update button did nothing and said nothing.
+    ///
+    /// The lock is the real thing, not a stand-in: a handle opened without
+    /// `FILE_SHARE_DELETE`, which is how Windows holds a running image and the
+    /// only property that mattered. Read-only would not do — `remove_file`
+    /// clears that attribute itself and the file would vanish.
+    #[cfg(windows)]
+    #[test]
+    fn an_undeletable_rollback_does_not_block_the_next_update() {
+        let dir = std::env::temp_dir().join(format!("luvus-locked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let destination = dir.join("luvus.exe");
+        let candidate = dir.join("new.exe");
+        std::fs::write(&destination, b"old").unwrap();
+        std::fs::write(&candidate, b"new").unwrap();
+
+        // What every build before this scheme left behind, still in use.
+        let stuck = dir.join("luvus.old.exe");
+        std::fs::write(&stuck, b"ancient").unwrap();
+        let handle = deny_delete(&stuck);
+        assert!(
+            std::fs::remove_file(&stuck).is_err(),
+            "the setup is only meaningful if the file really cannot be deleted"
+        );
+
+        super::replace_executable(&candidate, &destination)
+            .expect("an undeletable rollback must not stop the install");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read(&stuck).unwrap(),
+            b"ancient",
+            "the one still in use is left exactly as it was"
+        );
+
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Hold `path` open the way Windows holds a running executable: readable by
+    /// others, but not deletable. Close the returned handle when done.
+    #[cfg(windows)]
+    fn deny_delete(path: &std::path::Path) -> windows_sys::Win32::Foundation::HANDLE {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, OPEN_EXISTING,
+        };
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                windows_sys::Win32::Foundation::GENERIC_READ,
+                FILE_SHARE_READ, // no FILE_SHARE_DELETE: this is the whole point
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(
+            !handle.is_null() && handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
+            "could not open {} to hold it",
+            path.display()
+        );
+        handle
     }
 
     #[test]

@@ -66,8 +66,14 @@ impl App {
     /// there is nothing to do (a few `HashSet` checks), and a no-op when the dock
     /// isn't mounted.
     pub fn ensure_file_tree(&mut self) {
-        let dock_visible =
-            self.client_files_visible || self.sidebars.side_of(&DockKind::Files).is_some();
+        // Mounted is not the same as *shown*: a folded dock, or one on a hidden
+        // sidebar, has nothing on screen to keep honest. It still cost four git
+        // processes every two seconds — the tint nobody could see was the single
+        // busiest thing luvus did while idle.
+        let dock_visible = self.client_files_visible
+            || self.sidebars.side_of(&DockKind::Files).is_some_and(|side| {
+                self.sidebars.get(side).visible && !self.dock_is_folded(&DockKind::Files)
+            });
         let diff_visible = self
             .layout()
             .leaves()
@@ -1290,6 +1296,34 @@ mod tests {
     use crate::app::{DockKind, FileMenu, FileMenuItem, Side};
     use crate::layout::Axis;
     use ratatui::{backend::TestBackend, Terminal};
+
+    /// Keeping the FILES tint honest costs four git processes every two
+    /// seconds. A dock folded to its header row shows no rows to tint, so it
+    /// bought nothing — and folding FILES is the normal way to get it out of
+    /// the way, which left luvus polling for the rest of the session.
+    #[test]
+    fn a_folded_files_dock_stops_the_git_poll() {
+        let _env = crate::persist::test_env("files-dock-poll");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        app.sidebars.left.visible = true;
+        if app.sidebars.side_of(&DockKind::Files).is_none() {
+            app.sidebars.left.docks.push(DockKind::Files);
+        }
+        app.toggle_dock_fold(&DockKind::Files);
+        assert!(app.dock_is_folded(&DockKind::Files));
+
+        app.ensure_file_tree();
+        assert!(
+            !app.git_status_inflight,
+            "nothing on screen to tint, nothing to scan"
+        );
+
+        app.toggle_dock_fold(&DockKind::Files);
+        assert!(!app.dock_is_folded(&DockKind::Files));
+        app.ensure_file_tree();
+        assert!(app.git_status_inflight, "unfolding starts scanning again");
+    }
 
     #[test]
     fn files_focus_restores_last_side_across_restart() {
