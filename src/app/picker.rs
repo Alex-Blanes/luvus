@@ -1190,10 +1190,23 @@ mod tests {
         app.picker_activate();
         assert!(app.picker.is_none());
         assert!(crate::platform::same_path(&app.ws().cwd, &newer));
-        assert!(crate::platform::same_path(
-            &crate::persist::recent_workspaces()[0],
-            &newer
-        ));
+        // Say where the list went if it is not there: this only ever failed on
+        // macOS, where the file read back empty right after being written.
+        let recent = crate::persist::recent_workspaces();
+        let file = crate::persist::config_dir().join("recent-workspaces.json");
+        assert!(
+            recent
+                .first()
+                .is_some_and(|p| crate::platform::same_path(p, &newer)),
+            "newest recent should be {newer:?}; read {recent:?}; LUVUS_HOME={:?}; \
+             {file:?} exists={} contents={:?}; dir={:?}",
+            std::env::var_os("LUVUS_HOME"),
+            file.exists(),
+            std::fs::read_to_string(&file).ok(),
+            std::fs::read_dir(crate::persist::config_dir())
+                .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+                .ok(),
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
