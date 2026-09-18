@@ -4,11 +4,14 @@ pub(crate) static BUILTINS: &[&AgentDescriptor] = &[
     &super::claude::DESCRIPTOR,
     &super::codex::DESCRIPTOR,
     &super::gemini::DESCRIPTOR,
+    &super::antigravity::DESCRIPTOR,
+    &super::letta::DESCRIPTOR,
     &super::aider::DESCRIPTOR,
     &super::opencode::DESCRIPTOR,
     &super::copilot::DESCRIPTOR,
     &super::kimi::DESCRIPTOR,
     &super::qwen::DESCRIPTOR,
+    &super::kilo::DESCRIPTOR,
     &super::kiro::DESCRIPTOR,
     &super::cursor::DESCRIPTOR,
     &super::amp::DESCRIPTOR,
@@ -19,6 +22,7 @@ pub(crate) static BUILTINS: &[&AgentDescriptor] = &[
     &super::omp::DESCRIPTOR,
     &super::pi::DESCRIPTOR,
     &super::fx::DESCRIPTOR,
+    &super::devin::DESCRIPTOR,
 ];
 
 // Preserve the current Settings and CLI presentation order independently of
@@ -27,6 +31,8 @@ static INTEGRATIONS: &[&AgentDescriptor] = &[
     &super::claude::DESCRIPTOR,
     &super::copilot::DESCRIPTOR,
     &super::codex::DESCRIPTOR,
+    &super::antigravity::DESCRIPTOR,
+    &super::letta::DESCRIPTOR,
     &super::opencode::DESCRIPTOR,
     &super::kimi::DESCRIPTOR,
     &super::grok::DESCRIPTOR,
@@ -96,7 +102,64 @@ mod tests {
                 "invalid task prompt argument for {}",
                 descriptor.id
             );
+            if let Some(automation) = descriptor.automation {
+                let launches = [
+                    automation.read_only,
+                    automation.workspace,
+                    automation.full_access,
+                ];
+                assert!(
+                    launches.iter().any(Option::is_some),
+                    "{} advertises automation without a launch profile",
+                    descriptor.id
+                );
+                for launch in launches.into_iter().flatten() {
+                    assert!(
+                        launch
+                            .args
+                            .iter()
+                            .all(|arg| !arg.is_empty() && !arg.chars().any(char::is_control)),
+                        "invalid automation argument for {}",
+                        descriptor.id
+                    );
+                }
+            }
         }
+    }
+
+    #[test]
+    fn automation_capabilities_are_explicit_per_agent_and_access_level() {
+        use crate::automation::AutomationAccess;
+
+        let codex = find("codex").unwrap().automation.unwrap();
+        assert!(codex.supports(AutomationAccess::ReadOnly));
+        assert!(codex.supports(AutomationAccess::Workspace));
+        assert!(codex.supports(AutomationAccess::FullAccess));
+
+        let aider = find("aider").unwrap().automation.unwrap();
+        assert!(aider.supports(AutomationAccess::ReadOnly));
+        assert!(!aider.supports(AutomationAccess::Workspace));
+        assert!(aider.supports(AutomationAccess::FullAccess));
+
+        assert!(find("antigravity").unwrap().automation.is_none());
+        assert!(find("amp").unwrap().automation.is_none());
+        assert!(find("devin").unwrap().automation.is_none());
+        assert!(find("letta").unwrap().automation.is_none());
+
+        let pi = find("pi").unwrap().automation.unwrap();
+        assert!(pi.supports(AutomationAccess::ReadOnly));
+        assert!(!pi.supports(AutomationAccess::Workspace));
+        assert!(!pi.supports(AutomationAccess::FullAccess));
+
+        let kilo = find("kilo").unwrap().automation.unwrap();
+        assert!(!kilo.supports(AutomationAccess::ReadOnly));
+        assert!(!kilo.supports(AutomationAccess::Workspace));
+        assert!(kilo.supports(AutomationAccess::FullAccess));
+
+        let opencode = find("opencode2").unwrap().automation.unwrap();
+        assert!(!opencode.supports(AutomationAccess::ReadOnly));
+        assert!(!opencode.supports(AutomationAccess::Workspace));
+        assert!(opencode.supports(AutomationAccess::FullAccess));
     }
 
     #[test]
@@ -134,6 +197,13 @@ mod tests {
     fn aliases_resolve_to_the_canonical_descriptor() {
         assert_eq!(find("cursor-agent").map(|agent| agent.id), Some("cursor"));
         assert_eq!(find("CURSOR").map(|agent| agent.id), Some("cursor"));
+        assert_eq!(find("agy").map(|agent| agent.id), Some("antigravity"));
+        assert_eq!(find("KILOCODE").map(|agent| agent.id), Some("kilo"));
+        assert_eq!(find("LETTA-CODE").map(|agent| agent.id), Some("letta"));
+        assert_eq!(
+            find("ANTIGRAVITY-CLI").map(|agent| agent.id),
+            Some("antigravity")
+        );
         assert!(find("not-an-agent").is_none());
     }
 
@@ -153,11 +223,14 @@ mod tests {
             ("claude", &["claude"][..], &[][..]),
             ("codex", &["codex"][..], &[][..]),
             ("gemini", &["gemini"][..], &[][..]),
+            ("antigravity", &["antigravity-cli"][..], &["agy"][..]),
+            ("letta", &["letta-code"][..], &["letta"][..]),
             ("aider", &["aider"][..], &[][..]),
-            ("opencode", &["opencode"][..], &[][..]),
+            ("opencode", &["opencode", "opencode2"][..], &[][..]),
             ("copilot", &["copilot"][..], &[][..]),
             ("kimi", &["kimi"][..], &[][..]),
             ("qwen", &["qwen"][..], &[][..]),
+            ("kilo", &["kilocode"][..], &["kilo"][..]),
             ("kiro", &["kiro"][..], &[][..]),
             ("cursor", &["cursor-agent"][..], &["cursor"][..]),
             ("amp", &[][..], &["amp"][..]),
@@ -176,6 +249,7 @@ mod tests {
             ("omp", &["oh-my-pi", "omp-coding-agent"][..], &["omp"][..]),
             ("pi", &["pi-coding-agent"][..], &["pi"][..]),
             ("fx", &[][..], &["fx"][..]),
+            ("devin", &[][..], &["devin"][..]),
         ];
         assert_eq!(actual, expected);
         assert!(BUILTINS.iter().all(|descriptor| {
@@ -195,8 +269,24 @@ mod tests {
         assert_eq!(
             resumable,
             [
-                "claude", "codex", "gemini", "opencode", "copilot", "kimi", "qwen", "cursor",
-                "grok", "hermes", "muse", "omp", "pi", "fx",
+                "claude",
+                "codex",
+                "gemini",
+                "antigravity",
+                "letta",
+                "opencode",
+                "copilot",
+                "kimi",
+                "qwen",
+                "kilo",
+                "cursor",
+                "grok",
+                "hermes",
+                "muse",
+                "omp",
+                "pi",
+                "fx",
+                "devin",
             ]
         );
 
@@ -214,8 +304,19 @@ mod tests {
         assert_eq!(
             discoverable,
             [
-                "claude", "codex", "gemini", "opencode", "copilot", "kimi", "qwen", "grok",
-                "hermes", "muse", "omp", "pi", "fx",
+                "claude",
+                "codex",
+                "gemini",
+                "antigravity",
+                "opencode",
+                "copilot",
+                "kimi",
+                "qwen",
+                "grok",
+                "muse",
+                "omp",
+                "pi",
+                "fx",
             ]
         );
 
@@ -230,14 +331,25 @@ mod tests {
             })
             .map(|descriptor| descriptor.id)
             .collect();
-        assert_eq!(forkable, ["claude", "codex", "grok", "omp", "pi"]);
+        assert_eq!(forkable, ["claude", "codex", "kilo", "grok", "omp", "pi"]);
 
         assert_eq!(
             integrations()
                 .iter()
                 .map(|descriptor| descriptor.id)
                 .collect::<Vec<_>>(),
-            ["claude", "copilot", "codex", "opencode", "kimi", "grok", "hermes", "omp",]
+            [
+                "claude",
+                "copilot",
+                "codex",
+                "antigravity",
+                "letta",
+                "opencode",
+                "kimi",
+                "grok",
+                "hermes",
+                "omp",
+            ]
         );
     }
 }

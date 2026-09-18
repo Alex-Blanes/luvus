@@ -8,7 +8,19 @@ Start it with:
 ```sh
 luvus uhp access
 luvus uhp access --control
+luvus uhp access --ttl 7200
+luvus uhp access --control --ttl 3600
+luvus uhp access --no-expiry
+luvus uhp access --control --no-expiry
 ```
+
+`--ttl` configures the delegated authority lifetime in seconds from 1 through
+86400. Without it, both read-only and control access last 24 hours. The one-use
+pairing code lasts at most five minutes and is shortened automatically when the
+authority lifetime is shorter. `--no-expiry` instead binds authority to the
+foreground command: it remains valid until that process exits. Luvus rotates
+bounded upstream tokens internally and revokes them when access stops; the
+client token itself is accepted only by that loopback gateway.
 
 The command writes exactly one JSON descriptor line to stdout and remains in
 the foreground. The descriptor schema is
@@ -22,7 +34,8 @@ The first connection sends one pairing frame:
 {"type":"pair","code":"ABCD-EFGH-JKLM"}
 ```
 
-The response returns an in-memory delegated token, its scopes, and expiry.
+The response returns an in-memory client token and its scopes. A finite session
+includes `expires_at`; process-bound access includes `expires_on_close:true`.
 Pairing succeeds once, expires after five minutes, and is rejected after five
 failed attempts. Later connections carry ordinary LF-terminated UHP request
 frames with that token in `auth`. Ordinary requests use one connection per
@@ -38,3 +51,21 @@ the Luvus server and panes remain alive.
 
 UHP Access is not a new UHP version. Clients must discover live capabilities
 after pairing and validate frames against the installed UHP schema bundle.
+
+Control Access permits the exact `agent.keys` RPC for a recognized agent pane;
+read-only Access refuses it. It retains the owner key grammar: named keys,
+`ctrl+`/`c-` plus any ASCII letter (including `ctrl+z`), and single printable
+Unicode codepoints. A batch can compose escape sequences such as
+`["esc","[","Z"]`. This is intentionally wider than control-stream `send_key`.
+The ordinary 1 MiB frame limit still applies. Validation rejects an entire bad
+batch before queueing any prefix; success returns `{"type":"ok","pane":"7"}`
+and means queue admission, not child consumption. `agent.send`, pane raw input,
+agent launch/fork, close, token management, and standalone terminal input
+actions remain forbidden through Access. No request, response, or event shape
+changes are introduced by this permission.
+
+Control also permits `pane.rename` with the existing `pane` and `name` parameters;
+read-only Access denies it. Rename retains the owner name validation and
+`pane.renamed` event. An empty name clears the pane alias. Effective
+`access.allowed_methods` includes `pane.rename` only for Control endpoints
+whose owner advertises it; the request, response, and event schemas are unchanged.

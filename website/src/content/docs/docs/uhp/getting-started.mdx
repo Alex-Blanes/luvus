@@ -1,15 +1,30 @@
 ---
-title: Automating with UHP
+title: Getting started with UHP
 description: Connect a script or coding harness to Luvus through Universal Harness Protocol 1.0.
 ---
 
 Universal Harness Protocol, or UHP, is Luvus's single public automation
-contract. It covers workspaces, tabs, panes, agents, terminal streams, files,
-Git, DIFF, worktrees, modules, bars, configuration, and events.
+contract. It covers host sessions, workspaces, tabs, panes, agents, terminal
+streams, files, Git, DIFF, Mission Control, worktrees, modules, bars,
+configuration, and events.
 
 Normal commands such as `luvus pane list` are friendly wrappers over the same
 UHP methods. Unix sockets on macOS and Linux and named pipes on Windows are
 local transports, not separate APIs.
+
+## Before you connect
+
+Confirm that you are targeting the intended server and named session:
+
+```sh
+luvus server status
+luvus --session review uhp capabilities
+```
+
+Inside a Luvus pane, preserve its inherited endpoint and session environment.
+Outside Luvus, pass `--session <name>` explicitly when the default session is
+not your target. Begin with capability discovery and read-only calls. Add
+mutation or terminal-control authority only when the workflow requires it.
 
 ## Discover and inspect
 
@@ -22,7 +37,9 @@ luvus uhp snapshot
 
 UHP is always available to the local owner. Capability discovery returns
 `luvus-uhp` version `1.0`, the complete method registry, access contracts,
-limits, event sequence, identity rules, and terminal capabilities.
+limits, event sequence, identity rules, and terminal capabilities. Schema
+discovery includes `event_catalog.properties`, which maps general event names to
+their payload field schemas.
 
 ## Send one request
 
@@ -53,6 +70,30 @@ printf '%s\n' '{"id":"snap","method":"session.snapshot","params":{}}' \
 
 `uhp proxy` forwards one bounded request and response. Persistent event and
 terminal streams must connect to the discovered local endpoint.
+
+It also owns the on-demand host profile, which works without a running session:
+
+```sh
+printf '%s\n' '{"id":"host","method":"host.info","params":{}}' | luvus uhp proxy
+printf '%s\n' '{"id":"sessions","method":"session.list","params":{}}' | luvus uhp proxy
+```
+
+Use `host.capabilities` to discover that separate profile. Host mutations such
+as `session.delete`, `skill.enable`, and `integration.install` require
+`confirm:true`, reject delegated session tokens, and are not exposed by
+`luvus uhp access`.
+
+## Mission Control data
+
+`mission.snapshot` returns read-only live and resumable agent rows plus usage
+totals without opening or focusing the dashboard. `mission.refresh` schedules
+one off-render-path usage scan; take another snapshot after the refresh
+completes. Both accept `scope:"workspace"` or `scope:"all"` and an optional
+workspace target.
+
+```json
+{"id":"mission","method":"mission.snapshot","params":{"scope":"all"}}
+```
 
 ## Responses and mutations
 
@@ -114,7 +155,12 @@ Supply the returned secret in `auth`. Use `uhp.token.list` and
 For a provider or client that must work beyond the owner-only local endpoint,
 use `luvus uhp access`. It creates a scoped loopback gateway, emits a versioned
 machine-readable descriptor, and keeps transport outside Luvus core. See
-[Connecting UHP transports and clients](/docs/guides/uhp-access/).
+[Connecting UHP transports and clients](/docs/uhp/remote-access/).
 
-Continue with the [UHP reference](/docs/reference/uhp/) and
-[UHP method reference](/docs/reference/api/).
+## Continue building
+
+- Copy complete request flows from [Practical examples](/docs/uhp/examples/).
+- Find parameters and results in the [Method reference](/docs/uhp/methods/).
+- Build PTY capture and control with [Terminal methods](/docs/uhp/terminal/).
+- Carry UHP through a secure provider with [Remote access](/docs/uhp/remote-access/).
+- Validate a client with [Schemas and conformance](/docs/uhp/conformance/).

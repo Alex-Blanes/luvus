@@ -9,7 +9,7 @@ use super::{
     BarHit, BarLayout, BarRegion, BarSegment, BarSegmentKind, BarState, BarTone, OverflowHit,
     WidgetCandidate,
 };
-use crate::ui::theme::{spinner_frame, State, Theme};
+use crate::ui::theme::{State, Theme};
 use crate::ui::RenderTarget;
 use std::borrow::Cow;
 
@@ -19,7 +19,6 @@ pub fn draw_region(
     region: BarRegion,
     candidates: &[WidgetCandidate<'_>],
     layout: &BarLayout,
-    spinner: u64,
     t: &Theme,
 ) -> (Vec<BarHit>, Option<OverflowHit>) {
     if area.width == 0 || area.height == 0 || layout.is_empty() {
@@ -47,7 +46,6 @@ pub fn draw_region(
                 f,
                 rect,
                 segment,
-                spinner,
                 candidate.key == super::CORE_RUNTIME && segment_index == 0,
                 t,
             );
@@ -57,7 +55,7 @@ pub fn draw_region(
                     segment: segment_index,
                     rect,
                     action: action.clone(),
-                    value: segment.value.clone(),
+                    value: segment.click_value().map(str::to_string),
                 });
             }
             x = x.saturating_add(width);
@@ -98,29 +96,23 @@ fn draw_segment(
     f: &mut RenderTarget,
     rect: Rect,
     segment: &BarSegment,
-    spinner: u64,
     core_runtime_label: bool,
     t: &Theme,
 ) {
     let (text, state_color): (Cow<'_, str>, Option<Color>) = match &segment.kind {
-        BarSegmentKind::Text { text } | BarSegmentKind::Symbol { symbol: text } => {
+        BarSegmentKind::Text { text, .. } | BarSegmentKind::Symbol { symbol: text, .. } => {
             (Cow::Borrowed(text), None)
         }
-        BarSegmentKind::State { state, label } => {
+        BarSegmentKind::State { state, label, .. } => {
             let state = parse_state(state);
-            let glyph = if state == State::Working {
-                f.mark_working_animation();
-                spinner_frame(spinner)
-            } else {
-                state.dot()
-            };
+            let glyph = state.dot();
             let text = label
                 .as_ref()
                 .map(|label| format!("{glyph} {label}"))
                 .unwrap_or_else(|| glyph.to_string());
             (Cow::Owned(text), Some(state.color(t)))
         }
-        BarSegmentKind::Badge { text } => (Cow::Owned(format!("[{text}]")), None),
+        BarSegmentKind::Badge { text, .. } => (Cow::Owned(format!("[{text}]")), None),
         BarSegmentKind::Progress {
             value,
             total,
@@ -137,8 +129,8 @@ fn draw_segment(
                 None,
             )
         }
-        BarSegmentKind::Spacer { width } => (Cow::Owned(" ".repeat(*width as usize)), None),
-        BarSegmentKind::Separator => (Cow::Borrowed("  ·  "), None),
+        BarSegmentKind::Spacer { width, .. } => (Cow::Owned(" ".repeat(*width as usize)), None),
+        BarSegmentKind::Separator { .. } => (Cow::Borrowed("  ·  "), None),
     };
     let color = if core_runtime_label {
         t.overlay1
@@ -163,7 +155,9 @@ fn parse_state(state: &str) -> State {
     }
 }
 
-fn tone_color(tone: BarTone, t: &Theme) -> Color {
+/// The theme colour a tone resolves to. Shared by bar segments and module dock
+/// rows so both surfaces read the same under every theme.
+pub fn tone_color(tone: BarTone, t: &Theme) -> Color {
     match tone {
         BarTone::Normal => t.subtext0,
         BarTone::Muted => t.overlay0,
@@ -253,6 +247,92 @@ pub fn draw_overflow(f: &mut RenderTarget, area: Rect, state: &mut BarState, t: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::buffer::Buffer;
+
+    #[test]
+    fn working_state_uses_static_filled_marker() {
+        let area = Rect::new(0, 0, 16, 1);
+        let mut buffer = Buffer::empty(area);
+        let mut target = RenderTarget::new(&mut buffer, area);
+        let segment = BarSegment {
+            kind: BarSegmentKind::State {
+                state: "working".into(),
+                label: Some("agent".into()),
+                value: None,
+            },
+            tone: BarTone::Normal,
+            action: None,
+        };
+        draw_segment(
+            &mut target,
+            area,
+            &segment,
+            false,
+            &crate::ui::theme::by_name("quattro-rally"),
+        );
+
+        let rendered = (0..area.width)
+            .map(|x| buffer.cell((x, 0)).map(|cell| cell.symbol()).unwrap_or(" "))
+            .collect::<String>();
+        assert!(rendered.starts_with("● agent"));
+    }
+
+    // A spacer or a separator may carry an action, and the Bar contract lets any
+    // segment with an action carry the click payload that action is invoked with.
+    // Dropping it for these two would make their clicks fire with no value, which
+    // is silent: the action still runs, just without the argument the module sent.
+    #[test]
+    fn spacer_and_separator_click_values_reach_the_hit_target() {
+        let segments: Vec<BarSegment> = serde_json::from_str(
+            r#"[
+                {"type":"text","text":"CI","action":"open","value":"run-1842"},
+                {"type":"spacer","width":2,"action":"open","value":"gap"},
+                {"type":"separator","action":"open","value":"rule"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            segments
+                .iter()
+                .map(BarSegment::click_value)
+                .collect::<Vec<_>>(),
+            vec![Some("run-1842"), Some("gap"), Some("rule")],
+            "every click payload survives parsing"
+        );
+
+        let widget = super::super::BarWidget::new(
+            super::super::BarWidgetKey::new("test", "clickable"),
+            BarRegion::BottomRight,
+            segments,
+            Vec::new(),
+            50,
+        )
+        .unwrap();
+        let candidates = vec![WidgetCandidate {
+            key: "test:clickable",
+            widget: &widget,
+        }];
+        let layout = super::super::compose(&candidates, 40, 40);
+        let area = Rect::new(0, 0, 40, 1);
+        let mut buffer = Buffer::empty(area);
+        let mut target = RenderTarget::new(&mut buffer, area);
+        let (hits, _) = draw_region(
+            &mut target,
+            area,
+            BarRegion::BottomRight,
+            &candidates,
+            &layout,
+            &crate::ui::theme::by_name("quattro-rally"),
+        );
+
+        assert_eq!(
+            hits.iter()
+                .map(|hit| (hit.segment, hit.value.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![(0, Some("run-1842")), (1, Some("gap")), (2, Some("rule")),],
+            "each rendered hit carries its own segment's value"
+        );
+    }
 
     #[test]
     fn top_overflow_reserves_its_anchor_row_without_losing_a_fitting_item() {

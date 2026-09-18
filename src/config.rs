@@ -3,11 +3,14 @@
 //! has a serde default, so old/new configs round-trip and a missing or corrupt
 //! file just yields defaults.
 
-use std::fs;
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::app::{SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN};
 
@@ -65,16 +68,32 @@ pub struct Config {
     /// (`--permission-mode bypassPermissions`), so switching it on is deliberate.
     #[serde(default)]
     pub resume_launch_flags: bool,
-    /// What the AGENTS dock lists: the active workspace's agents and sessions,
-    /// everything, or live agents only. A missing value keeps the fork's
-    /// Workspace default. The visible Workspace / All / Active control updates
-    /// this preference.
+    /// Show only live agents in the AGENTS dock. Missing values retain the
+    /// historical All default so resumable sessions never appear lost after an
+    /// upgrade. The visible All / Active control updates this preference.
     #[serde(default)]
-    pub agents_filter: crate::app::AgentsFilter,
+    pub agents_active_only: bool,
+    /// Scope the AGENTS dock to the active workspace. This is a second axis,
+    /// independent of All / Active: that one selects lifecycle, this one selects
+    /// which project's rows are visible. Missing values keep the All-workspaces
+    /// default, so an upgrade never hides rows the user was already seeing. The
+    /// visible scope chip updates this preference.
+    #[serde(default)]
+    pub agents_this_workspace: bool,
+    /// This fork's earlier single AGENTS filter (`workspace` / `all` / `active`),
+    /// read only so [`normalize_config`] can translate it into the two switches
+    /// above; never written, so the first save drops it.
+    #[serde(default, skip_serializing)]
+    pub agents_filter: Option<String>,
     /// Custom keybindings: command id → key string (overrides the defaults).
     /// An empty value means the command is explicitly unbound.
     #[serde(default)]
     pub keybindings: std::collections::HashMap<String, String>,
+    /// Opt-in shortcuts handled without the command prefix: command id →
+    /// structured chord such as `alt+right`. Empty by default so normal shell
+    /// and nested-TUI input is never intercepted unless the user requests it.
+    #[serde(default)]
+    pub direct_keybindings: std::collections::HashMap<String, String>,
     /// The safe prefix that opens command mode (docs/64): an F1-F12 key or a
     /// Ctrl/Alt character chord such as `ctrl+space`, `ctrl+b`, or `alt+\\`.
     /// Plain text keys are rejected so normal terminal typing is never swallowed.
@@ -97,6 +116,12 @@ pub struct Config {
     /// or restart. This set keeps an off dock off; re-placing it clears the flag.
     #[serde(default)]
     pub docks_off: Vec<String>,
+    /// Docks folded to their header row, by dock id (this fork). Kept here, not
+    /// in `sidebars`, because `SidebarsConfig` also travels over the bincode
+    /// wire, where its shape has to match upstream's exactly. A folded dock
+    /// keeps its weight, so unfolding it gives back the height it had.
+    #[serde(default)]
+    pub collapsed_docks: Vec<String>,
     /// Luvus Bar placement groups. Dynamic content is never persisted here;
     /// only presentation preferences survive a restart.
     #[serde(default)]
@@ -205,13 +230,22 @@ pub struct LayoutConfig {
     /// its name, an unnamed pane its path (the original behavior).
     #[serde(default)]
     pub pane_title_path: bool,
-    /// In the AGENTS sidebar, show each agent's live session title (the OSC title
-    /// it sets, e.g. "Ship the desktop release…") in place of the `wsname · =<id>`
-    /// meta line. On by default — the title is what tells two sessions of the same
-    /// agent apart; falls back to the meta line when an agent set no useful title.
-    /// `default = "yes"` so an older config without the field also gets it on.
-    #[serde(default = "yes")]
+    /// In the AGENTS sidebar, show each agent's session title in place of the
+    /// `wsname · =<id>` meta line (live) or the project folder (resumable).
+    /// OSC title wins when the agent set one; otherwise a module-provided title
+    /// from `ui.agent_title.push`. Off by default. Luvus pane aliases are never
+    /// used as a title.
+    #[serde(default)]
     pub agent_title: bool,
+    /// Show the cwd line beneath each WORKSPACES entry. On by default to retain
+    /// the established two-row presentation; the row context menu persists the
+    /// compact one-row preference when this is disabled.
+    #[serde(default = "yes")]
+    pub workspace_paths: bool,
+    /// Show the workspace/path detail line beneath each AGENTS entry. On by
+    /// default; the row context menu can hide it for a denser one-row list.
+    #[serde(default = "yes")]
+    pub agent_paths: bool,
     /// Resume a session into its own workspace (else a new tab in the current one).
     #[serde(default = "yes", alias = "resume_in_new_node")]
     pub resume_in_new_workspace: bool,
@@ -276,12 +310,14 @@ pub struct LayoutConfig {
     /// client's viewport. `0` disables mobile presentation entirely.
     #[serde(default = "default_mobile_width", alias = "compact_width")]
     pub mobile_width: u16,
-    /// What luvus forwards to a pane for **Shift/Alt+Enter** ("new line, don't
-    /// submit"). A keyword from [`SHIFT_ENTER_CHOICES`]; default `esc-cr`
-    /// (`ESC CR`, the sequence Claude Code's `/terminal-setup` installs). Exposed
-    /// because agents/terminals disagree on which byte sequence they treat as a
-    /// newline — notably some Windows agents want a bare `LF` where macOS wants
-    /// `ESC CR`. Set once, applied to every pane's keystroke encoding.
+    /// What luvus forwards to a pane for modified Enter when the child has not
+    /// negotiated the Kitty keyboard protocol. A keyword from
+    /// [`SHIFT_ENTER_CHOICES`]; default `esc-cr` (`ESC CR`, the sequence Claude
+    /// Code's `/terminal-setup` installs). Kitty modes preserve the real
+    /// modifiers instead, so Shift+Enter and Alt+Enter remain distinct. Exposed
+    /// because agents/terminals disagree on which legacy byte sequence they
+    /// treat as a newline — notably some Windows agents want a bare `LF` where
+    /// macOS wants `ESC CR`. Set once, applied to every pane's key encoding.
     #[serde(default = "default_shift_enter")]
     pub shift_enter: String,
 }
@@ -298,12 +334,13 @@ fn default_shift_enter() -> String {
     SHIFT_ENTER_CHOICES[0].0.to_string()
 }
 
-/// Ordered choices for what Shift/Alt+Enter sends to a pane: `(keyword, label,
+/// Ordered choices for the legacy modified-Enter fallback: `(keyword, label,
 /// bytes)`. The keyword is the stable `config.layout.shift_enter` value; the
 /// label is shown in the Settings chooser; the bytes are what `encode_key`
-/// forwards. `ESC CR` leads because it is what agent CLIs expect out of the box
-/// (Claude Code's `/terminal-setup`). The others cover agents/terminals that
-/// bind a plain `LF` or the CSI-u modified-Enter form instead.
+/// forwards when no Kitty keyboard mode is active. `ESC CR` leads because it is
+/// what agent CLIs expect out of the box (Claude Code's `/terminal-setup`). The
+/// others cover agents/terminals that bind a plain `LF` or the CSI-u Shift+Enter
+/// form instead.
 pub const SHIFT_ENTER_CHOICES: &[(&str, &str, &[u8])] = &[
     ("esc-cr", "ESC CR (default)", b"\x1b\r"),
     ("lf", "LF (newline)", b"\n"),
@@ -312,7 +349,7 @@ pub const SHIFT_ENTER_CHOICES: &[(&str, &str, &[u8])] = &[
 ];
 
 /// Left + right sidebar layout (docs/29). Serialized under `sidebars`.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SidebarsConfig {
     #[serde(default = "SideConfig::left_default")]
     pub left: SideConfig,
@@ -325,7 +362,7 @@ pub struct SidebarsConfig {
 }
 
 /// One sidebar's persisted state: shown/hidden, width, and its ordered dock ids.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SideConfig {
     #[serde(default = "yes")]
     pub visible: bool,
@@ -333,15 +370,12 @@ pub struct SideConfig {
     pub width: u16,
     #[serde(default)]
     pub docks: Vec<String>,
-    /// Rows each dock asked for, by dock id (docs/29): the heights left by the
-    /// last divider drag. Keyed rather than positional so mounting, unmounting or
-    /// reordering a dock can't silently shift everyone's height. A dock with no
-    /// entry takes an equal share.
+    /// Relative height share of each dock on this side, parallel to `docks`.
+    /// Empty — the default, and what every config written before dock resizing
+    /// existed contains — means an equal split, so an older config keeps the
+    /// layout it already had.
     #[serde(default)]
-    pub dock_rows: std::collections::HashMap<String, u16>,
-    /// Docks folded to their header row, by dock id.
-    #[serde(default)]
-    pub collapsed: Vec<String>,
+    pub dock_weights: Vec<u16>,
 }
 
 impl SideConfig {
@@ -351,8 +385,7 @@ impl SideConfig {
             visible: true,
             width: SIDEBAR_WIDTH_DEFAULT,
             docks: vec!["workspaces".into(), "agents".into()],
-            dock_rows: std::collections::HashMap::new(),
-            collapsed: Vec::new(),
+            dock_weights: Vec::new(),
         }
     }
     /// The default right sidebar: off and empty.
@@ -361,8 +394,7 @@ impl SideConfig {
             visible: false,
             width: SIDEBAR_WIDTH_DEFAULT,
             docks: Vec::new(),
-            dock_rows: std::collections::HashMap::new(),
-            collapsed: Vec::new(),
+            dock_weights: Vec::new(),
         }
     }
 }
@@ -464,12 +496,16 @@ impl Default for Config {
             check_updates: true,
             auto_update: true,
             resume_launch_flags: false,
-            agents_filter: crate::app::AgentsFilter::default(),
+            agents_active_only: false,
+            agents_this_workspace: false,
+            agents_filter: None,
             keybindings: std::collections::HashMap::new(),
+            direct_keybindings: std::collections::HashMap::new(),
             prefix: default_prefix(),
             mission_pricing: std::collections::HashMap::new(),
             mission_budget: None,
             docks_off: Vec::new(),
+            collapsed_docks: Vec::new(),
             bars: BarConfig::default(),
         }
     }
@@ -482,7 +518,9 @@ impl Default for LayoutConfig {
             row_gap: 0,
             show_titles: true,
             pane_title_path: false,
-            agent_title: true,
+            agent_title: false,
+            workspace_paths: true,
+            agent_paths: true,
             resume_in_new_workspace: true,
             new_pane_to_workspace_root: false,
             file_open: default_file_open(),
@@ -570,7 +608,7 @@ fn config_path() -> PathBuf {
 pub fn load() -> Config {
     fs::read_to_string(config_path())
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(|s| parse_config(&s))
         .map(normalize_config)
         .unwrap_or_default()
 }
@@ -598,8 +636,76 @@ pub(crate) fn normalize_config(mut cfg: Config) -> Config {
         .layout
         .diff_context_lines
         .min(crate::diff::MAX_CONTEXT_LINES);
+    // Fork-only settings that upstream later modelled differently. Each is
+    // translated once; the legacy key is never serialized, so the first save
+    // removes it and a later choice is never overridden by it.
+    if let Some(filter) = cfg.agents_filter.take() {
+        (cfg.agents_this_workspace, cfg.agents_active_only) = match filter.as_str() {
+            "workspace" => (true, false),
+            "active" => (false, true),
+            _ => (false, false),
+        };
+    }
     cfg.version = cfg.version.max(CONFIG_VERSION);
     cfg
+}
+
+/// Parse `config.json`, carrying over what this fork used to keep per sidebar
+/// side — `dock_rows` (per-id heights) and `collapsed` (folded dock ids) — into
+/// upstream's positional `dock_weights` and the top-level `collapsed_docks`.
+/// Neither key exists on `SideConfig` any more (that struct must keep
+/// upstream's wire shape), so they are read from the raw JSON; the next save
+/// writes the new keys and the old ones are gone.
+fn parse_config(text: &str) -> Option<Config> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    let legacy: Vec<(Map<String, Value>, Vec<String>)> = ["left", "right"]
+        .iter()
+        .filter_map(|side| value.get("sidebars")?.get(side)?.as_object())
+        .map(|side| {
+            let rows = side
+                .get("dock_rows")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let collapsed = side
+                .get("collapsed")
+                .and_then(Value::as_array)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| id.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (rows, collapsed)
+        })
+        .collect();
+    let mut cfg: Config = serde_json::from_value(value).ok()?;
+    let sides = cfg
+        .sidebars
+        .as_mut()
+        .map(|s| vec![&mut s.left, &mut s.right])
+        .unwrap_or_default();
+    for (side, (rows, collapsed)) in sides.into_iter().zip(legacy) {
+        if side.dock_weights.is_empty() && !rows.is_empty() {
+            // Rows were absolute heights, but only their ratio matters to the
+            // split, so they serve as weights as they are. A dock without one
+            // leaves the split even, as before.
+            let weights: Vec<u16> = side
+                .docks
+                .iter()
+                .map(|id| rows.get(id).and_then(Value::as_u64).unwrap_or(0) as u16)
+                .collect();
+            if weights.iter().all(|w| *w > 0) {
+                side.dock_weights = weights;
+            }
+        }
+        for id in collapsed {
+            if !cfg.collapsed_docks.contains(&id) {
+                cfg.collapsed_docks.push(id);
+            }
+        }
+    }
+    Some(cfg)
 }
 
 fn legacy_scrollback_bytes(lines: usize) -> usize {
@@ -613,20 +719,230 @@ fn legacy_scrollback_bytes(lines: usize) -> usize {
         .clamp(SCROLLBACK_BYTES_MIN, SCROLLBACK_BYTES_MAX)
 }
 
-/// Save the config atomically (best effort).
+static CONFIG_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Save a complete config atomically (best effort).
+///
+/// Runtime app code should use [`save_changes`] instead. A complete write is
+/// appropriate for isolated initialization and tests, but a long-running named
+/// server may hold an older copy of fields changed by another server.
+#[cfg(test)]
 pub fn save(cfg: &Config) {
-    let dir = crate::persist::ensure_config_dir();
-    if !dir.is_dir() {
-        return;
+    let path = config_path();
+    let _ = with_config_lock(&path, || write_config_atomic(cfg, &path));
+}
+
+/// Persist only fields changed between one server's last local config and its
+/// current config. The newest shared config is reloaded under a cross-process
+/// lock before applying the deep patch, so a named server cannot overwrite an
+/// unrelated setting with an older in-memory value.
+///
+/// Returns `true` after either a successful write or a no-op. Callers retain
+/// their old baseline on `false`, allowing the next change to retry everything
+/// that has not reached disk yet.
+#[cfg(test)]
+pub fn save_changes(base: &Config, desired: &Config) -> bool {
+    save_changes_with_patch(base, desired, None)
+}
+
+/// Persist local changes and also apply an explicit user/API patch. The
+/// explicit patch matters when a stale server is asked to select the value it
+/// already has in memory: there may be no local delta, but the shared file must
+/// still record the user's choice.
+pub fn save_changes_with_patch(base: &Config, desired: &Config, explicit: Option<&Value>) -> bool {
+    SaveRequest::new(base.clone(), desired.clone(), explicit.cloned()).write()
+}
+
+/// Owned save inputs with a pinned path; workers never resolve session globals.
+pub(crate) struct SaveRequest {
+    base: Config,
+    desired: Config,
+    explicit: Option<Value>,
+    path: PathBuf,
+}
+
+impl SaveRequest {
+    pub(crate) fn new(base: Config, desired: Config, explicit: Option<Value>) -> Self {
+        Self {
+            base,
+            desired,
+            explicit,
+            path: config_path(),
+        }
     }
-    let Ok(json) = serde_json::to_string_pretty(cfg) else {
+
+    pub(crate) fn write(self) -> bool {
+        save_changes_at(
+            &self.path,
+            &self.base,
+            &self.desired,
+            self.explicit.as_ref(),
+        )
+    }
+}
+
+fn save_changes_at(
+    path: &std::path::Path,
+    base: &Config,
+    desired: &Config,
+    explicit: Option<&Value>,
+) -> bool {
+    let Ok(base) = serde_json::to_value(base) else {
+        return false;
+    };
+    let Ok(desired) = serde_json::to_value(desired) else {
+        return false;
+    };
+    let delta = value_delta(&base, &desired);
+    if delta.is_none() && explicit.is_none() {
+        return true;
+    }
+
+    with_config_lock(path, || {
+        let latest: Config = fs::read_to_string(path)
+            .ok()
+            .and_then(|text| parse_config(&text))
+            .map(normalize_config)
+            .unwrap_or_default();
+        let mut latest = serde_json::to_value(latest).map_err(io::Error::other)?;
+        if let Some(delta) = &delta {
+            apply_delta(&mut latest, delta);
+        }
+        if let Some(explicit) = explicit {
+            apply_delta(&mut latest, explicit);
+        }
+        let merged: Config = serde_json::from_value(latest).map_err(io::Error::other)?;
+        write_config_atomic(&normalize_config(merged), path)
+    })
+    .is_ok()
+}
+
+fn with_config_lock<T>(
+    path: &std::path::Path,
+    operation: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| io::Error::other("missing configuration directory"))?;
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if Some(dir) != crate::platform::home_dir().as_deref() {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    if !dir.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "configuration directory is unavailable",
+        ));
+    }
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join("config.lock"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    operation()
+}
+
+fn write_config_atomic(cfg: &Config, path: &std::path::Path) -> io::Result<()> {
+    let json = serde_json::to_vec_pretty(cfg).map_err(io::Error::other)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    let (temporary, mut file): (PathBuf, File) = (0..16)
+        .find_map(|_| {
+            let sequence = CONFIG_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let temporary = path.with_file_name(format!(
+                ".{file_name}.luvus-{}-{sequence}.tmp",
+                std::process::id()
+            ));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+            {
+                Ok(file) => Some(Ok((temporary, file))),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "temporary config files"))?;
+
+    let result = (|| {
+        file.write_all(&json)?;
+        file.flush()?;
+        drop(file);
+        crate::platform::atomic_replace_file(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Produce a JSON Merge Patch style delta, recursing into maps so independent
+/// nested settings such as two Layout fields do not replace each other.
+fn value_delta(base: &Value, desired: &Value) -> Option<Value> {
+    match (base, desired) {
+        (Value::Object(base), Value::Object(desired)) => {
+            let mut delta = Map::new();
+            for key in base.keys() {
+                if !desired.contains_key(key) {
+                    delta.insert(key.clone(), Value::Null);
+                }
+            }
+            for (key, desired) in desired {
+                match base.get(key).and_then(|base| value_delta(base, desired)) {
+                    Some(value) => {
+                        delta.insert(key.clone(), value);
+                    }
+                    None if !base.contains_key(key) => {
+                        delta.insert(key.clone(), desired.clone());
+                    }
+                    None => {}
+                }
+            }
+            (!delta.is_empty()).then_some(Value::Object(delta))
+        }
+        _ if base == desired => None,
+        _ => Some(desired.clone()),
+    }
+}
+
+fn apply_delta(target: &mut Value, delta: &Value) {
+    let Value::Object(delta) = delta else {
+        *target = delta.clone();
         return;
     };
-    let path = config_path();
-    let tmp = path.with_extension("json.tmp");
-    if let Ok(mut f) = fs::File::create(&tmp) {
-        if f.write_all(json.as_bytes()).is_ok() && f.flush().is_ok() {
-            let _ = fs::rename(&tmp, &path);
+    if !target.is_object() {
+        *target = Value::Object(Map::new());
+    }
+    let target = target.as_object_mut().expect("object assigned above");
+    for (key, value) in delta {
+        if value.is_null() {
+            target.remove(key);
+        } else if let Some(current) = target.get_mut(key) {
+            apply_delta(current, value);
+        } else {
+            target.insert(key.clone(), value.clone());
         }
     }
 }
@@ -640,16 +956,27 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.theme, "quattro-rally");
         assert!(c.layout.show_titles);
+        assert!(c.layout.workspace_paths);
+        assert!(c.layout.agent_paths);
         assert_eq!(c.layout.col_gap, 1);
         assert_eq!(c.layout.mobile_width, crate::app::MOBILE_WIDTH);
         // Empty object → all defaults (forward/back compat).
         let from_empty: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(from_empty.theme, "quattro-rally");
         assert_eq!(from_empty.sidebar_width, SIDEBAR_WIDTH_DEFAULT);
-        assert_eq!(
-            from_empty.agents_filter,
-            crate::app::AgentsFilter::Workspace,
-            "old configs retain the Workspace agents default"
+        assert!(from_empty.layout.workspace_paths);
+        assert!(from_empty.layout.agent_paths);
+        assert!(
+            from_empty.direct_keybindings.is_empty(),
+            "existing configs do not gain input-stealing direct shortcuts"
+        );
+        assert!(
+            !from_empty.agents_active_only,
+            "old configs retain the All agents default"
+        );
+        assert!(
+            !from_empty.agents_this_workspace,
+            "old configs retain the All-workspaces agents scope"
         );
         assert_eq!(
             from_empty.bars.bottom_right,
@@ -681,6 +1008,16 @@ mod tests {
         // the new preview default without their `file_open` choice moving.
         assert_eq!(old.layout.file_click, FILE_CLICK_PREVIEW);
         assert_eq!(c.layout.file_click, FILE_CLICK_PREVIEW);
+        let mut direct = Config::default();
+        direct
+            .direct_keybindings
+            .insert("next_tab".into(), "alt+right".into());
+        let direct_json = serde_json::to_string(&direct).unwrap();
+        let direct_roundtrip: Config = serde_json::from_str(&direct_json).unwrap();
+        assert_eq!(
+            direct_roundtrip.direct_keybindings.get("next_tab"),
+            Some(&"alt+right".to_string())
+        );
         let picked: Config = serde_json::from_str(r#"{"layout":{"file_click":"tab"}}"#).unwrap();
         assert_eq!(picked.layout.file_click, FILE_CLICK_TAB);
         let old_custom: Config = serde_json::from_str(r#"{"layout":{"scrollback":5000}}"#).unwrap();
@@ -719,22 +1056,144 @@ mod tests {
         assert_eq!(old.notifications.sound_style, crate::sound::STYLE_RETRO);
     }
 
+    /// A config written by this fork before the merge keeps what it showed: the
+    /// three-state AGENTS filter becomes the two switches, per-id dock heights
+    /// become positional weights, and neither legacy key survives a save.
     #[test]
-    fn agents_filter_preference_persists_every_choice() {
-        use crate::app::AgentsFilter;
+    fn fork_legacy_agents_filter_and_dock_rows_migrate_once() {
+        let _env = crate::persist::test_env("config-fork-legacy");
+        let old = r#"{
+            "version": 2,
+            "agents_filter": "active",
+            "sidebars": {
+                "left": {
+                    "visible": true, "width": 30,
+                    "docks": ["workspaces", "agents", "files"],
+                    "dock_rows": {"workspaces": 22, "agents": 8, "files": 16},
+                    "collapsed": ["files"]
+                },
+                "right": {"visible": false, "width": 30, "docks": []}
+            }
+        }"#;
+        let cfg = normalize_config(parse_config(old).unwrap());
+        assert!(cfg.agents_active_only && !cfg.agents_this_workspace);
+        let left = &cfg.sidebars.as_ref().unwrap().left;
+        assert_eq!(left.dock_weights, vec![22, 8, 16]);
+        assert_eq!(cfg.collapsed_docks, vec!["files".to_string()]);
+
+        let written = serde_json::to_value(&cfg).unwrap();
+        assert!(written.get("agents_filter").is_none());
+        assert!(written["sidebars"]["left"].get("dock_rows").is_none());
+        assert!(written["sidebars"]["left"].get("collapsed").is_none());
+
+        // Written once in the new shape, the old keys are gone for good: a
+        // second parse must not re-seed anything the user has changed since.
+        let mut changed = cfg.clone();
+        changed.sidebars.as_mut().unwrap().left.dock_weights = vec![1, 1, 1];
+        changed.collapsed_docks.clear();
+        let text = serde_json::to_string(&changed).unwrap();
+        let again = normalize_config(parse_config(&text).unwrap());
+        assert_eq!(again.sidebars.unwrap().left.dock_weights, vec![1, 1, 1]);
+        assert!(again.collapsed_docks.is_empty());
+
+        for (legacy, this_workspace, active_only) in
+            [("workspace", true, false), ("all", false, false)]
+        {
+            let cfg: Config =
+                serde_json::from_value(serde_json::json!({ "agents_filter": legacy })).unwrap();
+            let cfg = normalize_config(cfg);
+            assert_eq!(
+                (cfg.agents_this_workspace, cfg.agents_active_only),
+                (this_workspace, active_only),
+                "{legacy}"
+            );
+        }
+    }
+
+    #[test]
+    fn agents_scope_preference_persists_both_choices() {
+        let _env = crate::persist::test_env("config-agents-scope");
+        let mut config = Config::default();
+        assert!(!config.agents_this_workspace);
+
+        config.agents_this_workspace = true;
+        save(&config);
+        assert!(load().agents_this_workspace);
+
+        config.agents_this_workspace = false;
+        save(&config);
+        assert!(!load().agents_this_workspace);
+    }
+
+    #[test]
+    fn agents_filter_preference_persists_both_choices() {
         let _env = crate::persist::test_env("config-agents-filter");
         let mut config = Config::default();
-        assert_eq!(config.agents_filter, AgentsFilter::Workspace);
+        assert!(!config.agents_active_only);
 
-        for filter in [
-            AgentsFilter::All,
-            AgentsFilter::Active,
-            AgentsFilter::Workspace,
-        ] {
-            config.agents_filter = filter;
-            save(&config);
-            assert_eq!(load().agents_filter, filter);
-        }
+        config.agents_active_only = true;
+        save(&config);
+        assert!(load().agents_active_only);
+
+        config.agents_active_only = false;
+        save(&config);
+        assert!(!load().agents_active_only);
+    }
+
+    #[test]
+    fn stale_named_server_changes_preserve_newer_shared_fields() {
+        let _env = crate::persist::test_env("config-named-server-merge");
+        let mut initial = Config {
+            theme: "gruvbox-light".into(),
+            ..Config::default()
+        };
+        initial.keybindings.insert("close_pane".into(), "x".into());
+        save(&initial);
+
+        // Alpha and Beta model two named servers that loaded the same shared
+        // config before either one changed it.
+        let alpha_base = load();
+        let beta_base = load();
+
+        let mut alpha = alpha_base.clone();
+        alpha.theme = "quattro-rally".into();
+        assert!(save_changes(&alpha_base, &alpha));
+
+        // Beta still remembers the old light theme. Its unrelated change must
+        // not write that stale theme back to disk.
+        let mut beta = beta_base.clone();
+        beta.check_updates = false;
+        beta.keybindings.remove("close_pane");
+        assert!(save_changes(&beta_base, &beta));
+
+        let merged = load();
+        assert_eq!(merged.theme, "quattro-rally");
+        assert!(!merged.check_updates);
+        assert!(!merged.keybindings.contains_key("close_pane"));
+
+        // Deep patches also preserve independent fields in one nested section.
+        let alpha_base = alpha;
+        let beta_base = beta;
+        let mut alpha = alpha_base.clone();
+        alpha.layout.show_titles = false;
+        assert!(save_changes(&alpha_base, &alpha));
+        let mut beta = beta_base.clone();
+        beta.layout.files_show_hidden = true;
+        assert!(save_changes(&beta_base, &beta));
+
+        let merged = load();
+        assert!(!merged.layout.show_titles);
+        assert!(merged.layout.files_show_hidden);
+        assert_eq!(merged.theme, "quattro-rally");
+
+        // An explicit selection still wins when it matches this stale server's
+        // local value and therefore would not appear in the computed delta.
+        assert!(save_changes_with_patch(
+            &beta,
+            &beta,
+            Some(&serde_json::json!({"theme":"gruvbox-light"})),
+        ));
+        assert_eq!(load().theme, "gruvbox-light");
     }
 
     #[test]

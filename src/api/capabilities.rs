@@ -66,6 +66,7 @@ pub const METHODS: &[&str] = &[
     "pane.status",
     "pane.processes",
     "pane.report_session",
+    "pane.release_session",
     "pane.report_event",
     "pane.close",
     "attach.pane",
@@ -99,6 +100,8 @@ pub const METHODS: &[&str] = &[
     "git.branches",
     "git.log",
     "git.open",
+    "mission.snapshot",
+    "mission.refresh",
     "mission.open",
     "diff.refresh",
     "diff.list",
@@ -126,9 +129,22 @@ pub const METHODS: &[&str] = &[
     "task.heartbeat",
     "task.update",
     "task.done",
+    "task.retry",
     "task.merge",
     "task.release",
     "task.delete",
+    "automation.create",
+    "automation.list",
+    "automation.get",
+    "automation.update",
+    "automation.enable",
+    "automation.disable",
+    "automation.rebind",
+    "automation.delete",
+    "automation.run",
+    "automation.history",
+    "automation.preview",
+    "automation.health",
     "lease.acquire",
     "lease.list",
     "lease.release",
@@ -155,6 +171,8 @@ pub const METHODS: &[&str] = &[
     "theme.reload",
     "manifest.reload",
     "ui.sidebar",
+    "ui.agent_title.push",
+    "ui.agent_title.clear",
     "ui.dock.push",
     "ui.dock.list",
     "ui.dock.move",
@@ -185,6 +203,10 @@ pub const METHODS: &[&str] = &[
 ];
 
 const READ_ONLY_METHODS: &[&str] = &[
+    "host.capabilities",
+    "host.info",
+    "host.doctor",
+    "host.update.check",
     "uhp.capabilities",
     "uhp.stats",
     "uhp.token.list",
@@ -192,6 +214,10 @@ const READ_ONLY_METHODS: &[&str] = &[
     "server.agent_manifests",
     "config.get",
     "session.snapshot",
+    "session.list",
+    "session.status",
+    "skill.status",
+    "integration.status",
     "events.subscribe",
     "events.wait",
     "wait.output",
@@ -223,6 +249,8 @@ const READ_ONLY_METHODS: &[&str] = &[
     "git.status",
     "git.branches",
     "git.log",
+    "mission.snapshot",
+    "mission.refresh",
     "diff.list",
     "diff.get",
     "diff.note.list",
@@ -230,6 +258,11 @@ const READ_ONLY_METHODS: &[&str] = &[
     "task.list",
     "task.get",
     "task.next",
+    "automation.list",
+    "automation.get",
+    "automation.history",
+    "automation.preview",
+    "automation.health",
     "lease.list",
     "module.list",
     "module.info",
@@ -260,10 +293,18 @@ pub fn is_read_only(method: &str) -> bool {
 pub fn required_scope(method: &str) -> &'static str {
     if matches!(
         method,
-        "uhp.capabilities"
+        "host.capabilities"
+            | "host.info"
+            | "host.doctor"
+            | "host.update.check"
+            | "uhp.capabilities"
             | "uhp.stats"
             | "ping"
             | "session.snapshot"
+            | "session.list"
+            | "session.status"
+            | "skill.status"
+            | "integration.status"
             | "events.subscribe"
             | "events.wait"
             | "wait.output"
@@ -273,7 +314,10 @@ pub fn required_scope(method: &str) -> &'static str {
         "terminal"
     } else if method.starts_with("agent.") || method.starts_with("pane.report_") {
         "agent"
-    } else if method.starts_with("task.") || method.starts_with("lease.") {
+    } else if method.starts_with("task.")
+        || method.starts_with("lease.")
+        || method.starts_with("automation.")
+    {
         "orchestration"
     } else if method.starts_with("module.") {
         "extensions"
@@ -295,12 +339,25 @@ pub fn required_scope(method: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
+pub fn all_methods() -> impl Iterator<Item = &'static str> {
+    METHODS
+        .iter()
+        .copied()
+        .chain(crate::api::host::METHODS.iter().copied())
+        .chain(crate::machine::api::READ_METHODS.iter().copied())
+        .chain(crate::machine::api::CONTROL_METHODS.iter().copied())
+}
+
 fn is_idempotent(method: &str) -> bool {
-    is_read_only(method)
-        && !matches!(
-            method,
-            "events.subscribe" | "terminal.backend.events.subscribe" | "terminal.backend.observe"
-        )
+    method == "automation.rebind"
+        || (is_read_only(method)
+            && !matches!(
+                method,
+                "events.subscribe"
+                    | "terminal.backend.events.subscribe"
+                    | "terminal.backend.observe"
+            ))
 }
 
 #[cfg(test)]
@@ -349,6 +406,17 @@ pub fn capabilities(event_sequence: u64) -> Value {
             "event_wait_timeout_s":super::topology::MAX_EVENT_WAIT_S,
             "layout_depth":super::topology::MAX_LAYOUT_DEPTH,
             "workspace_move_block":super::topology::MAX_WORKSPACE_MOVE_BLOCK,
+            "task_title_bytes":crate::orch::MAX_TASK_TITLE_BYTES,
+            "task_prompt_bytes":crate::orch::MAX_TASK_PROMPT_BYTES,
+            "task_attempts":crate::orch::MAX_TASK_ATTEMPTS,
+            "agent_row_titles":crate::app::MAX_AGENT_ROW_TITLES,
+            "agent_row_title_bytes":crate::app::MAX_AGENT_ROW_TITLE_BYTES,
+            "agent_row_title_agent_bytes":crate::app::MAX_AGENT_ROW_TITLE_AGENT_BYTES,
+            "automations":crate::automation::MAX_AUTOMATIONS,
+            "automation_runs":crate::automation::MAX_RUNS,
+            "automation_prompt_bytes":crate::automation::MAX_PROMPT_BYTES,
+            "automation_gate_bytes":crate::automation::MAX_GATE_BYTES,
+            "automation_min_interval_s":crate::automation::MIN_INTERVAL_SECONDS,
         },
         "identity":{"workspace":"stable","tab":"stable","terminal":"pty_lifetime"},
         "events":{"resume":"after_sequence","loss":"resync_required"},
@@ -361,7 +429,8 @@ pub fn capabilities(event_sequence: u64) -> Value {
         "authorization":{"default":"local_owner","delegation":"scoped_ephemeral_token",
             "scopes":["read","workspace","agent","terminal","orchestration","extensions","admin","all"]},
         "concurrency":{"mutation_guard":"if_revision"},
-        "atomic_methods":["agent.start","agent.prompt","workspace.move_block","layout.apply","diff.note.apply"],
+        "atomic_methods":["agent.start","agent.prompt","automation.create","automation.rebind","automation.run","task.retry","workspace.move_block","layout.apply","diff.note.apply"],
+        "idempotency_keys":{"methods":["automation.create","automation.run"],"max_bytes":128},
         "graphics":false,
     })
 }
@@ -372,8 +441,9 @@ mod tests {
 
     #[test]
     fn registry_has_no_duplicates_and_contains_required_surface() {
-        let unique: std::collections::BTreeSet<_> = METHODS.iter().copied().collect();
-        assert_eq!(unique.len(), METHODS.len());
+        let methods = all_methods().collect::<Vec<_>>();
+        let unique: std::collections::BTreeSet<_> = methods.iter().copied().collect();
+        assert_eq!(unique.len(), methods.len());
         for required in [
             "uhp.capabilities",
             "workspace.get",
@@ -383,6 +453,9 @@ mod tests {
             "events.wait",
             "terminal.backend.observe",
             "terminal.backend.control",
+            "automation.create",
+            "automation.rebind",
+            "automation.health",
         ] {
             assert!(unique.contains(required), "missing {required}");
         }
@@ -399,11 +472,28 @@ mod tests {
         let capabilities = capabilities(0);
         assert_eq!(capabilities["limits"]["terminal_stream_capacity"], 8);
         assert_eq!(capabilities["limits"]["terminal_stream_queue"], 2);
+        assert_eq!(
+            capabilities["limits"]["task_title_bytes"],
+            crate::orch::MAX_TASK_TITLE_BYTES
+        );
+        assert_eq!(
+            capabilities["limits"]["task_prompt_bytes"],
+            crate::orch::MAX_TASK_PROMPT_BYTES
+        );
+        assert_eq!(capabilities["limits"]["agent_row_titles"], 256);
+        assert_eq!(capabilities["limits"]["agent_row_title_bytes"], 256);
+        assert_eq!(capabilities["limits"]["agent_row_title_agent_bytes"], 64);
         assert!(is_idempotent("pane.list"));
         assert!(!is_read_only("mission.open"));
         assert_eq!(required_scope("mission.open"), "workspace");
         assert_eq!(required_scope("session.snapshot"), "read");
         assert_eq!(required_scope("events.subscribe"), "read");
+        assert_eq!(required_scope("automation.create"), "orchestration");
+        assert_eq!(required_scope("automation.rebind"), "orchestration");
+        assert!(!is_read_only("automation.create"));
+        assert!(!is_read_only("automation.rebind"));
+        assert!(is_idempotent("automation.rebind"));
+        assert!(is_read_only("automation.preview"));
         for stream in [
             "events.subscribe",
             "terminal.backend.events.subscribe",

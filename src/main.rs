@@ -5,9 +5,12 @@
 mod agent;
 mod api;
 mod app;
+mod automation;
 mod bar;
 mod changelog;
 mod cli;
+mod clipboard;
+mod clipboard_image;
 mod config;
 mod detect;
 mod diff;
@@ -21,10 +24,10 @@ mod ipc;
 mod layout;
 mod links;
 mod logging;
+mod machine;
 mod mission;
 mod module;
 mod orch;
-mod paste;
 mod persist;
 mod platform;
 mod search;
@@ -44,7 +47,9 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
+#[cfg(not(windows))]
+use ratatui::crossterm::event::read as read_event;
 use ratatui::crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableFocusChange, EnableMouseCapture, Event, KeyboardEnhancementFlags,
@@ -88,6 +93,32 @@ fn main() -> Result<()> {
     if is_backend_discovery_request(&args) {
         std::process::exit(cli::run(&args)?);
     }
+    if args.get(1).map(String::as_str) == Some("remote-client-info")
+        && args.get(2).map(String::as_str) == Some("--json")
+        && args.len() == 3
+    {
+        return remote_client_info(&args);
+    }
+    // Private foreground routes used only by ORCH worker panes. Keep them
+    // ahead of migrations and TUI/server routing: it must run exactly one
+    // adapter process, settle its ORCH task, and exit.
+    if args.get(1).map(String::as_str) == Some("__task-worker") {
+        std::process::exit(orch::worker::run(&args)?);
+    }
+    if args.get(1).map(String::as_str) == Some("__automation-worker") {
+        std::process::exit(automation::run_worker(&args)?);
+    }
+    // A server restart initiated inside one of its panes cannot synchronously
+    // survive that server closing the pane's PTY. `restart_session_via_helper`
+    // launches this private route in a detached process group first.
+    if args.get(1).map(String::as_str) == Some("__restart-session-helper") {
+        if args.len() != 2 {
+            return Err(anyhow!("invalid internal session restart invocation"));
+        }
+        let selected = session::active_name();
+        session::restart_session(selected.as_deref()).map_err(anyhow::Error::msg)?;
+        return Ok(());
+    }
 
     // One-time local cleanup of the old default-on skill installation. This
     // never downloads or installs a skill; it only removes legacy managed
@@ -98,7 +129,7 @@ fn main() -> Result<()> {
         Some("client") => return ipc::client::run(&persist::client_socket_path()),
         // Remote attach (docs/18 RA): the bridge runs on the remote host (via
         // ssh); `--remote <host>` launches it from the local side.
-        Some("remote-client-bridge") => return remote_client_bridge(),
+        Some("remote-client-bridge") => return remote_client_bridge(&args[2..]),
         Some("--remote") => return remote_attach(&args),
         // `attach <id>` (docs/18 WA-2): focus + zoom the pane, then open the TUI
         // straight into that fullscreen terminal.
@@ -106,6 +137,10 @@ fn main() -> Result<()> {
         Some("integration") => {
             std::process::exit(integration::run(&args, i18n::cli::Context::configured())?)
         }
+        Some("machine") => std::process::exit(machine::run_cli(
+            &args[2.min(args.len())..],
+            i18n::cli::Context::configured(),
+        )?),
         Some("--local") => return run_local(),
         Some(_) if cli::is_cli(&args) => {
             let code = cli::run(&args)?;
@@ -190,8 +225,16 @@ pub(crate) fn emit_notification(msg: &str) {
 /// 2. **OSC 52** — a terminal escape; covers terminals that bridge it and setups
 ///    where no clipboard tool is installed. Harmless if unsupported.
 pub(crate) fn emit_clipboard(text: &str) {
-    let _ = system_clipboard_copy(text);
+    clipboard::copy_native(text);
+    emit_clipboard_escape(text);
+}
 
+pub(crate) fn emit_clipboard_to(text: &str, completion: std::sync::Arc<clipboard::Completion>) {
+    clipboard::copy_native_to(text, completion);
+    emit_clipboard_escape(text);
+}
+
+fn emit_clipboard_escape(text: &str) {
     use std::io::Write;
     let b64 = base64_encode(text.as_bytes());
     let mut out = std::io::stdout().lock();
@@ -383,6 +426,7 @@ fn play_sound_file(path: &Path) {
 }
 
 /// Pipe `text` into the first available OS clipboard command.
+#[cfg(not(unix))]
 fn system_clipboard_copy(text: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -409,10 +453,15 @@ fn system_clipboard_copy(text: &str) -> std::io::Result<()> {
             continue; // tool not installed — try the next
         };
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
+            if stdin.write_all(text.as_bytes()).is_err() {
+                let _ = child.kill();
+                let _ = child.wait();
+                continue;
+            }
         }
-        let _ = child.wait();
-        return Ok(());
+        if child.wait().is_ok_and(|status| status.success()) {
+            return Ok(());
+        }
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
@@ -578,11 +627,10 @@ fn retry_control_probe<T>(
 fn report_server_version(running: String) -> Result<()> {
     let binary = env!("LUVUS_VERSION_LABEL");
     if running != binary {
-        eprintln!(
+        return Err(anyhow!(
             "luvus v{binary} installed, but the running server is v{running} — \
              run `luvus server restart` to load it (your session is saved and restored)."
-        );
-        thread::sleep(Duration::from_millis(2000));
+        ));
     }
     Ok(())
 }
@@ -613,10 +661,127 @@ fn open_cwd_workspace() {
 /// Remote bridge role (docs/18 RA-1), run *on the remote host* by ssh. Ensure a
 /// server is up, then pump this process's stdin/stdout to/from the local socket
 /// so the `luvus --remote` client on the other end of the ssh pipe drives it.
-fn remote_client_bridge() -> Result<()> {
+fn remote_client_bridge(args: &[String]) -> Result<()> {
     let sock = persist::client_socket_path();
-    ensure_server_ready(&sock)?;
+    match args {
+        [] => ensure_server_ready(&sock)?,
+        [mode] if mode == "--existing-only" => ensure_server_existing(&sock)?,
+        [mode] if mode == "--start-if-missing" => ensure_server_start_if_missing(&sock)?,
+        _ => return Err(anyhow!("invalid remote client bridge mode")),
+    }
     ipc::client::remote_bridge(&sock)
+}
+
+/// Validate an already-running selected server without starting, stopping, or
+/// recycling it. Persistent saved-machine links use this path so a reconnect
+/// never gains foreground repair authority.
+fn ensure_server_existing(_sock: &Path) -> Result<()> {
+    let _running = retry_control_probe(
+        SERVER_CONTROL_TIMEOUT,
+        SERVER_RECOVERY_TIMEOUT,
+        server_version_with_timeout,
+    )
+    .context("selected remote Luvus session is not responding")?;
+    Ok(())
+}
+
+/// Start an absent selected server, but never recycle an existing one. This is
+/// reserved for an explicit foreground onboarding/enable operation.
+fn ensure_server_start_if_missing(sock: &Path) -> Result<()> {
+    if retry_control_probe(
+        SERVER_CONTROL_TIMEOUT,
+        SERVER_RECOVERY_TIMEOUT,
+        server_version_with_timeout,
+    )
+    .is_ok()
+    {
+        return Ok(());
+    }
+    match ipc::transport::connect_timeout(sock, SERVER_RECOVERY_TIMEOUT) {
+        Ok(_) => Err(anyhow!(
+            "selected remote Luvus session is present but not responding; no restart was attempted"
+        )),
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => Err(anyhow!(
+            "selected remote Luvus session endpoint is busy; no restart was attempted"
+        )),
+        Err(error) if remote_endpoint_is_missing(&error) => {
+            spawn_server()?;
+            wait_for_socket(sock)?;
+            let _running = retry_control_probe(
+                SERVER_CONTROL_TIMEOUT,
+                SERVER_RECOVERY_TIMEOUT,
+                server_version_with_timeout,
+            )
+            .context("new remote Luvus session did not become responsive")?;
+            Ok(())
+        }
+        Err(error) => Err(error).context(
+            "selected remote Luvus session endpoint could not be accessed; no server was started",
+        ),
+    }
+}
+
+fn remote_endpoint_is_missing(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound
+}
+
+/// Read-only capability probe used before a saved machine is enabled. It does
+/// not start a server, read a session, or mutate the remote installation.
+fn remote_client_info(args: &[String]) -> Result<()> {
+    let binary = args
+        .first()
+        .filter(|path| Path::new(path).is_absolute())
+        .cloned()
+        .unwrap_or_else(|| {
+            std::env::current_exe()
+                .unwrap_or_default()
+                .display()
+                .to_string()
+        });
+    println!(
+        "{}",
+        serde_json::json!({
+            "protocol_version": ipc::protocol::PROTOCOL_VERSION,
+            "machine_endpoint_version": machine::MACHINE_ENDPOINT_VERSION,
+            "capabilities": [machine::MACHINE_ENDPOINT_CAPABILITY],
+            "version": env!("CARGO_PKG_VERSION"),
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "binary": binary,
+        })
+    );
+    Ok(())
+}
+
+/// Attach through one previously validated profile. Unlike legacy `--remote`,
+/// this path never searches a remote PATH and never accepts arbitrary SSH
+/// options; OpenSSH configuration owns keys, ports, and jump hosts.
+pub(crate) fn remote_attach_profile(
+    destination: &str,
+    binary: &str,
+    session_name: Option<&str>,
+) -> Result<()> {
+    let mut command = Command::new("ssh");
+    command
+        .arg("-T")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=3")
+        .arg(destination);
+    let mut remote_args = Vec::new();
+    if let Some(name) = session_name {
+        session::validate_name(name).map_err(anyhow::Error::msg)?;
+        remote_args.extend(["--session", name]);
+    }
+    remote_args.push("remote-client-bridge");
+    machine::command::append(&mut command, binary, &remote_args)?;
+    let (result, _) = remote_attach_attempt(command);
+    result
 }
 
 /// `luvus attach <id>` (docs/18 WA-2): focus + zoom the pane (one round-trip via
@@ -671,6 +836,7 @@ fn remote_attach(args: &[String]) -> Result<()> {
 
 fn remote_attach_attempt(mut cmd: Command) -> (Result<()>, Option<std::process::ExitStatus>) {
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()); // stderr inherited so ssh can prompt for auth
+    platform::no_window(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow!("failed to launch ssh: {e}"));
@@ -833,18 +999,20 @@ fn server_cmd(args: &[String]) -> Result<()> {
         return ipc::server::run(); // internal role: run the server in the foreground
     };
     let context = i18n::cli::Context::configured();
-    match command {
-        "start" => server_start(context),
-        "stop" => server_stop(context),
-        "restart" => server_restart(context),
-        "status" => server_status(context),
-        "update-manifest" => update_manifest(context),
+    let options = &args[3..];
+    match (command, options) {
+        ("start", []) => server_start(context),
+        ("stop", []) => server_stop(context),
+        ("restart", []) => server_restart(context),
+        ("restart", [flag]) if flag == "--all" => server_restart_all(context),
+        ("status", []) => server_status(context),
+        ("update-manifest", []) => update_manifest(context),
         other => {
-            eprintln!("{}: {other}", context.text("unknown server command"));
+            eprintln!("{}: {}", context.text("unknown server command"), other.0);
             eprintln!(
                 "{}",
                 i18n::cli::help(
-                    "usage: luvus server <start|stop|restart|status|update-manifest>",
+                    "usage: luvus server <start|stop|restart [--all]|status|update-manifest>",
                     context.language(),
                 )
             );
@@ -1005,6 +1173,58 @@ fn server_restart(context: i18n::cli::Context) -> Result<()> {
     Ok(())
 }
 
+/// Restart every server that was running when the command began. Stopped
+/// namespaces remain stopped. The selected session is deliberately last so a
+/// command launched from one of its panes updates every sibling first.
+fn server_restart_all(context: i18n::cli::Context) -> Result<()> {
+    let current = session::display_name();
+    let sessions = restart_all_targets(&current, session::list_sessions()?);
+    if sessions.is_empty() {
+        let sock = persist::client_socket_path();
+        print_server_card(
+            context,
+            context.text("no luvus server running"),
+            None,
+            &sock,
+        );
+        return Ok(());
+    }
+
+    let mut errors = Vec::new();
+    for info in sessions {
+        let selected = (!info.default).then_some(info.name.as_str());
+        let restarted = if info.name == current {
+            session::restart_session_via_helper(selected)
+        } else {
+            session::restart_session(selected)
+        };
+        match restarted {
+            Ok(restarted) => print_server_card_for(
+                context,
+                context.text("restarted"),
+                Some(env!("CARGO_PKG_VERSION")),
+                &session::client_socket_path_for(selected),
+                &restarted.name,
+            ),
+            Err(error) => errors.push(format!("{}: {error}", info.name)),
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(errors.join("; ")))
+    }
+}
+
+fn restart_all_targets(
+    current: &str,
+    mut sessions: Vec<session::SessionInfo>,
+) -> Vec<session::SessionInfo> {
+    sessions.retain(|info| info.running);
+    sessions.sort_by_key(|info| info.name == current);
+    sessions
+}
+
 /// Poll (bounded) until the server releases its socket, so `stop`/`restart`
 /// return only once the old server is truly gone.
 fn wait_for_shutdown(_sock: &Path) -> Result<()> {
@@ -1068,11 +1288,21 @@ fn print_server_card(
     socket: &Path,
 ) {
     let session = session::display_name();
+    print_server_card_for(context, state, version, socket, &session);
+}
+
+fn print_server_card_for(
+    context: i18n::cli::Context,
+    state: &str,
+    version: Option<&str>,
+    socket: &Path,
+    session: &str,
+) {
     let socket = socket.display().to_string();
     let version = version.map(|value| format!("v{value}"));
     let mut rows = vec![
         (context.text("status"), state),
-        (context.text("session"), session.as_str()),
+        (context.text("session"), session),
     ];
     if let Some(version) = version.as_deref() {
         rows.push((context.text("version"), version));
@@ -1083,10 +1313,14 @@ fn print_server_card(
 
 fn print_detached_status(context: i18n::cli::Context) {
     let session = session::display_name();
+    print_detached_status_for(context, &session);
+}
+
+fn print_detached_status_for(context: i18n::cli::Context, session: &str) {
     let runtime = format!("{} + {}", context.text("server"), context.text("panes"));
     let rows = [
         (context.text("status"), context.text("detached")),
-        (context.text("session"), session.as_str()),
+        (context.text("session"), session),
         (runtime.as_str(), context.text("running")),
     ];
     cli::print_status_card("Luvus session", &rows);
@@ -1298,6 +1532,11 @@ fn run(terminal: &mut DefaultTerminal) -> Result<(bool, bool)> {
     };
     app.events = events.clone();
     app.set_color_mode(ipc::protocol::truecolor_supported());
+    // This process owns the terminal here, so measure cells once at startup the
+    // way an attaching client reports them after its handshake. Without this a
+    // local session that never resizes would split on the fallback aspect.
+    let (cell_width_px, cell_height_px) = ipc::protocol::local_cell_pixels();
+    app.set_client_cell_pixels(cell_width_px, cell_height_px);
     let pending = if app.config.theme == "terminal" {
         let probe = terminal::theme_probe::probe();
         if let Some(colors) = probe.colors.as_ref() {
@@ -1316,6 +1555,8 @@ fn run(terminal: &mut DefaultTerminal) -> Result<(bool, bool)> {
         EnableFocusChange,
         crossterm::terminal::SetTitle(window_title())
     );
+    #[cfg(windows)]
+    let _windows_input_mode = terminal::host_input::enable_input_mode();
     push_key_protocol();
     {
         let tx = tx.clone();
@@ -1334,8 +1575,6 @@ fn run(terminal: &mut DefaultTerminal) -> Result<(bool, bool)> {
     let mut last_draw = Instant::now();
     let mut last_save = Instant::now();
     let mut immediate_save_attempted = false;
-    let mut last_spin = Instant::now();
-
     loop {
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(ev) => {
@@ -1364,13 +1603,9 @@ fn run(terminal: &mut DefaultTerminal) -> Result<(bool, bool)> {
         // retain both flags and retry at the normal cadence instead of hot-looping.
         let immediate_save_due = app.persist_session_now && !immediate_save_attempted;
         let debounced_save_due = app.session_dirty && last_save.elapsed() > Duration::from_secs(2);
-        if immediate_save_due || debounced_save_due {
+        if !app.session_save_inflight && (immediate_save_due || debounced_save_due) {
             immediate_save_attempted = app.persist_session_now;
-            if persist::save(&app) {
-                app.persist_session_now = false;
-                app.session_dirty = false;
-                immediate_save_attempted = false;
-            }
+            app.schedule_session_save();
             last_save = Instant::now();
         }
 
@@ -1386,20 +1621,17 @@ fn run(terminal: &mut DefaultTerminal) -> Result<(bool, bool)> {
         if let Some(signal) = app.pending_sound.take() {
             emit_sound(signal);
         }
-        // Advance the working spinner ~10x/s (the loop redraws every frame).
-        if last_spin.elapsed() >= Duration::from_millis(100)
-            && (app.any_working() || app.bar.has_visible_working(&app.config.bars, app.compact))
-        {
-            app.spinner = app.spinner.wrapping_add(1);
-            last_spin = Instant::now();
-        }
         if let Some(url) = app.pending_open_url.take() {
             crate::platform::open_url(&url);
         }
         if let Some(text) = app.pending_clipboard.take() {
             emit_clipboard(&text);
         }
+        if let Some(notification) = clipboard::take_notification() {
+            emit_notification(notification);
+        }
         app.tick_toast(Instant::now());
+        app.tick_copy_highlight(Instant::now());
         app.tick_search_flash(Instant::now());
         app.tick_bar_notifications(Instant::now());
         // A forced redraw (resize / regained focus) wipes the terminal so the next
@@ -1417,7 +1649,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<(bool, bool)> {
     }
 
     let detached = app.detach_requested;
-    persist::save(&app);
+    app.finish_session_persistence();
     Ok((detached, app.relaunch_requested))
 }
 
@@ -1440,27 +1672,45 @@ fn remove_unbound_socket(path: &Path) -> std::io::Result<()> {
 }
 
 fn input_loop(tx: Sender<AppEvent>, pending: Vec<Event>) {
-    for event in pending {
-        let Some(event) = app_event(event) else {
-            continue;
-        };
-        if tx.send(event).is_err() {
-            return;
-        }
+    #[cfg(windows)]
+    {
+        crate::terminal::host_input::run_input_loop(pending, |event| send_input_event(&tx, event));
     }
-    while let Ok(event) = crate::paste::read() {
-        let sent = match app_event(event) {
-            Some(event) => tx.send(event),
-            None => Ok(()),
-        };
-        if sent.is_err() {
-            break;
+
+    #[cfg(not(windows))]
+    {
+        for event in pending {
+            if !send_input_event(&tx, event) {
+                return;
+            }
+        }
+        while let Ok(event) = read_event() {
+            if !send_input_event(&tx, event) {
+                break;
+            }
         }
     }
 }
 
+fn send_input_event(tx: &Sender<AppEvent>, event: Event) -> bool {
+    app_event(event).is_none_or(|event| tx.send(event).is_ok())
+}
+
 fn app_event(event: Event) -> Option<AppEvent> {
-    match event {
+    app_event_with_image(event, || {
+        crate::platform::clipboard_image()
+            .and_then(|png| crate::clipboard_image::stage_png(&png).ok())
+    })
+}
+
+fn app_event_with_image(
+    event: Event,
+    image: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> Option<AppEvent> {
+    match crate::terminal::host_key::normalize_platform_modifiers(event) {
+        Event::Key(k) if crate::clipboard_image::is_image_paste_key(&k) => {
+            image().map(AppEvent::PasteImage).or(Some(AppEvent::Key(k)))
+        }
         Event::Key(k) => Some(AppEvent::Key(k)),
         Event::Mouse(m) => Some(AppEvent::Mouse(m)),
         Event::Resize(_, _) => Some(AppEvent::Resize),
@@ -1479,10 +1729,72 @@ mod tests {
     use ratatui::Terminal;
 
     #[test]
+    fn stale_server_version_fails_before_binary_attach() {
+        let error = report_server_version("0.13.4".to_string()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("running server is v0.13.4"));
+        assert!(message.contains("luvus server restart"));
+    }
+
+    #[test]
+    fn matching_server_version_allows_binary_attach() {
+        // This fork compares build labels, not semver (see `report_server_version`).
+        report_server_version(env!("LUVUS_VERSION_LABEL").to_string()).unwrap();
+    }
+
+    #[test]
+    fn restart_all_targets_only_running_sessions_and_puts_selected_last() {
+        let info = |name: &str, running: bool| session::SessionInfo {
+            name: name.to_string(),
+            default: name == session::DEFAULT_SESSION_NAME,
+            running,
+            socket_path: String::new(),
+            session_dir: String::new(),
+            endpoint: session::SessionEndpoint {
+                transport: "test",
+                address: String::new(),
+            },
+        };
+        let targets = restart_all_targets(
+            "alpha",
+            vec![
+                info(session::DEFAULT_SESSION_NAME, true),
+                info("alpha", true),
+                info("stopped", false),
+                info("beta", true),
+            ],
+        );
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.name.as_str())
+                .collect::<Vec<_>>(),
+            [session::DEFAULT_SESSION_NAME, "beta", "alpha"]
+        );
+    }
+
+    #[test]
     fn send_server_stop_reports_absent_when_no_sockets() {
         let _env = crate::persist::test_env("stop-absent");
         crate::persist::ensure_session_dir();
         assert!(!send_server_stop().expect("absent server is not an error"));
+    }
+
+    #[test]
+    fn local_image_paste_uses_a_staged_path_and_falls_back_to_the_key() {
+        let key = ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('v'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        );
+        let path = std::path::PathBuf::from("clipboard-images/example.png");
+        assert!(matches!(
+            app_event_with_image(Event::Key(key), || Some(path.clone())),
+            Some(AppEvent::PasteImage(staged)) if staged == path
+        ));
+        assert!(matches!(
+            app_event_with_image(Event::Key(key), || None),
+            Some(AppEvent::Key(fallback)) if fallback == key
+        ));
     }
 
     #[test]
@@ -1544,6 +1856,23 @@ mod tests {
 
         assert_eq!(result.expect("recovery probe succeeds"), "0.13.1");
         assert_eq!(attempts, vec![ordinary, recovery]);
+    }
+
+    #[test]
+    fn remote_start_if_missing_rejects_non_missing_endpoint_errors() {
+        assert!(remote_endpoint_is_missing(&io::Error::from(
+            io::ErrorKind::NotFound
+        )));
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::ConnectionRefused,
+        ] {
+            assert!(
+                !remote_endpoint_is_missing(&io::Error::from(kind)),
+                "{kind:?} must not authorize starting a server"
+            );
+        }
     }
 
     #[test]
@@ -1992,6 +2321,9 @@ mod tests {
     /// every draw path — catches panics and layout regressions without a tty.
     #[test]
     fn renders_chrome() {
+        // Default config keeps the runtime-status bar (`tab n/m`); a user's
+        // `bars.off` must not make this integration test depend on $LUVUS_HOME.
+        let _env = crate::persist::test_env("renders-chrome");
         let (tx, _rx) = mpsc::channel::<AppEvent>();
         let mut app = App::new(80, 24, tx).expect("spawn pane");
         // Give the shell a moment to emit its prompt into the grid.
@@ -2007,7 +2339,10 @@ mod tests {
             text.push_str(cell.symbol());
         }
 
-        assert!(text.contains("luvus"), "brand missing");
+        assert!(
+            text.contains(&crate::session::display_name()),
+            "active session name missing"
+        );
         assert!(text.contains("WORKSPACES"), "workspaces header missing");
         assert!(text.contains("AGENTS"), "agents header missing");
         assert!(text.contains("tab"), "tab status missing");
@@ -2387,11 +2722,17 @@ mod tests {
     fn tiny_terminal_shows_guard_not_garbage() {
         let (tx, _rx) = mpsc::channel::<AppEvent>();
         let mut app = App::new(80, 24, tx).expect("spawn pane");
+        app.automation_rects
+            .push(("stale".into(), ratatui::layout::Rect::new(1, 1, 5, 2)));
 
         for (w, h) in [(1, 1), (5, 2), (23, 5), (20, 4)] {
             let backend = TestBackend::new(w, h);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal.draw(|f| ui::render(f, &mut app)).unwrap(); // must not panic
+            assert!(
+                app.automation_rects.is_empty(),
+                "tiny frames must clear stale automation hit geometry"
+            );
         }
 
         // At a small-but-writable size the guard message is visible.
@@ -2441,6 +2782,10 @@ mod tests {
         }
 
         // A genuinely tiny phone-keyboard-open viewport shows the guard, not garbage.
+        // Seed AGENTS overflow geometry first: the early return must not leave an
+        // invisible jump target clickable over the friendly message.
+        let junk = ratatui::layout::Rect::new(0, 0, 20, 4);
+        app.agents_elsewhere_rect = Some((app.layout().focus, junk));
         let mut term = Terminal::new(TestBackend::new(20, 4)).unwrap();
         term.draw(|f| ui::render(f, &mut app)).unwrap();
         let all: String = (0..4).map(|r| full_row(&term, r)).collect();
@@ -2448,6 +2793,7 @@ mod tests {
             all.contains("enlarge terminal"),
             "a tiny viewport gets the friendly guard"
         );
+        assert!(app.agents_elsewhere_rect.is_none());
     }
 
     /// The orchestration board tab (docs/22, ORCH-7) renders its header, a task
@@ -2767,6 +3113,24 @@ mod tests {
             !top.contains("Always active"),
             "the always-on reference is below the fold before scrolling:\n{top}"
         );
+
+        // Workspace defaults are terminal symbols internally, but the Keys UI
+        // describes the physical chords users should press.
+        for position in [1, 9] {
+            let command = crate::app::Cmd::JumpWorkspace(position);
+            let index = crate::app::Cmd::ALL
+                .iter()
+                .position(|candidate| *candidate == command)
+                .unwrap();
+            app.settings.as_mut().unwrap().cursor = crate::app::KEYS_HEADER_ROWS + index;
+            let workspace_jump = screen(&mut app);
+            assert!(
+                workspace_jump.contains(&format!("Jump to workspace {position}"))
+                    && workspace_jump.contains(&format!("Shift+{position}")),
+                "workspace jump shows its chord label:\n{workspace_jump}"
+            );
+        }
+        app.settings.as_mut().unwrap().cursor = 0;
 
         // Midway: the cursor reaches the first reference block (the fixed keys).
         // Step past the two header rows (prefix / preset) and every command.

@@ -3,6 +3,9 @@
 
 use super::*;
 use crate::files::view_text_w;
+use crate::terminal::keyboard::KeyboardProtocol;
+#[cfg(test)]
+use crate::terminal::keyboard::KittyKeyboardFlags;
 use unicode_width::UnicodeWidthChar;
 
 /// Keep the command overlay useful when a just-spawned child has not appeared
@@ -163,6 +166,7 @@ fn finish_selected_text(mut out: String) -> Option<String> {
 /// A second left click within this of the first, on the same cell (±1), is a
 /// double-click. Terminals emit no native double-click, so luvus times it.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+const COPY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(1400);
 
 /// A run of grid cells on one row: `(row, start_col, end_col)`, `end_col`
 /// exclusive — the same shape as [`crate::links::Link::spans`].
@@ -336,7 +340,7 @@ impl App {
             return true;
         };
         let response = self.handle_api(&req);
-        let _ = req.reply.send(response);
+        self.reply_after_automation_save(req, response);
         true
     }
 
@@ -419,6 +423,9 @@ impl App {
         // off-loop. Apply its completed registry before the empty-workspace guard
         // so the single writer always observes the result.
         let ev = match ev {
+            AppEvent::IoCompleted(completion) => {
+                return completion.apply(self);
+            }
             AppEvent::BackendCreateReady {
                 id,
                 reply,
@@ -438,7 +445,13 @@ impl App {
                 if let Some(pane) = self.panes.get_mut(&id) {
                     pane.cwd = cwd;
                 }
+                self.runtime_cwd_dirty = true;
+                self.runtime_proc_dirty = true;
                 self.register_backend_terminal(id);
+                self.reconcile_durable_active_targets(Some(id));
+                if self.durable_target_requires_readiness_scan(id) {
+                    self.request_proc_scan_if_stale(id);
+                }
                 crate::logging::event(
                     crate::logging::EventKind::PaneOpen,
                     &[
@@ -457,7 +470,11 @@ impl App {
                 return true;
             }
             AppEvent::ConfigReloaded { id, config, reply } => {
-                let response = match self.apply_socket_config(*config) {
+                if self.config_save_pending() {
+                    self.defer_config_reload(id, reply);
+                    return false;
+                }
+                let response = match self.apply_socket_config(*config, None) {
                     Ok(()) => {
                         json!({"id":id,"result":{"type":"config_reloaded","config":self.config}})
                     }
@@ -518,6 +535,34 @@ impl App {
                 }
                 return true;
             }
+            AppEvent::NamedSessionsLoaded { generation, result } => {
+                self.apply_named_sessions_loaded(generation, result);
+                return true;
+            }
+            AppEvent::NamedSessionPrepared {
+                generation,
+                name,
+                result,
+            } => {
+                self.apply_named_session_prepared(generation, name, result);
+                return true;
+            }
+            AppEvent::NamedSessionStopped {
+                generation,
+                name,
+                result,
+            } => {
+                self.apply_named_session_stopped(generation, name, result);
+                return true;
+            }
+            AppEvent::NamedSessionDeleted {
+                generation,
+                name,
+                result,
+            } => {
+                self.apply_named_session_deleted(generation, name, result);
+                return true;
+            }
             other => other,
         };
         // Control-API requests and parked `wait.output` replies must be answered
@@ -557,7 +602,7 @@ impl App {
                         return true;
                     }
                     let resp = self.handle_api(&req);
-                    let _ = req.reply.send(resp);
+                    self.reply_after_automation_save(req, resp);
                     return true;
                 }
                 AppEvent::WaitOutput { id, reply, .. } => {
@@ -640,10 +685,39 @@ impl App {
                 self.paste_into_focused_pane(&s);
                 false // goes to the pane; its echo (PtyData) renders it
             }
+            AppEvent::PasteImage(path) => {
+                // Image paths are terminal input, never modal text. Restrict
+                // delivery to the same normal focused-pane state that accepts
+                // ordinary typing so an image cannot leak through an overlay,
+                // native view, dashboard, or navigation mode.
+                if !self.focused_pane_accepts_image_paste() {
+                    crate::clipboard_image::discard_staged_png(&path);
+                    return false;
+                }
+                self.paste_into_focused_pane(&path.to_string_lossy());
+                false // the pane's echo is the event that changes the frame
+            }
             AppEvent::Resize => {
                 // A resize (or a same-size resize event a terminal emits on a
                 // move/expose) may have damaged the screen — force a full repaint.
                 self.force_redraw = true;
+                if let Some((width, height)) = crate::platform::terminal_cell_pixels() {
+                    self.set_client_cell_pixels(width, height);
+                }
+                true
+            }
+            AppEvent::PtyInputRejected(id) => {
+                crate::logging::event(
+                    crate::logging::EventKind::PtyInputRejected,
+                    &[crate::logging::Field::PaneId(u64::from(id.0))],
+                );
+                if let Some(pane) = self.panes.get(&id) {
+                    pane.acknowledge_input_rejection();
+                    self.show_toast(format!(
+                        "pane {} input queue full: input rejected; wait for the child to read",
+                        id.0
+                    ));
+                }
                 true
             }
             AppEvent::PtyData(id) => {
@@ -654,7 +728,16 @@ impl App {
                 if let Some(s) = self.status.get_mut(&id) {
                     s.last_activity = Instant::now();
                 }
+                if let Some(pane) = self.panes.get(&id) {
+                    if let Some(text) = pane.take_pending_clipboard() {
+                        self.pending_clipboard = Some(text);
+                    }
+                }
                 self.detection_dirty.insert(id);
+                if self.panes.contains_key(&id) {
+                    self.runtime_cwd_dirty_panes.insert(id);
+                }
+                self.runtime_proc_dirty = true;
                 // A parked `wait.output` for this pane just got new output to
                 // test against — resolve it on the same wake (docs/81).
                 self.check_output_waits(id);
@@ -662,6 +745,7 @@ impl App {
                 true // the pane's screen advanced
             }
             AppEvent::PtyExit(id) => {
+                self.runtime_cwd_dirty_panes.remove(&id);
                 crate::logging::event(
                     crate::logging::EventKind::PtyExit,
                     &[
@@ -694,15 +778,23 @@ impl App {
             } => {
                 let params = json!({ "pane": pane });
                 match self.resolve_pane(&params) {
-                    Some(id) => {
+                    Ok(Some(id)) => {
                         self.register_output_wait(
                             id, request_id, needle, reply, timeout, cancelled,
                         );
                     }
-                    None => {
+                    Ok(None) => {
                         let _ = reply.send(
                             json!({ "id": request_id, "error": {
                                 "code": "not_found", "message": "pane not found"
+                            }})
+                            .to_string(),
+                        );
+                    }
+                    Err((code, message)) => {
+                        let _ = reply.send(
+                            json!({ "id": request_id, "error": {
+                                "code": code, "message": message
                             }})
                             .to_string(),
                         );
@@ -713,28 +805,39 @@ impl App {
             AppEvent::AgentWait {
                 id: request_id,
                 pane,
-                state,
+                states,
                 reply,
                 timeout,
                 cancelled,
             } => {
                 let params = json!({"pane":pane});
-                match (
-                    self.resolve_pane(&params),
-                    crate::app::dispatch::parse_agent_wait_state(&state),
-                ) {
-                    (Some(id), Some(state)) => {
-                        self.register_agent_wait(id, request_id, state, reply, timeout, cancelled);
+                let parsed_states: Option<Vec<_>> = (!states.is_empty())
+                    .then(|| {
+                        states
+                            .iter()
+                            .map(|state| crate::app::dispatch::parse_agent_wait_state(state))
+                            .collect()
+                    })
+                    .flatten();
+                match (self.resolve_pane(&params), parsed_states) {
+                    (Ok(Some(id)), Some(states)) => {
+                        self.register_agent_wait(id, request_id, states, reply, timeout, cancelled);
                     }
-                    (None, _) => {
+                    (Ok(None), _) => {
                         let _ = reply.send(
                             json!({"id":request_id,"error":{"code":"not_found","message":"pane not found"}})
                                 .to_string(),
                         );
                     }
-                    (_, None) => {
+                    (Ok(Some(_)), None) => {
                         let _ = reply.send(
-                            json!({"id":request_id,"error":{"code":"invalid_request","message":"status must be idle, working, blocked, or done"}})
+                            json!({"id":request_id,"error":{"code":"invalid_request","message":"statuses must be a non-empty set of idle, working, blocked, or done"}})
+                                .to_string(),
+                        );
+                    }
+                    (Err((code, message)), _) => {
+                        let _ = reply.send(
+                            json!({"id":request_id,"error":{"code":code,"message":message}})
                                 .to_string(),
                         );
                     }
@@ -777,18 +880,61 @@ impl App {
             // Process-table churn is only a cache update, but a confirmed agent
             // exit changes the visible sidebar immediately. `apply_proc_scan`
             // distinguishes those cases so the common scan stays render-free.
-            AppEvent::ProcScanned(found) => self.apply_proc_scan(found),
+            AppEvent::ProcScanned(found) => {
+                let scan_succeeded = found.is_some();
+                let changed = self.apply_proc_scan(found);
+                if scan_succeeded {
+                    changed | self.reconcile_durable_active_targets(None)
+                } else {
+                    changed
+                }
+            }
             AppEvent::CwdScanned {
                 panes,
                 branches,
                 workspace_candidates,
             } => self.apply_cwd_scan(panes, branches, workspace_candidates),
-            // Mission Control usage (docs/54, MC-2): swap in the fresh cache; the
-            // mission render blits it. Repaint so a visible mission tab updates.
-            AppEvent::UsageScanned { usage, mtimes } => {
+            // Mission Control usage (docs/54, MC-2): replace a fleet scan or
+            // merge only the keys covered by a workspace scan. Repaint so a
+            // visible mission tab updates.
+            AppEvent::UsageScanned {
+                scope,
+                scanned,
+                mut usage,
+                mut mtimes,
+                report_owned,
+            } => {
                 self.usage_scan_inflight = false;
-                self.agent_usage = usage;
-                self.usage_mtimes = mtimes;
+                self.prune_reported_usage();
+                let excluded = report_owned
+                    .into_iter()
+                    .chain(self.reported_usage.keys().cloned())
+                    .collect::<std::collections::HashSet<_>>();
+                usage.retain(|key, _| !excluded.contains(key));
+                mtimes.retain(|key, _| !excluded.contains(key));
+                if scope == crate::mission::MissionScope::All {
+                    let mut next = usage;
+                    for key in self.reported_usage.keys() {
+                        if let Some(value) = self.agent_usage.get(key) {
+                            next.insert(key.clone(), value.clone());
+                        }
+                    }
+                    self.agent_usage = next;
+                    self.usage_mtimes = mtimes;
+                } else {
+                    for key in scanned {
+                        if !self.reported_usage.contains_key(&key) {
+                            self.agent_usage.remove(&key);
+                        }
+                        self.usage_mtimes.remove(&key);
+                    }
+                    self.agent_usage.extend(
+                        usage
+                            .into_iter()
+                            .filter(|(key, _)| !self.reported_usage.contains_key(key)),
+                    );
+                    self.usage_mtimes.extend(mtimes);
+                }
                 // Fleet burn rate: change in total cost since the last scan (docs/54).
                 let total: f64 = self.agent_usage.values().filter_map(|u| u.cost).sum();
                 let now = std::time::Instant::now();
@@ -974,9 +1120,19 @@ impl App {
             // Handled by the server loop; never reaches here at runtime.
             AppEvent::ClientConnected { .. }
             | AppEvent::ClientDetach { .. }
-            | AppEvent::ClientInput { .. } => false,
+            | AppEvent::ClientSurfaceInterest { .. }
+            | AppEvent::ClientPrepareSurface { .. }
+            | AppEvent::ClientShellDockLayout { .. }
+            | AppEvent::ClientShellSidebars { .. }
+            | AppEvent::ClientShellWorkspaceFocus { .. }
+            | AppEvent::ClientShellWorkspaceMenu { .. }
+            | AppEvent::ClientOpenWorkspacePicker { .. }
+            | AppEvent::ClientCellPixels { .. }
+            | AppEvent::ClientInput { .. }
+            | AppEvent::Shutdown => false,
             // Consumed by the pre-dispatch worker-result branch above.
-            AppEvent::ThemeUninstalled { .. }
+            AppEvent::IoCompleted(_)
+            | AppEvent::ThemeUninstalled { .. }
             | AppEvent::ConfigReloaded { .. }
             | AppEvent::ManifestsReloaded { .. }
             | AppEvent::BackendCreateReady { .. }
@@ -986,6 +1142,12 @@ impl App {
             | AppEvent::SearchResults { .. }
             | AppEvent::SearchFederatedResults { .. }
             | AppEvent::SearchHandoffReady { .. } => unreachable!(),
+            AppEvent::NamedSessionsLoaded { .. }
+            | AppEvent::NamedSessionPrepared { .. }
+            | AppEvent::NamedSessionStopped { .. }
+            | AppEvent::NamedSessionDeleted { .. } => {
+                unreachable!()
+            }
         }
     }
 
@@ -1017,10 +1179,13 @@ impl App {
     /// Route pasted text into an open text-input modal by replaying it as
     /// keypresses, so a paste fills the field instead of leaking to the pane
     /// underneath. Mirrors `handle_key`'s text-input precedence; returns whether
-    /// a modal consumed it. Control chars (newlines/tabs) are dropped — these are
-    /// all single-line fields.
+    /// a modal consumed it. Control characters are dropped from single-line
+    /// fields; the ORCH prompt preserves normalized line feeds.
     fn paste_into_modal(&mut self, s: &str) -> bool {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        if self.named_session_menu.is_some() {
+            return self.paste_named_session_prompt(s);
+        }
         if self.module_setting_edit.is_some() {
             for character in s.chars().filter(|character| !character.is_control()) {
                 self.handle_module_setting_key(KeyEvent::new(
@@ -1041,6 +1206,30 @@ impl App {
             self.picker_paste(s);
             return true;
         }
+        // The open-worktree list has no text input; swallow the paste so it
+        // can't leak into the pane under the modal.
+        if self.worktree_open.is_some() {
+            return true;
+        }
+        if self.orch_form.is_some() {
+            let multiline = self
+                .orch_form
+                .as_ref()
+                .is_some_and(|form| form.field == crate::app::OrchFormField::Prompt);
+            for character in s.replace("\r\n", "\n").replace('\r', "\n").chars() {
+                if character == '\n' && multiline {
+                    if let Some(form) = self.orch_form.as_mut() {
+                        form.push_char('\n');
+                    }
+                } else if !character.is_control() {
+                    self.handle_orch_form_key(KeyEvent::new(
+                        KeyCode::Char(character),
+                        KeyModifiers::NONE,
+                    ));
+                }
+            }
+            return true;
+        }
         let handler: fn(&mut Self, KeyEvent) = if self.worktree_prompt.is_some() {
             Self::handle_worktree_prompt_key
         } else if self.tab_rename.is_some() {
@@ -1051,8 +1240,6 @@ impl App {
             Self::handle_ws_rename_key
         } else if self.pane_rename.is_some() {
             Self::handle_pane_rename_key
-        } else if self.orch_form.is_some() {
-            Self::handle_orch_form_key
         } else {
             return false;
         };
@@ -1112,6 +1299,34 @@ impl App {
         let (c, r) = at?;
         let hit = |rect: Rect| c >= rect.x && c < rect.right() && r >= rect.y && r < rect.bottom();
         let first = |rects: &[Rect]| rects.iter().copied().find(|rect| hit(*rect));
+
+        if self.session_delete_confirm.is_some() {
+            return [self.modal_commit_rect, self.modal_cancel_rect]
+                .into_iter()
+                .flatten()
+                .find(|rect| hit(*rect));
+        }
+        if self.named_session_menu.is_some() {
+            if self.session_menu.is_some() {
+                if let Some(menu) = &self.session_menu {
+                    if let Some(rect) = menu.items.iter().map(|(_, r)| *r).find(|r| hit(*r)) {
+                        return Some(rect);
+                    }
+                }
+                // Hover stays inside the Stop menu while it is open — do not
+                // highlight the session list behind it when moving the mouse.
+                return self.named_session_close_rect.filter(|rect| hit(*rect));
+            }
+            return self
+                .named_session_close_rect
+                .filter(|rect| hit(*rect))
+                .or_else(|| {
+                    self.named_session_row_rects
+                        .iter()
+                        .map(|(_, rect)| *rect)
+                        .find(|rect| hit(*rect))
+                });
+        }
 
         if self.changelog_open {
             return self
@@ -1186,6 +1401,22 @@ impl App {
         if let Some(menu) = &self.dock_menu {
             return first(&menu.rects);
         }
+        // The open-worktree list hovers per row, not just on its footer buttons:
+        // without the row rects here, crossing from one row to the next would not
+        // count as a changed frame and the highlight would never repaint.
+        if self.worktree_open.is_some() {
+            return self
+                .worktree_open_rects
+                .iter()
+                .filter(|(target, _)| matches!(*target, PickerHit::Row(_)))
+                .map(|(_, rect)| *rect)
+                .chain(
+                    [self.modal_commit_rect, self.modal_cancel_rect]
+                        .into_iter()
+                        .flatten(),
+                )
+                .find(|rect| hit(*rect));
+        }
         let modal_owns_mouse = self.file_prompt.is_some()
             || self.file_delete.is_some()
             || self.worktree_delete.is_some()
@@ -1231,6 +1462,7 @@ impl App {
             .chain(self.diff_row_rects.iter().map(|(_, rect)| *rect))
             .chain(
                 [
+                    self.named_session_button_rect,
                     self.switcher_button_rect,
                     self.mobile_pane_prev_rect,
                     self.mobile_pane_next_rect,
@@ -1269,6 +1501,13 @@ impl App {
 
     fn apply_mouse(&mut self, m: ratatui::crossterm::event::MouseEvent) {
         use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        // A new primary-button gesture replaces any copied mouse selection,
+        // even when a modal, menu, resize handle, or child TUI claims the press
+        // below. This keeps the delayed highlight from surviving an unrelated
+        // click through one of those early-return paths.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.clear_selection();
+        }
         // Track the cursor for hover affordances (e.g. the session delete ✕).
         self.hover = Some((m.column, m.row));
         if let MouseEventKind::Down(_) = m.kind {
@@ -1284,6 +1523,82 @@ impl App {
                     self.help_scroll = self.help_scroll.saturating_add(2).min(self.help_scroll_max)
                 }
                 MouseEventKind::Down(MouseButton::Left) => self.help_open = false,
+                _ => {}
+            }
+            return;
+        }
+        if self.session_delete_confirm.is_some() {
+            if let Some(key) = self.modal_button_key(&m) {
+                self.session_delete_key(key);
+            }
+            return;
+        }
+        if self.named_session_menu.is_some() {
+            // Context menu on a session row owns the click first.
+            if self.session_menu.is_some() {
+                match m.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        // If this press scrolls the session popup, keep the
+                        // context menu under the cursor like other menus.
+                        if self.menu_scroll.wheel(m.column, m.row, 0) {
+                            // no-op: just update hover for menu_scroll internal state
+                        }
+                        self.session_menu_click(m.column, m.row);
+                    }
+                    MouseEventKind::Down(MouseButton::Right) => {
+                        // Re-anchor: right-clicking another row moves the menu, like Agents.
+                        if let Some(idx) = self
+                            .named_session_row_rects
+                            .iter()
+                            .find(|(_, r)| {
+                                m.column >= r.x
+                                    && m.column < r.right()
+                                    && m.row >= r.y
+                                    && m.row < r.bottom()
+                            })
+                            .map(|(i, _)| *i)
+                        {
+                            self.open_session_menu_for_row(idx, m.column, m.row);
+                        } else if !self.session_menu.as_ref().is_some_and(|menu| {
+                            menu.items.iter().any(|(_, r)| {
+                                m.column >= r.x
+                                    && m.column < r.right()
+                                    && m.row >= r.y
+                                    && m.row < r.bottom()
+                            })
+                        }) {
+                            self.session_menu = None;
+                        }
+                    }
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        let _ = self.menu_scroll.wheel(m.column, m.row, 0);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.named_session_click(m.column, m.row)
+                }
+                MouseEventKind::Down(MouseButton::Right) => {
+                    // Right-click exposes the action valid for this row's state.
+                    if let Some(idx) = self
+                        .named_session_row_rects
+                        .iter()
+                        .find(|(_, r)| {
+                            m.column >= r.x
+                                && m.column < r.right()
+                                && m.row >= r.y
+                                && m.row < r.bottom()
+                        })
+                        .map(|(i, _)| *i)
+                    {
+                        self.open_session_menu_for_row(idx, m.column, m.row);
+                    }
+                }
+                MouseEventKind::ScrollUp => self.move_named_session_cursor(-1),
+                MouseEventKind::ScrollDown => self.move_named_session_cursor(1),
                 _ => {}
             }
             return;
@@ -1417,10 +1732,11 @@ impl App {
                         .map(|(hit, _)| hit.clone());
                     if let Some(hit) = hit {
                         self.orch_activate_hit(hit);
-                    } else if self.orch_form.is_some() {
+                    } else if self.orch_form.is_some() || self.orch_detail.is_some() {
                         // Match Settings and the folder picker: the modal
                         // surface is inert, while its dimmed backdrop cancels.
                         self.orch_form = None;
+                        self.orch_detail = None;
                     }
                 }
                 MouseEventKind::ScrollUp if self.orch_detail.is_some() => {
@@ -1458,6 +1774,8 @@ impl App {
                         })
                         .map(|(hit, _)| *hit);
                     match hit {
+                        Some(PickerHit::OpenWorkspaceTab) => {}
+                        Some(PickerHit::RemoteMachineTab) => self.picker_open_remote_machine(),
                         Some(PickerHit::Row(i)) => self.picker_click(i),
                         Some(PickerHit::Hint(k)) => {
                             self.handle_picker_key(KeyEvent::new(k, KeyModifiers::NONE))
@@ -1602,14 +1920,72 @@ impl App {
         if self.compact && m.row < self.last_pane_area.y {
             return;
         }
-        // Text-input modals: only the ⏎/esc footer buttons respond to the mouse;
-        // any other click is swallowed (the centered modal owns the screen).
+        // The new-worktree prompt: the ⏎/esc footer buttons act as those keys,
+        // a click on the modal body is inert, and a click on the dimmed backdrop
+        // cancels — the same gesture as the open-worktree list below.
         if self.worktree_prompt.is_some() {
             if let Some(k) = self.modal_button_key(&m) {
                 self.handle_worktree_prompt_key(k);
+            } else if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                // Only a rendered prompt knows where its body is; until then
+                // the click is swallowed rather than guessed as "outside".
+                let outside = self.worktree_prompt_rect.is_some_and(|rect| {
+                    m.column < rect.x
+                        || m.column >= rect.right()
+                        || m.row < rect.y
+                        || m.row >= rect.bottom()
+                });
+                if outside {
+                    self.handle_worktree_prompt_key(KeyEvent::new(
+                        KeyCode::Esc,
+                        KeyModifiers::NONE,
+                    ));
+                }
             }
             return;
         }
+        // The open-worktree list is a list, not a text field: it owns the mouse
+        // the way the folder picker does — a click opens the row under it, the
+        // wheel moves the cursor, and the dimmed backdrop cancels.
+        if self.worktree_open.is_some() {
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    // The footer buttons come first: they overlay the modal body,
+                    // which would otherwise swallow them as inert chrome.
+                    if let Some(k) = self.modal_button_key(&m) {
+                        self.handle_worktree_open_key(k);
+                        return;
+                    }
+                    let (c, r) = (m.column, m.row);
+                    let hit = self
+                        .worktree_open_rects
+                        .iter()
+                        .find(|(_, rect)| {
+                            c >= rect.x && c < rect.right() && r >= rect.y && r < rect.bottom()
+                        })
+                        .map(|(hit, _)| *hit);
+                    match hit {
+                        Some(PickerHit::Row(i)) => self.worktree_open_click(i),
+                        // Inert modal surface; the footer is handled above.
+                        Some(PickerHit::OpenWorkspaceTab)
+                        | Some(PickerHit::RemoteMachineTab)
+                        | Some(PickerHit::Hint(_))
+                        | Some(PickerHit::Modal) => {}
+                        None => self.close_worktree_list(), // click outside cancels
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    self.handle_worktree_open_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+                }
+                MouseEventKind::ScrollDown => {
+                    self.handle_worktree_open_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+                }
+                _ => {}
+            }
+            return;
+        }
+        // Text-input modals: only the ⏎/esc footer buttons respond to the mouse;
+        // any other click is swallowed (the centered modal owns the screen).
         if self.tab_rename.is_some() {
             if let Some(k) = self.modal_button_key(&m) {
                 self.handle_tab_rename_key(k);
@@ -1640,6 +2016,23 @@ impl App {
                 self.files_focused = false;
             }
         }
+        // WORKSPACES/AGENTS keyboard ownership follows the same rule as FILES:
+        // a pointer press outside the focused list returns input to the pane.
+        if matches!(m.kind, MouseEventKind::Down(_)) {
+            let area = match self.sidebar_focus {
+                Some(SidebarListFocus::Workspaces) => Some(self.workspaces_area),
+                Some(SidebarListFocus::Agents) => Some(self.agents_area),
+                None => None,
+            };
+            if area.is_some_and(|area| {
+                m.column < area.x
+                    || m.column >= area.right()
+                    || m.row < area.y
+                    || m.row >= area.bottom()
+            }) {
+                self.sidebar_focus = None;
+            }
+        }
         // Bar actions and the read-only overflow popup own their rendered
         // rectangles. This sits below every modal guard: while a modal is open,
         // it owns the screen and a click must never invoke a hidden bar action.
@@ -1654,8 +2047,8 @@ impl App {
         // highlight (docs/27, RESIZE-4), plus the sidebar edge seam (docs/29).
         self.update_hover_divider(m.column, m.row);
         self.update_hover_sidebar(m.column, m.row);
-        // Right-click a pane tab, WORKSPACES row, agent, file, dock row, or pane
-        // to open the matching context menu.
+        // Right-click a pane tab, WORKSPACES row, live/scheduled agent, ORCH
+        // row, file, dock row, or pane to open the matching context menu.
         if let MouseEventKind::Down(MouseButton::Right) = m.kind {
             let (c, r) = (m.column, m.row);
             let hit =
@@ -1666,12 +2059,33 @@ impl App {
                 self.open_ws_menu(*i, c, r);
             } else if let Some((id, _)) = self.agent_rects.iter().find(|(_, rect)| hit(*rect)) {
                 self.open_agent_menu(AgentTarget::Live(*id), c, r); // live agent → Close
+            } else if let Some((id, _)) = self.automation_rects.iter().find(|(_, rect)| hit(*rect))
+            {
+                let id = id.clone();
+                if let Some(pane) = self.automation_live_pane(&id) {
+                    self.open_agent_menu(AgentTarget::Live(pane), c, r);
+                } else {
+                    self.open_agent_menu(AgentTarget::Automation(id), c, r);
+                }
             } else if let Some((i, _)) = self.session_rects.iter().find(|(_, rect)| hit(*rect)) {
                 self.open_agent_menu(AgentTarget::Session(*i), c, r); // session → Resume/Close
             } else if let Some((row, _)) = self.diff_row_rects.iter().find(|(_, rect)| hit(*rect)) {
                 self.open_diff_menu(*row, c, r);
             } else if let Some((i, _)) = self.file_tree_rects.iter().find(|(_, rect)| hit(*rect)) {
                 self.open_file_menu(*i, c, r); // FILES-dock row → new/rename/delete (docs/38)
+            } else if let Some(automation) =
+                self.orch_hits
+                    .iter()
+                    .find_map(|(target, rect)| match target {
+                        OrchHit::Automation(automation) if hit(*rect) => Some(automation.clone()),
+                        _ => None,
+                    })
+            {
+                if let Some(pane) = self.automation_live_pane(&automation) {
+                    self.open_agent_menu(AgentTarget::Live(pane), c, r);
+                } else {
+                    self.open_agent_menu(AgentTarget::Automation(automation), c, r);
+                }
             } else if let Some((task, _)) =
                 self.orch_hits
                     .iter()
@@ -1741,11 +2155,17 @@ impl App {
                         return;
                     }
                 }
-                // A sidebar-edge drag (docs/29) claims the press first: its seam is
-                // the sidebar's own `│` column (never a pane), and its neighbour is
-                // only grabbed when it isn't pane content, so this can't swallow a
-                // click meant for a pane or a mouse-tracking agent.
+                // A sidebar-edge drag (docs/29) claims the press first, but its
+                // target is exactly the sidebar's rendered `│` rule. Pane borders
+                // and content remain available for selection and child mouse input.
                 if self.begin_sidebar_resize(m.column, m.row) {
+                    return;
+                }
+                // Then the horizontal rule between two stacked docks. Checked
+                // after the edge seam so a corner press still resizes the
+                // sidebar, and before pane resize because this target lives
+                // inside the sidebar, where no pane divider can be.
+                if self.begin_dock_resize(m.column, m.row) {
                     return;
                 }
                 // Pane resize (docs/27) takes priority over selection: a divider
@@ -1864,16 +2284,16 @@ impl App {
                     }
                     return;
                 }
-                if let Some((side, i)) = self.dock_drag {
-                    self.update_dock_drag(side, i, m.row);
-                    return;
-                }
                 if let Some(which) = self.bar_drag {
                     self.update_bar_drag(which, m.row);
                     return;
                 }
                 if self.sidebar_resize.is_some() {
                     self.update_sidebar_resize(m.column, m.row);
+                    return;
+                }
+                if self.dock_resize.is_some() {
+                    self.update_dock_resize(m.column, m.row);
                     return;
                 }
                 if self.resize_drag.is_some() {
@@ -1896,9 +2316,8 @@ impl App {
                 return;
             }
             MouseEventKind::Up(MouseButton::Left) | MouseEventKind::Up(MouseButton::Middle) => {
-                // A double-click already copied and highlighted on its press; its
-                // release keeps that selection rather than re-copying it or
-                // clearing it the way a plain click would.
+                // A double-click already copied and scheduled its highlight
+                // expiry on press. Its release only closes the gesture.
                 if self.dbl_click_release {
                     self.dbl_click_release = false;
                     return;
@@ -1913,15 +2332,15 @@ impl App {
                     }
                     return;
                 }
-                if self.dock_drag.take().is_some() {
-                    self.save_sidebars();
-                    return;
-                }
                 if self.bar_drag.take().is_some() {
                     return;
                 }
                 if self.sidebar_resize.is_some() {
                     self.end_sidebar_resize();
+                    return;
+                }
+                if self.dock_resize.is_some() {
+                    self.end_dock_resize();
                     return;
                 }
                 if self.resize_drag.is_some() {
@@ -1939,13 +2358,16 @@ impl App {
                 }
                 // A real drag copies its text + flashes a toast; a plain click
                 // clears the (1-cell) selection so nothing stays highlighted.
+                // After a successful copy the highlight lingers briefly so you can
+                // see what was copied; the toast times out on the same cadence.
                 match self.selection_text() {
                     Some(text) => {
                         self.pending_clipboard = Some(text);
                         let msg = self.catalog.copied;
                         self.show_toast(msg);
+                        self.schedule_copy_highlight_clear();
                     }
-                    None => self.selection = None,
+                    None => self.clear_selection(),
                 }
                 return;
             }
@@ -2061,7 +2483,7 @@ impl App {
                     }
                     Some(crate::app::ViewKind::Diff(v)) => {
                         let is_split = v.effective_split(rect.width);
-                        if hscroll != 0 {
+                        if hscroll != 0 && !v.effective_wrap(rect.width) {
                             if hscroll < 0 {
                                 v.horizontal = v.horizontal.saturating_sub(8);
                             } else {
@@ -2197,6 +2619,10 @@ impl App {
         }
 
         // The sidebar gear opens Settings.
+        if self.named_session_button_rect.is_some_and(hit) {
+            self.open_named_session_menu();
+            return;
+        }
         if self.settings_icon_rect.is_some_and(hit) {
             self.open_settings();
             return;
@@ -2232,18 +2658,6 @@ impl App {
             self.zoomed = !self.zoomed;
             return;
         }
-        // Clicking a pane's title strip opens the running-command overlay — the
-        // full argv from the OS, since an agent's on-screen `Bash(… …)` is
-        // elided before it ever reaches us.
-        if let Some((id, _)) = self
-            .pane_title_rects
-            .iter()
-            .find(|(_, rect)| hit(*rect))
-            .map(|(id, r)| (*id, *r))
-        {
-            self.open_cmd_inspect(id);
-            return;
-        }
         // Tab-bar scroll arrows: step to the previous / next tab.
         if self.tab_prev_rect.is_some_and(hit) {
             let a = self.ws().active_tab;
@@ -2274,17 +2688,6 @@ impl App {
             }
             return;
         }
-        // A press on the rule between two docks grabs it; the drag that follows
-        // moves rows from one dock to the other.
-        if let Some((side, i, _)) = self
-            .dock_dividers
-            .iter()
-            .find(|(_, _, rect)| hit(*rect))
-            .copied()
-        {
-            self.dock_drag = Some((side, i));
-            return;
-        }
         // A press on a sidebar list's scrollbar jumps that list to the clicked
         // position and grabs the thumb, so the drag that follows keeps scrolling.
         // Rows span the full dock width (bar column included), so this has to come
@@ -2294,7 +2697,7 @@ impl App {
             self.update_bar_drag(which, r);
             return;
         }
-        // The AGENTS Workspace/All/Active filter toggle.
+        // The AGENTS All/Active filter toggle.
         if let Some((val, _)) = self.agents_filter_rects.iter().find(|(_, rect)| hit(*rect)) {
             let val = *val;
             self.set_agents_filter(val);
@@ -2303,24 +2706,38 @@ impl App {
         // Anywhere else on a dock's header row folds/unfolds it. The header's own
         // controls (the `+` button, the AGENTS filter) are tested above, so they
         // still win on the cells they occupy.
-        if let Some((side, kind)) = self
+        if let Some(kind) = self
             .dock_slots_geom
             .iter()
             .find(|(_, _, rect)| r == rect.y && c >= rect.x && c < rect.right())
-            .map(|(s, k, _)| (*s, k.clone()))
+            .map(|(_, k, _)| k.clone())
         {
-            self.sidebars.get_mut(side).toggle_collapsed(&kind);
-            self.save_sidebars();
+            self.toggle_dock_fold(&kind);
+            return;
+        }
+        // The "blocked in other workspaces" line jumps to a pane this scope hid,
+        // rather than widening the list or cycling to a local blocked row.
+        if let Some((id, _)) = self.agents_elsewhere_rect.filter(|(_, rect)| hit(*rect)) {
+            self.sidebar_focus = None;
+            self.focus_pane_global(id);
             return;
         }
         if let Some((id, _)) = self.agent_rects.iter().find(|(_, rect)| hit(*rect)) {
             let id = *id;
+            self.sidebar_focus = None;
             self.focus_pane_global(id);
+            return;
+        }
+        if let Some((id, _)) = self.automation_rects.iter().find(|(_, rect)| hit(*rect)) {
+            let id = id.clone();
+            self.sidebar_focus = None;
+            self.open_automation_detail(&id);
             return;
         }
         // Clicking a resumable session row reopens it into a pane.
         if let Some((i, _)) = self.session_rects.iter().find(|(_, rect)| hit(*rect)) {
             let i = *i;
+            self.sidebar_focus = None;
             self.resume_session(i);
             return;
         }
@@ -2386,7 +2803,10 @@ impl App {
         }
         if let Some((i, _)) = self.ws_rects.iter().find(|(_, rect)| hit(*rect)) {
             let i = (*i).min(self.workspaces.len().saturating_sub(1));
-            self.active_ws = i;
+            self.sidebar_focus = None;
+            let tab = self.workspaces[i].active_tab;
+            let pane = self.workspaces[i].tabs[tab].layout.focus;
+            self.focus_location(i, tab, pane);
             return;
         }
         // Clicking a view-selector tab in the git tab switches section (docs/17).
@@ -2437,6 +2857,18 @@ impl App {
                     self.orch_select_task(&id);
                     self.orch_last_click = Some((id, now));
                 }
+            } else if let Some(OrchHit::Automation(id)) = target {
+                let now = Instant::now();
+                let double = self.orch_last_click.take().is_some_and(|(previous, when)| {
+                    previous == id && now.duration_since(when) <= DOUBLE_CLICK
+                });
+                if self.orch_select_automation(&id) {
+                    if double {
+                        self.open_automation_detail(&id);
+                    } else {
+                        self.orch_last_click = Some((id, now));
+                    }
+                }
             } else if let Some(target) = target {
                 self.orch_last_click = None;
                 self.orch_activate_hit(target);
@@ -2459,6 +2891,15 @@ impl App {
                 self.set_mission_scope(*scope);
                 return;
             }
+            if let Some((id, _)) = self
+                .mission_automation_rects
+                .iter()
+                .find(|(_, rect)| hit(*rect))
+            {
+                let id = id.clone();
+                self.open_automation_detail(&id);
+                return;
+            }
             let row = self
                 .mission_row_rects
                 .iter()
@@ -2471,13 +2912,7 @@ impl App {
         }
         if let Some((id, _)) = self.pane_rects.iter().find(|(_, rect)| hit(*rect)) {
             let id = *id;
-            if self.layout().focus != id {
-                // Leave the old pane's viewport exactly where it is. Only drop
-                // keyboard ownership so subsequent input follows the new focus.
-                self.scroll_pane = None;
-            }
-            self.layout_mut().focus = id;
-            self.mode = Mode::Normal;
+            self.focus_pane_global(id);
         }
     }
 
@@ -2495,37 +2930,6 @@ impl App {
     /// Scroll the grabbed list to wherever the pointer is now. `bar_offset` clamps
     /// the row into the track, so the thumb keeps following a drag that wanders off
     /// the 1-cell-wide bar or past either end.
-    /// Move the grabbed rule to the pointer: docks `i` and `i + 1` trade rows and
-    /// nothing else on the sidebar moves. The first drag freezes every open dock's
-    /// current height into `dock_rows` — until then heights are "an equal share",
-    /// and setting an absolute value for one pair alone would rescale the rest.
-    fn update_dock_drag(&mut self, side: Side, i: usize, row: u16) {
-        let slots: Vec<(DockKind, Rect)> = self
-            .dock_slots_geom
-            .iter()
-            .filter(|(s, _, _)| *s == side)
-            .map(|(_, k, r)| (k.clone(), *r))
-            .collect();
-        let (Some((ka, ra)), Some((kb, rb))) = (slots.get(i), slots.get(i + 1)) else {
-            return;
-        };
-        // A folded dock is a header row; it has no rows to trade.
-        let st = self.sidebars.get(side);
-        if st.is_collapsed(ka) || st.is_collapsed(kb) {
-            return;
-        }
-        let (a, b) = crate::ui::sidebar::split_pair(*ra, *rb, row);
-        let frozen: Vec<(String, u16)> = slots
-            .iter()
-            .filter(|(k, _)| !st.is_collapsed(k))
-            .map(|(k, r)| (k.id().to_string(), r.height))
-            .collect();
-        let st = self.sidebars.get_mut(side);
-        st.dock_rows.extend(frozen);
-        st.dock_rows.insert(ka.id().to_string(), a);
-        st.dock_rows.insert(kb.id().to_string(), b);
-    }
-
     fn update_bar_drag(&mut self, which: BarDrag, r: u16) {
         let Some(bar) = self.sidebar_bars.iter().find(|b| b.list == which).copied() else {
             return;
@@ -2659,7 +3063,13 @@ impl App {
                     // forwarded, so typing to the agent resumes with no lost key.
                     pane.scroll_to_bottom();
                     exit = true;
-                    if let Some(bytes) = encode_key(&key, newline, pane.application_cursor()) {
+                    let modes = pane.key_encoding_modes();
+                    if let Some(bytes) = encode_key_with_modes(
+                        &key,
+                        newline,
+                        modes.application_cursor,
+                        modes.protocol,
+                    ) {
                         pane.send(&bytes);
                     }
                 }
@@ -2681,7 +3091,7 @@ impl App {
             return false;
         };
         let (offset, history) = pane.scroll_state();
-        self.selection = None;
+        self.clear_selection();
         self.scroll_pane = None;
         self.copy_mode = Some(CopyMode {
             pane: id,
@@ -2910,9 +3320,7 @@ impl App {
             return false;
         }
         pane.scroll_to_bottom(); // the app's coordinates are the live screen's
-        self.scroll_pane = None;
-        self.layout_mut().focus = id;
-        self.mode = Mode::Normal;
+        self.focus_pane_global(id);
         let g = crate::app::MouseGrab {
             pane: id,
             btn: base_btn + mouse_mod_bits(m.modifiers),
@@ -3100,8 +3508,8 @@ impl App {
         // Highlight exactly the copied cells: from the first covered cell to the
         // last, which for a rejoined soft-wrapped path runs through the full rows
         // between them (the same reading-order rule `Selection` copies with). The
-        // highlight is transient (screen coordinates, cleared on the next click),
-        // so it carries no retained-history span.
+        // highlight is transient (screen coordinates, cleared after copy or the
+        // next click), so it carries no retained-history span.
         if let (Some(first), Some(last)) = (spans.first(), spans.last()) {
             self.selection = Some(Selection {
                 pane,
@@ -3116,6 +3524,7 @@ impl App {
         self.pending_clipboard = Some(text);
         let msg = self.catalog.copied;
         self.show_toast(msg);
+        self.schedule_copy_highlight_clear();
         true
     }
 
@@ -3172,7 +3581,49 @@ impl App {
             // column the underline lands on (or which cells Ctrl-click opens).
             engine.visible_rows_aligned()
         };
-        let link = crate::links::link_at(rows.rows(), col - content.x, row - content.y)?;
+        let grid_col = col - content.x;
+        let grid_row = row - content.y;
+
+        // OSC 8 carries an authoritative target which can differ from the label
+        // Claude and other terminal programs render. Preserve it rather than
+        // reclassifying a visible filename as a website. An unsupported or
+        // malformed target is deliberately inert and never falls back to the
+        // label, since that would undo the safety boundary.
+        if let Some(hyperlink) = rows.hyperlink_at(grid_row, grid_col) {
+            let uri = hyperlink.uri();
+            let visible = crate::links::link_at(rows.rows(), grid_col, grid_row);
+            let line = visible.as_ref().and_then(|link| match &link.hit {
+                crate::links::Hit::Path { line, .. } => *line,
+                crate::links::Hit::Url(_) => None,
+            });
+            let (hit, target) = if let Some(path) = crate::links::file_uri_path(uri) {
+                if !path.is_file() {
+                    return None;
+                }
+                (
+                    crate::links::Hit::Path {
+                        raw: uri.to_string(),
+                        text: path.to_string_lossy().into_owned(),
+                        line,
+                    },
+                    LinkTarget::File { path, line },
+                )
+            } else if crate::platform::is_openable_url(uri) {
+                (
+                    crate::links::Hit::Url(uri.to_string()),
+                    LinkTarget::Url(uri.to_string()),
+                )
+            } else {
+                return None;
+            };
+            let link = crate::links::Link {
+                hit,
+                spans: hyperlink.spans().to_vec(),
+            };
+            return Some(HoverLink { pane, link, target });
+        }
+
+        let link = crate::links::link_at(rows.rows(), grid_col, grid_row)?;
         let target = match &link.hit {
             crate::links::Hit::Url(u) => {
                 crate::platform::is_openable_url(u).then(|| LinkTarget::Url(u.clone()))?
@@ -3249,7 +3700,27 @@ impl App {
     }
 
     pub fn show_toast(&mut self, text: impl Into<String>) {
-        self.toast = Some((text.into(), Instant::now() + Duration::from_millis(1400)));
+        self.toast = Some((text.into(), Instant::now() + COPY_HIGHLIGHT_DURATION));
+    }
+
+    fn schedule_copy_highlight_clear(&mut self) {
+        self.selection_clear_at = Some(Instant::now() + COPY_HIGHLIGHT_DURATION);
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.selection_clear_at = None;
+    }
+
+    /// Clear an expired copied-selection highlight; returns true when it changed
+    /// so the loop repaints once to remove it, since idle frames aren't rendered.
+    pub fn tick_copy_highlight(&mut self, now: Instant) -> bool {
+        if self.selection_clear_at.is_some_and(|at| now >= at) {
+            self.clear_selection();
+            true
+        } else {
+            false
+        }
     }
 
     /// Clear an expired toast; returns true when it changed (so the loop redraws
@@ -3296,6 +3767,50 @@ impl App {
         });
         self.mark_user_input(); // so the echo isn't misread as agent work
         target
+    }
+
+    /// Whether the current input owner is the normal focused terminal pane.
+    /// Dedicated image paste is intentionally stricter than text paste because
+    /// a Luvus modal has no meaningful image value to accept.
+    fn focused_pane_accepts_image_paste(&self) -> bool {
+        self.mode == Mode::Normal
+            && self.bar.overflow.is_none()
+            && self.cmd_inspect.is_none()
+            && !self.help_open
+            && !self.changelog_open
+            && self.module_setting_edit.is_none()
+            && self.named_session_menu.is_none()
+            && self.settings.is_none()
+            && self.search.is_none()
+            && self.picker.is_none()
+            && self.worktree_prompt.is_none()
+            && self.worktree_open.is_none()
+            && self.tab_rename.is_none()
+            && self.tab_menu.is_none()
+            && self.ws_menu.is_none()
+            && self.pane_menu.is_none()
+            && self.agent_menu.is_none()
+            && self.file_prompt.is_none()
+            && self.file_delete.is_none()
+            && self.worktree_delete.is_none()
+            && self.file_menu.is_none()
+            && self.diff_menu.is_none()
+            && self.orch_menu.is_none()
+            && self.dock_menu.is_none()
+            && !self.switcher
+            && self.pane_rename.is_none()
+            && self.ws_rename.is_none()
+            && self.orch_form.is_none()
+            && self.orch_start.is_none()
+            && self.orch_detail.is_none()
+            && self.scroll_pane.is_none()
+            && self.copy_mode.is_none()
+            && self.sidebar_focus.is_none()
+            && !self.files_focused
+            && !self.active_is_git()
+            && !self.active_is_orch()
+            && !self.active_is_mission()
+            && self.focused().is_some()
     }
 
     /// Record that the user just typed into the focused pane, so detection can
@@ -3417,6 +3932,23 @@ impl App {
             self.handle_module_setting_key(key);
             return true;
         }
+        if self.session_delete_confirm.is_some() {
+            self.session_delete_key(key);
+            return true;
+        }
+        if self.named_session_menu.is_some() {
+            // Context menu Esc should close the menu before the session popup.
+            if self.session_menu.is_some() && key.code == KeyCode::Esc {
+                self.session_menu = None;
+                return true;
+            }
+            if self.session_menu.is_some() {
+                self.handle_session_menu_key(key);
+                return true;
+            }
+            self.named_session_key(key);
+            return true;
+        }
         // The Settings modal captures all input while open.
         if self.settings.is_some() {
             self.handle_settings_key(key);
@@ -3435,6 +3967,11 @@ impl App {
         // The new-worktree branch prompt captures all input while open.
         if self.worktree_prompt.is_some() {
             self.handle_worktree_prompt_key(key);
+            return true;
+        }
+        // The open-worktree list modal captures all input while open.
+        if self.worktree_open.is_some() {
+            self.handle_worktree_open_key(key);
             return true;
         }
         // The tab-rename modal (docs/28) captures all input while open.
@@ -3537,6 +4074,28 @@ impl App {
         if self.mode == Mode::Resize {
             return self.handle_resize_mode_key(key);
         }
+        // Explicit direct shortcuts are the only normal-mode keys Luvus takes
+        // before pane/dashboard dispatch. The configured prefix retains
+        // precedence, and an empty direct map makes this a cheap no-op.
+        if self.mode == Mode::Normal && !self.prefix.matches(&key) {
+            if let Some(command) = keys::direct_command(&self.direct_keymap, &key) {
+                self.run_cmd(command);
+                return true;
+            }
+        }
+        // WORKSPACES/AGENTS dock focus is explicit and separate from pane focus.
+        if let Some(focus) = self.sidebar_focus {
+            if self.prefix.matches(&key) {
+                self.sidebar_focus = None;
+                self.mode = Mode::Prefix;
+            } else {
+                match focus {
+                    SidebarListFocus::Workspaces => self.handle_workspaces_key(key),
+                    SidebarListFocus::Agents => self.handle_agents_key(key),
+                };
+            }
+            return true;
+        }
         // FILES/DIFF dock focus is explicit and separate from terminal-pane
         // focus. The prefix remains available for global commands; ordinary
         // keys never leak into the pane until Esc/q returns control to it.
@@ -3577,18 +4136,28 @@ impl App {
                 if self.prefix.matches(&key) {
                     let prefix = self.prefix.key_event();
                     let newline = self.config.shift_enter_bytes().to_vec();
-                    let app_cursor = self.focused().is_some_and(|p| p.application_cursor());
-                    if let (Some(p), Some(bytes)) =
-                        (self.focused(), encode_key(&prefix, &newline, app_cursor))
-                    {
-                        p.send(&bytes);
+                    if let Some(pane) = self.focused() {
+                        let modes = pane.key_encoding_modes();
+                        if let Some(bytes) = encode_key_with_modes(
+                            &prefix,
+                            &newline,
+                            modes.application_cursor,
+                            modes.protocol,
+                        ) {
+                            pane.send(&bytes);
+                        }
                     }
                     return true; // left prefix mode → the status bar updates
                 }
-                // Fixed convenience keys (not rebindable): `1`–`9` jump to a tab,
-                // `?` opens the shortcut cheat-sheet.
+                // Fixed convenience keys (not rebindable): unshifted `1`–`9`
+                // jump to a tab, and `?` opens the shortcut cheat-sheet. Shifted
+                // digits continue to the configurable command map below, where
+                // their normalized number-row symbols select workspaces.
                 if let KeyCode::Char(c) = key.code {
-                    if c.is_ascii_digit() && c != '0' {
+                    if c.is_ascii_digit()
+                        && c != '0'
+                        && !key.modifiers.contains(KeyModifiers::SHIFT)
+                    {
                         self.switch_tab(c as usize - '1' as usize);
                         return true;
                     }
@@ -3598,13 +4167,10 @@ impl App {
                         return true;
                     }
                 }
-                // Fixed scrollback keys (like the digits above): scroll the
-                // focused pane's history. `[`/`]` page up/down (no Fn needed on a
-                // Mac), and so do PageUp/PageDown; Home/End jump to the top / live
-                // bottom (Fn+↑/↓/←/→ on a MacBook).
+                // Fixed physical scrollback keys: PageUp/PageDown move by a page;
+                // Home/End jump to the top / live bottom. Printable keys resolve
+                // through the configurable command map below.
                 let scroll_code = match key.code {
-                    KeyCode::Char('[') => Some(KeyCode::PageUp),
-                    KeyCode::Char(']') => Some(KeyCode::PageDown),
                     c @ (KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End) => {
                         Some(c)
                     }
@@ -3616,9 +4182,8 @@ impl App {
                 }
                 // Everything else resolves through the keybinding registry
                 // (defaults + user overrides; see `app/keys.rs`). `key_string`
-                // ignores modifiers, so the command key works whether you
-                // released Ctrl after the prefix (`Ctrl+Space` then `c`) or kept
-                // it held as a fast chord (`Ctrl+Space`+`Ctrl+c`).
+                // ignores held Ctrl/Alt and normalizes shifted digits, so both
+                // two-step and held-chord input resolve to the configured key.
                 if let Some(cmd) = keys::key_string(&key).and_then(|s| self.keymap.get(&s).copied())
                 {
                     self.run_cmd(cmd);
@@ -3668,8 +4233,13 @@ impl App {
                 let newline = self.config.shift_enter_bytes();
                 // Cursor keys follow the pane's DECCKM state: a `less` that
                 // turned application cursor mode on only recognizes SS3 codes.
-                let app_cursor = self.focused().is_some_and(|p| p.application_cursor());
-                if let Some(bytes) = encode_key(&key, newline, app_cursor) {
+                let modes = self
+                    .focused()
+                    .map(|pane| pane.key_encoding_modes())
+                    .unwrap_or_default();
+                if let Some(bytes) =
+                    encode_key_with_modes(&key, newline, modes.application_cursor, modes.protocol)
+                {
                     if let Some(p) = self.focused() {
                         // Typing snaps the view back to the live bottom, so you
                         // always see what you type (like every terminal).
@@ -3788,12 +4358,39 @@ fn mouse_wheel_seq(up: bool, col: u16, row: u16, sgr: bool) -> Vec<u8> {
 /// `app_cursor` mirrors the pane's DECCKM state: cursor keys go out as SS3
 /// (`ESC O <letter>`) when the app enabled application cursor mode, exactly as a
 /// real terminal would send them — some apps (`less`) only recognize the SS3
-/// form once they've turned the mode on.
-fn encode_key(key: &KeyEvent, newline: &[u8], app_cursor: bool) -> Option<Vec<u8>> {
+/// form once they've turned the mode on. Unnegotiated Alt+character stays
+/// ESC+char; after Kitty disambiguate it is CSI-u so `Alt+/` is not two keys.
+#[cfg(test)]
+fn encode_key(
+    key: &KeyEvent,
+    newline: &[u8],
+    app_cursor: bool,
+    disambiguate: bool,
+) -> Option<Vec<u8>> {
+    let protocol = if disambiguate {
+        KeyboardProtocol::Kitty {
+            flags: KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES,
+        }
+    } else {
+        KeyboardProtocol::Legacy
+    };
+    encode_key_with_modes(key, newline, app_cursor, protocol)
+}
+
+fn encode_key_with_modes(
+    key: &KeyEvent,
+    newline: &[u8],
+    app_cursor: bool,
+    protocol: KeyboardProtocol,
+) -> Option<Vec<u8>> {
     // AltGr arrives as Ctrl+Alt on Windows (`keys::is_ctrl_chord`) and types a
     // character — it is neither a Ctrl chord nor an `ESC`-prefixed Alt key.
     let ctrl = super::keys::is_ctrl_chord(key.modifiers);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    // Kitty's report-all mode implies disambiguation, even when the child did
+    // not also set the dedicated disambiguation bit.
+    let disambiguate = protocol.disambiguates_escape_codes();
+    let report_all = protocol.reports_all_keys();
     // True exactly when `is_ctrl_chord` refused a Ctrl+Alt press as AltGr. Only
     // the `Char` arm may act on it: every other key keeps both modifiers, so
     // `Ctrl+Alt+Enter` is still a modified Enter and sends the newline sequence.
@@ -3802,22 +4399,65 @@ fn encode_key(key: &KeyEvent, newline: &[u8], app_cursor: bool) -> Option<Vec<u8
 
     let bytes: Vec<u8> = match key.code {
         KeyCode::Char(c) => {
-            if ctrl {
-                let b = match c.to_ascii_lowercase() {
-                    'a'..='z' => (c.to_ascii_uppercase() as u8) & 0x1f,
-                    ' ' | '@' => 0,
-                    '[' => 0x1b,
-                    '\\' => 0x1c,
-                    ']' => 0x1d,
-                    '^' => 0x1e,
-                    '_' => 0x1f,
-                    _ => return None,
+            if report_all
+                && !altgr
+                && modified_char_has_canonical_identity(c, key.modifiers, cfg!(windows))
+            {
+                let codepoint = if ctrl && matches!(c, '/' | '7') {
+                    '/'
+                } else if c.is_alphabetic() {
+                    single_lowercase_codepoint(c)
+                } else {
+                    c
                 };
+                return Some(csi_u_char(codepoint, key.modifiers));
+            } else if ctrl {
+                if disambiguate
+                    && modified_char_has_canonical_identity(c, key.modifiers, cfg!(windows))
+                {
+                    // Once the nested application opts into Kitty keyboard
+                    // disambiguation, every Ctrl+character chord with a known
+                    // canonical identity uses CSI-u. This preserves the key
+                    // identity instead of mixing negotiated CSI-u with legacy
+                    // control bytes.
+                    let codepoint = match c {
+                        // Crossterm represents a legacy 0x1f input byte as
+                        // Ctrl+7. The originating terminal could not
+                        // distinguish it from Ctrl+/, so prefer the user-facing
+                        // slash binding for the nested CSI-u client.
+                        '/' | '7' => '/',
+                        // Kitty reports the unshifted codepoint and carries
+                        // Shift in the modifier parameter. Normalize Unicode
+                        // letters too when their lowercase form is one scalar.
+                        character if shift && character.is_alphabetic() => {
+                            single_lowercase_codepoint(character)
+                        }
+                        _ => c,
+                    };
+                    return Some(csi_u_char(codepoint, key.modifiers));
+                }
+                let b = legacy_control_byte(c)?;
                 if alt {
                     vec![0x1b, b]
                 } else {
                     vec![b]
                 }
+            } else if disambiguate
+                && !altgr
+                && (alt
+                    || key
+                        .modifiers
+                        .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META))
+                && modified_char_has_canonical_identity(c, key.modifiers, cfg!(windows))
+            {
+                // Kitty disambiguate reports alt/super+key as CSI-u instead of
+                // ESC+char or a Super-stripped character.
+                let codepoint = if shift && c.is_alphabetic() {
+                    single_lowercase_codepoint(c)
+                } else {
+                    c
+                };
+                return Some(csi_u_char(codepoint, key.modifiers));
             } else {
                 let mut s = c.to_string().into_bytes();
                 if alt && !altgr {
@@ -3829,36 +4469,67 @@ fn encode_key(key: &KeyEvent, newline: &[u8], app_cursor: bool) -> Option<Vec<u8
                 }
             }
         }
-        // Shift/Alt+Enter means "new line, don't submit" in every agent CLI.
-        // A terminal sends a bare `CR` for both Enter and Shift+Enter, so this
-        // only ever fires when the terminal disambiguates modified keys — either
-        // via the keyboard protocol (`main::push_key_protocol`, macOS/Linux) or
-        // native console records (Windows). The bytes are configurable
-        // (`config::shift_enter`); the default `ESC CR` is what agents expect out
-        // of the box (Claude Code's `/terminal-setup`).
+        // Preserve modified Enter identities after the child negotiates Kitty
+        // disambiguation. Some agents assign Shift+Enter and Alt+Enter distinct
+        // actions, so collapsing both to the configured newline would lose an
+        // identity the protocol explicitly preserves.
+        KeyCode::Enter if disambiguate && (shift || alt) => csi_u_code(13, key.modifiers),
+        KeyCode::Enter if report_all => csi_u_code(13, key.modifiers),
+        // Legacy input cannot reliably distinguish modified Enter variants.
+        // Keep the configurable compatibility sequence for agents that use
+        // either Shift+Enter or Alt+Enter as their newline chord.
         KeyCode::Enter if shift || alt => newline.to_vec(),
         KeyCode::Enter => vec![b'\r'],
-        KeyCode::Tab => vec![b'\t'],
-        KeyCode::BackTab => vec![0x1b, b'[', b'Z'],
-        // Ctrl+Backspace is "delete the word behind the cursor" in every editor,
-        // and `0x17` is the only encoding both shells act on. Measured in a pane,
-        // typing `hola mundo` and pressing it:
-        //
-        // | bytes     | PowerShell (PSReadLine) | bash (readline)   |
-        // |-----------|-------------------------|-------------------|
-        // | `0x17`    | `hola` — the word       | `hola` — the word |
-        // | `0x08`    | `hola` — the word       | `hola mund` — one |
-        // | `ESC DEL` | a literal `^H` printed  | `hola` — the word |
-        //
-        // `ESC DEL` is readline's own `backward-kill-word`, so it reads like the
-        // right answer and is the wrong one: ConPTY hands PSReadLine an escape it
-        // cannot decode and the junk lands in the prompt.
-        KeyCode::Backspace if ctrl => vec![0x17],
-        // Alt+Backspace keeps the standard Alt encoding — `ESC` then the key —
-        // like every other Alt chord here.
-        KeyCode::Backspace if alt => vec![0x1b, 0x7f],
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Esc => vec![0x1b],
+        KeyCode::Tab => {
+            if report_all {
+                csi_u_code(9, key.modifiers)
+            } else {
+                vec![b'\t']
+            }
+        }
+        KeyCode::BackTab => {
+            if report_all {
+                let mut modifiers = key.modifiers;
+                modifiers.insert(KeyModifiers::SHIFT);
+                csi_u_code(9, modifiers)
+            } else {
+                vec![0x1b, b'[', b'Z']
+            }
+        }
+        KeyCode::Backspace => {
+            if report_all {
+                csi_u_code(127, key.modifiers)
+            } else if ctrl {
+                // Ctrl+Backspace is "delete the word behind the cursor" in every
+                // editor, and `0x17` is the only legacy encoding both shells act
+                // on. Measured in a pane, typing `hola mundo` and pressing it:
+                //
+                // | bytes     | PowerShell (PSReadLine) | bash (readline)   |
+                // |-----------|-------------------------|-------------------|
+                // | `0x17`    | `hola` — the word       | `hola` — the word |
+                // | `0x08`    | `hola` — the word       | `hola mund` — one |
+                // | `ESC DEL` | a literal `^H` printed  | `hola` — the word |
+                //
+                // `ESC DEL` is readline's own `backward-kill-word`, so it reads
+                // like the right answer and is the wrong one: ConPTY hands
+                // PSReadLine an escape it cannot decode and the junk lands in the
+                // prompt.
+                vec![0x17]
+            } else if alt {
+                vec![0x1b, 0x7f]
+            } else {
+                vec![0x7f]
+            }
+        }
+        KeyCode::Esc => {
+            if disambiguate {
+                csi_u_code(27, key.modifiers)
+            } else if alt {
+                vec![0x1b, 0x1b]
+            } else {
+                vec![0x1b]
+            }
+        }
         // Keep navigation modifiers intact. Crossterm reports these directly
         // from Windows console records, while terminals on Unix report them via
         // xterm/Kitty escape sequences. Dropping the modifiers here turned
@@ -3901,8 +4572,60 @@ fn encode_key(key: &KeyEvent, newline: &[u8], app_cursor: bool) -> Option<Vec<u8
     Some(bytes)
 }
 
+/// A native Windows key event can contain only the shifted punctuation and its
+/// Shift modifier, not the unshifted key identity Kitty requires. Keep those
+/// combinations on the pre-existing legacy path until the Windows input layer
+/// can preserve the virtual-key or scan-code identity alongside the event.
+fn modified_char_has_canonical_identity(
+    character: char,
+    modifiers: KeyModifiers,
+    windows: bool,
+) -> bool {
+    !windows || !modifiers.contains(KeyModifiers::SHIFT) || character.is_alphabetic()
+}
+
+/// Lowercase a key identity only when Unicode maps it to exactly one scalar.
+fn single_lowercase_codepoint(character: char) -> char {
+    let mut lowercase = character.to_lowercase();
+    let first = lowercase.next().unwrap_or(character);
+    if lowercase.next().is_none() {
+        first
+    } else {
+        character
+    }
+}
+
+fn legacy_control_byte(character: char) -> Option<u8> {
+    Some(match character.to_ascii_lowercase() {
+        'a'..='z' => (character.to_ascii_uppercase() as u8) & 0x1f,
+        ' ' | '@' => 0,
+        '[' => 0x1b,
+        '\\' => 0x1c,
+        ']' => 0x1d,
+        '^' => 0x1e,
+        // Ctrl+/ is the user-facing chord for the US control byte. Legacy
+        // terminal input arrives through crossterm as Ctrl+7, while enhanced
+        // keyboard protocols preserve `/`.
+        '_' | '/' | '7' => 0x1f,
+        _ => return None,
+    })
+}
+
 fn csi(final_byte: u8) -> Vec<u8> {
     vec![0x1b, b'[', final_byte]
+}
+
+fn csi_u_char(character: char, modifiers: KeyModifiers) -> Vec<u8> {
+    csi_u_code(u32::from(character), modifiers)
+}
+
+fn csi_u_code(codepoint: u32, modifiers: KeyModifiers) -> Vec<u8> {
+    let modifier = key_modifier_param(modifiers);
+    if modifier == 1 {
+        format!("\x1b[{codepoint}u").into_bytes()
+    } else {
+        format!("\x1b[{codepoint};{modifier}u").into_bytes()
+    }
 }
 
 /// Encode a cursor key (arrows / Home / End). In application cursor mode
@@ -3951,6 +4674,106 @@ fn csi_tilde_key(code: u8, modifiers: KeyModifiers) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::keyboard::KittyKeyboardFlags;
+
+    #[test]
+    fn task_prompt_paste_preserves_normalized_newlines() {
+        let _env = crate::persist::test_env("orch-prompt-paste");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.orch_form = Some(crate::app::OrchForm {
+            kind: crate::app::OrchFormKind::Task,
+            field: crate::app::OrchFormField::Prompt,
+            ..crate::app::OrchForm::default()
+        });
+
+        assert!(app.paste_into_modal("first\r\nsecond\rthird\tline"));
+        assert_eq!(
+            app.orch_form.as_ref().unwrap().prompt,
+            "first\nsecond\nthirdline"
+        );
+    }
+
+    #[test]
+    fn image_path_paste_reaches_only_a_normal_focused_pane() {
+        let _env = crate::persist::test_env("image-path-paste-route");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        let focus = app.layout().focus;
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
+        app.panes
+            .get_mut(&focus)
+            .unwrap()
+            .replace_input_sender_for_test(input_tx);
+
+        let path = std::path::PathBuf::from("clipboard-images/example.png");
+        assert!(!app.handle_event(AppEvent::PasteImage(path.clone())));
+        let crate::terminal::pty::InputAction::Bytes(bytes) = input_rx.try_recv().unwrap() else {
+            panic!("image path should use the ordinary paste queue");
+        };
+        assert_eq!(bytes, path.to_string_lossy().as_bytes());
+
+        app.help_open = true;
+        let png = crate::clipboard_image::encode_rgba_png(1, 1, |_, _| [1, 2, 3, 255])
+            .expect("fixture PNG");
+        let blocked = crate::clipboard_image::stage_png(&png).expect("staged image");
+        assert!(!app.handle_event(AppEvent::PasteImage(blocked.clone())));
+        assert!(input_rx.try_recv().is_err());
+        assert!(app.help_open, "the image gesture must not dismiss help");
+        assert!(!blocked.exists(), "rejected image must not remain staged");
+    }
+
+    #[test]
+    fn prefix_digits_jump_to_tabs_and_shifted_digits_jump_to_workspaces() {
+        let _env = crate::persist::test_env("prefix-shifted-workspace-jump");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        let focus = app.layout().focus;
+        for position in 2..=9 {
+            app.workspaces[0]
+                .tabs
+                .push(Tab::panes(TileLayout::new(focus)));
+            app.workspaces.push(Workspace {
+                id: crate::ids::public_id("workspace"),
+                name: format!("workspace-{position}"),
+                cwd: std::path::PathBuf::from(format!("/tmp/workspace-{position}")),
+                branch: None,
+                git_ahead_behind: None,
+                worktree: None,
+                tabs: vec![Tab::panes(TileLayout::new(focus))],
+                active_tab: 0,
+                pinned: false,
+            });
+        }
+
+        let prefix = || AppEvent::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        let shifted = ['!', '@', '#', '$', '%', '^', '&', '*', '('];
+        for (index, (digit, symbol)) in ('1'..='9').zip(shifted).enumerate() {
+            app.active_ws = 0;
+            app.handle_event(prefix());
+            app.handle_event(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char(digit),
+                KeyModifiers::NONE,
+            )));
+            assert_eq!(app.active_ws, 0, "plain digit stays in the workspace");
+            assert_eq!(app.ws().active_tab, index, "plain digit jumps to a tab");
+
+            // Unix legacy input reports the shifted symbol without modifiers,
+            // Windows retains Shift on that symbol, and enhanced Unix input
+            // reports the base digit with Shift. All three travel through the
+            // real prefix path and resolve to the same configurable action.
+            for key in [
+                KeyEvent::new(KeyCode::Char(symbol), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char(symbol), KeyModifiers::SHIFT),
+                KeyEvent::new(KeyCode::Char(digit), KeyModifiers::SHIFT),
+            ] {
+                app.active_ws = usize::from(index == 0);
+                app.handle_event(prefix());
+                app.handle_event(AppEvent::Key(key));
+                assert_eq!(app.active_ws, index, "{key:?} jumps to workspace");
+            }
+        }
+    }
 
     #[test]
     fn command_inspect_fills_only_a_missing_process_root() {
@@ -4276,15 +5099,14 @@ mod tests {
         assert!(crate::platform::same_path(&app.ws().cwd, &open_root));
     }
 
-    // Agents treat Enter as "submit" and Shift+Enter as "new line". A terminal
-    // sends a bare CR for both, so luvus asks for the disambiguating keyboard
-    // protocol and forwards the modified form as `ESC CR` — the sequence agent
-    // CLIs already understand.
+    // Legacy input cannot preserve distinct Shift/Alt+Enter identities, so it
+    // keeps the configured compatibility sequence while plain Enter submits.
     #[test]
-    fn shift_enter_sends_a_newline_not_a_submit() {
+    fn legacy_modified_enter_sends_a_newline_not_a_submit() {
         // The default newline sequence is `ESC CR`.
         let nl = b"\x1b\r";
-        let enter = |m: KeyModifiers| encode_key(&KeyEvent::new(KeyCode::Enter, m), nl, false);
+        let enter =
+            |m: KeyModifiers| encode_key(&KeyEvent::new(KeyCode::Enter, m), nl, false, false);
         assert_eq!(
             enter(KeyModifiers::NONE),
             Some(b"\r".to_vec()),
@@ -4305,9 +5127,62 @@ mod tests {
             encode_key(
                 &KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
                 nl,
+                false,
                 false
             ),
             Some(b"\r".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_modes_preserve_modified_enter_identity() {
+        let encode = |modifiers, protocol| {
+            encode_key_with_modes(
+                &KeyEvent::new(KeyCode::Enter, modifiers),
+                b"\x1b\r",
+                false,
+                protocol,
+            )
+        };
+
+        for protocol in [
+            KeyboardProtocol::Kitty {
+                flags: KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES,
+            },
+            KeyboardProtocol::Kitty {
+                flags: KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+            },
+        ] {
+            assert_eq!(
+                encode(KeyModifiers::SHIFT, protocol),
+                Some(b"\x1b[13;2u".to_vec())
+            );
+            assert_eq!(
+                encode(KeyModifiers::ALT, protocol),
+                Some(b"\x1b[13;3u".to_vec())
+            );
+            assert_eq!(
+                encode(KeyModifiers::SHIFT | KeyModifiers::ALT, protocol),
+                Some(b"\x1b[13;4u".to_vec())
+            );
+        }
+        assert_eq!(
+            encode(
+                KeyModifiers::NONE,
+                KeyboardProtocol::Kitty {
+                    flags: KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES,
+                },
+            ),
+            Some(b"\r".to_vec())
+        );
+        assert_eq!(
+            encode(
+                KeyModifiers::NONE,
+                KeyboardProtocol::Kitty {
+                    flags: KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+                },
+            ),
+            Some(b"\x1b[13u".to_vec())
         );
     }
 
@@ -4319,8 +5194,9 @@ mod tests {
     fn altgr_types_its_character_instead_of_a_control_byte() {
         let nl = b"\x1b\r";
         let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
-        let enc =
-            |c: char, m: KeyModifiers| encode_key(&KeyEvent::new(KeyCode::Char(c), m), nl, false);
+        let enc = |c: char, m: KeyModifiers| {
+            encode_key(&KeyEvent::new(KeyCode::Char(c), m), nl, false, false)
+        };
         if cfg!(windows) {
             for c in ['\\', '@', '#', '[', ']', '{', '}', '|', '~', '€'] {
                 assert_eq!(
@@ -4347,7 +5223,7 @@ mod tests {
         // The exception is for characters only: every other key keeps both
         // modifiers, so Ctrl+Alt+Enter is still a modified Enter.
         assert_eq!(
-            encode_key(&KeyEvent::new(KeyCode::Enter, altgr), nl, false),
+            encode_key(&KeyEvent::new(KeyCode::Enter, altgr), nl, false, false),
             Some(nl.to_vec()),
             "Ctrl+Alt+Enter still sends the configured newline"
         );
@@ -4358,14 +5234,20 @@ mod tests {
     #[test]
     fn shift_enter_sequence_is_configurable() {
         let shift = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
-        assert_eq!(encode_key(&shift, b"\n", false), Some(b"\n".to_vec()));
         assert_eq!(
-            encode_key(&shift, b"\x1b[13;2u", false),
+            encode_key(&shift, b"\n", false, false),
+            Some(b"\n".to_vec())
+        );
+        assert_eq!(
+            encode_key(&shift, b"\x1b[13;2u", false, false),
             Some(b"\x1b[13;2u".to_vec())
         );
         // Plain Enter ignores the newline sequence and always submits.
         let plain = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(encode_key(&plain, b"\n", false), Some(b"\r".to_vec()));
+        assert_eq!(
+            encode_key(&plain, b"\n", false, false),
+            Some(b"\r".to_vec())
+        );
     }
 
     #[test]
@@ -4374,6 +5256,7 @@ mod tests {
             encode_key(
                 &KeyEvent::new(KeyCode::Char('a'), modifiers),
                 b"\x1b\r",
+                false,
                 false,
             )
         };
@@ -4400,6 +5283,7 @@ mod tests {
                 &KeyEvent::new(KeyCode::Backspace, modifiers),
                 b"\x1b\r",
                 false,
+                false,
             )
         };
 
@@ -4413,8 +5297,304 @@ mod tests {
     }
 
     #[test]
+    fn alt_punctuation_uses_csi_u_only_after_negotiation() {
+        let encode = |character, disambiguate| {
+            encode_key(
+                &KeyEvent::new(KeyCode::Char(character), KeyModifiers::ALT),
+                b"\x1b\r",
+                false,
+                disambiguate,
+            )
+        };
+
+        assert_eq!(encode('/', false), Some(b"\x1b/".to_vec()));
+        assert_eq!(encode(';', false), Some(b"\x1b;".to_vec()));
+        assert_eq!(encode('a', false), Some(b"\x1ba".to_vec()));
+
+        assert_eq!(encode('/', true), Some(b"\x1b[47;3u".to_vec()));
+        assert_eq!(encode(';', true), Some(b"\x1b[59;3u".to_vec()));
+        assert_eq!(encode('\'', true), Some(b"\x1b[39;3u".to_vec()));
+        assert_eq!(encode('a', true), Some(b"\x1b[97;3u".to_vec()));
+        assert_eq!(
+            encode_key(
+                &KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+                b"\x1b\r",
+                false,
+                true,
+            ),
+            Some(if cfg!(windows) {
+                b"\x1b/".to_vec()
+            } else {
+                b"\x1b[47;4u".to_vec()
+            })
+        );
+    }
+
+    #[test]
+    fn alt_backspace_sends_meta_delete_for_word_deletion() {
+        let key = |modifiers, disambiguate| {
+            encode_key(
+                &KeyEvent::new(KeyCode::Backspace, modifiers),
+                b"\x1b\r",
+                false,
+                disambiguate,
+            )
+        };
+
+        assert_eq!(key(KeyModifiers::NONE, false), Some(vec![0x7f]));
+        assert_eq!(key(KeyModifiers::NONE, true), Some(vec![0x7f]));
+        assert_eq!(key(KeyModifiers::ALT, false), Some(vec![0x1b, 0x7f]));
+        assert_eq!(key(KeyModifiers::ALT, true), Some(vec![0x1b, 0x7f]));
+        // This fork: Ctrl+Backspace deletes a word as `0x17` (see the Backspace
+        // arm of `encode_key` and `ctrl_backspace_kills_the_word_behind_the_cursor`).
+        assert_eq!(key(KeyModifiers::CONTROL, false), Some(vec![0x17]));
+        assert_eq!(key(KeyModifiers::CONTROL, true), Some(vec![0x17]));
+    }
+
+    #[test]
+    fn tab_and_backspace_require_report_all_for_csi_u() {
+        let encode = |code, modifiers, protocol| {
+            encode_key_with_modes(&KeyEvent::new(code, modifiers), b"\x1b\r", false, protocol)
+        };
+
+        for protocol in [
+            KeyboardProtocol::Legacy,
+            KeyboardProtocol::Kitty {
+                flags: KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES,
+            },
+        ] {
+            assert_eq!(
+                encode(KeyCode::Tab, KeyModifiers::CONTROL, protocol),
+                Some(b"\t".to_vec())
+            );
+            assert_eq!(
+                encode(KeyCode::BackTab, KeyModifiers::NONE, protocol),
+                Some(b"\x1b[Z".to_vec())
+            );
+            assert_eq!(
+                encode(KeyCode::Backspace, KeyModifiers::ALT, protocol),
+                Some(vec![0x1b, 0x7f])
+            );
+        }
+
+        let report_all = KeyboardProtocol::Kitty {
+            flags: KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+        };
+        assert_eq!(
+            encode(KeyCode::Tab, KeyModifiers::CONTROL, report_all),
+            Some(b"\x1b[9;5u".to_vec())
+        );
+        assert_eq!(
+            encode(KeyCode::Tab, KeyModifiers::ALT, report_all),
+            Some(b"\x1b[9;3u".to_vec())
+        );
+        assert_eq!(
+            encode(KeyCode::BackTab, KeyModifiers::NONE, report_all),
+            Some(b"\x1b[9;2u".to_vec())
+        );
+        assert_eq!(
+            encode(KeyCode::Backspace, KeyModifiers::ALT, report_all),
+            Some(b"\x1b[127;3u".to_vec())
+        );
+        assert_eq!(
+            encode(KeyCode::Backspace, KeyModifiers::CONTROL, report_all),
+            Some(b"\x1b[127;5u".to_vec())
+        );
+        assert_eq!(
+            encode(KeyCode::Enter, KeyModifiers::NONE, report_all),
+            Some(b"\x1b[13u".to_vec())
+        );
+        assert_eq!(
+            encode(KeyCode::Char('a'), KeyModifiers::NONE, report_all),
+            Some(b"\x1b[97u".to_vec())
+        );
+        assert_eq!(
+            encode(KeyCode::Char('A'), KeyModifiers::SHIFT, report_all),
+            Some(b"\x1b[97;2u".to_vec())
+        );
+        assert_eq!(
+            encode(KeyCode::Char('7'), KeyModifiers::CONTROL, report_all),
+            Some(b"\x1b[47;5u".to_vec())
+        );
+    }
+
+    #[test]
+    fn disambiguate_and_report_all_encode_esc_and_modified_chars() {
+        let encode = |code, modifiers, protocol| {
+            encode_key_with_modes(&KeyEvent::new(code, modifiers), b"\x1b\r", false, protocol)
+        };
+
+        assert_eq!(
+            encode(KeyCode::Esc, KeyModifiers::NONE, KeyboardProtocol::Legacy),
+            Some(vec![0x1b])
+        );
+        for protocol in [
+            KeyboardProtocol::Kitty {
+                flags: KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES,
+            },
+            KeyboardProtocol::Kitty {
+                flags: KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+            },
+        ] {
+            assert_eq!(
+                encode(KeyCode::Esc, KeyModifiers::NONE, protocol),
+                Some(b"\x1b[27u".to_vec())
+            );
+            assert_eq!(
+                encode(KeyCode::Esc, KeyModifiers::ALT, protocol),
+                Some(b"\x1b[27;3u".to_vec())
+            );
+            assert_eq!(
+                encode(KeyCode::Char('a'), KeyModifiers::SUPER, protocol),
+                Some(b"\x1b[97;9u".to_vec())
+            );
+        }
+        assert_eq!(
+            encode(KeyCode::Esc, KeyModifiers::ALT, KeyboardProtocol::Legacy),
+            Some(vec![0x1b, 0x1b])
+        );
+        assert_eq!(
+            encode(
+                KeyCode::Char('a'),
+                KeyModifiers::SUPER,
+                KeyboardProtocol::Legacy
+            ),
+            Some(b"a".to_vec())
+        );
+    }
+
+    #[test]
+    fn windows_shifted_punctuation_is_excluded_from_csi_u_without_key_identity() {
+        let alt_shift = KeyModifiers::ALT | KeyModifiers::SHIFT;
+        assert!(!modified_char_has_canonical_identity('?', alt_shift, true));
+        assert!(!modified_char_has_canonical_identity('/', alt_shift, true));
+        assert!(!modified_char_has_canonical_identity('€', alt_shift, true));
+        assert!(modified_char_has_canonical_identity('A', alt_shift, true));
+        assert!(modified_char_has_canonical_identity('?', alt_shift, false));
+    }
+
+    #[test]
+    fn control_slash_reaches_nested_tuis_across_terminal_encodings() {
+        let encode = |character, disambiguate| {
+            encode_key(
+                &KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL),
+                b"\x1b\r",
+                false,
+                disambiguate,
+            )
+        };
+
+        assert_eq!(encode('/', false), Some(vec![0x1f]));
+        assert_eq!(
+            encode('7', false),
+            Some(vec![0x1f]),
+            "crossterm decodes the legacy 0x1f byte as Ctrl+7"
+        );
+        assert_eq!(encode('_', false), Some(vec![0x1f]));
+
+        assert_eq!(encode('/', true), Some(b"\x1b[47;5u".to_vec()));
+        assert_eq!(
+            encode('7', true),
+            Some(b"\x1b[47;5u".to_vec()),
+            "a legacy Ctrl+/ alias regains slash identity for a nested CSI-u client"
+        );
+        assert_eq!(encode('_', true), Some(b"\x1b[95;5u".to_vec()));
+    }
+
+    #[test]
+    fn control_characters_use_full_csi_u_only_after_negotiation() {
+        let encode = |character, disambiguate| {
+            encode_key(
+                &KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL),
+                b"\x1b\r",
+                false,
+                disambiguate,
+            )
+        };
+
+        // Legacy mode retains traditional control bytes and cannot represent
+        // the remaining chords without losing their Ctrl modifier.
+        assert_eq!(encode('a', false), Some(vec![0x01]));
+        assert_eq!(encode('[', false), Some(vec![0x1b]));
+        for character in [';', '\'', ',', '.', '-', '=', '`', '1', '8', '€'] {
+            assert_eq!(
+                encode(character, false),
+                None,
+                "Ctrl+{character} has no legacy representation"
+            );
+        }
+
+        // After the nested application opts in, every Ctrl+character chord is
+        // encoded consistently as CSI-u, including those with legacy bytes.
+        for character in ['a', '[', ';', '\'', ',', '.', '-', '=', '`', '1', '8', '€'] {
+            assert_eq!(
+                encode(character, true),
+                Some(format!("\x1b[{};5u", character as u32).into_bytes()),
+                "Ctrl+{character} should use negotiated CSI-u"
+            );
+        }
+        // Shifted Unicode letters use their unshifted, single-codepoint form
+        // once CSI-u is negotiated. Legacy mode remains unable to represent
+        // this chord and therefore keeps its previous no-output behavior.
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        let unicode = |disambiguate| {
+            encode_key(
+                &KeyEvent::new(KeyCode::Char('É'), ctrl_shift),
+                b"\x1b\r",
+                false,
+                disambiguate,
+            )
+        };
+        assert_eq!(unicode(false), None);
+        assert_eq!(
+            unicode(true),
+            Some(format!("\x1b[{};6u", 'é' as u32).into_bytes())
+        );
+    }
+
+    /// `Ctrl+Shift+<letter>` must survive the trip to a nested TUI. The legacy
+    /// fold `to_ascii_uppercase() & 0x1f` is caseless, so it maps Ctrl+Shift+P
+    /// and Ctrl+P onto the same 0x10 and an agent binding the shifted chord
+    /// silently gets the unshifted action instead.
+    #[test]
+    fn control_shift_letters_reach_nested_tuis_distinctly() {
+        let encode = |character, modifiers, disambiguate| {
+            encode_key(
+                &KeyEvent::new(KeyCode::Char(character), modifiers),
+                b"\x1b\r",
+                false,
+                disambiguate,
+            )
+        };
+        let ctrl = KeyModifiers::CONTROL;
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+
+        // Legacy encoding cannot separate them; this is the collapse itself.
+        assert_eq!(encode('p', ctrl, false), Some(vec![0x10]));
+        assert_eq!(encode('p', ctrl_shift, false), Some(vec![0x10]));
+
+        // A CSI-u client gets full negotiated encoding for both chords. The
+        // codepoint stays lowercase `p` and Shift rides in the modifier param:
+        // 5 = ctrl, 6 = ctrl+shift.
+        assert_eq!(encode('p', ctrl, true), Some(b"\x1b[112;5u".to_vec()));
+        assert_eq!(encode('p', ctrl_shift, true), Some(b"\x1b[112;6u".to_vec()));
+        assert_ne!(encode('p', ctrl, true), encode('p', ctrl_shift, true));
+
+        // Crossterm may report the shifted press as uppercase; it must still
+        // report 112, never 80, or the ambiguity returns.
+        assert_eq!(encode('P', ctrl_shift, true), Some(b"\x1b[112;6u".to_vec()));
+
+        // Plain typing and Shift-only capitals remain untouched by the
+        // negotiated Ctrl encoding.
+        assert_eq!(encode('a', ctrl, true), Some(b"\x1b[97;5u".to_vec()));
+        assert_eq!(encode('A', KeyModifiers::SHIFT, true), Some(b"A".to_vec()));
+        assert_eq!(encode('a', KeyModifiers::NONE, true), Some(b"a".to_vec()));
+    }
+
+    #[test]
     fn navigation_keys_preserve_modifiers_for_nested_prompt_editors() {
-        let key = |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", false);
+        let key =
+            |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", false, false);
 
         // The existing unmodified sequences stay byte-for-byte compatible.
         assert_eq!(
@@ -4462,7 +5642,8 @@ mod tests {
         // When the pane enabled DECCKM (`ESC[?1h`), unmodified cursor keys go out
         // as SS3 (`ESC O <letter>`) — the bytes a real terminal sends once the
         // app turned the mode on. `less` is strict about this and ignores CSI.
-        let app = |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", true);
+        let app =
+            |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", true, false);
         assert_eq!(
             app(KeyCode::Up, KeyModifiers::NONE),
             Some(b"\x1bOA".to_vec())
@@ -4501,7 +5682,8 @@ mod tests {
 
     #[test]
     fn tilde_navigation_keys_preserve_modifiers() {
-        let key = |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", false);
+        let key =
+            |code, modifiers| encode_key(&KeyEvent::new(code, modifiers), b"\x1b\r", false, false);
         assert_eq!(
             key(KeyCode::Delete, KeyModifiers::NONE),
             Some(b"\x1b[3~".to_vec())
@@ -4518,8 +5700,14 @@ mod tests {
 
     #[test]
     fn function_keys_encode_to_tilde_codes() {
-        let key =
-            |n, modifiers| encode_key(&KeyEvent::new(KeyCode::F(n), modifiers), b"\x1b\r", false);
+        let key = |n, modifiers| {
+            encode_key(
+                &KeyEvent::new(KeyCode::F(n), modifiers),
+                b"\x1b\r",
+                false,
+                false,
+            )
+        };
         // F1–F4 and F5–F12 carry the standard xterm CSI-tilde codes.
         assert_eq!(key(1, KeyModifiers::NONE), Some(b"\x1b[11~".to_vec()));
         assert_eq!(key(4, KeyModifiers::NONE), Some(b"\x1b[14~".to_vec()));
@@ -5026,6 +6214,231 @@ mod link_click_tests {
         assert_eq!(app.layout().focus, worker);
     }
 
+    fn add_active_agent_automation(app: &mut App) -> (crate::ids::PaneId, String) {
+        let pane = app.layout().focus;
+        let terminal_id = app
+            .panes
+            .get(&pane)
+            .and_then(|pane| pane.terminal_runtime())
+            .expect("test pane has a live terminal")
+            .terminal_id;
+        app.status.get_mut(&pane).unwrap().agent = "codex".into();
+        let workspace_id = app.workspace_of_pane(pane).unwrap().id.clone();
+        let definition = app
+            .automation
+            .create(
+                crate::automation::CreateAutomation {
+                    name: "continue review".into(),
+                    enabled: true,
+                    trigger: crate::automation::Trigger::Once {
+                        at_utc: 4_000_000_000,
+                    },
+                    target: crate::automation::AutomationTarget::ActiveAgent {
+                        pane_id: pane.0,
+                        terminal_id,
+                        if_busy: crate::automation::ActiveAgentBusyPolicy::Wait,
+                        durable: None,
+                    },
+                    task: crate::automation::TaskTemplate {
+                        title: "continue review".into(),
+                        prompt: "Review the current changes.".into(),
+                        agent_id: "codex".into(),
+                        workspace_id,
+                        mode: crate::orch::TaskWorkerMode::Workspace,
+                        access: crate::automation::AutomationAccess::Workspace,
+                        paths: Vec::new(),
+                        gate: None,
+                    },
+                    policy: crate::automation::AutomationPolicy::default(),
+                },
+                None,
+                10,
+            )
+            .unwrap();
+        (pane, definition.id)
+    }
+
+    #[test]
+    fn automation_row_opens_details_and_uses_the_live_agent_context() {
+        let _env = crate::persist::test_env("automation-row-actions");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 30, tx).unwrap();
+        let (pane, automation) = add_active_agent_automation(&mut app);
+        app.open_orch_board();
+        app.orch_view = crate::app::OrchView::Automations;
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let row = app
+            .orch_hits
+            .iter()
+            .find_map(|(hit, rect)| {
+                matches!(hit, OrchHit::Automation(id) if id == &automation).then_some(*rect)
+            })
+            .expect("automation row is clickable");
+        let at = (row.x + 1, row.y);
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert!(matches!(
+            app.agent_menu.as_ref().map(|menu| menu.target.clone()),
+            Some(AgentTarget::Live(target)) if target == pane
+        ));
+        assert!(app.orch_detail.is_none());
+        app.agent_menu = None;
+
+        double_click(&mut app, at);
+        assert_eq!(app.orch_detail.as_deref(), Some(automation.as_str()));
+        app.handle_orch_detail_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.orch_detail.is_none());
+        assert!(!app.active_is_orch());
+        assert_eq!(app.layout().focus, pane);
+    }
+
+    #[test]
+    fn automation_detail_enter_follows_a_live_orch_worker() {
+        let _env = crate::persist::test_env("automation-worker-detail");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 30, tx).unwrap();
+        let worker = app.layout().focus;
+        let workspace_id = app.workspaces[0].id.clone();
+        let definition = app
+            .automation
+            .create(
+                crate::automation::CreateAutomation {
+                    name: "scheduled review".into(),
+                    enabled: true,
+                    trigger: crate::automation::Trigger::Once {
+                        at_utc: 4_000_000_000,
+                    },
+                    target: crate::automation::AutomationTarget::NewWorker,
+                    task: crate::automation::TaskTemplate {
+                        title: "scheduled review".into(),
+                        prompt: "Review changes".into(),
+                        agent_id: "codex".into(),
+                        workspace_id,
+                        mode: crate::orch::TaskWorkerMode::Workspace,
+                        access: crate::automation::AutomationAccess::Workspace,
+                        paths: Vec::new(),
+                        gate: None,
+                    },
+                    policy: crate::automation::AutomationPolicy::default(),
+                },
+                None,
+                10,
+            )
+            .unwrap();
+        let run = app
+            .automation
+            .request_run(&definition.id, None, 20)
+            .unwrap();
+        let task = app
+            .orch
+            .add_task("scheduled review".into(), Vec::new(), Vec::new(), None)
+            .unwrap();
+        app.orch.claim(&task.id, worker.0).unwrap();
+        app.automation
+            .bind_task(&run.id, task.id.clone(), 21)
+            .unwrap();
+        app.open_orch_board();
+        app.open_automation_detail(&definition.id);
+
+        app.handle_orch_detail_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.orch_detail.is_none());
+        assert!(!app.active_is_orch());
+        assert_eq!(app.layout().focus, worker);
+    }
+
+    #[test]
+    fn scheduled_sidebar_uses_detail_on_left_and_agent_menu_on_right() {
+        let _env = crate::persist::test_env("automation-sidebar-actions");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 30, tx).unwrap();
+        let (pane, automation) = add_active_agent_automation(&mut app);
+        let row = Rect::new(2, 4, 24, 2);
+        app.automation_rects = vec![(automation.clone(), row)];
+        let at = (row.x + 1, row.y);
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert!(matches!(
+            app.agent_menu.as_ref().map(|menu| menu.target.clone()),
+            Some(AgentTarget::Live(target)) if target == pane
+        ));
+        assert!(app.orch_detail.is_none());
+        app.agent_menu = None;
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.orch_detail.as_deref(), Some(automation.as_str()));
+        assert!(app.agent_menu.is_none());
+    }
+
+    #[test]
+    fn scheduled_sidebar_opens_automation_menu_without_a_live_pane() {
+        let _env = crate::persist::test_env("automation-sidebar-placeholder-menu");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 30, tx).unwrap();
+        let workspace_id = app.workspaces[0].id.clone();
+        let definition = app
+            .automation
+            .create(
+                crate::automation::CreateAutomation {
+                    name: "scheduled review".into(),
+                    enabled: true,
+                    trigger: crate::automation::Trigger::Once {
+                        at_utc: 4_000_000_000,
+                    },
+                    target: crate::automation::AutomationTarget::NewWorker,
+                    task: crate::automation::TaskTemplate {
+                        title: "scheduled review".into(),
+                        prompt: "Review changes".into(),
+                        agent_id: "codex".into(),
+                        workspace_id,
+                        mode: crate::orch::TaskWorkerMode::Workspace,
+                        access: crate::automation::AutomationAccess::Workspace,
+                        paths: Vec::new(),
+                        gate: None,
+                    },
+                    policy: crate::automation::AutomationPolicy::default(),
+                },
+                None,
+                10,
+            )
+            .unwrap();
+        let row = Rect::new(2, 4, 24, 2);
+        app.automation_rects = vec![(definition.id.clone(), row)];
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            (row.x + 1, row.y),
+            KeyModifiers::NONE,
+        ));
+
+        let menu = app.agent_menu.as_ref().expect("automation menu opens");
+        assert_eq!(menu.target, AgentTarget::Automation(definition.id.clone()));
+        let items = app.agent_menu_items(menu.target.clone());
+        assert!(items.contains(&crate::app::AgentMenuItem::AutomationDetails));
+        assert!(items.contains(&crate::app::AgentMenuItem::AutomationRun));
+        assert!(items.contains(&crate::app::AgentMenuItem::AutomationToggle));
+        assert!(items.contains(&crate::app::AgentMenuItem::AutomationDelete));
+        assert!(app.orch_detail.is_none());
+
+        app.agent_menu_action(crate::app::AgentMenuItem::AutomationDetails);
+        assert_eq!(app.orch_detail.as_deref(), Some(definition.id.as_str()));
+        assert!(app.agent_menu.is_none());
+    }
+
     #[test]
     fn new_task_form_stays_open_inside_and_closes_on_its_backdrop() {
         let _env = crate::persist::test_env("orch-form-backdrop");
@@ -5176,6 +6589,35 @@ mod link_click_tests {
         (app, term, (content.x + at, content.y))
     }
 
+    /// A fixture whose visible label and OSC 8 target intentionally differ.
+    fn fixture_showing_osc8(
+        label: &str,
+        uri: &str,
+        at: u16,
+    ) -> (App, Terminal<TestBackend>, (u16, u16)) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let pane = app.layout().focus;
+        let sequence = format!("\x1b[H\x1b[2J\x1b]8;id=agent;{uri}\x1b\\{label}\x1b]8;;\x1b\\\r\n");
+        app.panes
+            .get(&pane)
+            .unwrap()
+            .engine
+            .lock()
+            .unwrap()
+            .advance(sequence.as_bytes());
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(p, _)| *p == pane)
+            .map(|(_, r)| *r)
+            .expect("pane content rect");
+        (app, term, (content.x + at, content.y))
+    }
+
     fn double_click(app: &mut App, at: (u16, u16)) {
         app.handle_event(mouse(
             MouseEventKind::Down(MouseButton::Left),
@@ -5225,6 +6667,58 @@ mod link_click_tests {
         let (app, id, tabs) = click_cargo_toml(KeyModifiers::CONTROL);
         assert_eq!(app.ws().tabs.len(), tabs, "no new tab");
         assert!(app.preview_views.contains(&id), "it is the preview pane");
+    }
+
+    #[test]
+    fn osc8_file_target_overrides_a_domain_shaped_label() {
+        let _env = crate::persist::test_env("link-osc8-file");
+        let path = std::env::current_dir().unwrap().join("Cargo.toml");
+        let uri = format!("file://{}", path.display());
+        let (app, _term, at) = fixture_showing_osc8("luvus.dev", &uri, 2);
+
+        match app.link_at_screen(at.0, at.1).map(|hover| hover.target) {
+            Some(LinkTarget::File {
+                path: target,
+                line: None,
+            }) => assert_eq!(target, path),
+            other => panic!("OSC 8 file target must win over its label, got {other:?}"),
+        }
+        assert!(app.pending_open_url.is_none());
+    }
+
+    #[test]
+    fn osc8_file_label_preserves_a_visible_line_number() {
+        let _env = crate::persist::test_env("link-osc8-line");
+        let path = std::env::current_dir().unwrap().join("Cargo.toml");
+        let uri = format!("file://{}", path.display());
+        let (app, _term, at) = fixture_showing_osc8("Cargo.toml:42", &uri, 3);
+
+        assert!(matches!(
+            app.link_at_screen(at.0, at.1).map(|hover| hover.target),
+            Some(LinkTarget::File {
+                path: target,
+                line: Some(42)
+            }) if target == path
+        ));
+    }
+
+    #[test]
+    fn unsupported_osc8_target_is_inert_without_label_fallback() {
+        let _env = crate::persist::test_env("link-osc8-inert");
+        let (app, _term, at) = fixture_showing_osc8("luvus.dev", "vscode://file/repo/main.rs", 2);
+
+        assert_eq!(app.link_at_screen(at.0, at.1), None);
+    }
+
+    #[test]
+    fn http_osc8_target_opens_even_when_its_label_looks_like_a_file() {
+        let _env = crate::persist::test_env("link-osc8-http");
+        let (app, _term, at) = fixture_showing_osc8("Cargo.toml", "https://example.com/actual", 2);
+
+        assert_eq!(
+            app.link_at_screen(at.0, at.1).map(|hover| hover.target),
+            Some(LinkTarget::Url("https://example.com/actual".into()))
+        );
     }
 
     /// `Open in tab` is the other click behavior, and the only placement that
@@ -5519,6 +7013,20 @@ mod link_click_tests {
                 " Morning arrives without ceremony,\n a thin gold line on the edge of the glass.\n The kettle speaks in its private language,"
             )
         );
+        assert!(
+            app.selection.is_some(),
+            "the copied drag keeps its highlight briefly"
+        );
+        assert!(
+            !app.tick_copy_highlight(Instant::now()),
+            "the highlight stays until the toast cadence elapses"
+        );
+        assert!(app.selection.is_some());
+        assert!(
+            app.tick_copy_highlight(Instant::now() + COPY_HIGHLIGHT_DURATION),
+            "the highlight clears once the timer expires"
+        );
+        assert!(app.selection.is_none());
     }
 
     #[test]
@@ -5656,10 +7164,14 @@ mod link_click_tests {
             KeyModifiers::NONE,
         ));
         assert!(
-            app.cmd_inspect.is_some(),
-            "the title click opened the command overlay (setup sanity)"
+            app.cmd_inspect.is_none(),
+            "the title click did not open the command overlay"
         );
-        app.close_cmd_inspect();
+        assert_eq!(
+            app.layout().focus,
+            bottom,
+            "the title click focused the pane"
+        );
         // Reset focus *after* the title click, so only the body click can move it.
         app.layout_mut().focus = top;
         app.handle_event(mouse(
@@ -5714,6 +7226,66 @@ mod link_click_tests {
             "the second press copies the whitespace word"
         );
         assert!(app.selection.is_some(), "and highlights it");
+        let clear_at = app
+            .selection_clear_at
+            .expect("the second press schedules highlight expiry");
+
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert!(!app.dbl_click_release, "release closes the gesture");
+        assert_eq!(
+            app.selection_clear_at,
+            Some(clear_at),
+            "release does not restart the press-time expiry"
+        );
+        assert!(app.tick_copy_highlight(clear_at));
+        assert!(app.selection.is_none(), "the press-time deadline clears it");
+    }
+
+    #[test]
+    fn a_new_left_press_clears_a_copied_highlight_before_overlay_handling() {
+        let _env = crate::persist::test_env("copy-highlight-overlay-click");
+        let (mut app, _t, at) = fixture_showing("hello world", 6);
+        let end = (at.0 + 4, at.1);
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            end,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            end,
+            KeyModifiers::NONE,
+        ));
+        assert!(app.selection.is_some(), "the copied drag is highlighted");
+        assert!(
+            app.selection_clear_at.is_some(),
+            "the copied drag has a pending expiry"
+        );
+
+        // The help overlay returns near the start of `apply_mouse`. Its click
+        // must still replace the delayed terminal highlight immediately.
+        app.help_open = true;
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            (0, 0),
+            KeyModifiers::NONE,
+        ));
+        assert!(!app.help_open, "the overlay handled the click");
+        assert!(app.selection.is_none(), "the old highlight cleared first");
+        assert!(
+            app.selection_clear_at.is_none(),
+            "its obsolete timer cleared with it"
+        );
     }
 
     #[test]
