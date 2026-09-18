@@ -22,6 +22,12 @@
       "required": ["major"],
       "additionalProperties": false
     },
+    "features": {
+      "type": "object",
+      "properties": { "machines": { "const": true } },
+      "required": ["machines"],
+      "additionalProperties": false
+    },
     "endpoint": {
       "type": "object",
       "properties": {
@@ -49,13 +55,18 @@
         "mode": { "enum": ["read_only", "control"] },
         "scopes": {
           "type": "array",
-          "items": { "enum": ["read", "workspace", "agent", "terminal"] },
+          "items": { "enum": ["read", "workspace", "agent", "terminal", "orchestration", "machine"] },
           "minItems": 1,
           "uniqueItems": true
         },
-        "expires_at": { "type": "integer", "minimum": 0 }
+        "expires_at": { "type": "integer", "minimum": 0 },
+        "expires_on_close": { "const": true }
       },
-      "required": ["mode", "scopes", "expires_at"],
+      "required": ["mode", "scopes"],
+      "oneOf": [
+        { "required": ["expires_at"], "not": { "required": ["expires_on_close"] } },
+        { "required": ["expires_on_close"], "not": { "required": ["expires_at"] } }
+      ],
       "additionalProperties": false
     }
   },
@@ -67,7 +78,11 @@
     },
     {
       "if": { "properties": { "authority": { "properties": { "mode": { "const": "control" } }, "required": ["mode"] } } },
-      "then": { "properties": { "authority": { "properties": { "scopes": { "const": ["read", "workspace", "agent", "terminal"] } } } } }
+      "then": { "properties": { "authority": { "properties": { "scopes": { "oneOf": [
+        { "const": ["read", "workspace", "agent", "terminal"] },
+        { "const": ["read", "workspace", "agent", "terminal", "orchestration"] },
+        { "const": ["read", "workspace", "agent", "terminal", "orchestration", "machine"] }
+      ] } } } } }
     }
   ],
   "additionalProperties": false

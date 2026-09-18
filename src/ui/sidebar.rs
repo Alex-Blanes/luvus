@@ -5,7 +5,7 @@
 //! single-purpose left sidebar.
 
 use super::*;
-use crate::app::{AgentsFilter, BarDrag, SidebarBar};
+use crate::app::{BarDrag, SidebarBar, SidebarListFocus};
 
 fn attention(s: State) -> u8 {
     match s {
@@ -18,7 +18,7 @@ fn attention(s: State) -> u8 {
 }
 
 /// Most urgent pane state across a whole workspace.
-fn rollup(app: &App, ws_index: usize) -> State {
+pub(crate) fn rollup(app: &App, ws_index: usize) -> State {
     let mut best = State::Idle;
     if let Some(ws) = app.workspaces.get(ws_index) {
         for tab in &ws.tabs {
@@ -35,24 +35,38 @@ fn rollup(app: &App, ws_index: usize) -> State {
 
 // ── sidebar ───────────────────────────────────────────────────────────────
 
-/// (workspace rows, live-agent rows, resumable-session rows, new-workspace button).
+/// Workspace, live-agent, scheduled-automation, resumable-session, and new-workspace hits.
 pub(super) type SidebarHits = (
     Vec<(usize, Rect)>,
     Vec<(PaneId, Rect)>,
+    Vec<(String, Rect)>,
     Vec<(usize, Rect)>,
     Option<Rect>,
 );
 
 /// Clickable geometry a single dock reports back to the container.
 type WorkspaceHits = (Vec<(usize, Rect)>, Option<Rect>);
-type AgentHits = (Vec<(PaneId, Rect)>, Vec<(usize, Rect)>);
+type AgentHits = (Vec<(PaneId, Rect)>, Vec<(String, Rect)>, Vec<(usize, Rect)>);
 
-/// Rows each list item occupies: two content rows, drawn back-to-back.
-const ROW_STRIDE: u16 = 2;
+/// Rows of sidebar chrome above the dock stack: the brand/menu row plus one
+/// blank separator row. The dock body, and therefore dock-height measurement
+/// during a divider drag, starts this many rows below the sidebar origin.
+pub(crate) const SIDEBAR_CHROME_ROWS: u16 = 2;
 
-/// How many items fit in a list `rows` tall.
-fn list_capacity(rows: u16) -> usize {
-    (rows / ROW_STRIDE) as usize
+/// Rows an expanded list item occupies: two content rows, drawn back-to-back.
+const EXPANDED_ROW_STRIDE: u16 = 2;
+
+fn dock_row_stride(paths_visible: bool) -> u16 {
+    if paths_visible {
+        EXPANDED_ROW_STRIDE
+    } else {
+        1
+    }
+}
+
+/// How many items fit in a list `rows` tall at its current row height.
+fn list_capacity(rows: u16, row_stride: u16) -> usize {
+    (rows / row_stride) as usize
 }
 
 /// A scrollbar on the sidebar's right edge, shown only when the list overflows
@@ -60,6 +74,9 @@ fn list_capacity(rows: u16) -> usize {
 /// background strip while remaining terminal-native: a faint one-eighth-cell
 /// track carries a brighter thumb of the same narrow width, sized to the
 /// visible fraction.
+///
+/// This fork also records every drawn bar in `bars`, so a click or drag on it
+/// scrolls the list (see [`bar_offset`]).
 pub(crate) fn draw_scrollbar(
     f: &mut RenderTarget,
     bars: &mut Vec<SidebarBar>,
@@ -76,19 +93,15 @@ pub(crate) fn draw_scrollbar(
     // Only a drawn bar is recorded, so the hit-test never fires on a list that
     // fits (no bar on screen to aim at).
     bars.push(bar);
-    let len = track.height as usize;
-    let thumb = (len * cap / total).clamp(1, len);
-    let span = total - cap;
-    let pos = ((len - thumb) * scroll.min(span))
-        .checked_div(span)
-        .unwrap_or(0);
-    let buf = f.buffer_mut();
-    for i in 0..len {
-        let on = i >= pos && i < pos + thumb;
-        let cell = &mut buf[(track.x, track.y + i as u16)];
-        cell.set_symbol("▕");
-        cell.set_fg(if on { t.overlay1 } else { t.surface1 });
-    }
+    super::workspace_row::scrollbar(
+        f.buffer_mut(),
+        track,
+        total,
+        cap,
+        scroll,
+        t.overlay1,
+        t.surface1,
+    );
 }
 
 /// The inverse of `draw_scrollbar`'s thumb placement: which scroll offset a click
@@ -106,61 +119,50 @@ pub(crate) fn bar_offset(bar: SidebarBar, r: u16) -> usize {
         .min(span)
 }
 
-/// Rows a dock keeps when the user drags a divider all the way onto it: its
-/// header plus one item. Below that the dock is a label with nothing under it —
-/// collapsing is the way to reclaim the space, not a zero-height slot.
-pub(crate) const MIN_DOCK_ROWS: u16 = 3;
-
-/// Split a sidebar `body` rect into one slot per dock, with a one-row divider
-/// between each. `docks` is `(rows the dock asked for, collapsed)`: `0` rows means
-/// "an equal share", so a sidebar nobody has dragged still splits evenly. A
-/// collapsed dock keeps exactly its header row and drops out of the split, which
-/// is what makes folding one worth doing. Returns `(slots, divider_rows)`.
-fn dock_slots(body: Rect, docks: &[(u16, bool)]) -> (Vec<Rect>, Vec<u16>) {
-    let n = docks.len();
+/// Split a sidebar `body` rect into `n` stacked dock slots with a one-row
+/// divider between each. Reduces to the legacy 50/50 split for two docks (the
+/// divider is taken from the remainder, so `slot0 = body.height / n`).
+/// Returns `(slots, divider_rows)`.
+fn dock_slots(body: Rect, weights: &[u16]) -> (Vec<Rect>, Vec<u16>) {
+    let n = weights.len();
     let mut slots = Vec::with_capacity(n);
     let mut dividers = Vec::new();
     if n == 0 {
         return (slots, dividers);
     }
-    let folded = docks.iter().filter(|(_, c)| *c).count() as u16;
-    // Dividers and folded headers come off the top; the rest is what the open
-    // docks share.
-    let avail = body
-        .height
-        .saturating_sub(n as u16 - 1)
-        .saturating_sub(folded);
-    let open: Vec<u16> = docks.iter().filter(|(_, c)| !*c).map(|(w, _)| *w).collect();
-    let equal = if open.is_empty() {
-        0
-    } else {
-        (avail / open.len() as u16).max(1)
-    };
-    // Requested rows are a *ratio*, not an absolute: the terminal resizes, and a
-    // height dragged at one size has to mean the same thing at another.
-    let want: Vec<u32> = open
-        .iter()
-        .map(|w| if *w == 0 { equal } else { *w } as u32)
-        .collect();
-    let sum: u32 = want.iter().sum::<u32>().max(1);
-    let mut heights: Vec<u16> = want
-        .iter()
-        .map(|w| (w * avail as u32 / sum) as u16)
-        .collect();
-    // The rounding remainder goes to the last open dock, so the slots always fill
-    // the body exactly and no row is left unpainted.
-    let used: u16 = heights.iter().sum();
-    if let Some(last) = heights.last_mut() {
-        *last += avail.saturating_sub(used);
-    }
-    let mut heights = heights.into_iter();
+    let bottom = body.bottom();
     let mut y = body.y;
-    for (i, (_, collapsed)) in docks.iter().enumerate() {
-        let h = if *collapsed {
-            1
+    // Equal weights keep the legacy even split (`remaining / docks_left`), so a
+    // sidebar that has never been dragged lays out to the cell it always did.
+    // Unequal weights — including rendered heights stored after a drag — are
+    // proportioned against the *content* rows still unallocated (remaining
+    // minus the divider rows still to be drawn). That is the pool those
+    // heights already sum to, so a second layout produces the same geometry
+    // instead of stealing a row from an untouched dock to pay for a divider.
+    let equal = weights.iter().all(|w| *w == weights[0]);
+    for i in 0..n {
+        let remaining = bottom.saturating_sub(y);
+        let weight_left: u32 = weights[i..].iter().map(|w| u32::from(*w)).sum();
+        let docks_left = (n - i) as u16;
+        let pool = if equal {
+            remaining
         } else {
-            heights.next().unwrap_or(0)
+            remaining.saturating_sub(docks_left.saturating_sub(1))
         };
+        let share = (u32::from(pool) * u32::from(weights[i]))
+            .checked_div(weight_left)
+            .unwrap_or(0) as u16;
+        // The drag keeps both sides of a divider at the floor, but weights are
+        // relative and the body is not: a lopsided pair, or the same pair after
+        // the terminal shrinks, can round a share down to nothing and hide a
+        // dock. Hold the floor here too, while reserving what the docks below
+        // still need (their own floor plus a divider row each) so honouring it
+        // cannot starve them. On a body too small for every floor the
+        // reservation shrinks the ceiling below the floor, and the `min` keeps
+        // the clamp well-formed while the layout degrades evenly.
+        let reserved = docks_left.saturating_sub(1) * (crate::app::MIN_DOCK_HEIGHT + 1);
+        let ceiling = remaining.saturating_sub(reserved);
+        let h = share.clamp(crate::app::MIN_DOCK_HEIGHT.min(ceiling), ceiling);
         slots.push(Rect::new(body.x, y, body.width, h));
         y += h;
         if i + 1 < n {
@@ -171,21 +173,52 @@ fn dock_slots(body: Rect, docks: &[(u16, bool)]) -> (Vec<Rect>, Vec<u16>) {
     (slots, dividers)
 }
 
-/// The heights a divider drag leaves: the pointer at `row` sets where docks
-/// `i` and `i + 1` meet, and the pair's total is conserved so the rest of the
-/// sidebar doesn't move. Both keep at least [`MIN_DOCK_ROWS`]; dragging past
-/// that just parks the divider at the limit.
-pub(crate) fn split_pair(top: Rect, bottom: Rect, row: u16) -> (u16, u16) {
-    let total = top.height + bottom.height;
-    // `total` can be under two minimums on a short terminal — then there is
-    // nothing to give, and the split stays where it is.
-    if total < MIN_DOCK_ROWS * 2 {
-        return (top.height, bottom.height);
+/// [`dock_slots`] with this fork's folded docks: a folded dock keeps exactly
+/// its header row and drops out of the weighted split, which is what makes
+/// folding one worth doing. With nothing folded this *is* `dock_slots`, so an
+/// unfolded sidebar lays out exactly as upstream's does.
+///
+/// The open docks are split by `dock_slots` over a body shortened by what the
+/// folded ones take — their header row plus the divider each one adds — so
+/// the open heights, the folded rows and every divider still add up to `body`.
+fn folded_dock_slots(body: Rect, weights: &[u16], folded: &[bool]) -> (Vec<Rect>, Vec<u16>) {
+    let k = folded.iter().filter(|f| **f).count() as u16;
+    if k == 0 {
+        return dock_slots(body, weights);
     }
-    let h = row
-        .saturating_sub(top.y)
-        .clamp(MIN_DOCK_ROWS, total - MIN_DOCK_ROWS);
-    (h, total - h)
+    let open: Vec<u16> = weights
+        .iter()
+        .zip(folded)
+        .filter(|(_, f)| !**f)
+        .map(|(w, _)| *w)
+        .collect();
+    let virtual_body = Rect::new(
+        body.x,
+        body.y,
+        body.width,
+        body.height.saturating_sub(2 * k),
+    );
+    let (open_slots, _) = dock_slots(virtual_body, &open);
+    let mut open_heights = open_slots.iter().map(|r| r.height);
+    let n = weights.len();
+    let mut slots = Vec::with_capacity(n);
+    let mut dividers = Vec::new();
+    let mut y = body.y;
+    for (i, is_folded) in folded.iter().enumerate() {
+        let h = if *is_folded {
+            1
+        } else {
+            open_heights.next().unwrap_or(0)
+        };
+        let h = h.min(body.bottom().saturating_sub(y));
+        slots.push(Rect::new(body.x, y, body.width, h));
+        y += h;
+        if i + 1 < n {
+            dividers.push(y);
+            y += 1;
+        }
+    }
+    (slots, dividers)
 }
 
 /// A one-row horizontal rule between two stacked docks.
@@ -193,15 +226,12 @@ pub(crate) fn split_pair(top: Rect, bottom: Rect, row: u16) -> (u16, u16) {
 /// Drawn in `border`, the same colour a pane frame uses, so every rule in the
 /// chrome belongs to one family and a theme that tints its borders (quattro-rally
 /// gold, matrix green) tints this too.
-/// `hot` (hovered or being dragged) lights the rule in `border_focus`, the same
-/// colour the sidebar's own resize seam uses — it is the same kind of handle.
-fn draw_dock_divider(f: &mut RenderTarget, area: Rect, y: u16, hot: bool, t: &Theme) {
-    let fg = if hot { t.border_focus } else { t.border };
+fn draw_dock_divider(f: &mut RenderTarget, area: Rect, y: u16, t: &Theme) {
     let buf = f.buffer_mut();
     for x in (area.x + 1)..area.right().saturating_sub(1) {
         buf[(x, y)]
             .set_symbol("─")
-            .set_style(Style::new().fg(fg).bg(t.base));
+            .set_style(Style::new().fg(t.border).bg(t.base));
     }
 }
 
@@ -250,7 +280,7 @@ pub(super) fn draw_sidebar(
     // blank separator row). The body is inset by one column on the separator side
     // so a dock never paints over the edge rule; the dock draw fns stay
     // side-agnostic.
-    let body_top = area.y + 2;
+    let body_top = area.y.saturating_add(SIDEBAR_CHROME_ROWS);
     let (body_x, body_w) = match side {
         Side::Left => (area.x, area.width),
         Side::Right => (area.x + 1, area.width.saturating_sub(1)),
@@ -262,41 +292,26 @@ pub(super) fn draw_sidebar(
         area.bottom().saturating_sub(body_top),
     );
     let docks = app.sidebars.get(side).docks.clone();
-    let spec: Vec<(u16, bool)> = {
-        let st = app.sidebars.get(side);
-        docks
-            .iter()
-            .map(|d| {
-                (
-                    st.dock_rows.get(d.id()).copied().unwrap_or(0),
-                    st.is_collapsed(d),
-                )
-            })
-            .collect()
-    };
-    let (slots, dividers) = dock_slots(body, &spec);
+    let folded: Vec<bool> = docks.iter().map(|d| app.dock_is_folded(d)).collect();
+    let (slots, dividers) =
+        folded_dock_slots(body, &app.sidebars.get(side).dock_weights(), &folded);
+    // Publish the rules so a press can grab one. Recomputed every frame, so a
+    // sidebar that stops being drawn leaves no stale drag target behind.
+    app.dock_dividers.retain(|(s, _, _)| *s != side);
     for (i, &dy) in dividers.iter().enumerate() {
-        let dragging = app.dock_drag == Some((side, i));
-        draw_dock_divider(
-            f,
-            body,
-            dy,
-            dragging || app.hover_dock_divider == Some((side, i)),
-            t,
-        );
-        app.dock_dividers
-            .push((side, i, Rect::new(body.x, dy, body.width, 1)));
+        draw_dock_divider(f, body, dy, t);
+        app.dock_dividers.push((side, i, dy));
     }
 
     let mut ws_rects = Vec::new();
     let mut agent_rects = Vec::new();
+    let mut automation_rects = Vec::new();
     let mut session_rects = Vec::new();
     let mut new_ws_rect = None;
-    for (kind, slot) in docks.iter().zip(slots) {
+    for ((kind, slot), is_folded) in docks.iter().zip(slots).zip(folded) {
         // The header row is the fold handle for every dock, built-in or module.
         app.dock_slots_geom.push((side, kind.clone(), slot));
-        let folded = app.sidebars.get(side).is_collapsed(kind);
-        if folded {
+        if is_folded {
             line_at(f, slot, slot.y, header(&dock_title(kind, app), t));
         } else {
             match kind {
@@ -306,8 +321,9 @@ pub(super) fn draw_sidebar(
                     new_ws_rect = n;
                 }
                 DockKind::Agents => {
-                    let (a, s) = draw_agents_dock(f, slot, app, t);
+                    let (a, scheduled, s) = draw_agents_dock(f, slot, app, t);
                     agent_rects = a;
+                    automation_rects = scheduled;
                     session_rects = s;
                 }
                 DockKind::Files => super::files::draw_files_dock(f, slot, app, t),
@@ -316,19 +332,27 @@ pub(super) fn draw_sidebar(
         }
         // Drawn last so it sits on top of whatever the dock painted. Every dock
         // indents its own header by two columns, which is exactly this slot.
-        let chevron = if folded { "▸" } else { "▾" };
-        f.buffer_mut()[(slot.x, slot.y)]
-            .set_symbol(chevron)
-            .set_style(Style::new().fg(t.overlay1).bg(t.base));
+        if slot.height > 0 {
+            let chevron = if is_folded { "▸" } else { "▾" };
+            f.buffer_mut()[(slot.x, slot.y)]
+                .set_symbol(chevron)
+                .set_style(Style::new().fg(t.overlay1).bg(t.base));
+        }
     }
 
-    (ws_rects, agent_rects, session_rects, new_ws_rect)
+    (
+        ws_rects,
+        agent_rects,
+        automation_rects,
+        session_rects,
+        new_ws_rect,
+    )
 }
 
 /// The left sidebar's chrome, all on the **top row** (`area.y`, aligned with the
-/// tab bar): the `«` collapse chevron at the left edge, then the `luvus` wordmark,
-/// then the Menu pill at the right. Sets `settings_icon_rect` and
-/// `sidebar_toggle_rect`.
+/// tab bar): the `«` collapse chevron at the left edge, then the active named
+/// session, then the Menu pill at the right. Sets the session, Settings/Menu,
+/// and sidebar-toggle hit geometry.
 fn draw_left_chrome(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) {
     let cat = app.catalog;
     let hover = app.hover;
@@ -336,9 +360,6 @@ fn draw_left_chrome(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
         hover
             .is_some_and(|(hc, hr)| hc >= rc.x && hc < rc.right() && hr >= rc.y && hr < rc.bottom())
     };
-    let cx = area.x + 2;
-    let cw = area.width.saturating_sub(3);
-
     // The `«` collapse button sits at the left edge of the top row — the exact
     // row + column the tab-bar's `»` reopen button uses when the sidebar is
     // hidden, so toggling it never makes the control jump. Click it (or ⌃Space b)
@@ -359,11 +380,12 @@ fn draw_left_chrome(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     let menu_w = crate::ui::display_width(&menu_label) as u16;
     let menu = Rect::new(area.right().saturating_sub(menu_w + 1), area.y, menu_w, 1);
 
-    // The product wordmark lives here; the clickable build version now occupies
-    // the bottom-right status slot where the redundant workspace directory used
-    // to be.
-    let brand = Line::from(Span::styled("  luvus", Style::new().fg(t.text).bold()));
-    f.buffer_mut().set_line(cx, area.y, &brand, cw);
+    // The active named session replaces the static product wordmark. It is a
+    // bounded click target; long names truncate before the fixed Menu pill. Two
+    // quiet cells separate it from the collapse chevron so the controls do not
+    // read as one combined button.
+    let session_x = toggle.right().saturating_add(2).min(menu.x);
+    draw_named_session_button(f, area.y, session_x, menu.x, app, t);
 
     // Menu drawn after the wordmark so the pill always sits on top.
     let (fg, bg) = if over(menu) {
@@ -397,13 +419,15 @@ fn draw_right_chrome(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme)
     };
     f.render_widget(Paragraph::new(Span::styled(" » ", style)), toggle);
 
-    // If the left sidebar (which normally owns the Menu button) isn't shown,
-    // surface Menu here so Settings is never stranded (docs/29). Placed on the
-    // top row at the left, clear of the `»` collapse chevron on the right.
-    if !app.sidebars.left.shown() {
+    // If no rendered left sidebar claimed the chrome, surface both Menu and the
+    // active session here so neither control is stranded (docs/29). Menu remains
+    // at the sidebar's left edge and the session follows it toward the `»`
+    // collapse control.
+    if app.settings_icon_rect.is_none() {
         let label = format!(" {} ", app.catalog.menu);
         let w = crate::ui::display_width(&label) as u16;
-        let menu = Rect::new(area.x + 2, area.y, w.min(area.width), 1);
+        let chrome_left = area.x.saturating_add(2);
+        let menu = Rect::new(chrome_left, area.y, w.min(area.width), 1);
         if menu.right() <= toggle.x {
             let (fg, bg) = if over(menu) {
                 (t.crust, t.accent)
@@ -415,8 +439,52 @@ fn draw_right_chrome(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme)
                 menu,
             );
             app.settings_icon_rect = Some(menu);
+            draw_named_session_button(f, area.y, menu.right().saturating_add(1), toggle.x, app, t);
         }
     }
+}
+
+/// Draw the active named-session label into the available chrome interval.
+/// Both sidebars use this helper so the selector follows Menu when only the
+/// right sidebar is mounted, while preserving identical truncation and hover
+/// behavior on either side.
+fn draw_named_session_button(
+    f: &mut RenderTarget,
+    y: u16,
+    x: u16,
+    right: u16,
+    app: &mut App,
+    t: &Theme,
+) {
+    let available = right.saturating_sub(x);
+    let slot = Rect::new(x, y, available, 1);
+    app.named_session_slot_rect = (app.server_mode && slot.width > 0).then_some(slot);
+    if app.client_shell_owns_session_chrome {
+        // The machine-aware client owns this complete interval. A remote
+        // endpoint must contribute neither session pixels nor a live hit
+        // target, regardless of the length of its backing session name.
+        app.named_session_button_rect = None;
+        return;
+    }
+    let name = crate::ui::truncate(
+        &crate::session::display_name(),
+        available.saturating_sub(2) as usize,
+    );
+    // Symmetric padding makes the hover/open highlight read as a compact pill
+    // without relying on a dropdown glyph or letting the text touch its edges.
+    let label = format!(" {name} ");
+    let width = (crate::ui::display_width(&label) as u16).min(available);
+    let rect = Rect::new(x, y, width, 1);
+    app.named_session_button_rect = (app.server_mode && rect.width > 0).then_some(rect);
+    let hovered = app.hover.is_some_and(|(column, row)| {
+        column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
+    });
+    let style = if app.server_mode && (app.named_session_menu.is_some() || hovered) {
+        Style::new().fg(t.crust).bg(t.accent).bold()
+    } else {
+        Style::new().fg(t.text).bold()
+    };
+    f.render_widget(Paragraph::new(Span::styled(label, style)), rect);
 }
 
 /// The WORKSPACES dock: node rows (state dot + name + branch + path), the `+`
@@ -439,6 +507,21 @@ fn draw_workspaces_dock(
     };
     let mut ws_rects = Vec::new();
 
+    // A machine-aware thin client owns the complete Workspaces projection.
+    // The server still chooses the native dock geometry and theme, but leaves
+    // its cells blank so the client can present one stable list containing
+    // owner-local workspaces and remote machines while endpoint content swaps
+    // underneath it. This also gives popup/modal occlusion a clean baseline.
+    if app.client_machine_capable {
+        app.client_shell_dock_rect = Some(area);
+        if app.client_shell_owns_workspaces {
+            // Preserve native keyboard paging and menu anchoring even though
+            // endpoint grouping is painted by the thin client.
+            app.workspaces_area = area;
+            return (ws_rects, None);
+        }
+    }
+
     line_at(f, area.y, header(cat.workspaces, t));
     let new_ws_rect = if area.width >= 8 {
         let rect = Rect::new(area.right().saturating_sub(4), area.y, 3, 1);
@@ -455,8 +538,35 @@ fn draw_workspaces_dock(
     };
     let nlist_top = area.y + 1;
     let nrows = area.height.saturating_sub(1);
-    let ncap = list_capacity(nrows);
+    let paths_visible = app.config.layout.workspace_paths;
+    let row_stride = dock_row_stride(paths_visible);
     let ntotal = app.workspaces.len();
+    // A machine-aware display client owns only the endpoint labels. The server
+    // still owns the Workspaces layout and appends a bounded client projection
+    // to this list, so remote endpoints share its row height and Show Paths
+    // behavior without receiving the owner-local machine catalog.
+    let endpoint_count = if app.client_shell_dock_rect.is_none() {
+        usize::from(app.client_shell_dock_rows)
+    } else {
+        0
+    };
+    let total_capacity = list_capacity(nrows, row_stride);
+    let workspace_floor = usize::from(ntotal > 0 && total_capacity > 0);
+    let endpoint_capacity = if endpoint_count <= total_capacity.saturating_sub(workspace_floor) {
+        endpoint_count
+    } else {
+        // Never expose a misleading partial endpoint list. The machine-aware
+        // client keeps its complete keyboard selector in Menu when the
+        // Workspaces dock is too short for every saved endpoint.
+        0
+    };
+    let ncap = total_capacity.saturating_sub(endpoint_capacity);
+    let endpoint_leading = app.client_shell_dock_leading && endpoint_capacity > 0;
+    let machine_children = endpoint_leading && app.client_shell_dock_indent_workspaces;
+    let endpoint_rows = u16::try_from(endpoint_capacity)
+        .unwrap_or(u16::MAX)
+        .saturating_mul(row_stride);
+    let workspace_top = nlist_top.saturating_add(if endpoint_leading { endpoint_rows } else { 0 });
     // Draw order groups each worktree under the node it branched from (docs/18
     // WT-4), so scroll positions index into this order, not raw creation order.
     let order = app.workspace_display_order();
@@ -464,9 +574,17 @@ fn draw_workspaces_dock(
         .iter()
         .position(|(i, _)| *i == app.active_ws)
         .unwrap_or(0);
+    let keyboard_focused = app.sidebar_focus == Some(SidebarListFocus::Workspaces);
+    app.workspace_cursor = app.workspace_cursor.min(ntotal.saturating_sub(1));
     // Auto-reveal the active workspace when it changes (cycle / new / resume), without
     // fighting wheel scrolling (which never changes `active_ws`).
-    if app.active_ws != app.last_active_ws_shown {
+    if keyboard_focused {
+        if app.workspace_cursor < app.workspaces_scroll {
+            app.workspaces_scroll = app.workspace_cursor;
+        } else if ncap > 0 && app.workspace_cursor >= app.workspaces_scroll + ncap {
+            app.workspaces_scroll = app.workspace_cursor + 1 - ncap;
+        }
+    } else if app.active_ws != app.last_active_ws_shown {
         if active_pos < app.workspaces_scroll {
             app.workspaces_scroll = active_pos;
         } else if ncap > 0 && active_pos >= app.workspaces_scroll + ncap {
@@ -475,93 +593,73 @@ fn draw_workspaces_dock(
         app.last_active_ws_shown = app.active_ws;
     }
     app.workspaces_scroll = app.workspaces_scroll.min(ntotal.saturating_sub(ncap));
-    app.workspaces_area = Rect::new(area.x, nlist_top, area.width, nrows);
     let nscroll = app.workspaces_scroll;
-    for (vi, (i, is_member)) in order.into_iter().skip(nscroll).take(ncap).enumerate() {
-        let y = nlist_top + vi as u16 * ROW_STRIDE;
+    let visible = order
+        .into_iter()
+        .skip(nscroll)
+        .take(ncap)
+        .collect::<Vec<_>>();
+    let workspace_rows = u16::try_from(visible.len())
+        .unwrap_or(u16::MAX)
+        .saturating_mul(row_stride);
+    app.workspaces_area = Rect::new(area.x, workspace_top, area.width, workspace_rows);
+    for (vi, (i, is_member)) in visible.into_iter().enumerate() {
+        let y = workspace_top + vi as u16 * row_stride;
         let active = i == app.active_ws;
-        ws_rects.push((i, Rect::new(area.x, y, area.width, 2)));
+        let selected = keyboard_focused && nscroll + vi == app.workspace_cursor;
+        ws_rects.push((i, Rect::new(area.x, y, area.width, row_stride)));
         let st = rollup(app, i);
         let ws = &app.workspaces[i];
         let terminal_cwd = app.workspace_terminal_cwd(i).unwrap_or(&ws.cwd);
-        let name_style = if active {
-            Style::new().fg(t.accent).bold()
-        } else {
-            Style::new().fg(t.subtext1)
-        };
-        // A linked worktree is nested under its parent checkout with a connector.
-        let indent: u16 = if is_member { 2 } else { 0 };
-        // Row 1: state dot + workspace name + git branch (dot aligned with "WORKSPACES").
-        // On a narrow sidebar the name keeps priority: it is ellipsized only when
-        // it can't share the row, and the branch is fitted (then ellipsized, then
-        // dropped) into whatever space is left, so the row never hard-cuts.
-        let avail = (cw as usize).saturating_sub(indent as usize + 2);
-        let name_w = crate::ui::display_width(&ws.name);
-        let (name_disp, branch_disp) = match &ws.branch {
-            Some(b) => {
-                let branch_seg = 2 + crate::ui::display_width(b); // "  branch"
-                if name_w + branch_seg <= avail {
-                    (ws.name.clone(), Some(b.clone()))
-                } else if name_w + 4 <= avail {
-                    (
-                        ws.name.clone(),
-                        Some(crate::ui::truncate(b, avail - name_w - 2)),
-                    )
-                } else {
-                    (crate::ui::truncate(&ws.name, avail), None)
-                }
-            }
-            None => (crate::ui::truncate(&ws.name, avail), None),
-        };
-        let mut line1: Vec<Span> = Vec::new();
-        if is_member {
-            line1.push(Span::styled("└ ", Style::new().fg(t.overlay0)));
-        }
-        line1.push(Span::styled(st.dot(), Style::new().fg(st.color(t))));
-        line1.push(Span::raw(" "));
-        line1.push(Span::styled(name_disp, name_style));
-        if let Some(b) = &branch_disp {
-            line1.push(Span::styled(
-                format!("  {b}"),
-                Style::new().fg(if active { t.green } else { t.overlay0 }),
-            ));
-        }
-        line_at(f, y, Line::from(line1));
-        // Row 2: the project path, indented under the name (extra for members).
-        let pad = 2 + indent as usize;
-        line_at(
-            f,
-            y + 1,
-            Line::from(Span::styled(
-                format!(
-                    "{}{}",
-                    " ".repeat(pad),
-                    short_path(terminal_cwd, cw.saturating_sub(pad as u16))
-                ),
-                Style::new().fg(if active { t.subtext0 } else { t.overlay0 }),
-            )),
+        super::workspace_row::draw(
+            f.buffer_mut(),
+            Rect::new(area.x, y, area.width, row_stride),
+            super::workspace_row::WorkspaceRow {
+                name: &ws.name,
+                branch: ws.branch.as_deref(),
+                path: &short_path(terminal_cwd, u16::MAX),
+                dot: st.dot(),
+                dot_color: st.color(t),
+                nested: machine_children || is_member,
+                active,
+                selected,
+                hovered: false,
+            },
+            super::workspace_row::Palette {
+                accent: t.accent,
+                normal: t.subtext1,
+                muted: t.overlay0,
+                path: t.subtext0,
+                branch: t.green,
+                active_bg: t.sel_bg,
+                selected_bg: t.surface1,
+            },
         );
-        if active {
-            let buf = f.buffer_mut();
-            for row in [y, y + 1] {
-                for x in area.x..area.right().saturating_sub(1) {
-                    buf[(x, row)].set_bg(t.sel_bg);
-                }
-            }
-        }
     }
     draw_scrollbar(
         f,
         &mut app.sidebar_bars,
         SidebarBar {
             list: BarDrag::Workspaces,
-            track: Rect::new(bar_col, nlist_top, 1, nrows),
+            track: Rect::new(bar_col, workspace_top, 1, workspace_rows),
             total: ntotal,
             cap: ncap,
         },
         nscroll,
         t,
     );
+    if endpoint_capacity > 0 {
+        app.client_shell_dock_rect = Some(Rect::new(
+            area.x,
+            if endpoint_leading {
+                nlist_top
+            } else {
+                workspace_top.saturating_add(workspace_rows)
+            },
+            area.width,
+            endpoint_rows,
+        ));
+    }
     (ws_rects, new_ws_rect)
 }
 
@@ -579,64 +677,46 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
         }
     };
     let mut agent_rects = Vec::new();
+    let mut automation_rects = Vec::new();
     let mut session_rects = Vec::new();
 
     let aheader = area.y;
     line_at(f, aheader, header(cat.agents, t));
-    // Filter toggle, right-aligned in the header row. "Space" lists only the
-    // active workspace's agents and sessions, "All" adds the whole session
-    // history, "Active" shows only live agents.
+    // All/Active filter toggle, right-aligned in the header row. "All" shows the
+    // session history too; "Active" shows only live agents.
     app.agents_filter_rects.clear();
-    let filter = app.agents_filter;
-    let label = |v: AgentsFilter| {
-        format!(
-            " {} ",
-            match v {
-                AgentsFilter::Workspace => cat.scope_workspace,
-                AgentsFilter::All => cat.all,
-                AgentsFilter::Active => cat.active,
-            }
-        )
-    };
-    let width = |v: AgentsFilter| crate::ui::display_width(&label(v)) as u16;
-    let every = [
-        AgentsFilter::Workspace,
-        AgentsFilter::All,
-        AgentsFilter::Active,
-    ];
-    // Room left of the toggle once the dock title has its own: the title must stay
-    // readable. Three segments don't fit a default 26-column sidebar, so there they
-    // collapse to a single chip showing the current filter, which cycles on click.
-    let room = area
-        .width
-        .saturating_sub(3 + crate::ui::display_width(cat.agents) as u16);
-    let segs: &[AgentsFilter] = if every.iter().map(|v| width(*v)).sum::<u16>() <= room {
-        &every
-    } else {
-        std::slice::from_ref(&filter)
-    };
-    let total: u16 = segs.iter().map(|v| width(*v)).sum();
-    if total <= room {
+    let active_only = app.agents_active_only;
+    if area.width >= 22 {
+        let segs = [
+            (format!(" {} ", cat.all), false),
+            (format!(" {} ", cat.active), true),
+        ];
+        let total: u16 = segs
+            .iter()
+            .map(|(l, _)| crate::ui::display_width(l) as u16)
+            .sum();
         let mut x = area.right().saturating_sub(1 + total);
-        for val in segs {
-            let (label, val) = (label(*val), *val);
-            let w = crate::ui::display_width(&label) as u16;
+        for (label, val) in &segs {
+            let (label, val) = (label.as_str(), *val);
+            let w = crate::ui::display_width(label) as u16;
             let rect = Rect::new(x, aheader, w, 1);
-            let style = if filter == val {
+            let style = if active_only == val {
                 Style::new().fg(t.crust).bg(t.accent).bold()
             } else {
                 Style::new().fg(t.overlay1).bg(t.surface1)
             };
             f.render_widget(Paragraph::new(Span::styled(label, style)), rect);
-            // Collapsed, the lone chip is the cycle button: clicking it advances.
-            app.agents_filter_rects
-                .push((if segs.len() == 1 { val.next() } else { val }, rect));
+            app.agents_filter_rects.push((val, rect));
             x = x.saturating_add(w);
         }
     }
+    // Workspace scope is controlled by prefix `A`, Settings → Keys, or an
+    // agent/session row's context menu. It consumes no extra dock row.
+    let scoped = app.agents_scope_active();
     let alist_top = aheader + 1;
     let arows = area.bottom().saturating_sub(alist_top);
-    let acap = list_capacity(arows);
+    let paths_visible = app.config.layout.agent_paths;
+    let row_stride = dock_row_stride(paths_visible);
     app.agents_area = Rect::new(area.x, alist_top, area.width, arows);
 
     let focus = app.layout().focus;
@@ -645,19 +725,21 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     // The row's second line is `workspace · mention`, where the mention is how you
     // delegate to the pane (`=name` or `=<id>`). The tab is intentionally dropped here
     // in favor of the pane token, which is what a script or delegation needs.
-    // "Space" keeps the list to the workspace in front of you; the other two
-    // filters sweep every workspace.
-    let scope = (filter == AgentsFilter::Workspace).then_some(app.active_ws);
     let mut live: Vec<(PaneId, String)> = Vec::new();
+    let mut blocked_elsewhere: Vec<PaneId> = Vec::new();
     for (wi, ws) in app.workspaces.iter().enumerate() {
-        if scope.is_some_and(|a| a != wi) {
-            continue;
-        }
-        for tab in ws.tabs.iter() {
+        let visible = !scoped || wi == app.active_ws;
+        for tab in &ws.tabs {
             for id in tab.layout.leaves() {
                 if let Some(s) = app.status.get(&id) {
-                    if app.manifests.is_agent(&s.agent) || s.agent_session.is_some() {
+                    let is_agent = app.manifests.is_agent(&s.agent) || s.agent_session.is_some();
+                    if !is_agent {
+                        continue;
+                    }
+                    if visible {
                         live.push((id, ws.name.clone()));
+                    } else if s.state == State::Blocked {
+                        blocked_elsewhere.push(id);
                     }
                 }
             }
@@ -670,21 +752,120 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     if !app.pinned_agents.is_empty() {
         live.sort_by_key(|(id, _)| !app.pinned_agents.contains(id));
     }
-    // "Active" hides the on-disk resumable history entirely; "Space" keeps the
-    // sessions rooted at the active workspace's folder. Indices into `resumable`
-    // are carried through, since the row menu resumes and deletes by index.
-    let sessions: Vec<usize> = if filter == AgentsFilter::Active {
-        Vec::new()
-    } else {
-        let root = scope.map(|i| app.workspaces[i].cwd.clone());
+    // Armed definitions appear in Active as lightweight placeholders. Their
+    // hit target opens read-only automation detail rather than focusing a pane.
+    // As soon as a due occurrence owns a live ORCH task, the ordinary pane row
+    // replaces this projection.
+    let mut scheduled: Vec<(
+        String,
+        String,
+        String,
+        u64,
+        bool,
+        Option<crate::automation::ActiveTargetState>,
+    )> = app
+        .automation
+        .automations
+        .iter()
+        .filter_map(|automation| {
+            if !automation.enabled {
+                return None;
+            }
+            let (workspace_index, workspace) = app
+                .workspaces
+                .iter()
+                .enumerate()
+                .find(|(_, workspace)| workspace.id == automation.task.workspace_id)?;
+            if scoped && workspace_index != app.active_ws {
+                return None;
+            }
+            let live_run = app
+                .automation
+                .runs
+                .iter()
+                .rev()
+                .find(|run| run.automation_id == automation.id && run.status.is_live());
+            let pane_backed = live_run
+                .and_then(|run| run.task_id.as_deref())
+                .and_then(|task| app.orch.task(task))
+                .and_then(|task| task.assignee)
+                .is_some_and(|pane| app.panes.contains_key(&PaneId(pane)));
+            if pane_backed
+                || live_run.is_some_and(|run| {
+                    matches!(
+                        run.status,
+                        crate::automation::RunStatus::Running
+                            | crate::automation::RunStatus::Review
+                    )
+                })
+            {
+                return None;
+            }
+            let starting = live_run.is_some();
+            let deadline = live_run
+                .map(|run| run.scheduled_at)
+                .or(automation.next_run_at)?;
+            Some((
+                automation.id.clone(),
+                automation.task.agent_id.clone(),
+                workspace.name.clone(),
+                deadline,
+                starting,
+                app.automation
+                    .active_target_states
+                    .get(&automation.id)
+                    .copied(),
+            ))
+        })
+        .collect();
+    scheduled.sort_by_key(|item| item.3);
+    // Scope resumable history by workspace ownership too. Longest matching root
+    // wins, matching pane-home semantics when workspaces are nested. Keep the
+    // original indices so click-to-resume still addresses `app.resumable`.
+    let session_owner = |cwd: &std::path::Path| {
+        app.workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, ws)| crate::platform::is_subpath(cwd, &ws.cwd))
+            .max_by_key(|(_, ws)| ws.cwd.as_os_str().len())
+            .map(|(wi, _)| wi)
+    };
+    let resumable_scoped: Vec<usize> = if scoped && !active_only {
         app.resumable
             .iter()
             .enumerate()
-            .filter(|(_, s)| root.as_ref().is_none_or(|r| s.cwd == *r))
+            .filter(|(_, session)| session_owner(&session.cwd) == Some(app.active_ws))
             .map(|(i, _)| i)
             .collect()
+    } else {
+        Vec::new()
     };
-    let atotal = live.len() + sessions.len();
+    // Preserve the allocation-free default path: unscoped All indexes the
+    // existing history directly, while only the opt-in scoped projection builds
+    // an index. Active does neither because history is hidden.
+    let resumable_total = if active_only {
+        0
+    } else if scoped {
+        resumable_scoped.len()
+    } else {
+        app.resumable.len()
+    };
+    let atotal = live.len() + scheduled.len() + resumable_total;
+    // The overflow line is always visible while attention is hidden, even if no
+    // local rows exist. Reserve exactly one terminal row for it.
+    let has_elsewhere = scoped && !blocked_elsewhere.is_empty();
+    let keyboard_focused = app.sidebar_focus == Some(SidebarListFocus::Agents);
+    let keyboard_total = atotal + usize::from(has_elsewhere);
+    app.agent_cursor = app.agent_cursor.min(keyboard_total.saturating_sub(1));
+    app.agents_elsewhere_rect = None;
+    let acap = list_capacity(arows.saturating_sub(u16::from(has_elsewhere)), row_stride);
+    if keyboard_focused && app.agent_cursor < atotal {
+        if app.agent_cursor < app.agents_scroll {
+            app.agents_scroll = app.agent_cursor;
+        } else if acap > 0 && app.agent_cursor >= app.agents_scroll + acap {
+            app.agents_scroll = app.agent_cursor + 1 - acap;
+        }
+    }
     app.agents_scroll = app.agents_scroll.min(atotal.saturating_sub(acap));
     let ascroll = app.agents_scroll;
 
@@ -693,7 +874,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
             f,
             alist_top,
             Line::from(Span::styled(
-                if filter == AgentsFilter::Active {
+                if active_only {
                     cat.no_active_agents
                 } else {
                     cat.no_agents_or_sessions
@@ -703,7 +884,8 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
         );
     } else {
         for (vi, k) in (ascroll..atotal).take(acap).enumerate() {
-            let y = alist_top + vi as u16 * ROW_STRIDE;
+            let y = alist_top + vi as u16 * row_stride;
+            let selected = keyboard_focused && app.agent_cursor == k;
             if let Some((id, wsname)) = live.get(k) {
                 // A live agent: runtime status + which workspace it runs in.
                 let id = *id;
@@ -719,15 +901,10 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 } else {
                     Style::new().fg(t.subtext1)
                 };
-                agent_rects.push((id, Rect::new(area.x, y, area.width, 2)));
-                // A working agent gets a live rotating-circle spinner in the dot
-                // slot; every other state keeps its static dot.
-                let dot = if st == State::Working {
-                    f.mark_working_animation();
-                    crate::ui::theme::spinner_frame(app.spinner)
-                } else {
-                    st.dot()
-                };
+                agent_rects.push((id, Rect::new(area.x, y, area.width, row_stride)));
+                // Working stays visually prominent without scheduling animation
+                // frames while the agent is busy.
+                let dot = st.dot();
                 let label = format!(" {}  ", st.label());
                 let prefix_w = crate::ui::display_width(dot) + crate::ui::display_width(&label);
                 let agent = crate::ui::truncate(&agent, (cw as usize).saturating_sub(prefix_w));
@@ -740,71 +917,95 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                         Span::styled(agent, name_style),
                     ]),
                 );
-                // Row 2: project · tab · how to mention this pane, styled exactly
-                // like a workspace's path row. It was pinned to `overlay0`, which
-                // lands on `sel_bg` for the focused row and is then all but
-                // unreadable — the same reason the workspaces dock brightens its
-                // path when active. The trailing token is the pane's live alias
-                // (`=name`, set by `agent name`) or its pane id (`=3`), so the
-                // reader can paste the token directly into a delegation line.
-                let mention = app
-                    .agent_name_for(id)
-                    .map(|n| format!("={n}"))
-                    .unwrap_or_else(|| format!("={}", id.0));
-                // When enabled, show the agent's live session title (its OSC
-                // title, e.g. "Ship the desktop release…") in place of the meta
-                // line; fall back to it when the agent set no useful title.
-                let meta = app
-                    .config
-                    .layout
-                    .agent_title
-                    .then(|| app.pane_title(id))
-                    .flatten()
-                    .map(|ttl| format!("  {ttl}"))
-                    // Scoped to one workspace, its name on every row is noise —
-                    // the pane token identifies the agent, which is what you need.
-                    .unwrap_or_else(|| match scope {
-                        Some(_) => format!("  {mention}"),
-                        None => format!("  {wsname} · {mention}"),
-                    });
-                line_at(
-                    f,
-                    y + 1,
-                    Line::from(Span::styled(
-                        crate::ui::truncate(&meta, cw as usize),
-                        Style::new().fg(if focused { t.subtext0 } else { t.overlay0 }),
-                    )),
-                );
+                if paths_visible {
+                    // Row 2: project + how to mention this pane, styled exactly
+                    // like a workspace's path row. The trailing token is the
+                    // pane's live alias (`=name`) or its pane id (`=3`).
+                    let mention = app
+                        .agent_name_for(id)
+                        .map(|n| format!("={n}"))
+                        .unwrap_or_else(|| format!("={}", id.0));
+                    // When enabled, show OSC first, then a module-provided
+                    // title; fall back to workspace · =pane when neither is set.
+                    let meta = app
+                        .config
+                        .layout
+                        .agent_title
+                        .then(|| app.pane_title(id))
+                        .flatten()
+                        .map(|ttl| format!("  {ttl}"))
+                        .unwrap_or_else(|| format!("  {wsname} · {mention}"));
+                    line_at(
+                        f,
+                        y + 1,
+                        Line::from(Span::styled(
+                            crate::ui::truncate(&meta, cw as usize),
+                            Style::new().fg(if focused { t.subtext0 } else { t.overlay0 }),
+                        )),
+                    );
+                }
                 if focused {
                     let buf = f.buffer_mut();
-                    for row in [y, y + 1] {
+                    for row in y..y + row_stride {
                         for x in area.x..area.right().saturating_sub(1) {
                             buf[(x, row)].set_bg(t.sel_bg);
                         }
                     }
                 }
+            } else if let Some((automation, agent, workspace, deadline, starting, target_state)) =
+                scheduled.get(k.saturating_sub(live.len()))
+            {
+                automation_rects.push((
+                    automation.clone(),
+                    Rect::new(area.x, y, area.width, row_stride),
+                ));
+                let (status, status_color) = match target_state {
+                    Some(crate::automation::ActiveTargetState::Restoring) => {
+                        (cat.automation_restoring, t.amber)
+                    }
+                    Some(crate::automation::ActiveTargetState::NeedsRebind) => {
+                        (cat.automation_needs_rebind, t.coral)
+                    }
+                    _ if *starting => (cat.automation_starting, t.accent),
+                    _ => (cat.automation_scheduled, t.accent),
+                };
+                let label = format!(" {status}  ");
+                let prefix_w = 1 + crate::ui::display_width(&label);
+                line_at(
+                    f,
+                    y,
+                    Line::from(vec![
+                        Span::styled("◷", Style::new().fg(status_color)),
+                        Span::styled(label, Style::new().fg(status_color)),
+                        Span::styled(
+                            crate::ui::truncate(agent, (cw as usize).saturating_sub(prefix_w)),
+                            Style::new().fg(t.subtext1).bold(),
+                        ),
+                    ]),
+                );
+                if paths_visible {
+                    line_at(
+                        f,
+                        y + 1,
+                        Line::from(Span::styled(
+                            crate::ui::truncate(
+                                &format!("  {workspace} · UTC {}", super::format_utc(*deadline)),
+                                cw as usize,
+                            ),
+                            Style::new().fg(t.overlay0),
+                        )),
+                    );
+                }
             } else {
                 // A resumable session discovered on disk — click to reopen.
-                let si = sessions[k - live.len()];
+                let visible_index = k - live.len() - scheduled.len();
+                let si = if scoped {
+                    resumable_scoped[visible_index]
+                } else {
+                    visible_index
+                };
                 let s = &app.resumable[si];
-                // The name the session carried while it was live (its own title),
-                // remembered across restarts. Nothing to fall back on but the
-                // project folder, for a session luvus never hosted.
-                let meta = app
-                    .config
-                    .layout
-                    .agent_title
-                    .then(|| app.session_titles.get(&s.session_id))
-                    .flatten()
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        s.cwd
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("project")
-                            .to_string()
-                    });
-                let row = Rect::new(area.x, y, area.width, 2);
+                let row = Rect::new(area.x, y, area.width, row_stride);
                 session_rects.push((si, row));
                 let label = " resume  ";
                 let prefix_w = 1 + crate::ui::display_width(label);
@@ -818,16 +1019,45 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                         Span::styled(name, Style::new().fg(t.subtext0)),
                     ]),
                 );
-                line_at(
-                    f,
-                    y + 1,
-                    Line::from(Span::styled(
-                        crate::ui::truncate(&format!("  {meta}"), cw as usize),
-                        Style::new().fg(t.overlay0),
-                    )),
-                );
+                if paths_visible {
+                    let proj = s
+                        .cwd
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("project");
+                    let meta = app
+                        .config
+                        .layout
+                        .agent_title
+                        .then(|| {
+                            // A module's title wins; otherwise the title the agent
+                            // itself showed while it was live (this fork remembers
+                            // it by session id, so a closed session keeps a name).
+                            app.agent_row_title_for_session(&s.agent, &s.session_id)
+                                .or_else(|| {
+                                    app.session_titles.get(&s.session_id).map(String::as_str)
+                                })
+                                .map(|title| format!("  {title}"))
+                        })
+                        .flatten()
+                        .unwrap_or_else(|| format!("  {proj}"));
+                    line_at(
+                        f,
+                        y + 1,
+                        Line::from(Span::styled(
+                            crate::ui::truncate(&meta, cw as usize),
+                            Style::new().fg(t.overlay0),
+                        )),
+                    );
+                }
                 // Removing / reopening a session is on the row's right-click menu
                 // (docs/28) — no per-row ✕ button.
+            }
+            if selected {
+                f.buffer_mut().set_style(
+                    Rect::new(area.x, y, area.width.saturating_sub(1), row_stride),
+                    Style::new().fg(t.accent).bg(t.surface1),
+                );
             }
         }
         draw_scrollbar(
@@ -835,7 +1065,12 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
             &mut app.sidebar_bars,
             SidebarBar {
                 list: BarDrag::Agents,
-                track: Rect::new(bar_col, alist_top, 1, arows),
+                track: Rect::new(
+                    bar_col,
+                    alist_top,
+                    1,
+                    arows.saturating_sub(u16::from(has_elsewhere)),
+                ),
                 total: atotal,
                 cap: acap,
             },
@@ -844,7 +1079,39 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
         );
     }
 
-    (agent_rects, session_rects)
+    if has_elsewhere {
+        let y = area.bottom().saturating_sub(1);
+        if y >= alist_top {
+            let text = cat
+                .blocked_elsewhere
+                .replace("{n}", &blocked_elsewhere.len().to_string());
+            let state = State::Blocked;
+            let dot = state.dot();
+            let prefix_width = crate::ui::display_width(dot) + 1;
+            line_at(
+                f,
+                y,
+                Line::from(vec![
+                    Span::styled(dot, Style::new().fg(state.color(t))),
+                    Span::raw(" "),
+                    Span::styled(
+                        crate::ui::truncate(&text, (cw as usize).saturating_sub(prefix_width)),
+                        Style::new().fg(t.subtext0),
+                    ),
+                ]),
+            );
+            app.agents_elsewhere_rect =
+                Some((blocked_elsewhere[0], Rect::new(area.x, y, area.width, 1)));
+            if keyboard_focused && app.agent_cursor == atotal {
+                f.buffer_mut().set_style(
+                    Rect::new(area.x, y, area.width.saturating_sub(1), 1),
+                    Style::new().fg(t.accent).bg(t.surface1),
+                );
+            }
+        }
+    }
+
+    (agent_rects, automation_rects, session_rects)
 }
 
 /// A module-contributed dock (docs/29, DOCK-4): a header (its cached title) and
@@ -876,8 +1143,56 @@ fn draw_module_dock(f: &mut RenderTarget, area: Rect, id: &str, app: &mut App, t
             spans.push(Span::raw(" "));
             prefix_w = 2;
         }
-        let text = crate::ui::truncate(&row.text, (cw as usize).saturating_sub(prefix_w));
-        spans.push(Span::styled(text, Style::new().fg(t.subtext1)));
+        let tone_of = |name: Option<&str>| {
+            name.and_then(crate::bar::BarTone::from_name)
+                .map_or(t.subtext1, |tone| crate::bar::render::tone_color(tone, t))
+        };
+        let row_color = tone_of(row.tone.as_deref());
+        let budget = (cw as usize).saturating_sub(prefix_w);
+        if row.spans.is_empty() {
+            let text = crate::ui::truncate(&row.text, budget);
+            spans.push(Span::styled(text, Style::new().fg(row_color)));
+        } else {
+            // Truncate the joined spans as one line, exactly like `truncate`
+            // does for plain text: when they overflow, the last column is the
+            // ellipsis, so a dropped tail (`72%` after a bar that exactly fills
+            // the dock) is never silent.
+            let total: usize = row
+                .spans
+                .iter()
+                .map(|sp| crate::ui::display_width(&sp.text))
+                .sum();
+            let ellipsis = total > budget && budget > 0;
+            let mut left = if ellipsis { budget - 1 } else { budget };
+            let mut last_color = row_color;
+            for sp in &row.spans {
+                if left == 0 {
+                    break;
+                }
+                let text = crate::ui::clip_columns(&sp.text, left);
+                let shown = crate::ui::display_width(&text);
+                // A span that did not fit whole ends the line, even when it
+                // put nothing on screen (a wide glyph at the edge). Otherwise
+                // the spans after it would slide left into its place and the
+                // row would read as a different value than the module sent.
+                let cut = shown < crate::ui::display_width(&sp.text);
+                left -= shown;
+                if shown > 0 {
+                    last_color = if sp.tone.is_some() {
+                        tone_of(sp.tone.as_deref())
+                    } else {
+                        row_color
+                    };
+                    spans.push(Span::styled(text, Style::new().fg(last_color)));
+                }
+                if cut {
+                    break;
+                }
+            }
+            if ellipsis {
+                spans.push(Span::styled("…", Style::new().fg(last_color)));
+            }
+        }
         line_at(f, y, Line::from(spans));
         if row.action.is_some() {
             app.module_dock_rects
@@ -929,6 +1244,100 @@ fn header(text: &str, t: &Theme) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
+    /// Equal weights must lay out exactly as the former `remaining / docks_left`
+    /// did, to the cell: every sidebar that has never been resized keeps the
+    /// geometry it had before weights existed.
+    #[test]
+    fn equal_weights_reproduce_the_former_even_split() {
+        let body = ratatui::layout::Rect::new(0, 0, 20, 30);
+        let (slots, dividers) = super::dock_slots(body, &[1, 1, 1]);
+        assert_eq!(
+            slots.iter().map(|s| s.height).collect::<Vec<_>>(),
+            vec![10, 9, 9]
+        );
+        assert_eq!(dividers, vec![10, 20]);
+        // Every row is accounted for: slots plus one row per divider.
+        let used: u16 = slots.iter().map(|s| s.height).sum::<u16>() + dividers.len() as u16;
+        assert_eq!(used, body.height);
+    }
+
+    /// Rendered heights stored as weights after a drag must survive a second
+    /// layout pass. The previous formula proportioned against remaining rows
+    /// *including* dividers, so `[15, 8, 5]` on a 30-row body became `[16, 8, 4]`
+    /// and grew a dock that was not part of the drag.
+    #[test]
+    fn persisted_heights_round_trip_through_layout() {
+        let body = ratatui::layout::Rect::new(0, 0, 20, 30);
+        let weights = [15_u16, 8, 5];
+        let (slots, dividers) = super::dock_slots(body, &weights);
+        assert_eq!(
+            slots.iter().map(|s| s.height).collect::<Vec<_>>(),
+            weights,
+            "heights used as weights must reproduce themselves"
+        );
+        assert_eq!(dividers, vec![15, 24]);
+        let (again, dividers_again) = super::dock_slots(body, &weights);
+        assert_eq!(
+            again.iter().map(|s| s.height).collect::<Vec<_>>(),
+            weights,
+            "a second pass must not drift"
+        );
+        assert_eq!(dividers_again, dividers);
+    }
+
+    /// A weighted split hands out the sidebar in proportion, and still spends
+    /// every row.
+    #[test]
+    fn weights_split_the_sidebar_in_proportion() {
+        let body = ratatui::layout::Rect::new(0, 0, 20, 31);
+        let (slots, dividers) = super::dock_slots(body, &[2, 1]);
+        assert_eq!(slots[0].height, 20, "twice the weight, twice the rows");
+        assert_eq!(slots[1].height, 10);
+        assert_eq!(dividers.len(), 1);
+        let used: u16 = slots.iter().map(|s| s.height).sum::<u16>() + dividers.len() as u16;
+        assert_eq!(used, body.height, "no row is lost to rounding");
+    }
+
+    /// Weights are relative but the body is not, so a lopsided pair — or an
+    /// ordinary one after the terminal shrinks — could round a share down to
+    /// nothing and hide a dock. Every dock keeps the floor the drag promises.
+    #[test]
+    fn a_lopsided_weight_still_keeps_every_dock_at_the_floor() {
+        let floor = crate::app::MIN_DOCK_HEIGHT;
+        let body = ratatui::layout::Rect::new(0, 0, 20, 20);
+        let (slots, dividers) = super::dock_slots(body, &[1, 100]);
+        assert_eq!(
+            slots[0].height, floor,
+            "the starved dock is held at the floor"
+        );
+        assert!(
+            slots[1].height >= floor,
+            "and the greedy one still fits: {slots:?}"
+        );
+        let used: u16 = slots.iter().map(|s| s.height).sum::<u16>() + dividers.len() as u16;
+        assert_eq!(used, body.height, "no row is lost");
+
+        // Three docks, with the middle one starved.
+        let (slots, _) = super::dock_slots(body, &[100, 1, 100]);
+        for slot in &slots {
+            assert!(
+                slot.height >= floor,
+                "every dock keeps the floor: {slots:?}"
+            );
+        }
+    }
+
+    /// A body too small to give every dock its floor must still lay out and
+    /// spend every row rather than panic on an inverted clamp.
+    #[test]
+    fn a_body_below_every_floor_degrades_instead_of_panicking() {
+        let body = ratatui::layout::Rect::new(0, 0, 20, 5);
+        let (slots, dividers) = super::dock_slots(body, &[1, 1]);
+        assert_eq!(slots.len(), 2);
+        let used: u16 = slots.iter().map(|s| s.height).sum::<u16>() + dividers.len() as u16;
+        assert_eq!(used, body.height);
+    }
+
     use super::{bar_offset, list_capacity};
     use crate::app::{App, BarDrag, SidebarBar};
     use crate::event::AppEvent;
@@ -951,6 +1360,7 @@ mod tests {
             };
             super::draw_scrollbar(&mut target, &mut bars, bar, 0, &theme);
         }
+        assert_eq!(bars.len(), 1, "a drawn bar is recorded for the mouse");
 
         let symbols: Vec<&str> = (0..area.height)
             .map(|row| buffer.cell((0, row)).expect("scrollbar cell").symbol())
@@ -980,6 +1390,72 @@ mod tests {
         })
     }
 
+    #[test]
+    fn keyboard_focus_highlights_workspace_and_agent_rows() {
+        let _env = crate::persist::test_env("sidebar-keyboard-highlight");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+
+        app.focus_workspaces_dock();
+        term.draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let workspace = app.ws_rects[0].1;
+        assert_eq!(
+            term.backend()
+                .buffer()
+                .cell((workspace.x, workspace.y))
+                .unwrap()
+                .bg,
+            app.theme.surface1
+        );
+
+        app.resumable.push(crate::agent::SessionInfo {
+            agent: "claude".into(),
+            session_id: "sidebar-highlight".into(),
+            cwd: std::env::current_dir().unwrap(),
+            updated: std::time::SystemTime::now(),
+        });
+        app.focus_agents_dock();
+        term.draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let session = app.session_rects[0].1;
+        assert_eq!(
+            term.backend()
+                .buffer()
+                .cell((session.x, session.y))
+                .unwrap()
+                .bg,
+            app.theme.surface1
+        );
+    }
+
+    #[test]
+    fn hidden_sidebar_paths_compact_workspace_and_agent_rows() {
+        let _env = crate::persist::test_env("sidebar-path-row-height");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        app.resumable.push(crate::agent::SessionInfo {
+            agent: "claude".into(),
+            session_id: "sidebar-path-row".into(),
+            cwd: std::env::current_dir().unwrap(),
+            updated: std::time::SystemTime::now(),
+        });
+
+        term.draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        assert_eq!(app.ws_rects[0].1.height, 2);
+        assert_eq!(app.session_rects[0].1.height, 2);
+
+        app.config.layout.workspace_paths = false;
+        app.config.layout.agent_paths = false;
+        term.draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        assert_eq!(app.ws_rects[0].1.height, 1);
+        assert_eq!(app.session_rects[0].1.height, 1);
+    }
+
     /// The column each agent row's state label starts at, for every row drawn.
     fn label_columns(term: &Terminal<TestBackend>, label: &str) -> Vec<u16> {
         let buf = term.backend().buffer();
@@ -994,9 +1470,7 @@ mod tests {
     }
 
     // The state icon sits in a fixed one-column slot, so the text after it must
-    // start at the same column no matter which state is shown — and, for a
-    // working agent, at every frame of the spinner. Otherwise the row visibly
-    // shifts as the icon animates.
+    // start at the same column no matter which state is shown.
     /// The fg colour of the first cell of the row containing `needle`.
     fn fg_of_row(term: &Terminal<TestBackend>, needle: &str) -> Option<ratatui::style::Color> {
         let buf = term.backend().buffer();
@@ -1020,10 +1494,6 @@ mod tests {
         let mut app = App::new(120, 40, tx).unwrap();
         let id = app.layout().focus;
         app.status.get_mut(&id).unwrap().agent = "claude".into();
-        // The token line is the fallback shown when the agent set no session title.
-        app.config.layout.agent_title = false;
-        // "All" spans every workspace, so rows carry `workspace · token`.
-        app.agents_filter = crate::app::AgentsFilter::All;
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
 
         // Unnamed: the row's second line shows the pane token (how you mention it),
@@ -1040,16 +1510,6 @@ mod tests {
         assert!(
             buffer_contains(&term, "· =worker"),
             "a named agent row shows =name"
-        );
-
-        // Scoped to the active workspace, its name on every row is redundant —
-        // the token stays, the `workspace ·` prefix goes.
-        app.agents_filter = crate::app::AgentsFilter::Workspace;
-        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert!(buffer_contains(&term, "=worker"), "the token survives");
-        assert!(
-            !buffer_contains(&term, "· =worker"),
-            "the workspace prefix is dropped when the list is workspace-scoped"
         );
     }
 
@@ -1088,8 +1548,6 @@ mod tests {
         let mut app = App::new(120, 40, tx).unwrap();
         let id = app.layout().focus;
         app.status.get_mut(&id).unwrap().agent = "claude".into();
-        app.config.layout.agent_title = false;
-        app.agents_filter = crate::app::AgentsFilter::All;
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
 
@@ -1115,22 +1573,13 @@ mod tests {
         app.status.get_mut(&id).unwrap().agent = "claude".into();
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
 
-        // Where the label lands for each static state.
+        // Where the label lands for each state.
         let mut columns = Vec::new();
-        for st in [State::Idle, State::Blocked, State::Done] {
+        for st in [State::Idle, State::Blocked, State::Working, State::Done] {
             app.status.get_mut(&id).unwrap().state = st;
             term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
             let cols = label_columns(&term, st.label());
             assert!(!cols.is_empty(), "the {st:?} row should be drawn");
-            columns.extend(cols);
-        }
-        // …and for every frame of the working spinner.
-        app.status.get_mut(&id).unwrap().state = State::Working;
-        for frame in 0..crate::ui::theme::SPINNER_FRAMES {
-            app.spinner = frame;
-            term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-            let cols = label_columns(&term, State::Working.label());
-            assert!(!cols.is_empty(), "the working row should be drawn");
             columns.extend(cols);
         }
 
@@ -1140,55 +1589,6 @@ mod tests {
             1,
             "every state icon must leave the label in the same column, got {distinct:?}"
         );
-    }
-
-    #[test]
-    fn agents_workspace_filter_is_the_default_and_scopes_the_history() {
-        let _env = crate::persist::test_env("agents-scope");
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new(120, 40, tx).unwrap();
-        let sess = |p: &str| crate::agent::SessionInfo {
-            agent: "claude".into(),
-            session_id: p.into(),
-            cwd: std::path::PathBuf::from(p),
-            updated: std::time::SystemTime::UNIX_EPOCH,
-        };
-        // One session in the active workspace's folder, one somewhere else.
-        let here = app.ws().cwd.clone();
-        app.resumable = vec![sess("/tmp/elsewhere"), sess(here.to_str().unwrap())];
-        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
-
-        assert_eq!(app.agents_filter, crate::app::AgentsFilter::Workspace);
-        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert_eq!(
-            app.session_rects.len(),
-            1,
-            "only the active workspace's session is listed"
-        );
-        // The row still points at the right entry in `resumable`, which is what
-        // the row menu resumes and deletes by.
-        assert_eq!(app.session_rects[0].0, 1);
-
-        // The default 26-column sidebar has no room for three segments, so the
-        // toggle collapses to one chip that cycles: Workspace → All → Active.
-        assert_eq!(app.agents_filter_rects.len(), 1, "collapsed to one chip");
-        assert_eq!(app.agents_filter_rects[0].0, crate::app::AgentsFilter::All);
-        assert!(buffer_contains(&term, app.catalog.scope_workspace));
-
-        app.agents_filter = crate::app::AgentsFilter::All;
-        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert_eq!(app.session_rects.len(), 2, "All lists the whole history");
-
-        // A remembered title names the history row in place of the project folder.
-        app.session_titles
-            .insert("/tmp/elsewhere".into(), "Ship the release".into());
-        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert!(buffer_contains(&term, "Ship the rel"));
-
-        // Widen the sidebar and all three segments fit, each picking its own filter.
-        app.sidebars.left.width = 44;
-        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert_eq!(app.agents_filter_rects.len(), 3, "three filter segments");
     }
 
     #[test]
@@ -1207,12 +1607,11 @@ mod tests {
         }];
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
 
-        // All: retained sessions remain visible after a fresh start or snapshot
-        // restore, so history never appears to have been lost.
-        app.agents_filter = crate::app::AgentsFilter::All;
-        app.sidebars.left.width = 44;
+        // Default = All: retained sessions remain visible after a fresh start or
+        // snapshot restore, so history never appears to have been lost.
+        assert!(!app.agents_active_only);
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert_eq!(app.agents_filter_rects.len(), 3, "filter toggle drawn");
+        assert_eq!(app.agents_filter_rects.len(), 2, "All/Active toggle drawn");
         assert!(buffer_contains(&term, "Active"), "toggle label present");
         assert!(
             buffer_contains(&term, "resume"),
@@ -1224,7 +1623,7 @@ mod tests {
         let active = app
             .agents_filter_rects
             .iter()
-            .find(|(filter, _)| *filter == crate::app::AgentsFilter::Active)
+            .find(|(active, _)| *active)
             .map(|(_, rect)| *rect)
             .expect("Active filter target");
         app.handle_event(AppEvent::Mouse(MouseEvent {
@@ -1233,12 +1632,10 @@ mod tests {
             row: active.y,
             modifiers: KeyModifiers::NONE,
         }));
-        assert_eq!(app.agents_filter, crate::app::AgentsFilter::Active);
+        assert!(app.agents_active_only);
         assert_eq!(app.agents_scroll, 0);
-        assert_eq!(
-            crate::config::load().agents_filter,
-            crate::app::AgentsFilter::Active
-        );
+        app.flush_config_for_test(&_rx);
+        assert!(crate::config::load().agents_active_only);
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
         assert!(
             !buffer_contains(&term, "resume"),
@@ -1259,7 +1656,7 @@ mod tests {
         let all = app
             .agents_filter_rects
             .iter()
-            .find(|(filter, _)| *filter == crate::app::AgentsFilter::All)
+            .find(|(active, _)| !*active)
             .map(|(_, rect)| *rect)
             .expect("All filter target");
         app.handle_event(AppEvent::Mouse(MouseEvent {
@@ -1268,33 +1665,297 @@ mod tests {
             row: all.y,
             modifiers: KeyModifiers::NONE,
         }));
-        assert_eq!(app.agents_filter, crate::app::AgentsFilter::All);
+        assert!(!app.agents_active_only);
         assert_eq!(app.agents_scroll, 0);
-        assert_eq!(
-            crate::config::load().agents_filter,
-            crate::app::AgentsFilter::All
-        );
+        app.flush_config_for_test(&_rx);
+        assert!(!crate::config::load().agents_active_only);
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
         assert!(buffer_contains(&term, "resume"));
     }
 
-    /// End to end with the mouse: the header row folds its dock, and the rule
-    /// between two docks drags to resize them. Both survive a restart, which is
-    /// the point — a layout you have to redo every session is not a layout.
     #[test]
-    fn dock_headers_fold_and_dividers_resize_with_the_mouse() {
-        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-        let _env = crate::persist::test_env("dock-resize");
+    fn agents_workspace_scope_filters_both_row_kinds_and_keeps_attention_global() {
+        let _env = crate::persist::test_env("agents-workspace-scope");
         let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+
+        // One workspace starts unscoped; scope remains available through the
+        // prefix command and every agent/session row menu.
+        assert!(!app.agents_this_workspace);
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+
+        let first_pane = app.layout().focus;
+        app.status.get_mut(&first_pane).unwrap().agent = "claude".into();
+        let first_root = crate::persist::config_dir().join("parent-project");
+        std::fs::create_dir_all(&first_root).unwrap();
+        app.workspaces[0].cwd = first_root.clone();
+        let second_root = first_root.join("nested-project");
+        std::fs::create_dir_all(&second_root).unwrap();
+        assert!(app.create_workspace_at(second_root.clone()));
+        let second_pane = app.layout().focus;
+        app.status.get_mut(&second_pane).unwrap().agent = "codex".into();
+        assert_eq!(app.active_ws, 1);
+
+        let first_workspace = app.workspaces[0].id.clone();
+        let second_workspace = app.workspaces[1].id.clone();
+        for (name, agent_id, workspace_id) in [
+            ("first schedule", "agent-first", first_workspace),
+            ("second schedule", "agent-second", second_workspace),
+        ] {
+            app.automation
+                .create(
+                    crate::automation::CreateAutomation {
+                        name: name.into(),
+                        enabled: true,
+                        trigger: crate::automation::Trigger::Once { at_utc: 100 },
+                        target: crate::automation::AutomationTarget::NewWorker,
+                        task: crate::automation::TaskTemplate {
+                            title: name.into(),
+                            prompt: "run the scheduled task".into(),
+                            agent_id: agent_id.into(),
+                            workspace_id,
+                            mode: crate::orch::TaskWorkerMode::Workspace,
+                            access: crate::automation::AutomationAccess::Workspace,
+                            paths: vec![],
+                            gate: None,
+                        },
+                        policy: crate::automation::AutomationPolicy::default(),
+                    },
+                    None,
+                    1,
+                )
+                .unwrap();
+        }
+
+        app.resumable = vec![
+            crate::agent::SessionInfo {
+                agent: "kimi".into(),
+                session_id: "second-history".into(),
+                cwd: second_root.join("nested"),
+                updated: std::time::SystemTime::UNIX_EPOCH,
+            },
+            crate::agent::SessionInfo {
+                agent: "hermes".into(),
+                session_id: "first-history".into(),
+                cwd: first_root.join("nested"),
+                updated: std::time::SystemTime::UNIX_EPOCH,
+            },
+        ];
+
+        // All workspaces is the default. Workspace scope is not a third member
+        // of the All/Active segmented control and consumes no extra row.
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert_eq!(app.agents_filter_rects.len(), 2);
+        assert!(!buffer_contains(&term, "Here"));
+        for visible in ["claude", "codex", "kimi", "hermes"] {
+            assert!(
+                buffer_contains(&term, visible),
+                "{visible} is initially visible"
+            );
+        }
+        assert_eq!(
+            app.automation_rects.len(),
+            2,
+            "unscoped dock shows schedules from both workspaces"
+        );
+
+        app.agents_scroll = 4;
+        app.open_agent_menu(crate::app::AgentTarget::Live(second_pane), 0, 0);
+        app.agent_menu_action(crate::app::AgentMenuItem::ToggleWorkspaceScope);
+        assert!(app.agents_this_workspace);
+        assert!(!app.agents_active_only, "scope is independent of lifecycle");
+        assert_eq!(app.agents_scroll, 0);
+        app.flush_config_for_test(&_rx);
+        assert!(crate::config::load().agents_this_workspace);
+
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(buffer_contains(&term, "codex"));
+        assert!(buffer_contains(&term, "kimi"));
+        assert!(!buffer_contains(&term, "claude"));
+        assert!(!buffer_contains(&term, "hermes"));
+        assert_eq!(
+            app.automation_rects
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a2"],
+            "workspace scope also filters scheduled automation rows"
+        );
+        assert!(app.agents_elsewhere_rect.is_none());
+
+        // Lifecycle remains an independent second axis: Active hides the local
+        // resumable row but leaves workspace scope selected.
+        assert!(app.set_agents_filter(true));
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(app.agents_this_workspace);
+        assert!(buffer_contains(&term, "codex"));
+        assert!(!buffer_contains(&term, "kimi"));
+        assert!(app.set_agents_filter(false));
+
+        // A hidden blocked row still participates in global attention. The one
+        // overflow line names the count and targets a pane the scope actually hid.
+        app.status.get_mut(&first_pane).unwrap().state = crate::ui::theme::State::Blocked;
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(buffer_contains(&term, "1 blocked in other"));
+        let (target, overflow) = app.agents_elsewhere_rect.expect("attention overflow");
+        assert_eq!(target, first_pane);
+        app.handle_event(AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: overflow.x,
+            row: overflow.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(app.layout().focus, first_pane);
+        assert!(
+            app.agents_this_workspace,
+            "jump does not silently widen the list"
+        );
+
+        // With one workspace, persisted scope still applies to resumable
+        // history under that workspace root.
+        app.workspaces.truncate(1);
+        app.active_ws = 0;
+        assert!(app.agents_this_workspace);
+        assert!(app.agents_scope_active());
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(buffer_contains(&term, "hermes"));
+        assert!(
+            buffer_contains(&term, "kimi"),
+            "after the nested workspace closes, its cwd belongs to the parent"
+        );
+        assert_eq!(
+            app.automation_rects
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a1"],
+            "closed-workspace schedules do not leak into the remaining scope"
+        );
+    }
+
+    #[test]
+    fn agent_title_shows_module_title_not_alias() {
+        let _env = crate::persist::test_env("agent-module-title");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.config.layout.agent_title = true;
+        let id = app.layout().focus;
+        {
+            let status = app.status.get_mut(&id).unwrap();
+            status.agent = "pi".into();
+            status.agent_session = Some(crate::app::AgentSession {
+                agent: "pi".into(),
+                session_id: "sess-1".into(),
+            });
+        }
+        app.agent_names.insert("chezmoi".into(), id);
+        assert!(app.set_agent_row_title_for_session(
+            "pi".into(),
+            "sess-1".into(),
+            Some("Ship desktop".into()),
+        ));
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(
+            buffer_contains(&term, "Ship desktop"),
+            "idle live rows show the module-provided session title"
+        );
+        assert!(
+            !buffer_contains(&term, "=chezmoi"),
+            "a Luvus pane alias must not stand in for the session title"
+        );
+    }
+
+    #[test]
+    fn resumable_rows_show_module_session_title() {
+        let _env = crate::persist::test_env("resumable-module-title");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.config.layout.agent_title = true;
+        app.agents_active_only = false;
+        app.resumable = vec![crate::agent::SessionInfo {
+            agent: "pi".into(),
+            session_id: "sess-closed".into(),
+            cwd: std::path::PathBuf::from("/tmp/proj"),
+            updated: std::time::SystemTime::UNIX_EPOCH,
+        }];
+        assert!(app.set_agent_row_title_for_session(
+            "pi".into(),
+            "sess-closed".into(),
+            Some("Closed session name".into()),
+        ));
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(buffer_contains(&term, "resume"));
+        assert!(
+            buffer_contains(&term, "Closed session name"),
+            "All history rows show the module-provided title"
+        );
+    }
+
+    // ── this fork ────────────────────────────────────────────────────────────
+
+    /// Without a module title, a closed session is still named by the title its
+    /// agent showed while live (remembered by session id), not the bare folder.
+    #[test]
+    fn resumable_rows_fall_back_to_the_remembered_live_title() {
+        let _env = crate::persist::test_env("agents-remembered-title");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.config.layout.agent_title = true;
+        app.agents_active_only = false;
+        app.resumable = vec![crate::agent::SessionInfo {
+            agent: "claude".into(),
+            session_id: "sess-remembered".into(),
+            cwd: std::path::PathBuf::from("/tmp/proj"),
+            updated: std::time::SystemTime::UNIX_EPOCH,
+        }];
+        app.session_titles
+            .insert("sess-remembered".into(), "Ship the release".into());
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(buffer_contains(&term, "Ship the release"));
+    }
+
+    /// A folded dock keeps only its header row; the open docks share the rest
+    /// by weight, and every row of the body is still accounted for. With
+    /// nothing folded the layout is upstream's, cell for cell.
+    #[test]
+    fn folded_docks_keep_their_header_and_the_rest_is_shared() {
+        let body = Rect::new(0, 2, 26, 30);
+        assert_eq!(
+            super::folded_dock_slots(body, &[1, 1, 1], &[false, false, false]),
+            super::dock_slots(body, &[1, 1, 1]),
+        );
+
+        let (slots, dividers) = super::folded_dock_slots(body, &[22, 8, 16], &[false, true, false]);
+        assert_eq!(slots[1].height, 1, "folded to its header");
+        assert_eq!(slots[1].y, dividers[0] + 1);
+        assert_eq!(slots[2].y, dividers[1] + 1);
+        let used: u16 = slots.iter().map(|s| s.height).sum::<u16>() + dividers.len() as u16;
+        assert_eq!(used, body.height, "no row is lost");
+        assert!(
+            slots[0].height > slots[2].height,
+            "the open docks keep their proportion: {slots:?}"
+        );
+    }
+
+    /// End to end with the mouse: a click on a dock's header row folds it, the
+    /// fold is saved, and a second click gives the dock its height back.
+    #[test]
+    fn dock_headers_fold_and_unfold_with_the_mouse() {
+        let _env = crate::persist::test_env("dock-fold");
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut app = App::new(120, 40, tx).unwrap();
         app.sidebars.left.docks = vec![
             crate::app::DockKind::Workspaces,
             crate::app::DockKind::Agents,
         ];
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        let click = |app: &mut App, kind, c, r| {
-            app.handle_event(crate::event::AppEvent::Mouse(MouseEvent {
-                kind,
+        let click = |app: &mut App, c, r| {
+            app.handle_event(AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
                 column: c,
                 row: r,
                 modifiers: KeyModifiers::NONE,
@@ -1302,119 +1963,20 @@ mod tests {
         };
 
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        let (_, _, agents) = app.dock_slots_geom[1];
-        let divider = app.dock_dividers[0].2;
-        let before = agents.height;
-
-        // Drag the rule up three rows: AGENTS gains what WORKSPACES gives up.
-        click(
-            &mut app,
-            MouseEventKind::Down(MouseButton::Left),
-            4,
-            divider.y,
-        );
-        click(
-            &mut app,
-            MouseEventKind::Drag(MouseButton::Left),
-            4,
-            divider.y - 3,
-        );
-        click(
-            &mut app,
-            MouseEventKind::Up(MouseButton::Left),
-            4,
-            divider.y - 3,
-        );
-        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert_eq!(app.dock_slots_geom[1].2.height, before + 3);
-        assert_eq!(
-            app.dock_slots_geom[0].2.bottom() + 1,
-            app.dock_dividers[0].2.y + 1,
-            "the rule follows the dock above it"
-        );
-
-        // Click the AGENTS header: the dock folds to that single row and the one
-        // above takes the rest.
-        let header = app.dock_slots_geom[1].2;
-        click(
-            &mut app,
-            MouseEventKind::Down(MouseButton::Left),
-            header.x + 6,
-            header.y,
-        );
+        let open = app.dock_slots_geom[1].2;
+        click(&mut app, open.x + 6, open.y);
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
         assert_eq!(app.dock_slots_geom[1].2.height, 1, "folded to its header");
-        assert!(app
-            .sidebars
-            .left
-            .is_collapsed(&crate::app::DockKind::Agents));
-
-        // Both the fold and the dragged heights are in the saved config.
-        let saved = crate::config::load();
-        let left = saved.sidebars.unwrap().left;
-        assert_eq!(left.collapsed, vec!["agents".to_string()]);
-        assert_eq!(left.dock_rows.get("agents").copied(), Some(before + 3));
-
-        // Clicking the header again unfolds it, back to the dragged heights. The
-        // folded dock sits lower now — its neighbour grew — so aim at where the
-        // header actually is, not where it was.
-        let header = app.dock_slots_geom[1].2;
-        click(
-            &mut app,
-            MouseEventKind::Down(MouseButton::Left),
-            header.x + 6,
-            header.y,
-        );
-        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert_eq!(app.dock_slots_geom[1].2.height, before + 3);
-    }
-
-    /// Docks split the body evenly until someone drags a rule; after that the
-    /// heights recorded per dock are honoured, and a folded dock keeps only its
-    /// header row so the others get everything it gave up.
-    #[test]
-    fn dock_slots_split_evenly_then_follow_the_recorded_heights() {
-        let body = Rect::new(0, 2, 26, 21);
-        // Untouched: two docks, one divider, an even split of the rest.
-        let (slots, dividers) = super::dock_slots(body, &[(0, false), (0, false)]);
-        assert_eq!(dividers.len(), 1);
-        assert_eq!(slots[0].height, 10);
-        assert_eq!(slots[1].height, 10);
-        assert_eq!(slots[1].y, dividers[0] + 1);
-
-        // Dragged: the pair's rows are honoured and still fill the body.
-        let (slots, _) = super::dock_slots(body, &[(6, false), (14, false)]);
-        assert_eq!((slots[0].height, slots[1].height), (6, 14));
-
-        // Folded: the header row is all it takes, the rest goes to its neighbour.
-        let (slots, _) = super::dock_slots(body, &[(0, true), (0, false)]);
-        assert_eq!(slots[0].height, 1);
-        assert_eq!(slots[1].height, 19);
+        app.flush_config_for_test(&rx);
         assert_eq!(
-            slots[1].bottom(),
-            body.bottom(),
-            "the slots always fill the body exactly"
+            crate::config::load().collapsed_docks,
+            vec!["agents".to_string()]
         );
-    }
 
-    /// A rule drag conserves the pair's rows — the sidebar below it must not
-    /// shift — and neither dock is squeezed past its minimum.
-    #[test]
-    fn a_divider_drag_moves_rows_between_the_pair_only() {
-        let top = Rect::new(0, 2, 26, 10);
-        let bottom = Rect::new(0, 13, 26, 10);
-        let total = top.height + bottom.height;
-
-        let (a, b) = super::split_pair(top, bottom, 8);
-        assert_eq!((a, b), (6, 14));
-        assert_eq!(a + b, total, "rows are traded, never created");
-
-        // Dragged past the top dock's floor: it parks at the minimum.
-        let (a, b) = super::split_pair(top, bottom, top.y);
-        assert_eq!((a, b), (super::MIN_DOCK_ROWS, total - super::MIN_DOCK_ROWS));
-        // …and past the bottom one's.
-        let (a, b) = super::split_pair(top, bottom, 999);
-        assert_eq!((a, b), (total - super::MIN_DOCK_ROWS, super::MIN_DOCK_ROWS));
+        let header = app.dock_slots_geom[1].2;
+        click(&mut app, header.x + 6, header.y);
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert_eq!(app.dock_slots_geom[1].2.height, open.height);
     }
 
     /// A click on the bar must land the thumb where it was clicked — i.e.
@@ -1426,7 +1988,7 @@ mod tests {
             list: BarDrag::Agents,
             track,
             total: 25,
-            cap: list_capacity(track.height), // 10 items in a 20-row, 2-rows-per-item list
+            cap: list_capacity(track.height, 2), // 10 two-row items in 20 rows
         };
         assert_eq!(bar.cap, 10);
         let (len, span) = (track.height as usize, bar.total - bar.cap);
@@ -1443,13 +2005,10 @@ mod tests {
             span,
             "a drag past the end pins to the end"
         );
-
         for r in track.y..track.bottom() {
             let off = bar_offset(bar, r);
-            let pos = ((len - thumb) * off.min(span)) / span; // draw_scrollbar's thumb top
+            let pos = ((len - thumb) * off.min(span)) / span;
             let clicked = (r - track.y) as usize;
-            // Within a row: more offsets than thumb positions, so both the
-            // click→offset and offset→thumb maps floor.
             assert!(
                 pos.abs_diff(clicked.min(len - thumb)) <= 1,
                 "row {r}: thumb at {pos}, clicked {clicked}"
@@ -1506,6 +2065,283 @@ mod chrome_colour_tests {
             seam(&term),
             t.border_focus,
             "the hovered resize seam uses the focus border colour"
+        );
+    }
+}
+
+/// Module dock rows with a `tone` or `spans` (docs: *Writing a Module*, dock
+/// field table). Rendered through the real sidebar so the colours below are
+/// what a module author sees, not what a helper returns.
+#[cfg(test)]
+mod dock_tone_tests {
+    use crate::app::{App, DockRow, DockSpan, Side};
+    use ratatui::{backend::TestBackend, style::Color, Terminal};
+
+    fn row(text: &str, tone: Option<&str>, spans: &[(&str, Option<&str>)]) -> DockRow {
+        DockRow {
+            text: text.into(),
+            dot: None,
+            tone: tone.map(Into::into),
+            spans: spans
+                .iter()
+                .map(|(text, tone)| DockSpan {
+                    text: (*text).into(),
+                    tone: tone.map(Into::into),
+                })
+                .collect(),
+            action: Some("noop".into()),
+            value: None,
+            menu: Vec::new(),
+        }
+    }
+
+    fn render(app: &mut App) -> Terminal<TestBackend> {
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|frame| crate::ui::render(frame, app)).unwrap();
+        term
+    }
+
+    /// The `TestEnv` comes back with the app so `$LUVUS_HOME` stays isolated
+    /// for the whole test body, not just this call.
+    fn app_with_rows(
+        name: &str,
+        rows: Vec<DockRow>,
+    ) -> (crate::persist::TestEnv, App, Terminal<TestBackend>) {
+        let env = crate::persist::test_env(name);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.push_module_dock("mod:quota", Some("QUOTA".into()), Side::Left, rows);
+        assert_eq!(
+            app.sidebars
+                .side_of(&crate::app::DockKind::Module("mod:quota".into())),
+            Some(Side::Left),
+            "the dock mounted, so its rows are on screen"
+        );
+        let term = render(&mut app);
+        (env, app, term)
+    }
+
+    /// Where `needle` starts in the buffer, compared cell by cell so a
+    /// multi-byte glyph such as `━` counts as one column (a byte offset from
+    /// `str::find` would land on the wrong cell).
+    fn locate(term: &Terminal<TestBackend>, needle: &str) -> Option<(u16, u16)> {
+        let buf = term.backend().buffer();
+        let want: Vec<String> = needle.chars().map(|c| c.to_string()).collect();
+        for r in 0..buf.area.height {
+            let syms: Vec<&str> = (0..buf.area.width)
+                .map(|c| buf.cell((c, r)).map(|x| x.symbol()).unwrap_or(" "))
+                .collect();
+            for start in 0..=syms.len().saturating_sub(want.len()) {
+                if want.iter().enumerate().all(|(i, w)| syms[start + i] == w) {
+                    return Some((start as u16, r));
+                }
+            }
+        }
+        None
+    }
+
+    fn fg_at(term: &Terminal<TestBackend>, needle: &str) -> Color {
+        let (x, y) = locate(term, needle).unwrap_or_else(|| panic!("{needle:?} is on screen"));
+        term.backend().buffer().cell((x, y)).unwrap().fg
+    }
+
+    #[test]
+    fn row_tone_colours_the_text_and_untoned_rows_keep_the_default() {
+        let (_env, app, term) = app_with_rows(
+            "dock-tone-row",
+            vec![
+                row("session 72%", Some("success"), &[]),
+                row("plain row", None, &[]),
+                row("typo row", Some("reddish"), &[]),
+            ],
+        );
+        let t = &app.theme;
+        assert_eq!(
+            fg_at(&term, "session 72%"),
+            t.mint,
+            "success is the theme's mint"
+        );
+        assert_eq!(
+            fg_at(&term, "plain row"),
+            t.subtext1,
+            "no tone: exactly as before"
+        );
+        assert_eq!(
+            fg_at(&term, "typo row"),
+            t.subtext1,
+            "an unknown tone falls back to the default instead of failing"
+        );
+    }
+
+    #[test]
+    fn spans_take_their_own_tone_or_inherit_the_rows() {
+        let (_env, app, term) = app_with_rows(
+            "dock-tone-spans",
+            vec![
+                row(
+                    "week [xx] 41%",
+                    Some("warning"),
+                    &[
+                        ("week ", None),
+                        ("[", Some("muted")),
+                        ("xx", Some("success")),
+                        ("] 41%", None),
+                    ],
+                ),
+                row("day [yy]", None, &[("day ", None), ("[yy]", Some("error"))]),
+            ],
+        );
+        let t = &app.theme;
+        assert_eq!(
+            fg_at(&term, "week"),
+            t.amber,
+            "no span tone: the row's warning"
+        );
+        assert_eq!(fg_at(&term, "[xx"), t.overlay0, "muted span");
+        assert_eq!(fg_at(&term, "xx]"), t.mint, "success span");
+        assert_eq!(
+            fg_at(&term, "] 41%"),
+            t.amber,
+            "tail inherits the row again"
+        );
+        assert_eq!(
+            fg_at(&term, "day"),
+            t.subtext1,
+            "no row tone either: the default"
+        );
+        assert_eq!(fg_at(&term, "[yy]"), t.coral, "error span");
+    }
+
+    #[test]
+    fn spans_truncate_as_one_line_with_a_trailing_ellipsis() {
+        // Learn the dock's text budget from the rect a clickable row records:
+        // the text starts two columns in and the dock keeps a one-column gutter.
+        let (_env, mut app, _term) =
+            app_with_rows("dock-tone-trunc", vec![row("probe", None, &[])]);
+        let rect = app.module_dock_rects[0].2;
+        let budget = rect.width as usize - 3;
+        assert!(budget > 8, "sidebar wide enough for the cases below");
+        let text_x = rect.x + 2;
+        let last_x = text_x + budget as u16 - 1;
+
+        let fill = "a".repeat(budget);
+        app.push_module_dock(
+            "mod:quota",
+            Some("QUOTA".into()),
+            Side::Left,
+            vec![
+                // Bar exactly fills the dock, then a number that cannot fit.
+                row(
+                    "over",
+                    None,
+                    &[(fill.as_str(), Some("success")), ("72%", Some("error"))],
+                ),
+                // Exactly fits: no ellipsis, nothing dropped.
+                row(
+                    "exact",
+                    None,
+                    &[
+                        ("b".repeat(budget - 3).as_str(), None),
+                        ("41%", Some("error")),
+                    ],
+                ),
+                // A single span wider than the dock.
+                row(
+                    "wide",
+                    None,
+                    &[("c".repeat(budget + 5).as_str(), Some("warning"))],
+                ),
+            ],
+        );
+        let term = render(&mut app);
+        let buf = term.backend().buffer();
+        let t = &app.theme;
+
+        assert!(
+            locate(&term, "72%").is_none(),
+            "the tail that cannot fit is dropped"
+        );
+        let (_, y) = locate(&term, "aaaa").expect("the bar row is on screen");
+        assert_eq!(
+            buf.cell((last_x, y)).unwrap().symbol(),
+            "…",
+            "the last column is the ellipsis"
+        );
+        assert_eq!(
+            buf.cell((last_x - 1, y)).unwrap().symbol(),
+            "a",
+            "the bar runs right up to it"
+        );
+        assert_eq!(
+            buf.cell((last_x, y)).unwrap().fg,
+            t.mint,
+            "the ellipsis takes the cut span's colour"
+        );
+        let after = buf.cell((last_x + 1, y)).unwrap().symbol();
+        assert!(
+            !matches!(after, "a" | "7" | "…"),
+            "nothing spills past the dock into the border column, got {after:?}"
+        );
+
+        let (_, y) = locate(&term, "41%").expect("an exact fit keeps its tail");
+        assert_eq!(
+            buf.cell((last_x, y)).unwrap().symbol(),
+            "%",
+            "no ellipsis when it fits"
+        );
+        assert_eq!(buf.cell((last_x - 2, y)).unwrap().fg, t.coral);
+
+        let (_, y) = locate(&term, "cccc").expect("the wide row is on screen");
+        assert_eq!(buf.cell((last_x, y)).unwrap().symbol(), "…");
+        assert_eq!(buf.cell((last_x, y)).unwrap().fg, t.amber);
+    }
+
+    /// A two-column glyph that does not fit at the edge ends the line. The
+    /// spans after it must not slide left into its place, or the row would
+    /// read as a different value than the module pushed.
+    #[test]
+    fn a_wide_glyph_at_the_edge_ends_the_line_instead_of_being_skipped() {
+        let (_env, mut app, _term) = app_with_rows("dock-tone-wide", vec![row("probe", None, &[])]);
+        let rect = app.module_dock_rects[0].2;
+        let budget = rect.width as usize - 3;
+        let text_x = rect.x + 2;
+
+        // Two narrow columns are left for the ellipsis and the glyph: the
+        // glyph needs two on its own, so it is dropped, and so is "Q9".
+        let lead = "d".repeat(budget - 2);
+        app.push_module_dock(
+            "mod:quota",
+            Some("QUOTA".into()),
+            Side::Left,
+            vec![row(
+                "wide",
+                None,
+                &[(lead.as_str(), None), ("日", Some("error")), ("Q9", None)],
+            )],
+        );
+        let term = render(&mut app);
+        let buf = term.backend().buffer();
+        let t = &app.theme;
+
+        let (_, y) = locate(&term, "dddd").expect("the row is on screen");
+        assert!(
+            locate(&term, "日").is_none(),
+            "the glyph that did not fit is not drawn"
+        );
+        assert!(
+            locate(&term, "Q9").is_none(),
+            "nothing after it slides into its place"
+        );
+        let ell_x = text_x + (budget - 2) as u16;
+        assert_eq!(
+            buf.cell((ell_x, y)).unwrap().symbol(),
+            "…",
+            "the ellipsis follows the last drawn span"
+        );
+        assert_eq!(
+            buf.cell((ell_x, y)).unwrap().fg,
+            t.subtext1,
+            "the ellipsis takes the colour of a span that was drawn, not the dropped one"
         );
     }
 }

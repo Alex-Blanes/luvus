@@ -34,18 +34,6 @@ impl SettingsTab {
         SettingsTab::Language,
     ];
 
-    pub fn icon(self) -> &'static str {
-        match self {
-            SettingsTab::General => "[G]",
-            SettingsTab::Theme => "[T]",
-            SettingsTab::Layout => "[L]",
-            SettingsTab::Keys => "[K]",
-            SettingsTab::Modules => "[M]",
-            SettingsTab::Integrations => "[A]",
-            SettingsTab::Language => "[L]",
-        }
-    }
-
     /// The tab label in the active UI language (docs/21).
     pub fn label(self, cat: &crate::i18n::Catalog) -> &'static str {
         match self {
@@ -870,9 +858,38 @@ impl App {
             .retain(|(theme_id, _)| theme_id != id);
         self.pending_theme_uninstalls
             .insert(id.to_string(), restore);
+        self.show_toast(self.catalog.settings.theme_removing.replace("{id}", id));
+        self.deferred_theme_uninstalls.push(id.to_string());
+        self.flush_theme_uninstalls(true);
+    }
+
+    /// Saving and removing use separate workers. Do not let removal observe the
+    /// previous active theme on disk while the fallback save is still in flight.
+    pub(super) fn flush_theme_uninstalls(&mut self, saved: bool) -> bool {
+        if saved && self.config_save_pending() {
+            return false;
+        }
+        let changed = !self.deferred_theme_uninstalls.is_empty();
+        for id in std::mem::take(&mut self.deferred_theme_uninstalls) {
+            if !saved {
+                self.finish_theme_uninstall(
+                    id,
+                    Err("settings save failed; theme was not removed".into()),
+                );
+            } else if theme::canonical(&self.config.theme) == id {
+                self.finish_theme_uninstall(
+                    id,
+                    Err("theme is active again; removal cancelled".into()),
+                );
+            } else {
+                self.start_theme_uninstall(id);
+            }
+        }
+        changed
+    }
+
+    fn start_theme_uninstall(&self, id: String) {
         let tx = self.app_tx.clone();
-        let id = id.to_string();
-        self.show_toast(self.catalog.settings.theme_removing.replace("{id}", &id));
         std::thread::spawn(move || {
             let result = crate::theme::install::uninstall(&id)
                 .map(|_| crate::theme::ThemeRegistry::load())
@@ -926,7 +943,7 @@ impl App {
         let theme_id = self.config.theme.clone();
         self.set_effective_theme(&theme_id, selected);
         self.changelog_rows = None;
-        config::save(&self.config);
+        self.persist_config_patch(&serde_json::json!({"theme": theme_id}));
     }
 
     /// Swap the server's in-memory registry after an off-loop scan. A missing
@@ -949,7 +966,7 @@ impl App {
     fn apply_language(&mut self, code: &str) {
         self.config.language = code.to_string();
         self.catalog = crate::i18n::by_code(code);
-        config::save(&self.config);
+        self.persist_config_patch(&serde_json::json!({"language": code}));
     }
 
     /// Layout tab ‹ ›/click on a row's control (docs/29). Width sliders step by
@@ -988,7 +1005,7 @@ impl App {
                 ) as usize;
                 self.config.layout.scrollback_bytes = Some(next);
                 self.apply_history_budget();
-                config::save(&self.config);
+                self.persist_config();
             }
             LayoutRow::MobileWidth => {
                 let current = self.config.layout.mobile_width;
@@ -998,20 +1015,20 @@ impl App {
                     (24, std::cmp::Ordering::Less) => 0,
                     _ => (current as i32 + 4 * delta).clamp(24, 200) as u16,
                 };
-                config::save(&self.config);
+                self.persist_config();
             }
             LayoutRow::PaneTitles => {
                 self.config.layout.show_titles = !self.config.layout.show_titles;
-                config::save(&self.config);
+                self.persist_config();
             }
             LayoutRow::PaneTitlePath => {
                 self.config.layout.pane_title_path = !self.config.layout.pane_title_path;
-                config::save(&self.config);
+                self.persist_config();
             }
             LayoutRow::ResumeWs => {
                 self.config.layout.resume_in_new_workspace =
                     !self.config.layout.resume_in_new_workspace;
-                config::save(&self.config);
+                self.persist_config();
             }
             LayoutRow::DiffLayout => {
                 self.config.layout.diff_layout = if delta < 0 {
@@ -1029,23 +1046,23 @@ impl App {
                 } else {
                     self.config.layout.diff_layout.cycle()
                 };
-                config::save(&self.config);
+                self.persist_config();
             }
             LayoutRow::DiffWrap => {
                 self.config.layout.diff_wrap = !self.config.layout.diff_wrap;
-                config::save(&self.config);
+                self.persist_config();
             }
             LayoutRow::DiffContext => {
                 self.config.layout.diff_context_lines =
                     (self.config.layout.diff_context_lines as i32 + delta)
                         .clamp(0, i32::from(crate::diff::MAX_CONTEXT_LINES))
                         as u16;
-                config::save(&self.config);
+                self.persist_config();
             }
             LayoutRow::DiffLineNumbers => {
                 self.config.layout.diff_show_line_numbers =
                     !self.config.layout.diff_show_line_numbers;
-                config::save(&self.config);
+                self.persist_config();
             }
             LayoutRow::DiffMarkers => {
                 self.config.layout.diff_marker_style = if delta < 0 {
@@ -1053,15 +1070,15 @@ impl App {
                 } else {
                     self.config.layout.diff_marker_style.cycle()
                 };
-                config::save(&self.config);
+                self.persist_config();
             }
             LayoutRow::DiffColors => {
                 self.config.layout.diff_color_mode = self.config.layout.diff_color_mode.cycle();
-                config::save(&self.config);
+                self.persist_config();
             }
             LayoutRow::DiffLiveRefresh => {
                 self.config.layout.diff_live_refresh = !self.config.layout.diff_live_refresh;
-                config::save(&self.config);
+                self.persist_config();
             }
             #[cfg(windows)]
             LayoutRow::Shell => self.cycle_shell(delta),
@@ -1094,7 +1111,7 @@ impl App {
                 };
                 self.config.bars.place(&key, region);
                 self.bar.clear_geometry();
-                config::save(&self.config);
+                self.persist_config();
                 if let Some(next) = self
                     .layout_rows()
                     .iter()
@@ -1149,7 +1166,7 @@ impl App {
                 };
                 self.config.bars.place(&key, next);
                 self.bar.clear_geometry();
-                config::save(&self.config);
+                self.persist_config();
                 if let Some(cursor) = self
                     .layout_rows()
                     .iter()
@@ -1179,7 +1196,7 @@ impl App {
             .unwrap_or(0) as i32;
         let next = (((cur + delta) % n + n) % n) as usize;
         self.config.layout.file_open = opts[next].clone();
-        config::save(&self.config);
+        self.persist_config();
     }
 
     /// Cycle what a plain FILES click does (docs/38): preview ⇄ open in tab.
@@ -1195,7 +1212,7 @@ impl App {
             .unwrap_or(0) as i32;
         let next = (((cur + delta) % n + n) % n) as usize;
         self.config.layout.file_click = opts[next].to_string();
-        config::save(&self.config);
+        self.persist_config();
     }
 
     /// The current click-behavior choice as a display string. An unrecognized
@@ -1218,7 +1235,7 @@ impl App {
             .unwrap_or(0) as i32;
         let next = (((cur + delta) % n + n) % n) as usize;
         self.config.layout.shift_enter = opts[next].0.to_string();
-        config::save(&self.config);
+        self.persist_config();
     }
 
     /// The current Shift+Enter choice's display label (the raw keyword if unknown).
@@ -1259,12 +1276,12 @@ impl App {
             .unwrap_or(0) as i32;
         let next = (((cur + delta) % n + n) % n) as usize;
         self.config.shell = choices[next].0.to_string();
-        config::save(&self.config);
+        self.persist_config();
     }
 
     fn apply_gaps(&mut self) {
         crate::layout::set_gaps(self.config.layout.col_gap, self.config.layout.row_gap);
-        config::save(&self.config);
+        self.persist_config();
     }
 
     /// Push the retained-history budget to every live pane. Alacritty's
@@ -1288,34 +1305,34 @@ impl App {
             Some(GeneralRow::ShiftEnter) => self.cycle_shift_enter(delta),
             Some(GeneralRow::CheckUpdates) => {
                 self.config.check_updates = !self.config.check_updates;
-                config::save(&self.config);
+                self.persist_config();
             }
             Some(GeneralRow::AutoUpdate) => {
                 self.config.auto_update = !self.config.auto_update;
-                config::save(&self.config);
+                self.persist_config();
             }
             Some(GeneralRow::ResumeFlags) => {
                 self.config.resume_launch_flags = !self.config.resume_launch_flags;
-                config::save(&self.config);
+                self.persist_config();
             }
             Some(GeneralRow::NewPaneToWorkspaceRoot) => {
                 self.config.layout.new_pane_to_workspace_root =
                     !self.config.layout.new_pane_to_workspace_root;
-                config::save(&self.config);
+                self.persist_config();
             }
             Some(GeneralRow::AgentTitle) => {
                 self.config.layout.agent_title = !self.config.layout.agent_title;
-                config::save(&self.config);
+                self.persist_config();
             }
             Some(GeneralRow::SoundStyle) => self.cycle_sound_style(delta),
             Some(GeneralRow::SoundDone) => {
                 self.config.notifications.sound_on_done = !self.config.notifications.sound_on_done;
-                config::save(&self.config);
+                self.persist_config();
             }
             Some(GeneralRow::SoundBlocked) => {
                 self.config.notifications.sound_on_blocked =
                     !self.config.notifications.sound_on_blocked;
-                config::save(&self.config);
+                self.persist_config();
             }
             // Test rows fire on Enter/click only (see `settings_activate`) —
             // arrows must not ring them, or holding ‹ › would spam cues.
@@ -1333,7 +1350,7 @@ impl App {
         let count = crate::sound::STYLES.len() as i32;
         let next = ((index + delta) % count + count) % count;
         self.config.notifications.sound_style = crate::sound::STYLES[next as usize].key().into();
-        config::save(&self.config);
+        self.persist_config();
     }
 
     pub fn sound_style_label(&self) -> &'static str {
@@ -1614,6 +1631,7 @@ mod tests {
             app.config.layout.diff_marker_style,
             crate::diff::DiffMarkerStyle::Bars
         );
+        app.flush_config_for_test(&_rx);
         assert_eq!(
             crate::config::load().layout.diff_marker_style,
             crate::diff::DiffMarkerStyle::Bars,
@@ -1656,6 +1674,7 @@ mod tests {
             app.config.layout.diff_color_mode,
             crate::diff::DiffColorMode::Standard
         );
+        app.flush_config_for_test(&_rx);
         assert_eq!(
             crate::config::load().layout.diff_color_mode,
             crate::diff::DiffColorMode::Standard,
@@ -1694,6 +1713,7 @@ mod tests {
 
         app.adjust_general(row, 1);
         assert!(app.config.resume_launch_flags, "the toggle flipped");
+        app.flush_config_for_test(&_rx);
         assert!(
             crate::config::load().resume_launch_flags,
             "and it was saved"
@@ -1738,6 +1758,7 @@ mod tests {
             app.config.layout.new_pane_to_workspace_root,
             "the toggle flipped"
         );
+        app.flush_config_for_test(&_rx);
         assert!(
             crate::config::load().layout.new_pane_to_workspace_root,
             "and it was saved"
@@ -2010,27 +2031,6 @@ mod tests {
         assert_eq!(SettingsTab::ALL.len(), 7, "still seven tabs");
     }
 
-    #[test]
-    fn settings_tab_markers_have_consistent_terminal_width() {
-        let expected = [
-            (SettingsTab::General, "[G]"),
-            (SettingsTab::Theme, "[T]"),
-            (SettingsTab::Layout, "[L]"),
-            (SettingsTab::Keys, "[K]"),
-            (SettingsTab::Modules, "[M]"),
-            (SettingsTab::Integrations, "[A]"),
-            (SettingsTab::Language, "[L]"),
-        ];
-        for (tab, marker) in expected {
-            assert_eq!(tab.icon(), marker);
-            assert_eq!(
-                unicode_width::UnicodeWidthStr::width(tab.icon()),
-                3,
-                "{tab:?} marker must occupy three terminal columns"
-            );
-        }
-    }
-
     /// The General tab's "Open files with" slider cycles read-only → each detected
     /// editor → back, and steps backward with wraparound.
     #[test]
@@ -2099,6 +2099,7 @@ mod tests {
         app.settings_adjust(click, 1);
         assert_eq!(app.config.layout.file_click, config::FILE_CLICK_TAB);
         assert_eq!(app.file_click_label(), "Open in tab");
+        app.flush_config_for_test(&_rx);
         assert_eq!(
             crate::config::load().layout.file_click,
             config::FILE_CLICK_TAB,
@@ -2203,8 +2204,9 @@ mod tests {
         );
     }
 
-    /// The General tab's Shift+Enter chooser cycles through the known sequences
-    /// and drives the bytes `encode_key` forwards.
+    /// The General tab's modified-Enter fallback chooser cycles through the
+    /// known legacy sequences and drives the bytes `encode_key` forwards when
+    /// no Kitty keyboard mode is active.
     #[test]
     fn general_shift_enter_cycles_and_drives_the_bytes() {
         let _env = crate::persist::test_env("shift-enter-cycle");
@@ -2401,6 +2403,8 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(80, 24, tx).unwrap();
         app.apply_theme("custom-enter");
+        app.flush_config_for_test(&rx);
+        assert_eq!(crate::config::load().theme, "custom-enter");
         app.open_settings();
         app.settings_set_tab(SettingsTab::Theme);
         let index = app.theme_registry.index_of("custom-enter").unwrap();
@@ -2410,6 +2414,7 @@ mod tests {
 
         assert_eq!(app.config.theme, theme::THEMES[0]);
         assert!(app.theme_uninstall_pending("custom-enter"));
+        assert_eq!(app.deferred_theme_uninstalls, vec!["custom-enter"]);
         let event = loop {
             match rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap() {
                 event @ crate::event::AppEvent::ThemeUninstalled { .. } => break event,
@@ -2420,6 +2425,43 @@ mod tests {
         };
         app.handle_event(event);
         assert!(app.theme_registry.get("custom-enter").is_none());
+    }
+
+    #[test]
+    fn theme_removal_save_failure_keeps_the_file_and_restores_selection() {
+        let _env = crate::persist::test_env("theme-remove-save-failure");
+        let source = crate::persist::ensure_config_dir().join("custom-save-failure.toml");
+        crate::theme::install::init(&source, "custom-save-failure", None).unwrap();
+        let installed = crate::theme::install::install(source.to_str().unwrap(), true).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.apply_theme("custom-save-failure");
+        app.flush_config_for_test(&rx);
+        app.request_theme_uninstall("custom-save-failure");
+        app.flush_theme_uninstalls(false);
+        assert!(installed.path.exists());
+        assert!(!app.theme_uninstall_pending("custom-save-failure"));
+        assert!(app.deferred_theme_uninstalls.is_empty());
+        assert_eq!(app.config.theme, "custom-save-failure");
+        app.flush_config_for_test(&rx);
+    }
+
+    #[test]
+    fn theme_removal_cancels_when_reselected_before_save_completes() {
+        let _env = crate::persist::test_env("theme-remove-reselected");
+        let source = crate::persist::ensure_config_dir().join("custom-reselected.toml");
+        crate::theme::install::init(&source, "custom-reselected", None).unwrap();
+        let installed = crate::theme::install::install(source.to_str().unwrap(), true).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.apply_theme("custom-reselected");
+        app.flush_config_for_test(&rx);
+        app.request_theme_uninstall("custom-reselected");
+        app.apply_theme("custom-reselected");
+        app.flush_config_for_test(&rx);
+        assert!(installed.path.exists());
+        assert!(!app.theme_uninstall_pending("custom-reselected"));
+        assert_eq!(app.config.theme, "custom-reselected");
     }
 
     #[test]

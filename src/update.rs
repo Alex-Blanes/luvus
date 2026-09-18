@@ -123,6 +123,63 @@ pub enum CheckOutcome {
     Failed,
 }
 
+#[derive(Clone, Debug)]
+pub struct ReleaseStatus {
+    pub current: String,
+    pub latest: String,
+    pub available: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct InstallResult {
+    pub current: String,
+    pub latest: String,
+    pub channel: String,
+    pub updated: bool,
+}
+
+/// Structured update check for the on-demand UHP host profile (`host.update.check`).
+/// Unlike the periodic notifier, an explicit request reports network and
+/// manifest errors. Versions are this fork's build labels, not upstream semver.
+pub fn release_status() -> Result<ReleaseStatus> {
+    let manifest = manifest_url();
+    let release = fetch_release(&manifest).ok_or_else(|| {
+        anyhow!("could not check {manifest}; check your connection and try again")
+    })?;
+    Ok(ReleaseStatus {
+        current: installed_label(),
+        latest: release.label(),
+        available: is_newer_build(&release),
+    })
+}
+
+/// `host.update.install`: put the newest fork build in place, through the same
+/// guard as the background installer — only an installation luvus owns.
+pub fn install_latest() -> Result<InstallResult> {
+    let manifest = manifest_url();
+    let release = fetch_release(&manifest).ok_or_else(|| {
+        anyhow!("could not check {manifest}; check your connection and try again")
+    })?;
+    let current = installed_label();
+    if !is_newer_build(&release) {
+        return Ok(InstallResult {
+            current,
+            latest: release.label(),
+            channel: "current".to_string(),
+            updated: false,
+        });
+    }
+    if !install_in_place(&release)? {
+        bail!("this Luvus binary is managed by a package manager; update it there");
+    }
+    Ok(InstallResult {
+        current,
+        latest: release.label(),
+        channel: "direct".to_string(),
+        updated: true,
+    })
+}
+
 /// One fetch-compare, with the answer handed back rather than swallowed.
 fn fetch_outcome(url: &str) -> CheckOutcome {
     match fetch_release(url) {
