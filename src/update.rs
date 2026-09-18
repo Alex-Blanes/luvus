@@ -196,7 +196,23 @@ fn fetch_release(url: &str) -> Option<ForkRelease> {
 /// A published build is newer only when this binary knows its own build number.
 /// Without one every check would claim an update forever.
 fn is_newer_build(release: &ForkRelease) -> bool {
-    current_build().is_some_and(|build| release.build > build)
+    current_build().is_some_and(|build| newer_fork_build(release, CURRENT, build))
+}
+
+/// Upstream's semver first, the fork build number only to break a tie.
+///
+/// The build number counts commits since the upstream tag (`build.rs`), so it
+/// starts over at every upstream release: `0.14.2 - 0.76` is newer than
+/// `0.13.1 - 0.79`. Comparing the number alone made the background installer
+/// treat that older release as an update and put it over the newer binary.
+fn newer_fork_build(release: &ForkRelease, version: &str, build: u32) -> bool {
+    if is_newer(&release.version, version) {
+        return true;
+    }
+    if is_newer(version, &release.version) {
+        return false;
+    }
+    release.build > build
 }
 
 /// `luvus update`: bring everything as up to date as it can be from inside a
@@ -910,6 +926,22 @@ mod tests {
         assert!(parse_manifest("not json").is_none());
         assert!(parse_manifest(r#"{"version":"0.13.0"}"#).is_none());
         assert!(parse_manifest(r#"{"build":49}"#).is_none());
+    }
+
+    /// Build numbers restart at every upstream release, so the published
+    /// `0.13.1 - 0.79` must never read as an update to `0.14.2 - 0.76` — that
+    /// comparison is what would have downgraded this binary in the background.
+    #[test]
+    fn a_newer_upstream_release_outranks_a_higher_build_number() {
+        let release = |version: &str, build: u32| ForkRelease {
+            version: version.into(),
+            build,
+            tag: format!("build-{build}"),
+        };
+        assert!(!newer_fork_build(&release("0.13.1", 79), "0.14.2", 76));
+        assert!(newer_fork_build(&release("0.14.2", 77), "0.14.2", 76));
+        assert!(!newer_fork_build(&release("0.14.2", 76), "0.14.2", 76));
+        assert!(newer_fork_build(&release("0.15.0", 3), "0.14.2", 76));
     }
 
     /// The upstream probe reads GitHub's release JSON and compares semver — the
