@@ -26,32 +26,37 @@ pub(crate) fn project_dir(base: &Path, cwd: &Path) -> PathBuf {
 }
 
 fn newest_jsonl(dir: &Path) -> Option<(SystemTime, PathBuf, String)> {
-    let mut best: Option<(SystemTime, PathBuf, String)> = None;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Some(stem) = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
-            continue;
-        };
-        if best
-            .as_ref()
-            .map(|(current, _, _)| modified > *current)
-            .unwrap_or(true)
-        {
-            best = Some((modified, path, stem));
-        }
-    }
-    best
+    newest_jsonls(dir, 1).into_iter().next()
 }
+
+/// The `n` most recently written transcripts in one project folder, newest
+/// first, as `(modified, path, session id)`.
+fn newest_jsonls(dir: &Path, n: usize) -> Vec<(SystemTime, PathBuf, String)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(SystemTime, PathBuf, String)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+                return None;
+            }
+            let stem = path.file_stem()?.to_str()?.to_string();
+            let modified = entry.metadata().and_then(|m| m.modified()).ok()?;
+            Some((modified, path, stem))
+        })
+        .collect();
+    found.sort_by_key(|(modified, _, _)| std::cmp::Reverse(*modified));
+    found.truncate(n);
+    found
+}
+
+/// Sessions the AGENTS history takes from each project folder (this fork).
+/// One was not enough: the newest transcript in a folder is usually the agent
+/// still running there, which the sidebar hides as live — and the conversation
+/// you closed a moment before, one step older, never reached the list.
+const RECENT_PER_PROJECT: usize = 3;
 
 pub(in crate::agent) fn list(base: &Path, cwd: &Path) -> Vec<String> {
     let dir = project_dir(base, cwd);
@@ -120,8 +125,8 @@ pub(in crate::agent) fn recent(base: &Path, limit: usize) -> Vec<SessionInfo> {
     directories.truncate(limit);
     directories
         .into_iter()
-        .filter_map(|(_, directory)| {
-            let (updated, path, id) = newest_jsonl(&directory)?;
+        .flat_map(|(_, directory)| newest_jsonls(&directory, RECENT_PER_PROJECT))
+        .filter_map(|(updated, path, id)| {
             Some(SessionInfo {
                 agent: "claude".to_string(),
                 session_id: id,

@@ -63,9 +63,21 @@ pub fn is_resumable(agent: &str) -> bool {
     source(agent).is_some()
 }
 
+/// How many resumable sessions the AGENTS history scan keeps (this fork).
+///
+/// The cap is applied across every agent and folder *before* the dock scopes
+/// to a workspace, so with upstream's 12 a busy afternoon elsewhere pushed the
+/// sessions of the workspace you are in out of the list — and they seemed to
+/// come and go at random.
+pub const RESUMABLE_SESSIONS: usize = 30;
+
 /// The most recently active resumable sessions across known agents, newest
-/// first, at most one per `(agent, cwd)`, capped at `limit`. Used to populate
-/// the AGENTS sidebar with sessions you can reopen.
+/// first, each session once, capped at `limit`. Used to populate the AGENTS
+/// sidebar with sessions you can reopen.
+///
+/// This fork deduplicates by session id, not by `(agent, cwd)`: one row per
+/// folder meant that a closed conversation was hidden behind any newer one in
+/// the same folder — typically the agent still running there.
 pub fn recent_sessions(limit: usize) -> Vec<SessionInfo> {
     let mut out = Vec::new();
     for descriptor in registry::descriptors() {
@@ -79,7 +91,7 @@ pub fn recent_sessions(limit: usize) -> Vec<SessionInfo> {
     }
     out.sort_by_key(|s| std::cmp::Reverse(s.updated));
     let mut seen = std::collections::HashSet::new();
-    out.retain(|s| seen.insert((s.agent.clone(), s.cwd.clone())));
+    out.retain(|s| seen.insert((s.agent.clone(), s.session_id.clone())));
     out.truncate(limit);
     out
 }
@@ -1158,6 +1170,35 @@ mod tests {
         assert_eq!(got[0].agent, "claude");
         assert_eq!(got[0].session_id, "sess-1");
         assert_eq!(got[0].cwd, PathBuf::from("/Users/x/app"));
+    }
+
+    /// This fork: one folder can hold several conversations, and the newest is
+    /// usually the one still running. The history takes the newest few, so the
+    /// conversation closed just before it is still offered — and beyond the few
+    /// the folder stays bounded.
+    #[test]
+    fn claude_recent_offers_several_sessions_per_project() {
+        let base = tmp("claude-recent-several");
+        let dir = base.join("projects").join("-Users-x-app");
+        fs::create_dir_all(&dir).unwrap();
+        for id in ["s1", "s2", "s3", "s4"] {
+            fs::write(
+                dir.join(format!("{id}.jsonl")),
+                "{\"cwd\":\"/Users/x/app\",\"role\":\"user\"}\n",
+            )
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let got: Vec<String> = claude_recent(&base, 5)
+            .into_iter()
+            .map(|s| s.session_id)
+            .collect();
+        assert_eq!(
+            got,
+            vec!["s4", "s3", "s2"],
+            "newest first, three per folder"
+        );
     }
 
     #[test]

@@ -7440,7 +7440,7 @@ impl App {
     /// tests. The periodic path in `detect_tick` runs the same scan on a worker
     /// thread instead and applies it via [`Self::apply_scanned_sessions`].
     fn refresh_resumable(&mut self) {
-        let found = crate::agent::recent_sessions(12);
+        let found = crate::agent::recent_sessions(crate::agent::RESUMABLE_SESSIONS);
         self.apply_scanned_sessions(found);
     }
 
@@ -7563,6 +7563,11 @@ impl App {
         }
         if lifecycle_changed {
             self.session_dirty = true;
+            // An agent that just returned to the shell left a conversation on
+            // disk that the AGENTS history should now offer. Scans otherwise
+            // run only on attach, so without this it appeared after the next
+            // attach, or not at all.
+            self.runtime_sessions_dirty = true;
         }
         lifecycle_changed
     }
@@ -7589,11 +7594,27 @@ impl App {
         // runs. `same_path`, not `PathBuf` equality: the same folder reaches us
         // spelled differently (`~`, a drive letter in another case, a trailing
         // separator) and a spelling difference was enough to miss the match.
-        let open: Vec<(String, PathBuf)> = self
+        //
+        // Only for such panes, and only the newest session in their folder —
+        // the one that is most likely theirs. This used to hide *every*
+        // session of that agent in that folder whenever any pane ran it there,
+        // reported id or not, so a conversation you had just closed vanished
+        // from the list as long as another one was open beside it.
+        let unidentified: Vec<(String, PathBuf)> = self
             .status
             .iter()
-            .filter(|(_, s)| crate::agent::is_resumable(&s.agent))
+            .filter(|(_, s)| s.agent_session.is_none() && crate::agent::is_resumable(&s.agent))
             .filter_map(|(id, s)| self.panes.get(id).map(|p| (s.agent.clone(), p.cwd.clone())))
+            .collect();
+        // `found` is newest first, so the first match per pane is its newest.
+        let presumed_live: HashSet<String> = unidentified
+            .iter()
+            .filter_map(|(agent, cwd)| {
+                found
+                    .iter()
+                    .find(|s| s.agent == *agent && crate::platform::same_path(cwd, &s.cwd))
+                    .map(|s| s.session_id.clone())
+            })
             .collect();
         let dismissed = &self.dismissed_sessions;
         let fresh: Vec<crate::agent::SessionInfo> = found
@@ -7601,9 +7622,7 @@ impl App {
             .filter(|s| {
                 !dismissed.contains(&s.session_id)
                     && !live_ids.contains(&s.session_id)
-                    && !open.iter().any(|(agent, cwd)| {
-                        *agent == s.agent && crate::platform::same_path(cwd, &s.cwd)
-                    })
+                    && !presumed_live.contains(&s.session_id)
             })
             .collect();
         let changed = fresh.len() != self.resumable.len()
@@ -8264,7 +8283,15 @@ impl App {
             self.usage_mtimes.remove(&key);
         }
         self.panes.remove(&id);
-        self.status.remove(&id);
+        // A closed agent pane leaves its conversation for the AGENTS history to
+        // offer, and scans otherwise run only on attach (this fork).
+        if self
+            .status
+            .remove(&id)
+            .is_some_and(|s| s.agent_session.is_some() || crate::agent::is_resumable(&s.agent))
+        {
+            self.runtime_sessions_dirty = true;
+        }
         self.views.remove(&id);
         // Parked `wait.output` calls can never see new output on a dead pane, and
         // every close path (close_pane, close_tab, close_workspace) funnels
@@ -14796,6 +14823,62 @@ mod tests {
             app.resumable.is_empty(),
             "same folder, different spelling — still the session in this pane"
         );
+
+        // The symptom this fork fixed: a conversation closed in the same folder
+        // as a running one must still be offered. By folder alone only the
+        // newest session there is presumed to be the live one (scans list
+        // newest first); an older one in that folder stays resumable…
+        app.apply_scanned_sessions(vec![sess("here", &cwd), sess("closed", &cwd)]);
+        assert_eq!(
+            app.resumable
+                .iter()
+                .map(|s| &s.session_id)
+                .collect::<Vec<_>>(),
+            vec!["closed"],
+            "only the presumed-live session is hidden"
+        );
+        // …and once the pane reports its id, the folder no longer hides anything.
+        app.status.get_mut(&pane).unwrap().agent_session = Some(AgentSession {
+            agent: "claude".into(),
+            session_id: "here".into(),
+        });
+        app.apply_scanned_sessions(vec![
+            sess("here", &cwd),
+            sess("closed", &cwd),
+            sess("older", &cwd),
+        ]);
+        assert_eq!(
+            app.resumable
+                .iter()
+                .map(|s| &s.session_id)
+                .collect::<Vec<_>>(),
+            vec!["closed", "older"],
+            "a known id hides exactly its own session"
+        );
+    }
+
+    /// Closing an agent pane must schedule a history rescan: scans otherwise
+    /// run only when a client attaches, so the conversation just closed would
+    /// not appear until then.
+    #[test]
+    fn closing_an_agent_pane_rescans_the_resumable_history() {
+        let _env = crate::persist::test_env("close-agent-rescans");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.split(Axis::Col);
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).unwrap().agent = "claude".into();
+        app.runtime_sessions_dirty = false;
+
+        app.close_pane(pane);
+        assert!(app.runtime_sessions_dirty, "a closed agent pane rescans");
+
+        // A plain shell pane closing has nothing to add to the history.
+        app.split(Axis::Col);
+        let shell = app.layout().focus;
+        app.runtime_sessions_dirty = false;
+        app.close_pane(shell);
+        assert!(!app.runtime_sessions_dirty);
     }
 
     /// The WORKSPACES/AGENTS scrollbar is interactive: a press jumps the list to

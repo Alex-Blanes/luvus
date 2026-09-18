@@ -386,7 +386,9 @@ impl App {
             self.sessions_scan_inflight = true;
             let tx = self.app_tx.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(AppEvent::SessionsScanned(crate::agent::recent_sessions(12)));
+                let _ = tx.send(AppEvent::SessionsScanned(crate::agent::recent_sessions(
+                    crate::agent::RESUMABLE_SESSIONS,
+                )));
             });
         }
         // Process scans are triggered by attached PTY activity or by a bounded
