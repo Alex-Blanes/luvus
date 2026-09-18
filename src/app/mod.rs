@@ -5496,7 +5496,10 @@ impl App {
     /// `workspace.new` is an explicit "give me another", and a fresh worktree or a
     /// just-created folder can't collide by construction.
     pub fn open_workspace_at(&mut self, cwd: PathBuf) -> bool {
-        match self
+        // An explicit open by path — the picker, `workspace.open` — is what the
+        // picker's recent rows list (this fork). Automatic attach-opens do not
+        // come through here, so launching luvus somewhere does not count.
+        let opened = match self
             .workspaces
             .iter()
             .position(|w| crate::platform::same_path(&w.cwd, &cwd))
@@ -5505,8 +5508,12 @@ impl App {
                 self.active_ws = i;
                 true
             }
-            None => self.create_workspace_at(cwd),
+            None => self.create_workspace_at(cwd.clone()),
+        };
+        if opened {
+            crate::persist::remember_workspace(&cwd);
         }
+        opened
     }
 
     pub fn create_workspace_at(&mut self, cwd: PathBuf) -> bool {
@@ -9331,6 +9338,8 @@ mod tests {
             error: None,
             is_repo,
             show_hidden: false,
+            recent: Vec::new(),
+            recent_at: std::path::PathBuf::new(),
         };
 
         // On a git repo: `w` closes the picker and opens the branch prompt,

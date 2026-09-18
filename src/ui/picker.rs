@@ -199,6 +199,9 @@ pub(super) fn draw_picker(
             Row::OpenWorktree => ("⎇", cat.open_with_worktree.to_string(), t.accent),
             Row::Home => ("⌂", cat.home.to_string(), t.accent),
             Row::Up => ("↑", "..".to_string(), t.subtext0),
+            // A recently opened folder (this fork): the full path, since the
+            // tail is what tells two projects apart, and ⏎ opens it at once.
+            Row::Recent(idx) => ("↺", p.recent[idx].display().to_string(), t.subtext1),
             Row::Entry(idx) => {
                 let e = &p.entries[idx];
                 if e.is_dir {

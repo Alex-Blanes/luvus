@@ -47,6 +47,12 @@ pub struct FolderPicker {
     pub is_repo: bool,
     /// Whether dotfile entries are listed (`.` toggles).
     pub show_hidden: bool,
+    /// Folders opened recently that exist and are not already a workspace
+    /// (this fork), offered as rows while the picker is still at
+    /// [`FolderPicker::recent_at`] — where it opened. Browsing anywhere else
+    /// hides them; coming back shows them again.
+    pub recent: Vec<PathBuf>,
+    pub recent_at: PathBuf,
 }
 
 /// A selectable row in the picker. The action rows lead; the directory entries
@@ -61,6 +67,8 @@ pub enum Row {
     Home,
     /// `..` — go to the parent directory.
     Up,
+    /// `recent[idx]` — open that folder as a workspace at once (this fork).
+    Recent(usize),
     /// `entries[idx]`.
     Entry(usize),
 }
@@ -110,18 +118,31 @@ impl FolderPicker {
         }
     }
 
-    /// Total selectable rows.
-    pub fn row_count(&self) -> usize {
-        self.leading() + self.entries.len()
+    /// Recent-folder rows shown right now: only at the folder the picker
+    /// opened on, so they read as "start here" and never clutter a browse.
+    pub fn recent_rows(&self) -> usize {
+        if !self.at_drives() && self.path == self.recent_at {
+            self.recent.len()
+        } else {
+            0
+        }
     }
 
-    /// Classify the row at index `i`.
+    /// Total selectable rows.
+    pub fn row_count(&self) -> usize {
+        self.leading() + self.recent_rows() + self.entries.len()
+    }
+
+    /// Classify the row at index `i`: the action rows, then the recent folders,
+    /// then the browsed folder's entries.
     pub fn row(&self, i: usize) -> Row {
         let leading = self.leading();
+        let recent = self.recent_rows();
         match (i, self.is_repo) {
             // Checked first so a drive list, whose `leading` is 0, is all entries
             // rather than falling into the action arms below.
-            _ if i >= leading => Row::Entry(i - leading),
+            _ if i >= leading + recent => Row::Entry(i - leading - recent),
+            _ if i >= leading => Row::Recent(i - leading),
             (0, _) => Row::OpenFolder,
             (1, true) => Row::OpenWorktree,
             (1, false) | (2, true) => Row::Home,
@@ -498,7 +519,21 @@ impl App {
             .then_some(start)
             .or_else(crate::platform::home_dir)
             .unwrap_or_else(|| PathBuf::from("/"));
+        // Already a workspace, gone from disk, or the folder being shown: none
+        // of those is a place the recent rows could take you.
+        let recent: Vec<PathBuf> = crate::persist::recent_workspaces()
+            .into_iter()
+            .filter(|path| {
+                !crate::platform::same_path(path, &start)
+                    && !self
+                        .workspaces
+                        .iter()
+                        .any(|w| crate::platform::same_path(&w.cwd, path))
+                    && path.is_dir()
+            })
+            .collect();
         self.picker = Some(FolderPicker {
+            recent_at: start.clone(),
             path: start,
             entries: Vec::new(),
             cursor: 0,
@@ -510,6 +545,7 @@ impl App {
             error: None,
             is_repo: false,
             show_hidden: false,
+            recent,
         });
         self.picker_refresh();
     }
@@ -1019,6 +1055,15 @@ impl App {
             Row::OpenWorktree => self.picker_make_worktree(),
             Row::Home => self.picker_home(),
             Row::Up => self.picker_up(),
+            Row::Recent(idx) => {
+                if let Some(path) = self
+                    .picker
+                    .take()
+                    .and_then(|mut p| (idx < p.recent.len()).then(|| p.recent.swap_remove(idx)))
+                {
+                    self.open_workspace_at(path);
+                }
+            }
             Row::Entry(_) => self.picker_descend(),
         }
     }
@@ -1089,6 +1134,69 @@ mod tests {
     }
     use super::*;
 
+    /// This fork: folders opened before come back as rows under the actions,
+    /// newest first — minus any that is already a workspace or no longer
+    /// exists — only where the picker opened, and ⏎ on one opens it at once.
+    #[test]
+    fn recent_folders_are_offered_and_open_in_one_step() {
+        let _env = crate::persist::test_env("picker-recent");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        let root = std::env::temp_dir().join(format!("luvus-picker-recent-{}", std::process::id()));
+        let (older, newer, open) = (root.join("older"), root.join("newer"), root.join("open"));
+        for dir in [&older, &newer, &open] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let gone = root.join("gone");
+        for path in [&gone, &open, &older, &newer] {
+            crate::persist::remember_workspace(path);
+        }
+        // Reopened, spelled with a trailing separator: still one entry, moved
+        // to the front (`same_path` is lexical; that spelling is its business).
+        let older_again = PathBuf::from(format!("{}/", older.display()));
+        crate::persist::remember_workspace(&older_again);
+        assert_eq!(
+            crate::persist::recent_workspaces().len(),
+            4,
+            "the same folder spelled differently is one entry"
+        );
+        assert!(app.create_workspace_at(open.clone()));
+
+        app.open_folder_picker_at(root.clone());
+        let p = app.picker.as_ref().unwrap();
+        let leading = p.leading();
+        let offered: Vec<&PathBuf> = p.recent.iter().collect();
+        assert_eq!(
+            offered,
+            vec![&older_again, &newer],
+            "newest first; the open workspace and the missing folder are left out"
+        );
+        assert!(matches!(p.row(leading), Row::Recent(0)));
+        assert!(matches!(p.row(leading + 2), Row::Entry(_)));
+
+        // Browsing away hides them; they belong to where the picker opened.
+        app.picker_up();
+        assert_eq!(app.picker.as_ref().unwrap().recent_rows(), 0);
+        app.picker.as_mut().unwrap().path = root.clone();
+        assert_eq!(
+            app.picker.as_ref().unwrap().recent_rows(),
+            2,
+            "back where it opened"
+        );
+
+        // ⏎ on the second recent row opens it as a workspace and closes the
+        // picker, and that folder is now the newest recent one.
+        app.picker.as_mut().unwrap().cursor = leading + 1;
+        app.picker_activate();
+        assert!(app.picker.is_none());
+        assert!(crate::platform::same_path(&app.ws().cwd, &newer));
+        assert!(crate::platform::same_path(
+            &crate::persist::recent_workspaces()[0],
+            &newer
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn repo_adds_an_open_with_worktree_row_that_shifts_the_indices() {
         let mut p = FolderPicker {
@@ -1106,6 +1214,8 @@ mod tests {
             error: None,
             is_repo: false,
             show_hidden: false,
+            recent: Vec::new(),
+            recent_at: PathBuf::new(),
         };
         // Plain folder: [Open] [Home] [..] [a]
         assert_eq!(p.row_count(), 4);
@@ -1158,6 +1268,8 @@ mod tests {
             error: None,
             is_repo: true,
             show_hidden: false,
+            recent: Vec::new(),
+            recent_at: PathBuf::new(),
         });
         app.picker_activate(); // ⏎ / click on that row
         assert!(app.picker.is_none(), "picker closes");

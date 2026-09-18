@@ -227,6 +227,44 @@ pub fn config_dir() -> PathBuf {
     home.join(name)
 }
 
+/// How many folders [`recent_workspaces`] remembers (this fork).
+const RECENT_WORKSPACES_MAX: usize = 10;
+
+fn recent_workspaces_path() -> PathBuf {
+    config_dir().join("recent-workspaces.json")
+}
+
+/// Folders opened as workspaces most recently, newest first (this fork) — the
+/// "recent" rows of the folder picker, so a project opened before needs no
+/// browsing or pasting. Shared by every named session: it lives beside
+/// `config.json`, not in a session snapshot, and a missing or unreadable file
+/// is just an empty list.
+pub fn recent_workspaces() -> Vec<PathBuf> {
+    fs::read_to_string(recent_workspaces_path())
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Move `path` to the front of [`recent_workspaces`]. Best effort and small
+/// (a few paths), written in place of the old file through a temporary so a
+/// crash mid-write cannot leave a half list behind.
+pub fn remember_workspace(path: &Path) {
+    let mut list = recent_workspaces();
+    list.retain(|p| !crate::platform::same_path(p, path));
+    list.insert(0, path.to_path_buf());
+    list.truncate(RECENT_WORKSPACES_MAX);
+    let Ok(text) = serde_json::to_string_pretty(&list) else {
+        return;
+    };
+    let target = recent_workspaces_path();
+    let tmp = target.with_extension("json.tmp");
+    ensure_config_dir();
+    if fs::write(&tmp, text).is_ok() && fs::rename(&tmp, &target).is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
 /// Create the state dir if needed and, on Unix, keep it owner-only (`0700`).
 /// The control sockets inside grant full command execution as the user, and
 /// some BSDs ignore permissions on a socket *file* — the directory mode is the
