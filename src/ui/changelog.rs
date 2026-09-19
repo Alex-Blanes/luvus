@@ -1033,7 +1033,7 @@ mod tests {
 
         // It lands: the parked restart goes without a second click.
         app.handle_event(crate::event::AppEvent::SelfUpdateInstalled(
-            "0.12.0 - 0.77".into(),
+            "0.12.0 - 77".into(),
         ));
         assert!(
             app.relaunch_requested,

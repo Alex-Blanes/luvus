@@ -341,8 +341,8 @@ mod tests {
         assert_eq!(version.right(), 119);
     }
 
-    /// `build.rs` builds the shown label as `<version> - 0.<commits since the
-    /// upstream tag>`; without the tag it degrades to the bare version. Either
+    /// `build.rs` builds the shown label as `<version> - <commits reachable from
+    /// HEAD>`; without a git history it degrades to the bare version. Either
     /// way it must start with the real semver, or the sidebar would advertise a
     /// release the binary is not.
     #[test]
@@ -353,7 +353,9 @@ mod tests {
         let build = &label[version.len()..];
         assert!(
             build.is_empty()
-                || (build.starts_with(" - 0.") && build[5..].chars().all(|c| c.is_ascii_digit())),
+                || build
+                    .strip_prefix(" - ")
+                    .is_some_and(|n| { !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) }),
             "unexpected build suffix: {build:?}"
         );
     }

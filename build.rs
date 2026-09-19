@@ -55,13 +55,17 @@ fn main() {
     emit_fork_build();
 }
 
-/// Emit `LUVUS_VERSION_LABEL`: the release plus how many commits this checkout
-/// carries on top of the upstream tag `v<version>` — the fork's own build
-/// number, so the sidebar says `0.12.0 - 0.44` and you always know which of
-/// *your* builds is running. Every commit or merge on the branch bumps it.
-/// Falls back to the bare version when the tag is missing (crates.io tarball,
-/// shallow CI clone) — the label is only ever cosmetic, `CARGO_PKG_VERSION`
-/// stays the semver everything else compares.
+/// Emit `LUVUS_VERSION_LABEL`: the release plus this fork's build number, so
+/// the sidebar says `0.14.2 - 597` and you always know which of *your* builds
+/// is running.
+///
+/// The build number is every commit reachable from HEAD. It only ever grows,
+/// needs nothing but the history, and is the same here and in the release
+/// workflow (a full-history checkout). It used to count commits since the
+/// upstream tag `v<version>`, which restarted at every upstream merge — so
+/// build tags collided across versions — and needed that upstream tag pushed
+/// to the fork, where pushing it ran upstream's own release pipeline. Falls
+/// back to the bare version without a git history (crates.io tarball).
 fn emit_fork_build() {
     let git = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join(".git");
     // Rebuild when HEAD moves — a new commit or a merge is a new build number.
@@ -75,9 +79,8 @@ fn emit_fork_build() {
             println!("cargo:rerun-if-changed={}", git.join(reference).display());
         }
     }
-    let tag = format!("v{}", env::var("CARGO_PKG_VERSION").unwrap());
     let count = std::process::Command::new("git")
-        .args(["rev-list", "--count", &format!("{tag}..HEAD")])
+        .args(["rev-list", "--count", "HEAD"])
         .current_dir(env::var("CARGO_MANIFEST_DIR").unwrap())
         .output()
         .ok()
@@ -86,7 +89,7 @@ fn emit_fork_build() {
         .unwrap_or_default();
     let version = env::var("CARGO_PKG_VERSION").unwrap();
     let label = match count.parse::<u32>() {
-        Ok(n) => format!("{version} - 0.{n:02}"),
+        Ok(n) => format!("{version} - {n}"),
         Err(_) => version,
     };
     println!("cargo:rustc-env=LUVUS_VERSION_LABEL={label}");

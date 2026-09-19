@@ -35,9 +35,9 @@ const UPSTREAM_RELEASES_URL: &str = "https://api.github.com/repos/RizRiyz/luvus/
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
 /// This build's fork build number ([`build.rs`]). `None` when the binary was
-/// built without the `v<version>` tag in reach (a crates.io tarball, a shallow
-/// clone) — there is nothing to compare then, so the fork check stays quiet
-/// rather than nagging about an update it cannot reason about.
+/// built without a git history (a crates.io tarball) — there is nothing to
+/// compare then, so the fork check stays quiet rather than nagging about an
+/// update it cannot reason about.
 fn current_build() -> Option<u32> {
     env!("LUVUS_BUILD").parse().ok()
 }
@@ -56,7 +56,7 @@ impl ForkRelease {
     /// into `LUVUS_VERSION_LABEL`, so "available" and "installed" are comparable
     /// at a glance.
     fn label(&self) -> String {
-        format!("{} - 0.{:02}", self.version, self.build)
+        format!("{} - {}", self.version, self.build)
     }
 }
 
@@ -196,9 +196,9 @@ fn fetch_release(url: &str) -> Option<ForkRelease> {
 /// Is `release` newer than what is running? Semver first, build number only as
 /// the tiebreaker within one release.
 ///
-/// The build number counts commits since the `v<version>` tag, so **it resets
-/// every time the fork merges a new upstream release** — the count starts again
-/// from the new tag. Comparing the two numbers alone therefore reads a version
+/// The build number now counts every commit, so it only grows. It used to count
+/// commits since the `v<version>` tag, so **it reset every time the fork merged
+/// a new upstream release**. Comparing the two numbers alone therefore read a version
 /// bump as going backwards: at the 0.12.0 → 0.13.1 merge the running build was
 /// 94 and the first build of the newer release was 68, so `68 > 94` was false
 /// and the updater refused that release, and every release after it, until the
@@ -946,7 +946,7 @@ mod tests {
         super::check_once(&tx, &url, false);
         match rx.try_recv() {
             Ok(crate::event::AppEvent::UpdateAvailable(v)) => {
-                assert_eq!(v, format!("{} - 0.{:02}", super::CURRENT, build + 1));
+                assert_eq!(v, format!("{} - {}", super::CURRENT, build + 1));
             }
             _ => panic!("a higher build should have been reported"),
         }
@@ -982,12 +982,12 @@ mod tests {
         assert_eq!(release.version, "0.12.0"); // leading `v` trimmed
         assert_eq!(release.build, 49);
         assert_eq!(release.tag, "build-49");
-        assert_eq!(release.label(), "0.12.0 - 0.49");
+        assert_eq!(release.label(), "0.12.0 - 49");
 
         // `tag` is optional: the workflow names releases after the build.
         let implied = parse_manifest(r#"{"version":"0.12.0","build":7}"#).expect("no tag");
         assert_eq!(implied.tag, "build-7");
-        assert_eq!(implied.label(), "0.12.0 - 0.07");
+        assert_eq!(implied.label(), "0.12.0 - 7");
 
         // Garbage, or a manifest with no build number → None. Upstream's own
         // `luvus.dev/latest.json` lands here, and must not read as an update.
