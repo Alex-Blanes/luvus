@@ -1267,6 +1267,7 @@ mod tests {
 
     #[test]
     fn selecting_the_worktree_row_opens_the_branch_prompt() {
+        let _env = crate::persist::test_env("selecting-the-worktree-row-opens-the-branch-prom");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
         app.picker = Some(FolderPicker {
@@ -1292,6 +1293,7 @@ mod tests {
 
     #[test]
     fn picker_browses_and_opens_a_folder() {
+        let _env = crate::persist::test_env("picker-browses-and-opens-a-folder");
         let tmp = std::env::temp_dir().join(format!("luvus-picker-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("sub")).unwrap();
@@ -1564,6 +1566,7 @@ mod tests {
     /// behind it — the only way to reach a deep folder without walking there.
     #[test]
     fn pasting_a_path_jumps_the_picker_there() {
+        let _env = crate::persist::test_env("pasting-a-path-jumps-the-picker-there");
         let tmp = std::env::temp_dir().join(format!("luvus-pickpaste-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let deep = tmp.join("a").join("b");

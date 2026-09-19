@@ -9326,6 +9326,7 @@ mod tests {
 
     #[test]
     fn picker_w_creates_a_worktree_only_on_a_repo() {
+        let _env = crate::persist::test_env("picker-w-creates-a-worktree-only-on-a-repo");
         let mk = |path: &str, is_repo: bool| crate::app::FolderPicker {
             path: std::path::PathBuf::from(path),
             entries: Vec::new(),
@@ -14305,6 +14306,7 @@ mod tests {
 
     #[test]
     fn workspace_open_focuses_existing_or_creates_new() {
+        let _env = crate::persist::test_env("workspace-open-focuses-existing-or-creates-new");
         // `luvus` attaching from a new folder → `workspace.open` adds it; from a
         // folder that's already a workspace → it just focuses it (no duplicate).
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -14339,6 +14341,7 @@ mod tests {
 
     #[test]
     fn attach_open_does_not_steal_focus_from_the_active_workspace() {
+        let _env = crate::persist::test_env("attach-open-does-not-steal-focus-from-the-active");
         // The automatic attach-open (`focus: false`) must add the launch folder if
         // new, but never yank you off the workspace a restored session left you on.
         // This is the "reopen snaps back to the first workspace" bug.
@@ -15199,6 +15202,7 @@ mod tests {
 
     #[test]
     fn modals_render_in_the_selected_language() {
+        let _env = crate::persist::test_env("modals-render-in-the-selected-language");
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let (tx, _rx) = std::sync::mpsc::channel();
