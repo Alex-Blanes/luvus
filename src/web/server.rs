@@ -122,6 +122,8 @@ impl Drop for LiveTicket {
 struct ConnectionGuard(Arc<std::sync::atomic::AtomicUsize>);
 
 impl ConnectionGuard {
+    // `fetch_update` is deprecated for `try_update`, which is newer than rust-version.
+    #[allow(deprecated)]
     fn acquire(counter: &Arc<std::sync::atomic::AtomicUsize>, limit: usize) -> Option<Self> {
         counter
             .fetch_update(

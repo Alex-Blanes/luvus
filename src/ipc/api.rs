@@ -159,6 +159,8 @@ impl Drop for RequestMetrics {
 struct ConnectionPermit;
 
 impl ConnectionPermit {
+    // `fetch_update` is deprecated for `try_update`, which is newer than rust-version.
+    #[allow(deprecated)]
     fn acquire() -> Option<Self> {
         ACTIVE_CONNECTIONS
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
@@ -172,6 +174,8 @@ impl ConnectionPermit {
 struct TerminalStreamPermit;
 
 impl TerminalStreamPermit {
+    // `fetch_update` is deprecated for `try_update`, which is newer than rust-version.
+    #[allow(deprecated)]
     fn acquire() -> Option<Self> {
         ACTIVE_TERMINAL_STREAMS
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
