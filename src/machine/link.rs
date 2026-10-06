@@ -64,6 +64,8 @@ pub(crate) struct LinkTask {
 }
 
 impl LinkControl {
+    // `fetch_update` is deprecated for `try_update`, which is newer than rust-version.
+    #[allow(deprecated)]
     pub fn send(&self, message: &ClientMessage) -> Result<()> {
         if self.closed.load(Ordering::Acquire) {
             return Err(anyhow!("remote session connection is closed"));

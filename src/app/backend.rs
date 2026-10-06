@@ -37,6 +37,7 @@ impl App {
         if self.backend_terminal_index.get(&runtime.terminal_id) == Some(&pane_id) {
             return;
         }
+        self.backend_published_revisions.remove(&pane_id);
         self.backend_terminal_index
             .insert(runtime.terminal_id, pane_id);
         self.emit_backend_terminal_event(pane_id, "terminal.created", json!({}));
@@ -88,10 +89,15 @@ impl App {
     }
 
     pub(super) fn backend_output_changed(&mut self, pane_id: PaneId) {
+        self.agent_session_title_changed(pane_id);
         self.check_backend_revision_waits(pane_id);
-        // `PtyData` is already coalesced by Pane at the render cadence, so each
-        // wake can safely publish the latest revision without per-read spam or
-        // a trailing-edge debounce that might hide the final revision.
+        let Some(revision) = self.panes.get(&pane_id).map(Pane::content_revision) else {
+            return;
+        };
+        if self.backend_published_revisions.get(&pane_id) == Some(&revision) {
+            return;
+        }
+        self.backend_published_revisions.insert(pane_id, revision);
         self.emit_backend_terminal_event(pane_id, "terminal.output_ready", json!({}));
     }
 
@@ -119,6 +125,7 @@ impl App {
                 "capture must be dispatched through its bounded worker",
             )),
             "terminal.backend.type_literal" => self.backend_type_literal(params),
+            "terminal.backend.paste_text" => self.backend_paste_text(params),
             "terminal.backend.submit_text" => self.backend_submit_text(params),
             "terminal.backend.send_key" => self.backend_send_key(params),
             "terminal.backend.set_title" => self.backend_set_title(params),
@@ -192,6 +199,7 @@ impl App {
                 "content_revision":pane.content_revision(),
                 "terminal_title":pane.engine.lock().ok().and_then(|engine| engine.title()).map(|title| bounded_text(&title, backend::MAX_TITLE_BYTES)),
                 "label":self.backend_labels.get(&pane_id).map(|label| bounded_text(label, backend::MAX_TITLE_BYTES)),
+                "restore":!self.backend_non_restorable.contains(&pane_id),
             });
             let entry_bytes = serde_json::to_vec(&terminal)
                 .map_err(|_| BackendError::read("internal", "inventory serialization failed"))?
@@ -307,6 +315,25 @@ impl App {
         let text = required_bounded_string(params, "text", backend::MAX_INPUT_BYTES, true)?;
         self.panes[&pane_id]
             .try_send(text.as_bytes())
+            .map_err(|message| mutation_error("send_failed", message))?;
+        Ok(queued_action_json())
+    }
+
+    fn backend_paste_text(&self, params: &Value) -> BackendResult {
+        reject_mutation_fields(
+            params,
+            &[
+                "server_generation",
+                "terminal_id",
+                "pane_id",
+                "expected_root",
+                "text",
+            ],
+        )?;
+        let pane_id = self.resolve_backend_runtime(params, true)?;
+        let text = required_bounded_string(params, "text", backend::MAX_INPUT_BYTES, true)?;
+        self.panes[&pane_id]
+            .try_send_paste(text)
             .map_err(|message| mutation_error("send_failed", message))?;
         Ok(queued_action_json())
     }
@@ -527,11 +554,63 @@ impl App {
         }
     }
 
+    pub(super) fn workspace_delete_pending(&self, workspace_index: usize) -> bool {
+        let workspace = &self.workspaces[workspace_index];
+        self.worktree_deletes_inflight.values().any(|pending| {
+            pending.contains(&workspace.cwd, None)
+                || workspace
+                    .worktree
+                    .as_ref()
+                    .and_then(|membership| membership.directory_identity)
+                    == Some(pending.identity)
+        })
+    }
+
+    pub(super) fn backend_create_preflight(
+        &self,
+        cwd: &Path,
+        placement: &backend::CreatePlacement,
+    ) -> Result<(), BackendError> {
+        let deleting = || {
+            BackendError::mutation(
+                "create_failed",
+                "worktree deletion is still pending",
+                DispatchEvidence::NotStarted,
+            )
+        };
+        if self.worktree_delete_pending_for(cwd, Some(cwd)) {
+            return Err(deleting());
+        }
+        if let backend::CreatePlacement::Sibling(locator) = placement {
+            let params = json!({
+                "server_generation":locator.server_generation,
+                "terminal_id":locator.terminal_id,
+                "pane_id":locator.pane_id,
+            });
+            let target = self
+                .resolve_backend_runtime(&params, true)
+                .map_err(|error| {
+                    BackendError::mutation(error.code, error.message, DispatchEvidence::NotStarted)
+                })?;
+            let (workspace_index, _) = self.pane_location(target).ok_or_else(|| {
+                BackendError::mutation(
+                    "stale_route",
+                    "sibling terminal no longer has a pane location",
+                    DispatchEvidence::NotStarted,
+                )
+            })?;
+            if self.workspace_delete_pending(workspace_index) {
+                return Err(deleting());
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn start_backend_create(&mut self, req: ApiRequest) {
         let parsed = (|| -> Result<_, BackendError> {
             reject_mutation_fields(
                 &req.params,
-                &["cwd", "command", "label", "placement", "focus"],
+                &["cwd", "command", "label", "placement", "focus", "restore"],
             )?;
             let cwd = required_bounded_string(&req.params, "cwd", backend::MAX_CWD_BYTES, true)?;
             if cwd.contains('\0') || !std::path::Path::new(cwd).is_absolute() {
@@ -552,6 +631,18 @@ impl App {
                         DispatchEvidence::NotStarted,
                     )
                 })?;
+            let restore_explicit = req.params.get("restore").is_some();
+            let restore = match req.params.get("restore") {
+                None => true,
+                Some(Value::Bool(restore)) => *restore,
+                _ => {
+                    return Err(BackendError::mutation(
+                        "invalid_params",
+                        "restore must be a boolean",
+                        DispatchEvidence::NotStarted,
+                    ))
+                }
+            };
             let label = match req.params.get("label") {
                 None | Some(Value::Null) => None,
                 Some(Value::String(label))
@@ -685,6 +776,8 @@ impl App {
                     placement,
                     focus,
                     label,
+                    restore,
+                    restore_explicit,
                 },
             ))
         })();
@@ -702,45 +795,71 @@ impl App {
         let appearance = self.pane_appearance;
         let app_tx = self.app_tx.clone();
         let event_tx = self.app_tx.clone();
+        let pending_deletes = self
+            .worktree_deletes_inflight
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         std::thread::spawn(move || {
             let canonical = std::fs::canonicalize(&cwd)
                 .map_err(|_| "cwd does not exist or cannot be resolved".to_string())
-                .and_then(|cwd| {
-                    if cwd.is_dir() {
-                        Ok(cwd)
-                    } else {
+                .and_then(|resolved| {
+                    if !resolved.is_dir() {
                         Err("cwd is not a directory".to_string())
+                    } else if pending_deletes
+                        .iter()
+                        .any(|pending| pending.contains(&cwd, Some(&resolved)))
+                    {
+                        Err("worktree deletion is still pending".to_string())
+                    } else {
+                        Ok(resolved)
                     }
                 });
             let (resolved_cwd, branch, worktree, result) = match canonical {
                 Ok(resolved_cwd) => {
                     let branch = git_branch(&resolved_cwd);
                     let worktree = worktree_membership(&resolved_cwd);
-                    let result = match command.as_ref() {
-                        Some(command) => crate::terminal::pty::Pane::spawn_command(
-                            pane_id,
-                            80,
-                            24,
-                            resolved_cwd.clone(),
-                            app_tx,
-                            command,
-                            &[],
-                            history_budget,
-                            appearance,
-                        ),
-                        None => crate::terminal::pty::Pane::spawn(
-                            pane_id,
-                            80,
-                            24,
-                            resolved_cwd.clone(),
-                            app_tx,
-                            None,
-                            &shell,
-                            history_budget,
-                            appearance,
-                        ),
-                    }
-                    .map_err(|_| "PTY or root process failed to start".to_string());
+                    let (preflight_tx, preflight_rx) = std::sync::mpsc::channel();
+                    let preflight = event_tx
+                        .send(AppEvent::BackendCreatePreflight {
+                            cwd: resolved_cwd.clone(),
+                            placement: commit.placement.clone(),
+                            reply: preflight_tx,
+                        })
+                        .map_err(|_| "application event loop is unavailable".to_string())
+                        .and_then(|_| {
+                            preflight_rx
+                                .recv_timeout(Duration::from_secs(10))
+                                .map_err(|_| "backend create preflight timed out".to_string())?
+                                .map_err(|error| error.message)
+                        });
+                    let result = preflight.and_then(|()| {
+                        match command.as_ref() {
+                            Some(command) => crate::terminal::pty::Pane::spawn_command(
+                                pane_id,
+                                80,
+                                24,
+                                resolved_cwd.clone(),
+                                app_tx,
+                                command,
+                                &[],
+                                history_budget,
+                                appearance,
+                            ),
+                            None => crate::terminal::pty::Pane::spawn(
+                                pane_id,
+                                80,
+                                24,
+                                resolved_cwd.clone(),
+                                app_tx,
+                                None,
+                                &shell,
+                                history_budget,
+                                appearance,
+                            ),
+                        }
+                        .map_err(|_| "PTY or root process failed to start".to_string())
+                    });
                     (resolved_cwd, branch, worktree, result)
                 }
                 Err(error) => (cwd, None, None, Err(error)),
@@ -773,6 +892,20 @@ impl App {
         let fail = |error: BackendError| {
             let _ = reply.send(error.envelope(&request_id));
         };
+        // A deletion may begin between preflight and spawn. A successfully
+        // spawned but discarded pane must never claim it was not started.
+        if let Err(error) = self.backend_create_preflight(&cwd, &commit.placement) {
+            fail(BackendError::mutation(
+                error.code,
+                error.message,
+                if result.is_ok() {
+                    DispatchEvidence::Started
+                } else {
+                    DispatchEvidence::NotStarted
+                },
+            ));
+            return;
+        }
         let pane = match result {
             Ok(pane) => pane,
             Err(_) => {
@@ -857,6 +990,14 @@ impl App {
                     ));
                     return;
                 };
+                if self.workspace_delete_pending(workspace_index) {
+                    fail(BackendError::mutation(
+                        "create_failed",
+                        "worktree deletion is still pending",
+                        DispatchEvidence::Started,
+                    ));
+                    return;
+                }
                 let layout = &mut self.workspaces[workspace_index].tabs[tab_index].layout;
                 let previous_focus = layout.focus;
                 layout.focus = target;
@@ -874,8 +1015,13 @@ impl App {
         let command = pane.command.clone();
         self.panes.insert(pane_id, pane);
         self.status.insert(pane_id, PaneStatus::new(command));
+        let restore = commit.restore;
+        let restore_explicit = commit.restore_explicit;
         if let Some(label) = commit.label {
             self.backend_labels.insert(pane_id, label);
+        }
+        if !restore {
+            self.backend_non_restorable.insert(pane_id);
         }
         self.session_dirty = true;
         if let Some(workspace) = created_workspace {
@@ -894,7 +1040,7 @@ impl App {
             backend::CreatePlacement::Workspace => "workspace",
             backend::CreatePlacement::Sibling(_) => "sibling",
         };
-        let response = json!({"id":request_id,"result":{
+        let mut result = json!({
             "type":"terminal_backend_created",
             "state":"succeeded",
             "dispatch":"executed",
@@ -911,12 +1057,15 @@ impl App {
                 "pid":runtime.pid,
                 "start_marker":runtime.start_marker,
             }
-        }})
-        .to_string();
+        });
+        if restore_explicit {
+            result["restore"] = json!(restore);
+        }
+        let response = json!({"id":request_id,"result":result}).to_string();
         let _ = reply.send(response);
     }
 
-    pub(super) fn pane_location(&self, pane_id: PaneId) -> Option<(usize, usize)> {
+    pub(crate) fn pane_location(&self, pane_id: PaneId) -> Option<(usize, usize)> {
         self.workspaces
             .iter()
             .enumerate()
@@ -1030,6 +1179,7 @@ impl App {
                 "mode",
                 "lines",
                 "ansi",
+                "cursor",
             ],
         )?;
         let pane_id = self.resolve_backend_runtime(params, false)?;
@@ -1073,6 +1223,16 @@ impl App {
                 ))
             }
         };
+        let cursor = match params.get("cursor") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => {
+                return Err(BackendError::read(
+                    "invalid_params",
+                    "cursor must be a boolean",
+                ))
+            }
+        };
         let pane = self
             .panes
             .get(&pane_id)
@@ -1089,6 +1249,7 @@ impl App {
             mode,
             lines: lines as usize,
             ansi,
+            cursor,
         })
     }
 
@@ -1465,7 +1626,7 @@ fn required_display_string<'a>(
     Ok(value)
 }
 
-fn bounded_text(text: &str, max_bytes: usize) -> String {
+pub(super) fn bounded_text(text: &str, max_bytes: usize) -> String {
     let mut end = text.len().min(max_bytes);
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
@@ -1500,8 +1661,10 @@ fn backend_key_bytes(key: &str, application_cursor: bool) -> Option<Vec<u8>> {
         "pagedown" => b"\x1b[6~",
         "ctrl-c" => b"\x03",
         "ctrl-d" => b"\x04",
+        "ctrl-k" => b"\x0b",
         "ctrl-u" => b"\x15",
         "ctrl-w" => b"\x17",
+        "alt-d" => b"\x1bd",
         "space" => b" ",
         "digit-0" => b"0",
         "digit-1" => b"1",
@@ -1522,6 +1685,88 @@ fn backend_key_bytes(key: &str, application_cursor: bool) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn backend_create_restore_policy_requires_a_boolean() {
+        let _env = crate::persist::test_env("backend-create-restore-type");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let (reply, response) = std::sync::mpsc::channel();
+        app.start_backend_create(ApiRequest {
+            id: "create-restore-type".into(),
+            method: "terminal.backend.create".into(),
+            params: json!({
+                "cwd": std::env::current_dir().unwrap(),
+                "placement": {"kind": "workspace"},
+                "focus": false,
+                "restore": "false",
+            }),
+            reply,
+        });
+
+        let response: Value = serde_json::from_str(
+            &response
+                .recv_timeout(Duration::from_secs(2))
+                .expect("invalid request replies synchronously"),
+        )
+        .unwrap();
+        assert_eq!(response["error"]["code"], "invalid_params");
+        assert_eq!(response["error"]["dispatch"], "not_started");
+    }
+
+    #[test]
+    fn backend_create_defaults_to_restorable_without_changing_the_response_shape() {
+        let _env = crate::persist::test_env("backend-create-restore-default");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let (reply, response) = std::sync::mpsc::channel();
+        app.start_backend_create(ApiRequest {
+            id: "create-restore-default".into(),
+            method: "terminal.backend.create".into(),
+            params: json!({
+                "cwd": std::env::current_dir().unwrap(),
+                "placement": {"kind": "workspace"},
+                "focus": false,
+            }),
+            reply,
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let response = loop {
+            if let Ok(response) = response.try_recv() {
+                break response;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "terminal creation timed out");
+            app.handle_event(
+                rx.recv_timeout(remaining)
+                    .expect("terminal creation publishes an app event"),
+            );
+        };
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert!(
+            response["result"].get("restore").is_none(),
+            "legacy create requests keep the original strict response shape"
+        );
+        let pane = PaneId(
+            response["result"]["pane_id"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap(),
+        );
+        assert!(!app.backend_non_restorable.contains(&pane));
+        let inventory = app.backend_inventory(&json!({})).unwrap();
+        let pane_id = pane.0.to_string();
+        let terminal = inventory["terminals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|terminal| terminal["pane_id"].as_str() == Some(pane_id.as_str()))
+            .expect("created terminal is inventoried");
+        assert_eq!(terminal["restore"], true);
+        app.close_pane(pane);
+    }
+
     fn locator(app: &App, pane: PaneId) -> Value {
         let runtime = app.panes[&pane].terminal_runtime().unwrap();
         json!({
@@ -1536,6 +1781,257 @@ mod tests {
             .into_iter()
             .filter(|event| event["event"] == name)
             .collect()
+    }
+
+    #[test]
+    fn terminal_exit_reports_status_once_for_either_event_order() {
+        for io_first in [true, false] {
+            let _env = crate::persist::test_env(if io_first {
+                "backend-exit-io-first"
+            } else {
+                "backend-exit-reaper-first"
+            });
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let mut app = App::new(80, 24, tx).unwrap();
+            let pane = app.layout().focus;
+            let floor = crate::ipc::api::current_sequence(&app.events);
+            let io = AppEvent::PtyIoClosed(pane);
+            let reaped = AppEvent::PtyReaped(
+                pane,
+                crate::event::PtyExitStatus::from(portable_pty::ExitStatus::with_exit_code(3)),
+            );
+            if io_first {
+                app.handle_event(io);
+                assert!(app.panes.contains_key(&pane));
+                app.handle_event(reaped);
+            } else {
+                app.handle_event(reaped);
+                assert!(app.panes.contains_key(&pane));
+                app.handle_event(io);
+            }
+            assert!(!app.panes.contains_key(&pane));
+            assert_eq!(
+                backend_events_after(&app, floor, "terminal.exited").len(),
+                1
+            );
+            assert_eq!(
+                backend_events_after(&app, floor, "terminal.exited")[0]["data"]["detail"],
+                json!({"exit_code":3,"signal":null})
+            );
+            assert_eq!(
+                backend_events_after(&app, floor, "terminal.closed")[0]["data"]["detail"],
+                json!({"reason":"exited","exit_code":3,"signal":null})
+            );
+            app.handle_event(AppEvent::PtyIoClosed(pane));
+            assert_eq!(
+                backend_events_after(&app, floor, "terminal.exited").len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_exit_reports_signal_unknown_and_explicit_close() {
+        let _env = crate::persist::test_env("backend-exit-reasons");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let floor = crate::ipc::api::current_sequence(&app.events);
+        #[cfg(unix)]
+        // SAFETY: SIGKILL is a valid signal; strsignal returns a NUL-terminated
+        // description, copied before another call can reuse its buffer.
+        let killed = unsafe { std::ffi::CStr::from_ptr(libc::strsignal(libc::SIGKILL)) }
+            .to_str()
+            .unwrap();
+        #[cfg(windows)]
+        let killed = "Killed";
+        app.handle_event(AppEvent::PtyReaped(
+            pane,
+            portable_pty::ExitStatus::with_signal(killed).into(),
+        ));
+        app.handle_event(AppEvent::PtyIoClosed(pane));
+        let exited = backend_events_after(&app, floor, "terminal.exited");
+        let detail = &exited[0]["data"]["detail"];
+        assert!(detail["exit_code"].is_null());
+        #[cfg(unix)]
+        assert_eq!(detail["signal"], "SIGKILL");
+        #[cfg(windows)]
+        assert_eq!(detail["signal"], "Killed");
+
+        let mut app = App::new(80, 24, std::sync::mpsc::channel().0).unwrap();
+        let pane = app.layout().focus;
+        let floor = crate::ipc::api::current_sequence(&app.events);
+        app.handle_event(AppEvent::PtyIoClosed(pane));
+        assert!(app.tick_pty_exits(Instant::now() + PTY_EXIT_GRACE));
+        assert_eq!(
+            backend_events_after(&app, floor, "terminal.exited")[0]["data"]["detail"],
+            json!({"exit_code":null,"signal":null})
+        );
+
+        let mut app = App::new(80, 24, std::sync::mpsc::channel().0).unwrap();
+        let pane = app.layout().focus;
+        let floor = crate::ipc::api::current_sequence(&app.events);
+        app.close_pane(pane);
+        assert!(backend_events_after(&app, floor, "terminal.exited").is_empty());
+        assert_eq!(
+            backend_events_after(&app, floor, "terminal.closed")[0]["data"]["detail"],
+            json!({"reason":"closed"})
+        );
+
+        let mut app = App::new(80, 24, std::sync::mpsc::channel().0).unwrap();
+        let pane = app.layout().focus;
+        let floor = crate::ipc::api::current_sequence(&app.events);
+        app.handle_event(AppEvent::PtyReaped(
+            pane,
+            portable_pty::ExitStatus::with_exit_code(7).into(),
+        ));
+        app.close_pane(pane);
+        assert!(backend_events_after(&app, floor, "terminal.exited").is_empty());
+        assert_eq!(
+            backend_events_after(&app, floor, "terminal.closed")[0]["data"]["detail"],
+            json!({"reason":"closed","exit_code":7,"signal":null})
+        );
+    }
+
+    #[test]
+    fn rearm_publishes_only_a_new_trailing_terminal_revision() {
+        let _env = crate::persist::test_env("backend-output-tail");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let revision = app.panes[&pane].content_revision_handle();
+        // The pane runs a real shell. Let its startup output (slow under
+        // Windows ConPTY) finish first, so only this test moves the revision.
+        let mut settled = revision.load(std::sync::atomic::Ordering::Acquire);
+        let mut quiet_since = std::time::Instant::now();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while quiet_since.elapsed() < std::time::Duration::from_millis(300)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let now = revision.load(std::sync::atomic::Ordering::Acquire);
+            if now != settled {
+                settled = now;
+                quiet_since = std::time::Instant::now();
+            }
+        }
+        assert!(
+            quiet_since.elapsed() >= std::time::Duration::from_millis(300),
+            "the shell's startup output did not settle within five seconds"
+        );
+        app.panes[&pane].take_data_pending();
+        let base = revision.load(std::sync::atomic::Ordering::Acquire);
+
+        revision.fetch_add(1, std::sync::atomic::Ordering::Release);
+        app.panes[&pane].mark_data_pending_for_test();
+        let floor = crate::ipc::api::current_sequence(&app.events);
+        app.backend_output_changed(pane);
+        assert_eq!(
+            backend_events_after(&app, floor, "terminal.output_ready").len(),
+            1
+        );
+
+        let floor = crate::ipc::api::current_sequence(&app.events);
+        app.rearm_pty_notify_by_visibility();
+        assert!(backend_events_after(&app, floor, "terminal.output_ready").is_empty());
+
+        revision.fetch_add(1, std::sync::atomic::Ordering::Release);
+        app.panes[&pane].mark_data_pending_for_test();
+        let floor = crate::ipc::api::current_sequence(&app.events);
+        app.rearm_pty_notify_by_visibility();
+        let events = backend_events_after(&app, floor, "terminal.output_ready");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["data"]["content_revision"], base + 2);
+    }
+
+    #[test]
+    fn agent_osc_title_change_publishes_one_structural_event() {
+        use crate::terminal::appearance::PaneAppearance;
+        use crate::terminal::vt::{create_engine, VtEngineKind};
+
+        let _env = crate::persist::test_env("backend-agent-title-event");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).unwrap().agent = "pi".into();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let engine = create_engine(
+            VtEngineKind::Alacritty,
+            80,
+            24,
+            tx,
+            4 * 1024 * 1024,
+            PaneAppearance::default(),
+        );
+        app.panes.get_mut(&pane).unwrap().engine = engine.clone();
+        app.config.layout.agent_title = false;
+        let floor = crate::ipc::api::current_sequence(&app.events);
+
+        engine.lock().unwrap().advance(b"\x1b]2;Reviewing\x07");
+        app.backend_output_changed(pane);
+        let events = backend_events_after(&app, floor, "agent.title_changed");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["data"]["pane"], pane.0.to_string());
+        assert_eq!(events[0]["data"]["title"], "Reviewing");
+
+        app.backend_output_changed(pane);
+        assert_eq!(
+            backend_events_after(&app, floor, "agent.title_changed").len(),
+            1
+        );
+
+        engine.lock().unwrap().advance(b"\x1b]2;Done\x07");
+        app.backend_output_changed(pane);
+        let events = backend_events_after(&app, floor, "agent.title_changed");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1]["data"]["title"], "Done");
+    }
+
+    #[test]
+    fn an_animated_title_icon_is_not_announced_as_a_title_change() {
+        use crate::terminal::appearance::PaneAppearance;
+        use crate::terminal::vt::{create_engine, VtEngineKind};
+
+        let _env = crate::persist::test_env("backend-agent-title-spinner");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).unwrap().agent = "claude".into();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let engine = create_engine(
+            VtEngineKind::Alacritty,
+            80,
+            24,
+            tx,
+            4 * 1024 * 1024,
+            PaneAppearance::default(),
+        );
+        app.panes.get_mut(&pane).unwrap().engine = engine.clone();
+        let floor = crate::ipc::api::current_sequence(&app.events);
+
+        // A spinner redraws the terminal title many times a second.
+        for frame in ["⠂", "⠐", "✳", "⠂", "⠐", "✳"] {
+            engine
+                .lock()
+                .unwrap()
+                .advance(format!("\x1b]2;{frame} Ship the release\x07").as_bytes());
+            assert!(
+                app.agent_session_title_changed(pane),
+                "the TUI still sees each title generation"
+            );
+        }
+        let events = backend_events_after(&app, floor, "agent.title_changed");
+        assert_eq!(events.len(), 1, "one announcement for one displayed title");
+        assert_eq!(events[0]["data"]["title"], "Ship the release");
+
+        engine
+            .lock()
+            .unwrap()
+            .advance("\x1b]2;⠂ Ship the next release\x07".as_bytes());
+        app.agent_session_title_changed(pane);
+        let events = backend_events_after(&app, floor, "agent.title_changed");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1]["data"]["title"], "Ship the next release");
     }
 
     fn assert_capture_succeeds(app: &mut App, mut params: Value) {
@@ -1832,7 +2328,20 @@ mod tests {
         assert_eq!(target.pane_id, pane.0.to_string());
         assert_eq!(target.lines, 80);
         assert!(target.ansi);
+        assert!(!target.cursor);
         assert_eq!(app.layout().focus, pane);
+
+        let mut with_cursor = locator.clone();
+        with_cursor["cursor"] = json!(true);
+        assert!(app.prepare_backend_observe(&with_cursor).unwrap().cursor);
+        with_cursor["cursor"] = json!("yes");
+        assert_eq!(
+            app.prepare_backend_observe(&with_cursor)
+                .err()
+                .unwrap()
+                .code,
+            "invalid_params"
+        );
 
         let mut oversized = locator.clone();
         oversized["lines"] = json!(backend::MAX_OBSERVE_LINES + 1);
@@ -1861,6 +2370,8 @@ mod tests {
     fn logical_keys_are_strict_and_mode_aware() {
         assert_eq!(backend_key_bytes("left", false).unwrap(), b"\x1b[D");
         assert_eq!(backend_key_bytes("left", true).unwrap(), b"\x1bOD");
+        assert_eq!(backend_key_bytes("ctrl-k", false).unwrap(), b"\x0b");
+        assert_eq!(backend_key_bytes("alt-d", false).unwrap(), b"\x1bd");
         assert!(backend_key_bytes("raw-escape", false).is_none());
     }
 

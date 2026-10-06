@@ -191,6 +191,7 @@ pub const METHODS: &[&str] = &[
     "terminal.backend.observe",
     "terminal.backend.control",
     "terminal.backend.type_literal",
+    "terminal.backend.paste_text",
     "terminal.backend.submit_text",
     "terminal.backend.send_key",
     "terminal.backend.set_title",
@@ -423,12 +424,13 @@ pub fn capabilities(event_sequence: u64) -> Value {
         "agent_authorities":["integration_report","process_tree","launch_command","osc_title","screen_text","prior_identity","command_fallback"],
         "agent_states":["idle","working","blocked","done"],
         "terminal":{
-            "capabilities":crate::terminal::backend::CAPABILITIES,
+            "capabilities":crate::terminal::backend::advertised_capabilities(),
+            "features":crate::terminal::backend::FEATURES,
             "limits":crate::terminal::backend::limits_json(),
         },
         "authorization":{"default":"local_owner","delegation":"scoped_ephemeral_token",
             "scopes":["read","workspace","agent","terminal","orchestration","extensions","admin","all"]},
-        "concurrency":{"mutation_guard":"if_revision"},
+        "concurrency":{"mutation_guard":"if_revision","agent_prompt_terminal_id":true},
         "atomic_methods":["agent.start","agent.prompt","automation.create","automation.rebind","automation.run","task.retry","workspace.move_block","layout.apply","diff.note.apply"],
         "idempotency_keys":{"methods":["automation.create","automation.run"],"max_bytes":128},
         "graphics":false,
@@ -470,6 +472,10 @@ mod tests {
                 && contract["idempotent"].is_boolean()
         }));
         let capabilities = capabilities(0);
+        assert_eq!(
+            capabilities["concurrency"]["agent_prompt_terminal_id"],
+            true
+        );
         assert_eq!(capabilities["limits"]["terminal_stream_capacity"], 8);
         assert_eq!(capabilities["limits"]["terminal_stream_queue"], 2);
         assert_eq!(
@@ -483,6 +489,25 @@ mod tests {
         assert_eq!(capabilities["limits"]["agent_row_titles"], 256);
         assert_eq!(capabilities["limits"]["agent_row_title_bytes"], 256);
         assert_eq!(capabilities["limits"]["agent_row_title_agent_bytes"], 64);
+        assert_eq!(
+            capabilities["terminal"]["features"],
+            json!(["stream_cursor", "create_restore_policy"])
+        );
+        let terminal_capabilities = capabilities["terminal"]["capabilities"]
+            .as_array()
+            .expect("terminal capabilities");
+        for action in [
+            "paste_image",
+            "upload_start",
+            "upload_chunk",
+            "upload_finish",
+            "upload_cancel",
+        ] {
+            assert!(
+                terminal_capabilities.iter().any(|value| value == action),
+                "missing terminal action capability {action}"
+            );
+        }
         assert!(is_idempotent("pane.list"));
         assert!(!is_read_only("mission.open"));
         assert_eq!(required_scope("mission.open"), "workspace");

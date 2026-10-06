@@ -10,6 +10,11 @@ mod v2_integration;
 #[cfg(test)]
 pub(super) use sessions::{latest as opencode_latest, recent as opencode_recent};
 
+#[cfg(test)]
+pub(crate) fn without_binary_probe<T>(run: impl FnOnce() -> T) -> T {
+    integration::without_binary_probe(run)
+}
+
 pub(super) const DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     id: "opencode",
     // OpenCode 2 used `opencode2` during its preview. The released V2 CLI is
@@ -42,6 +47,7 @@ pub(super) const DESCRIPTOR: AgentDescriptor = AgentDescriptor {
             recent: sessions::recent,
             latest: sessions::latest,
             list: None,
+            titled: None,
         }),
         resume: |session| format!("opencode --session {session}\r"),
         fork: None,
