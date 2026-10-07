@@ -502,6 +502,7 @@ mod tests {
             "upload_chunk",
             "upload_finish",
             "upload_cancel",
+            "set_viewport",
         ] {
             assert!(
                 terminal_capabilities.iter().any(|value| value == action),

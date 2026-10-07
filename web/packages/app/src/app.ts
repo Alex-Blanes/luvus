@@ -6,6 +6,7 @@ import { pairingQrDataUrl } from "./pairing-qr.js";
 import { RenderScheduler } from "./render-scheduler.js";
 import { navigationBrand, navigationDot, refreshButton, trapNavigationFocus, type SidebarControls } from "./sidebar-controls.js";
 import { supportsFileUpload } from "./terminal-capabilities.js";
+import { viewportSizingAvailable } from "./terminal-viewport.js";
 import { filterWorkspacePanes, TerminalPaneRecency, TerminalWorkspaceSelection, terminalWorkspaceOptions, type TerminalPaneOption } from "./terminal-pane-options.js";
 import { TerminalPaneSidebar } from "./terminal-pane-sidebar.js";
 import { TerminalWorkspaceSidebar } from "./terminal-workspace-sidebar.js";
@@ -740,6 +741,7 @@ export class WebApp {
     const canUploadFiles = control && supportsFileUpload(
       this.#session.capabilities?.terminal?.capabilities,
     );
+    const viewportSizing = viewportSizingAvailable(this.#session.capabilities?.terminal?.capabilities, control);
     const terminal = new TerminalView(
       this.#bridge,
       snapshot,
@@ -747,6 +749,7 @@ export class WebApp {
       control,
       canUploadFiles,
       streamCursor,
+      viewportSizing,
       () => this.#terminalPaneOptions(),
       (selectedPane) => {
         const currentSnapshot = this.#session.snapshot;

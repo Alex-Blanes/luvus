@@ -43,6 +43,9 @@ try {
   const capabilities = await request(socket, "capabilities", "uhp.capabilities", {});
   assert.equal(capabilities.type, "uhp_capabilities");
   assert.ok(capabilities.access.allowed_methods.includes("terminal.backend.control"));
+  assert.ok(capabilities.terminal.capabilities.includes("set_viewport"));
+  assert.equal(capabilities.terminal.limits.viewport_cols, 500);
+  assert.equal(capabilities.terminal.limits.viewport_rows, 300);
 
   const deviceStatus = await request(socket, "device-status", "web.devices.status", {});
   assert.equal(deviceStatus.public_url, null);
@@ -62,6 +65,8 @@ try {
     .find((candidate) => candidate.kind === "terminal" && candidate.terminal_id);
   assert.ok(pane);
 
+  const initialFrame = waitFor(socket, (frame) => frame.type === "stream.frame"
+    && frame.stream_id === "control" && frame.frame?.event === "terminal.frame");
   const controlAck = waitFor(socket, (frame) => frame.type === "response" && frame.id === "control");
   socket.send(JSON.stringify({
     type: "stream.open",
@@ -78,6 +83,23 @@ try {
     },
   }));
   assert.equal((await controlAck).result.type, "terminal_backend_stream");
+  const revision = (await initialFrame).frame.data.content_revision;
+  const reflow = waitFor(socket, (frame) => frame.type === "stream.frame"
+    && frame.stream_id === "control" && frame.frame?.event === "terminal.frame"
+    && frame.frame.data.content_revision > revision);
+  const resized = await streamAction(socket, "viewport", "set_viewport", { cols: 40, rows: 18 });
+  assert.equal(resized.result?.dispatch, "executed");
+  await reflow;
+  if (process.platform !== "win32") {
+    const sizeMarker = `VIEWPORT_${process.pid}`;
+    const sizeOutput = waitFor(socket, (frame) => frame.type === "stream.frame"
+      && frame.stream_id === "control" && frame.frame?.data?.text?.includes(`${sizeMarker} 18 40`), 10_000);
+    const sizeAction = await streamAction(socket, "viewport-size", "submit_text", {
+      text: `printf '\\n${sizeMarker} '; stty size`,
+    });
+    assert.equal(sizeAction.result?.type, "terminal_backend_action");
+    await sizeOutput;
+  }
   const marker = "NATIVE_WEB_" + process.pid;
   const output = waitFor(socket, (frame) => frame.type === "stream.frame"
     && frame.stream_id === "control"
@@ -115,6 +137,14 @@ try {
       `terminal input ${id} failed: ${JSON.stringify(result)}`);
   }
   const burstElapsed = performance.now() - burstStarted;
+  // The gateway intentionally closes a stream on malformed input; it must
+  // never forward an out-of-bounds resize or revoke the browser's authority.
+  const invalidClosed = waitFor(socket, (frame) => frame.type === "stream.closed"
+    && frame.stream_id === "control");
+  socket.send(JSON.stringify({ type: "stream.action", stream_id: "control", id: "invalid-viewport",
+    action: "set_viewport", params: { cols: 501, rows: 18 } }));
+  await invalidClosed;
+  await request(socket, "after-invalid-viewport", "session.snapshot", {});
   const tabsClosed = Promise.all([closed(socket), closed(second.socket)]);
   socket.close();
   second.socket.close();
@@ -150,7 +180,7 @@ try {
   child.kill("SIGINT");
   await exited(child, 10_000);
   child = undefined;
-  process.stdout.write(`native luvus web integration passed (multi-tab, reconnect, revoke, finite expiry, shutdown; ${burstCount} inputs in ${Math.round(burstElapsed)}ms)\n`);
+  process.stdout.write(`native luvus web integration passed (viewport, validation, reflow, multi-tab, reconnect, revoke, finite expiry, shutdown; ${burstCount} inputs in ${Math.round(burstElapsed)}ms)\n`);
 } finally {
   for (const socket of sockets) socket.terminate();
   if (child?.exitCode === null) child.kill("SIGINT");
@@ -245,6 +275,12 @@ function request(socket, id, method, params) {
     if (frame.error) throw new Error(frame.error.code + ": " + frame.error.message);
     return frame.result;
   });
+}
+
+function streamAction(socket, id, action, params) {
+  const response = waitFor(socket, (frame) => frame.type === "response" && frame.id === id);
+  socket.send(JSON.stringify({ type: "stream.action", stream_id: "control", id, action, params }));
+  return response;
 }
 
 function waitFor(socket, predicate, timeoutMs = 5_000) {

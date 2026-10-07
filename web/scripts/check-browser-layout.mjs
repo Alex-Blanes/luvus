@@ -3,22 +3,58 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 
 /** Exercise the actual embedded client, not a synthetic DOM or CSS fixture. */
-export async function checkBrowserLayout({ cdp, sessionId, evaluate, until, screenshots }) {
+export async function checkBrowserLayout({ cdp, sessionId, evaluate, until, screenshots, checkViewport = false }) {
   const run = (expression) => evaluate(sessionId, expression);
   const streamErrors = [];
+  const viewportRequests = new Map();
+  let acceptedViewport;
   await cdp.call("Network.enable", {}, sessionId);
+  cdp.events.on("Network.webSocketFrameSent", (event) => {
+    if (!checkViewport || event.sessionId !== sessionId) return;
+    try {
+      const frame = JSON.parse(event.params.response.payloadData);
+      if (frame.type === "stream.action" && frame.action === "set_viewport" && viewportRequests.size < 64) {
+        viewportRequests.set(frame.id, frame.params);
+      }
+    } catch { /* Non-JSON network messages are not viewport requests. */ }
+  });
   cdp.events.on("Network.webSocketFrameReceived", (event) => {
     if (event.sessionId !== sessionId) return;
     try {
       const frame = JSON.parse(event.params.response.payloadData);
       if (frame.type === "response" && frame.error && streamErrors.length < 8) streamErrors.push(frame.error.code);
+      const viewport = viewportRequests.get(frame.id);
+      if (viewport && frame.type === "response") {
+        viewportRequests.delete(frame.id);
+        if (frame.result?.dispatch === "executed") acceptedViewport = viewport;
+      }
     } catch { /* Non-JSON network messages are not stream diagnostics. */ }
   });
+  const terminalViewport = async () => {
+    if (!checkViewport) return;
+    const wanted = await run(`(() => {
+      const output = document.querySelector('.terminal-output');
+      const probe = document.querySelector('.terminal-cell-probe');
+      if (!output || !probe) return null;
+      const style = getComputedStyle(output), cell = probe.getBoundingClientRect();
+      return {
+        cols: Math.min(500, Math.floor((output.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)) / (cell.width / 10) + .01)),
+        rows: Math.min(300, Math.floor((output.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom)) / cell.height + .01)),
+      };
+    })()`);
+    assert.ok(wanted?.cols >= 20 && wanted?.rows >= 4, "terminal has a measurable viewport");
+    try {
+      await until(() => acceptedViewport?.cols === wanted.cols && acceptedViewport?.rows === wanted.rows);
+    } catch (cause) {
+      throw new Error(`Terminal viewport was not applied: ${JSON.stringify({ wanted, acceptedViewport, streamErrors })}`, { cause });
+    }
+  };
   const viewport = async (width, height, mobile = false) => {
     await cdp.call("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile }, sessionId);
     await cdp.call("Emulation.setTouchEmulationEnabled", { enabled: mobile }, sessionId);
     await until(() => run(`innerWidth === ${width} && matchMedia('(min-width: 1024px)').matches === ${!mobile}`));
     await run("new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))");
+    if (await run("!!document.querySelector('.terminal-output')")) await terminalViewport();
   };
   const click = async (selector) => {
     const point = await run(`(() => {
@@ -44,6 +80,7 @@ export async function checkBrowserLayout({ cdp, sessionId, evaluate, until, scre
   const terminalReady = async () => {
     try {
       await until(() => run("!!document.querySelector('.terminal-content')?.textContent"));
+      await terminalViewport();
     } catch (cause) {
       await screenshot("terminal-not-ready");
       const state = await run("({ open: !!document.querySelector('.terminal-screen'), status: document.querySelector('.terminal-status')?.textContent, error: document.querySelector('.toast')?.textContent })");
@@ -135,6 +172,7 @@ export async function checkBrowserLayout({ cdp, sessionId, evaluate, until, scre
     assert.ok(geometry.workspaces.width <= 224, "workspace rail stays compact on wide screens");
     if (workspacesCollapsed) sameEdge(geometry.workspaces.width, 56, "collapsed workspace rail");
     if (panesCollapsed) sameEdge(geometry.panes.width, 56, "collapsed pane rail");
+    if (view === "terminal") await terminalViewport();
     return geometry;
   };
 
@@ -159,6 +197,7 @@ export async function checkBrowserLayout({ cdp, sessionId, evaluate, until, scre
   await until(() => run("!!document.querySelector('.terminal-sidebar-pane.active')"));
   await screenshot("terminal-desktop");
   await terminalControls("terminal-desktop-controls");
+  await viewport(1024, 900);
   await click('[aria-label="Collapse workspaces sidebar"]');
   await desktop("terminal", true, false);
   await click('[aria-label="Collapse panes sidebar"]');
@@ -206,4 +245,5 @@ export async function checkBrowserLayout({ cdp, sessionId, evaluate, until, scre
   await desktop("dashboard");
   await click('[data-view-key="pane-filter:false"]');
   console.log("browser layout passed: header-free desktop frame, aligned compact rails, both collapsed rails, compact action bar with default wrapping, live terminal input, mobile drawers, complementary breakpoint, and short viewport");
+  if (checkViewport) console.log("browser viewport sizing passed: window, sidebar, and mobile viewport changes reach the real debug server");
 }

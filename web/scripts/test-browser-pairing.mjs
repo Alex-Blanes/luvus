@@ -45,7 +45,7 @@ try {
   await ready(first);
   assert.equal(await evaluate(first.sessionId, "location.hash"), "");
   assert.equal(await evaluate(first.sessionId, "!!localStorage.getItem('luvus.web.ticket') && sessionStorage.getItem('luvus.web.ticket') === null"), true);
-  await checkBrowserLayout({ cdp, sessionId: first.sessionId, evaluate, until, screenshots });
+  await checkBrowserLayout({ cdp, sessionId: first.sessionId, evaluate, until, screenshots, checkViewport: true });
   if (screenshots) console.log(`Layout screenshots: ${screenshots}`);
   const second = await page(pairing.origin);
   await ready(second);
