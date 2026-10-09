@@ -73,6 +73,39 @@ pub(super) fn directory_identity(path: &Path) -> Option<super::DirectoryIdentity
     })
 }
 
+/// Open `path` with its default app through `ShellExecuteW`: no command line is
+/// built, so nothing re-parses the path. It can block on the handler, so callers
+/// run it off their own thread. COM is initialised first, as the Shell expects.
+pub(super) fn shell_open(path: &Path) {
+    use windows_sys::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let file: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let verb: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+    // SAFETY: both strings are NUL-terminated and outlive the call; COM is
+    // uninitialised only when this thread's initialisation succeeded.
+    unsafe {
+        let com = CoInitializeEx(
+            std::ptr::null(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+        );
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+        if com >= 0 {
+            CoUninitialize();
+        }
+    }
+}
+
 pub(super) fn clipboard_image() -> Option<Vec<u8>> {
     clipboard::clipboard_image()
 }

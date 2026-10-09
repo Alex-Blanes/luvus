@@ -908,6 +908,16 @@ fn draw_content(
                         toggle(app.config.resume_launch_flags, t),
                         t,
                     )),
+                    GeneralRow::FileLinkDefaultApp => ctls.push(ctl_row(
+                        f,
+                        area,
+                        y,
+                        i,
+                        cursor,
+                        cat.set_file_links_in_default_app,
+                        toggle(app.config.layout.file_links_in_default_app, t),
+                        t,
+                    )),
                     GeneralRow::NewPaneToWorkspaceRoot => ctls.push(ctl_row(
                         f,
                         area,

@@ -1668,10 +1668,15 @@ pub fn is_openable_url(url: &str) -> bool {
 /// browser cold-start cannot stall the event loop and the opener leaves no
 /// zombie behind in a long-running client.
 pub fn open_url(url: &str) {
-    use std::process::{Command, Stdio};
     if !is_openable_url(url) {
         return;
     }
+    spawn_opener(std::ffi::OsStr::new(url));
+}
+
+/// The opener loop behind [`open_url`], and behind [`open_file`] off Windows.
+fn spawn_opener(target: &std::ffi::OsStr) {
+    use std::process::{Command, Stdio};
     let openers: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
         &[("open", &[])]
     } else if cfg!(target_os = "windows") {
@@ -1686,7 +1691,7 @@ pub fn open_url(url: &str) {
         if spawn_reaped(no_window(
             Command::new(cmd)
                 .args(*args)
-                .arg(url)
+                .arg(target)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null()),
@@ -1696,6 +1701,82 @@ pub fn open_url(url: &str) {
             return;
         }
     }
+}
+
+/// Extensions the OS would *run* rather than open: programs, scripts,
+/// installers, shortcuts and macro-enabled documents. A `Ctrl`+click under
+/// `layout.file_links_in_default_app` refuses them (see [`is_openable_file`]).
+// ponytail: a fixed blocklist plus PATHEXT; a handler that runs code under an
+// unlisted extension still gets through. An allowlist if that ever matters.
+#[rustfmt::skip]
+const RUN_EXTENSIONS: &[&str] = &[
+    "exe", "com", "bat", "cmd", "scr", "pif", "cpl", "msc", "msi", "msp", "mst", "msix",
+    "msixbundle", "appx", "appxbundle", "appinstaller", "application", "appref-ms", "gadget",
+    "lnk", "url", "scf", "inf", "reg", "hta", "chm", "settingcontent-ms", "library-ms",
+    "search-ms", "searchconnector-ms", "diagcab", "ps1", "psm1", "psd1", "ps1xml", "psc1", "pssc",
+    "vb", "vbs", "vbe", "js", "jse", "wsf", "wsh", "ws", "wsc", "sct", "jar", "py", "pyw", "pyz",
+    "pyc", "pl", "rb", "sh", "bash", "zsh", "csh", "ksh", "fish", "command", "tool", "terminal",
+    "app", "pkg", "mpkg", "dmg", "desktop", "appimage", "run", "deb", "rpm", "scpt", "applescript",
+    "workflow", "iso", "img", "vhd", "vhdx", "xll", "xlam", "ppam", "docm", "dotm", "xlsm", "xltm",
+    "xlsb", "pptm", "potm", "ppsm", "sldm",
+];
+
+/// Whether `path` may go to the OS default app: an absolute path to an existing
+/// file that the OS would open, not run. Checked on the name as written and on
+/// the resolved one, so a trailing dot (`x.exe.`), an 8.3 alias or a symlink
+/// cannot hide an executable; on Unix an execute bit refuses it as well.
+pub fn is_openable_file(path: &Path) -> bool {
+    if !path.is_absolute() || !path.is_file() {
+        return false;
+    }
+    let Ok(real) = path.canonicalize() else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if !real
+            .metadata()
+            .is_ok_and(|meta| meta.permissions().mode() & 0o111 == 0)
+        {
+            return false;
+        }
+    }
+    let pathext = std::env::var("PATHEXT").unwrap_or_default();
+    !runs_when_opened(path, &pathext) && !runs_when_opened(&real, &pathext)
+}
+
+/// Whether the OS would run `path` by name: its extension is in
+/// [`RUN_EXTENSIONS`] or in `pathext` (Windows' `PATHEXT`, `;`-separated).
+/// A name that is not UTF-8 fails closed.
+fn runs_when_opened(path: &Path, pathext: &str) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return true;
+    };
+    // Windows drops trailing dots and spaces: `x.exe.` *is* `x.exe`.
+    let Some((_, ext)) = name.trim_end_matches(['.', ' ']).rsplit_once('.') else {
+        return false;
+    };
+    RUN_EXTENSIONS
+        .iter()
+        .any(|run| run.eq_ignore_ascii_case(ext))
+        || pathext
+            .split(';')
+            .any(|run| run.trim_start_matches('.').eq_ignore_ascii_case(ext))
+}
+
+/// Open `path` with the OS default app. Re-checks [`is_openable_file`], since
+/// the file can change between the click and now. Windows calls `ShellExecuteW`
+/// on a thread of its own; elsewhere it is [`open_url`]'s opener, with the
+/// absolute path as one argv entry.
+pub fn open_file(path: PathBuf) {
+    if !is_openable_file(&path) {
+        return;
+    }
+    #[cfg(windows)]
+    std::thread::spawn(move || windows::shell_open(&path));
+    #[cfg(not(windows))]
+    spawn_opener(path.as_os_str());
 }
 
 /// Start a fire-and-forget helper and collect its exit status off the caller
@@ -2332,6 +2413,54 @@ mod tests {
         ] {
             assert!(!super::is_openable_url(bad), "{bad:?} must be refused");
         }
+    }
+
+    /// The boundary for a printed path sent to the OS default app (this fork):
+    /// a file the OS would run must never get there, however its name is dressed.
+    #[test]
+    fn only_files_the_os_would_open_not_run_go_to_the_default_app() {
+        use std::path::Path;
+        for run in [
+            "x.exe", "X.BAT", "a.b.ps1", "x.exe.", "x.exe . ", "y.lnk", "s.sh", "m.xlsm",
+        ] {
+            assert!(
+                super::runs_when_opened(Path::new(run), ""),
+                "{run:?} must be refused"
+            );
+        }
+        assert!(
+            super::runs_when_opened(Path::new("x.foo"), ".COM;.FOO"),
+            "PATHEXT counts"
+        );
+        for open in [
+            "notes.md",
+            "README.TXT",
+            "a.tar.gz",
+            "Makefile",
+            ".bashrc",
+            "x.exe.md",
+        ] {
+            assert!(
+                !super::runs_when_opened(Path::new(open), ".COM;.EXE"),
+                "{open:?} should open"
+            );
+        }
+
+        let dir = std::env::temp_dir().join(format!("luvus-open-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let note = dir.join("note.md");
+        let script = dir.join("run.bat");
+        std::fs::write(&note, "# hi").unwrap();
+        std::fs::write(&script, "echo hi").unwrap();
+        assert!(super::is_openable_file(&note));
+        assert!(!super::is_openable_file(&script), "a script is refused");
+        assert!(
+            !super::is_openable_file(Path::new("note.md")),
+            "relative is refused"
+        );
+        assert!(!super::is_openable_file(&dir), "a folder is not a file");
+        assert!(!super::is_openable_file(&dir.join("missing.md")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]
