@@ -304,6 +304,12 @@ click behavior** choice:
 **`Ctrl`+`Shift`+click** opens a permanent pane beside the focus instead, the
 same as `Shift`+click on a FILES row.
 
+To open files in their own apps instead, turn on **Settings → General → Ctrl+click
+a file path: open in the default app**. A plain `Ctrl`+click then hands the file
+to the operating system's default app, on the machine running the session.
+Programs, scripts, installers and shortcuts are never handed over; they open in
+luvus as usual. `Ctrl`+`Shift`+click and the right-click menu stay in luvus.
+
 `path:42` preserves the requested line in Preview, permanent-pane and built-in
 read-only tab placements. A configured terminal editor opens the file at the
 top, because line-jump arguments differ between editors.
@@ -325,7 +331,9 @@ paths may not exist on the client machine; let the click reach luvus so its
 server-aware native file view handles the target instead. Luvus also suppresses
 these projections for SSH and tmux clients, where the outer terminal may belong
 to a different filesystem. A direct local terminal must identify itself before
-Luvus exposes server file paths to its file handler.
+Luvus exposes server file paths to its file handler. Windows Terminal never gets
+them: it keeps `Ctrl`+click on any link for itself and does not open these file
+links, so luvus leaves the path unlinked there and handles the click itself.
 
 **A path only underlines if the file is really there.** Paths are resolved against
 that pane's working directory, so `src/main.rs` means what it means to the shell

@@ -2851,7 +2851,14 @@ impl App {
                         if p.beside {
                             self.activate_link_in(p.target, crate::app::files::OpenTarget::Pane);
                         } else {
-                            self.activate_link(p.target);
+                            match p.target {
+                                LinkTarget::File { path, line }
+                                    if self.config.layout.file_links_in_default_app =>
+                                {
+                                    self.open_file_in_default_app(path, line)
+                                }
+                                target => self.activate_link(target),
+                            }
                         }
                     }
                     return;
@@ -4453,6 +4460,20 @@ impl App {
         }
         self.show_toast(crate::ui::truncate(&url, 60));
         self.pending_open_url = Some(url);
+    }
+
+    /// Queue `path` for the OS default app (this fork): a `Ctrl`+click on a
+    /// printed path under `layout.file_links_in_default_app`. A file the OS
+    /// would *run* rather than open opens in luvus instead, so a click on a
+    /// path an agent printed never executes it.
+    pub fn open_file_in_default_app(&mut self, path: PathBuf, line: Option<u32>) {
+        if !crate::platform::is_openable_file(&path) {
+            self.open_file_link(path, line, self.file_click_target());
+            return;
+        }
+        let name = path.file_name().unwrap_or(path.as_os_str());
+        self.show_toast(crate::ui::truncate(&name.to_string_lossy(), 60));
+        self.pending_open_file = Some(path);
     }
 
     pub fn show_toast(&mut self, text: impl Into<String>) {
@@ -10061,6 +10082,56 @@ mod link_click_tests {
             app.layout().leaves().len() >= 2,
             "split beside the pane that printed the path"
         );
+    }
+
+    /// With `layout.file_links_in_default_app` (this fork) a `Ctrl`+click hands
+    /// the path to the OS default app instead of a luvus view; `Ctrl`+`Shift`
+    /// still opens it beside, and a script falls back to the luvus viewer.
+    #[test]
+    fn ctrl_click_hands_a_file_path_to_the_default_app_when_set() {
+        let _env = crate::persist::test_env("link-file-default-app");
+        let (mut app, _t, at) = fixture_showing("edit Cargo.toml now", 7);
+        app.config.layout.file_links_in_default_app = true;
+        let leaves = app.layout().leaves().len();
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::CONTROL,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            at,
+            KeyModifiers::CONTROL,
+        ));
+        let path = app
+            .pending_open_file
+            .take()
+            .expect("queued for the default app");
+        assert!(path.ends_with("Cargo.toml"), "queued {path:?}");
+        assert_eq!(app.layout().leaves().len(), leaves, "no luvus view opened");
+        assert!(app.pending_open_url.is_none());
+
+        let mods = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), at, mods));
+        app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), at, mods));
+        assert!(app.pending_open_file.is_none(), "Ctrl+Shift stays in luvus");
+        assert!(app.layout().leaves().len() > leaves, "opened beside");
+
+        let dir = std::env::temp_dir().join(format!("luvus-link-run-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("run.bat");
+        std::fs::write(&script, "echo hi").unwrap();
+        app.open_file_in_default_app(script.clone(), None);
+        assert!(
+            app.pending_open_file.is_none(),
+            "a script never reaches the OS"
+        );
+        let id = app.layout().focus;
+        assert!(
+            matches!(app.views.get(&id), Some(crate::app::ViewKind::File(v)) if v.path == script),
+            "it opens read-only in luvus instead"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `src/main.rs:42` is one reference: the whole thing underlines, the path

@@ -723,6 +723,10 @@ pub fn run() -> Result<()> {
         if let Some(url) = app.pending_open_url.take() {
             broadcast_effect(&mut clients, ServerMessage::OpenUrl(url));
         }
+        // A file opens here, not at a client: this is the machine that has it.
+        if let Some(path) = app.pending_open_file.take() {
+            crate::platform::open_file(path);
+        }
         if let Some(text) = app.pending_clipboard.take() {
             dispatch_clipboard(&mut clients, foreground, &mut next_activity, text);
         }

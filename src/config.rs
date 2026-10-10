@@ -332,6 +332,12 @@ pub struct LayoutConfig {
     /// deserialization — an unrecognized value reads back as the default.
     #[serde(default = "default_file_click")]
     pub file_click: String,
+    /// `Ctrl`+click on a file path printed in a pane opens it with the OS
+    /// default app instead of in luvus (this fork). Off by default. The server
+    /// opens it, on the machine that holds the file; executables and scripts
+    /// still open in luvus. `Ctrl`+`Shift`+click and the menu stay in luvus.
+    #[serde(default)]
+    pub file_links_in_default_app: bool,
     /// Retained scrollback budget per pane. This is the user-facing memory dial:
     /// 10 MiB by default, regardless of how many panes are open. The Alacritty
     /// adapter derives a conservative row limit from it until the Ghostty engine
@@ -589,6 +595,7 @@ impl Default for LayoutConfig {
             new_pane_to_workspace_root: false,
             file_open: default_file_open(),
             file_click: default_file_click(),
+            file_links_in_default_app: false,
             scrollback_bytes: Some(SCROLLBACK_BYTES_DEFAULT),
             scrollback: default_scrollback(),
             files_show_hidden: true,

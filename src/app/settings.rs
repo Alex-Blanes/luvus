@@ -109,6 +109,8 @@ pub enum GeneralRow {
     FileOpen,
     /// What a plain click on a FILES row does: preview, or a whole tab.
     FileClick,
+    /// `Ctrl`+click on a printed file path opens it in the OS default app.
+    FileLinkDefaultApp,
     FilesShowHidden,
     ShiftEnter,
     CommanderWorking,
@@ -147,6 +149,7 @@ impl App {
         vec![
             GeneralRow::FileOpen,
             GeneralRow::FileClick,
+            GeneralRow::FileLinkDefaultApp,
             GeneralRow::FilesShowHidden,
             GeneralRow::ShiftEnter,
             GeneralRow::CommanderWorking,
@@ -1363,6 +1366,11 @@ impl App {
                     !self.config.layout.new_pane_to_workspace_root;
                 self.persist_config();
             }
+            Some(GeneralRow::FileLinkDefaultApp) => {
+                self.config.layout.file_links_in_default_app =
+                    !self.config.layout.file_links_in_default_app;
+                self.persist_config();
+            }
             Some(GeneralRow::AgentTitle) => {
                 self.config.layout.agent_title = !self.config.layout.agent_title;
                 self.persist_config();
@@ -1905,8 +1913,9 @@ mod tests {
         if let Some(ui) = app.settings.as_mut() {
             ui.tab = SettingsTab::General;
         }
-        // 14 upstream rows plus this fork's "install updates automatically".
-        assert_eq!(app.settings_rows(SettingsTab::General), 15);
+        // 14 upstream rows plus this fork's "install updates automatically" and
+        // "Ctrl+click a file path: open in the default app".
+        assert_eq!(app.settings_rows(SettingsTab::General), 16);
         let rows = app.general_rows();
         assert_eq!(rows[0], GeneralRow::FileOpen, "file-open leads the tab");
         assert_eq!(
