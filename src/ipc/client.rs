@@ -2083,9 +2083,14 @@ mod paint_tests {
                 _ => None,
             }
         }));
-        // Windows Terminal would take the Ctrl+click for itself (this fork).
+        // Windows Terminal would take the Ctrl+click for itself, even when
+        // another variable on its own would count as local terminal evidence.
         assert!(!host_terminal_shares_local_filesystem_with(|key| {
-            (key == "WT_SESSION").then(|| std::ffi::OsString::from("8f0c-uuid"))
+            match key {
+                "TERM_PROGRAM" => Some(std::ffi::OsString::from("vscode")),
+                "WT_SESSION" => Some(std::ffi::OsString::from("8f0c-uuid")),
+                _ => None,
+            }
         }));
     }
 
