@@ -2852,7 +2852,7 @@ fn handle_dock_input(
     } else if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
         // Only the disclosure gutter folds a group. Its label retains the
         // existing endpoint-switch action.
-        if mouse.column < rect.x.saturating_add(4) {
+        if in_heading_gutter(rect.x, mouse.column) {
             match hit.as_ref().map(|(hit, _)| hit) {
                 Some(DockHit::Endpoint(Endpoint::Local)) => {
                     dock.local_collapsed = !dock.local_collapsed;
@@ -4142,6 +4142,10 @@ fn paint_dock(
     paint_owner_session_button(terminal, dock, active, cursor, cursor_visible)
 }
 
+/// Paints the machine-aware Workspaces dock: the heading row, one row per
+/// endpoint heading or workspace, the scrollbar, and any open machine form.
+/// Workspace rows reuse the server's native row renderer; endpoint headings
+/// are painted here and recorded in `dock.hits` for mouse handling.
 fn paint_dock_content(
     terminal: &mut DefaultTerminal,
     dock: &mut DockState,
@@ -4365,11 +4369,14 @@ fn paint_dock_content(
                 cell.set_bg(bg);
             }
         }
+        // Endpoint headings sit one column left of the workspace rows beneath
+        // them, so a machine reads as the parent of its list rather than as
+        // another entry in it.
         write_endpoint_text(
             &mut cells,
             geometry,
             row,
-            2,
+            ENDPOINT_HEADING_INDENT,
             symbol,
             StyleSpec {
                 fg: tone,
@@ -4386,7 +4393,14 @@ fn paint_dock_content(
             bg: selected.then(|| protocol::unpack(style.active_bg)),
             bold,
         };
-        write_endpoint_text(&mut cells, geometry, row, 4, &label, primary);
+        write_endpoint_text(
+            &mut cells,
+            geometry,
+            row,
+            ENDPOINT_HEADING_INDENT + 2,
+            &label,
+            primary,
+        );
         if rect.show_paths {
             let secondary_style = StyleSpec {
                 fg: protocol::unpack(if selected {
@@ -4398,7 +4412,14 @@ fn paint_dock_content(
                 bold: false,
             };
             if let Some(value) = secondary_text.as_deref() {
-                write_endpoint_text(&mut cells, geometry, row + 1, 4, value, secondary_style);
+                write_endpoint_text(
+                    &mut cells,
+                    geometry,
+                    row + 1,
+                    ENDPOINT_HEADING_INDENT + 2,
+                    value,
+                    secondary_style,
+                );
             }
         }
         dock.hits
@@ -4544,6 +4565,14 @@ fn owner_session_projection(dock: &DockState) -> Option<(Rect, Rect, String)> {
 
 fn machine_header_active(endpoint_active: bool, collapsed: bool) -> bool {
     endpoint_active && collapsed
+}
+
+/// Whether a click at `column` lands in a heading row's disclosure gutter: the
+/// cells up to the chevron and the space after it, left of the label text. The
+/// boundary follows `ENDPOINT_HEADING_INDENT` so the whole label keeps its
+/// endpoint-switch action wherever the heading is painted.
+fn in_heading_gutter(rect_x: u16, column: u16) -> bool {
+    column < rect_x.saturating_add(ENDPOINT_HEADING_INDENT + 2)
 }
 
 fn broadcast_workspace_width(
@@ -5417,6 +5446,15 @@ struct StyleSpec {
     bold: bool,
 }
 
+/// Column of a machine or Local heading's chevron inside the Workspaces dock.
+/// Workspace rows start their state dot at column 2, so headings outdent by
+/// one cell to separate machines from the workspaces listed under them.
+const ENDPOINT_HEADING_INDENT: u16 = 1;
+
+/// Writes `text` into `cells` on `row` starting at `indent`, clipping at the
+/// dock's right edge and skipping zero-width characters. Wide characters take
+/// two cells; their continuation cell is blanked so the terminal does not
+/// repaint a stale glyph beside them.
 fn write_endpoint_text(
     cells: &mut [(u16, u16, Cell)],
     rect: Rect,
@@ -5722,6 +5760,23 @@ fn client_repeat_allowed(key: KeyEvent, dock: &DockState) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn heading_gutter_ends_where_the_label_begins() {
+        use super::{in_heading_gutter, ENDPOINT_HEADING_INDENT};
+        let label_column = ENDPOINT_HEADING_INDENT + 2;
+        for rect_x in [0u16, 1, 7] {
+            // The chevron and the space after it fold the group.
+            assert!(in_heading_gutter(rect_x, rect_x + ENDPOINT_HEADING_INDENT));
+            assert!(in_heading_gutter(
+                rect_x,
+                rect_x + ENDPOINT_HEADING_INDENT + 1
+            ));
+            // The first label character switches endpoints instead.
+            assert!(!in_heading_gutter(rect_x, rect_x + label_column));
+            assert!(!in_heading_gutter(rect_x, rect_x + label_column + 5));
+        }
+    }
+
     use super::*;
 
     #[test]
