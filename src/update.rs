@@ -103,6 +103,12 @@ pub fn spawn_check(tx: Sender<AppEvent>, auto_install: bool) {
 /// complaint. Opening the changelog is exactly the moment the question is being
 /// asked, so that asks again.
 pub fn check_now(tx: Sender<AppEvent>, auto_install: bool) {
+    // Tests open the changelog all the time, and CI's shallow checkout builds
+    // as build 1, so every published release looked newer: a real fetch and
+    // install ran under unrelated tests and raised `INSTALLING` mid-test.
+    if cfg!(test) {
+        return;
+    }
     thread::spawn(move || {
         check_once(&tx, &manifest_url(), auto_install);
         check_upstream_once(&tx, &upstream_url());
