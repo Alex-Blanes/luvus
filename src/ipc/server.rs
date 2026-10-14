@@ -1302,7 +1302,7 @@ fn broadcast(clients: &mut Clients, msg: ServerMessage) {
 
 /// What each attached client is told when the server restarts onto a newly
 /// installed binary. The foreground client is the one process that survives the
-/// swap and respawns the server, so it gets [`ServerMessage::Relaunch`]; any
+/// swap and respawns the server, so it gets [`protocol::RELAUNCH_REASON`]; any
 /// other client is told the server is going away, because two clients racing to
 /// respawn it would fight over the startup lock.
 ///
@@ -1316,12 +1316,13 @@ fn relaunch_plan(clients: &Clients, foreground: Option<u64>) -> Option<Vec<(u64,
         clients
             .keys()
             .map(|&id| {
-                let message = if id == foreground {
-                    ServerMessage::Relaunch
+                let reason = if id == foreground {
+                    protocol::RELAUNCH_REASON
                 } else {
-                    ServerMessage::ServerShutdown {
-                        reason: "server restarting".into(),
-                    }
+                    "server restarting"
+                };
+                let message = ServerMessage::ServerShutdown {
+                    reason: reason.into(),
                 };
                 (id, message)
             })
@@ -2129,7 +2130,7 @@ fn remove_unbound_socket(path: &Path) -> io::Result<()> {
 fn ends_client_writer(message: &ServerMessage) -> bool {
     matches!(
         message,
-        ServerMessage::Detach | ServerMessage::ServerShutdown { .. } | ServerMessage::Relaunch
+        ServerMessage::Detach | ServerMessage::ServerShutdown { .. }
     )
 }
 
@@ -2783,8 +2784,12 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(plan.len(), 2, "every attached client is accounted for");
-        assert!(matches!(plan[&7], ServerMessage::Relaunch));
-        assert!(matches!(plan[&9], ServerMessage::ServerShutdown { .. }));
+        let reason = |id| match &plan[&id] {
+            ServerMessage::ServerShutdown { reason } => reason.as_str(),
+            _ => panic!("client {id} is not told the server is going"),
+        };
+        assert_eq!(reason(7), crate::ipc::protocol::RELAUNCH_REASON);
+        assert_ne!(reason(9), crate::ipc::protocol::RELAUNCH_REASON);
 
         // Headless, or a foreground id that has already gone away: refuse, so
         // the restart never degrades into a plain stop.
