@@ -172,6 +172,14 @@ where
     deserializer.deserialize_seq(ClipboardImageVisitor)
 }
 
+/// The `ServerShutdown` reason that means "relaunch this client once the server
+/// is gone" (this fork): the server is exiting so a newly installed binary can
+/// take over, and the display client is the one process that survives the swap.
+/// A reason rather than a variant on purpose: bincode tags variants by index, so
+/// a fork-only variant shifts every later one and breaks the handshake with
+/// official Luvus servers, which speak the same protocol version.
+pub const RELAUNCH_REASON: &str = "luvus:relaunch";
+
 #[derive(Serialize, Deserialize, Clone)]
 pub enum ServerMessage {
     /// **Frozen wire position and shape.** `Welcome` is decoded before peers
@@ -207,11 +215,6 @@ pub enum ServerMessage {
     },
     /// Tell the client to detach (server keeps running).
     Detach,
-    /// The server is exiting so a newly-installed binary can take over: relaunch
-    /// this client once it is gone, rather than quitting to the shell. The
-    /// display client is a separate process from the server, so it is the one
-    /// thing that can survive the swap and bring the session straight back.
-    Relaunch,
     ServerShutdown {
         reason: String,
     },
@@ -805,6 +808,28 @@ fn sq(x: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bincode tags a variant by its index, and an official Luvus server of the
+    /// same protocol version answers the handshake with `Ready` (11) and then
+    /// `EndpointIdentity` (18). A fork-only variant in the middle of the enum once
+    /// shifted both, and `--remote` / `machine add` against such a server broke.
+    #[test]
+    fn server_message_tags_match_official_luvus() {
+        let tag = |message: &ServerMessage| {
+            bincode::serde::encode_to_vec(message, bincode::config::standard()).unwrap()[0]
+        };
+        assert_eq!(
+            tag(&ServerMessage::Ready {
+                probe_terminal: false
+            }),
+            11
+        );
+        let identity = ServerMessage::EndpointIdentity {
+            boot_id: 1,
+            session: "default".into(),
+        };
+        assert_eq!(tag(&identity), 18);
+    }
 
     /// `Hello` is decoded before the version check, so its encoded shape must stay
     /// byte-for-byte stable across releases. If this fails, an older client can no

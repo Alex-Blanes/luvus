@@ -510,7 +510,9 @@ where
                 }
                 break ClientExit::SwitchSession(name);
             }
-            Ok(ServerMessage::Relaunch) => break ClientExit::Relaunch,
+            Ok(ServerMessage::ServerShutdown { reason }) if reason == protocol::RELAUNCH_REASON => {
+                break ClientExit::Relaunch
+            }
             Ok(ServerMessage::Detach) => break ClientExit::Detached,
             Ok(ServerMessage::ServerShutdown { .. }) => break ClientExit::ServerStopped,
             Ok(_) => {}
