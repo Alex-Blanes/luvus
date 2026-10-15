@@ -37,12 +37,23 @@ jobs:
       github.event.workflow_run.conclusion == 'success'
     strategy:
       fail-fast: false
+      # One job at a time: both publish into the same release, and two jobs
+      # creating it at once race on the tag.
+      max-parallel: 1
       matrix:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            binary: target/release/luvus.exe
+            binary: target/x86_64-pc-windows-msvc/release/luvus.exe
             asset: luvus-x86_64-pc-windows-msvc.exe
+          # Static musl, like upstream's Linux release: runs on any distro's
+          # glibc (the NAS is Debian 12), and it is the asset the updater asks
+          # for on Linux. Built natively, not in `cross`'s container, so
+          # `build.rs` still has git to count the build number.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binary: target/x86_64-unknown-linux-musl/release/luvus
+            asset: luvus-x86_64-unknown-linux-musl
     runs-on: ${{ matrix.os }}
     steps:
       # Full history: `build.rs` counts every commit reachable from HEAD to get
@@ -58,6 +69,8 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
       - name: Work out the build number
@@ -70,7 +83,7 @@ jobs:
           echo "build=$build" >>"$GITHUB_OUTPUT"
           echo "tag=build-$build" >>"$GITHUB_OUTPUT"
 
-      - run: cargo build --release --locked
+      - run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package the binary and its digest
         shell: bash
