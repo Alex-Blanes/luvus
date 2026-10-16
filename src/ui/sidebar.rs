@@ -76,11 +76,10 @@ fn list_capacity(rows: u16, row_stride: u16) -> usize {
 /// A scrollbar on the sidebar's right edge, shown only when the list overflows
 /// its area. Thin block glyphs keep the indicator lighter than a full-cell
 /// background strip while remaining terminal-native: a faint one-eighth-cell
-/// track carries a brighter thumb of the same narrow width, sized to the
-/// visible fraction.
+/// track carries a brighter thumb, sized to the visible fraction.
 ///
-/// This fork also records every drawn bar in `bars`, so a click or drag on it
-/// scrolls the list (see [`bar_offset`]).
+/// This fork draws that thumb half a cell wide and records every drawn bar in
+/// `bars`, so a click or drag on it scrolls the list (see [`bar_offset`]).
 pub(crate) fn draw_scrollbar(
     f: &mut RenderTarget,
     bars: &mut Vec<SidebarBar>,
@@ -113,14 +112,7 @@ pub(crate) fn draw_scrollbar(
 /// must test this *before* the row hit-tests or a bar click just selects whatever
 /// row it lands on.
 pub(crate) fn bar_offset(bar: SidebarBar, r: u16) -> usize {
-    let (len, span) = (bar.track.height as usize, bar.total - bar.cap);
-    let thumb = (len * bar.cap / bar.total).clamp(1, len);
-    let r = r.clamp(bar.track.y, bar.track.bottom().saturating_sub(1));
-    // `len == thumb` (the thumb fills the track) means every row is the end.
-    ((r - bar.track.y) as usize * span)
-        .checked_div(len - thumb)
-        .unwrap_or(span)
-        .min(span)
+    super::workspace_row::scrollbar_offset(bar.track, bar.total, bar.cap, r)
 }
 
 /// Split a sidebar `body` rect into `n` stacked dock slots with a one-row
@@ -1370,8 +1362,8 @@ mod tests {
             .collect();
         assert_eq!(
             symbols,
-            vec!["▕", "▕", "▕", "▕", "▕", "▕"],
-            "the proportional thumb and track stay one-eighth of a cell wide"
+            vec!["▐", "▐", "▕", "▕", "▕", "▕"],
+            "a half-cell proportional thumb on a one-eighth-cell track"
         );
         assert_eq!(buffer.cell((0, 0)).expect("thumb cell").fg, theme.overlay1);
         assert_eq!(buffer.cell((0, 2)).expect("track cell").fg, theme.surface1);

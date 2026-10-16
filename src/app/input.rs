@@ -3448,13 +3448,13 @@ impl App {
     fn bar_hit(&self, c: u16, r: u16) -> Option<BarDrag> {
         self.sidebar_bars
             .iter()
-            .find(|b| c == b.track.x && r >= b.track.y && r < b.track.bottom())
+            .find(|b| crate::ui::workspace_row::scrollbar_hit(b.track, c, r))
             .map(|b| b.list)
     }
 
     /// Scroll the grabbed list to wherever the pointer is now. `bar_offset` clamps
     /// the row into the track, so the thumb keeps following a drag that wanders off
-    /// the 1-cell-wide bar or past either end.
+    /// the narrow bar or past either end.
     fn update_bar_drag(&mut self, which: BarDrag, r: u16) {
         let Some(bar) = self.sidebar_bars.iter().find(|b| b.list == which).copied() else {
             return;
