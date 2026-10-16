@@ -150,15 +150,37 @@ pub(crate) fn scrollbar(
     let pos = ((len - thumb) * scroll.min(span))
         .checked_div(span)
         .unwrap_or(0);
+    // This fork draws the thumb half a cell wide so it can be seen and grabbed;
+    // the track stays a faint one-eighth line.
     for i in 0..len {
+        let on_thumb = i >= pos && i < pos + thumb;
         buf[(track.x, track.y + i as u16)]
-            .set_symbol("▕")
-            .set_fg(if i >= pos && i < pos + thumb {
-                thumb_color
-            } else {
-                track_color
-            });
+            .set_symbol(if on_thumb { "▐" } else { "▕" })
+            .set_fg(if on_thumb { thumb_color } else { track_color });
     }
+}
+
+/// Whether a click at `(c, r)` grabs the bar drawn on `track`. The column to
+/// its left counts too, so the grab target is two cells wide, not one.
+pub(crate) fn scrollbar_hit(track: Rect, c: u16, r: u16) -> bool {
+    (track.x.saturating_sub(1)..=track.x).contains(&c) && r >= track.y && r < track.bottom()
+}
+
+/// The inverse of [`scrollbar`]'s thumb placement: which scroll offset a click
+/// at row `r` on `track` means. Rows past either end clamp to it, so a drag
+/// that wanders off the bar keeps following the pointer.
+pub(crate) fn scrollbar_offset(track: Rect, total: usize, cap: usize, r: u16) -> usize {
+    let (len, span) = (usize::from(track.height), total.saturating_sub(cap));
+    if len == 0 {
+        return 0;
+    }
+    let thumb = (len * cap / total.max(1)).clamp(1, len);
+    let r = r.clamp(track.y, track.bottom().saturating_sub(1));
+    // `len == thumb` (the thumb fills the track) means every row is the end.
+    (usize::from(r - track.y) * span)
+        .checked_div(len.saturating_sub(thumb))
+        .unwrap_or(span)
+        .min(span)
 }
 
 #[cfg(test)]
