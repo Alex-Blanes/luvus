@@ -279,9 +279,12 @@ luvus integration install claude    # or: copilot · codex · antigravity · let
 or toggle it in **Settings → Integrations**. What it does per agent:
 
 - **claude / copilot / codex**: registers a small session-start hook script in
-  the agent's own settings file. On Windows, Claude Code and Codex run a
-  PowerShell script through an encoded command, so a home path with spaces
-  works under Git Bash and `cmd.exe` and no `python3` is needed. An
+  the agent's own settings file. On Windows, Claude Code and Codex run
+  `luvus integration hook <agent>` directly when the Luvus binary's path has
+  no spaces or shell metacharacters, so no PowerShell starts on every event;
+  any other path runs a PowerShell script through an encoded command, so a
+  home path with spaces works under Git Bash and `cmd.exe`. Neither needs
+  `python3`. An
   integration an earlier release installed in another form (a raw Windows
   path, a missing event, an older script) is reported as not installed, and
   the server rewrites it in the current form when it starts; one you never
