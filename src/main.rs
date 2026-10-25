@@ -759,7 +759,10 @@ fn ensure_server_start_if_missing(sock: &Path) -> Result<()> {
         Err(error) if error.kind() == io::ErrorKind::TimedOut => Err(anyhow!(
             "selected remote Luvus session endpoint is busy; no restart was attempted"
         )),
-        Err(error) if remote_endpoint_is_missing(&error) => {
+        Err(error)
+            if remote_endpoint_is_missing(&error)
+                || remote_endpoint_is_stale(&error, persist::ServerPidFile::read()) =>
+        {
             spawn_server()?;
             wait_for_socket(sock)?;
             let _running = retry_control_probe(
@@ -778,6 +781,14 @@ fn ensure_server_start_if_missing(sock: &Path) -> Result<()> {
 
 fn remote_endpoint_is_missing(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound
+}
+
+/// A refused socket with no live recorded server is left over from a stopped,
+/// crashed, or rebooted server. A live server keeps its PID file, so a busy
+/// listener that refuses a connection is still never replaced; the new
+/// server's startup lock reclaims only a socket nothing is listening on.
+fn remote_endpoint_is_stale(error: &io::Error, live_server: Option<u32>) -> bool {
+    error.kind() == io::ErrorKind::ConnectionRefused && live_server.is_none()
 }
 
 /// Read-only capability probe used before a saved machine is enabled. It does
@@ -816,18 +827,7 @@ pub(crate) fn remote_attach_profile(
     binary: &str,
     session_name: Option<&str>,
 ) -> Result<()> {
-    let mut command = Command::new("ssh");
-    command
-        .arg("-T")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-o")
-        .arg("ServerAliveInterval=15")
-        .arg("-o")
-        .arg("ServerAliveCountMax=3")
-        .arg(destination);
+    let mut command = machine::ssh_command(destination, true);
     let mut remote_args = Vec::new();
     if let Some(name) = session_name {
         session::validate_name(name).map_err(anyhow::Error::msg)?;
@@ -1715,7 +1715,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<(bool, bool)> {
         // A forced redraw (resize / regained focus) wipes the terminal so the next
         // draw repaints every cell, healing damage ratatui's own diff can't see.
         if std::mem::take(&mut app.force_redraw) {
-            terminal.clear()?;
+            clear_local_fullscreen(terminal)?;
         }
         // Don't touch the cursor here — ratatui shows + positions it once per
         // draw. A per-frame `Hide` flickered it on any activity.
@@ -1729,6 +1729,20 @@ fn run(terminal: &mut DefaultTerminal) -> Result<(bool, bool)> {
     let detached = app.detach_requested;
     app.finish_session_persistence();
     Ok((detached, app.relaunch_requested))
+}
+
+/// Invalidate the fullscreen display without a synchronous cursor query.
+/// `Terminal::clear` queries the cursor, competing with the already-running
+/// input thread for the reply. The next draw owns cursor positioning anyway.
+fn clear_local_fullscreen<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+) -> std::result::Result<(), B::Error> {
+    terminal.backend_mut().clear()?;
+    // Reset both buffers while keeping the current-buffer index unchanged.
+    // Otherwise an unchanged cell could be skipped after the physical clear.
+    terminal.swap_buffers();
+    terminal.swap_buffers();
+    Ok(())
 }
 
 fn flush_local_commander_clipboard(app: &mut App) {
@@ -1816,6 +1830,20 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::path::PathBuf;
+
+    #[test]
+    fn local_fullscreen_clear_repaints_unchanged_cells() {
+        let mut terminal = Terminal::new(TestBackend::new(20, 4)).unwrap();
+        let draw = |frame: &mut ratatui::Frame| {
+            frame.render_widget(ratatui::widgets::Paragraph::new("unchanged"), frame.area());
+        };
+        terminal.draw(draw).unwrap();
+        let expected = terminal.backend().buffer().clone();
+        clear_local_fullscreen(&mut terminal).unwrap();
+        assert_ne!(terminal.backend().buffer(), &expected);
+        terminal.draw(draw).unwrap();
+        assert_eq!(terminal.backend().buffer(), &expected);
+    }
 
     #[test]
     fn host_keyboard_protocol_requests_only_crossterm_lossless_flags() {
@@ -2006,6 +2034,19 @@ mod tests {
                 !remote_endpoint_is_missing(&io::Error::from(kind)),
                 "{kind:?} must not authorize starting a server"
             );
+        }
+    }
+
+    #[test]
+    fn remote_start_if_missing_replaces_only_a_dead_servers_socket() {
+        let refused = io::Error::from(io::ErrorKind::ConnectionRefused);
+        assert!(remote_endpoint_is_stale(&refused, None));
+        assert!(
+            !remote_endpoint_is_stale(&refused, Some(4242)),
+            "a live server that refuses a connection is busy, not gone"
+        );
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::TimedOut] {
+            assert!(!remote_endpoint_is_stale(&io::Error::from(kind), None));
         }
     }
 

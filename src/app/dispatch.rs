@@ -234,6 +234,7 @@ impl App {
             "pane.zoom" => self.api_pane_zoom(method, p),
             "pane.rename" => self.api_pane_rename(method, p),
             "pane.swap" => self.api_pane_swap(method, p),
+            "pane.transpose" => self.api_pane_transpose(method, p),
             // `attach.pane` (docs/18 WA-2): focus a pane and zoom it, so a client
             // attaching next opens straight into that fullscreen terminal.
             "attach.pane" => self.api_attach_pane(method, p),
@@ -282,6 +283,7 @@ impl App {
             "module.list" => self.api_module_list(method, p),
             "module.info" => self.api_module_info(method, p),
             "module.link" => self.api_module_link(method, p),
+            "module.update" => self.api_module_update(method, p),
             "module.unlink" => self.api_module_unlink(method, p),
             "module.uninstall" => self.api_module_uninstall(method, p),
             "module.enable" => self.api_module_enable(method, p),

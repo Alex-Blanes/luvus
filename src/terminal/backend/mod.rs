@@ -11,6 +11,9 @@ use serde_json::{json, Value};
 
 use crate::terminal::vt::VtEngine;
 
+mod keys;
+pub(crate) use keys::control_key;
+
 pub const PROTOCOL_NAME: &str = "luvus-uhp";
 pub const PROTOCOL_MAJOR: u64 = 1;
 pub const PROTOCOL_MINOR: u64 = 0;
@@ -28,6 +31,11 @@ pub const MAX_OBSERVE_LINES: usize = 200;
 pub const MAX_OBSERVERS: usize = 8;
 pub const OBSERVER_QUEUE_CAPACITY: usize = 2;
 pub const MAX_INPUT_BYTES: usize = 256 * 1024;
+/// Bounds for the terminal size a control stream may request with
+/// `set_viewport`. Two cells is the smallest grid a PTY can use.
+pub const MIN_VIEWPORT_CELLS: u16 = 2;
+pub const MAX_VIEWPORT_COLS: u16 = 500;
+pub const MAX_VIEWPORT_ROWS: u16 = 300;
 pub const MAX_TITLE_BYTES: usize = 256;
 pub const MAX_NOTIFICATION_TITLE_BYTES: usize = 256;
 pub const MAX_NOTIFICATION_BODY_BYTES: usize = 8 * 1024;
@@ -67,6 +75,7 @@ pub const STREAM_ACTION_CAPABILITIES: &[&str] = &[
     "upload_chunk",
     "upload_finish",
     "upload_cancel",
+    "set_viewport",
 ];
 
 pub fn advertised_capabilities() -> Vec<&'static str> {
@@ -77,7 +86,7 @@ pub fn advertised_capabilities() -> Vec<&'static str> {
         .collect()
 }
 
-pub const FEATURES: &[&str] = &["stream_cursor", "create_restore_policy"];
+pub const FEATURES: &[&str] = &["stream_cursor", "create_restore_policy", "modified_keys"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureMode {
@@ -191,6 +200,14 @@ pub fn random_id() -> Result<String, String> {
     Ok(id)
 }
 
+/// One `set_viewport` dimension, or `None` when it is absent, not an integer,
+/// or outside the advertised bounds.
+pub fn viewport_dimension(value: Option<&Value>, max: u16) -> Option<u16> {
+    u16::try_from(value?.as_u64()?)
+        .ok()
+        .filter(|cells| (MIN_VIEWPORT_CELLS..=max).contains(cells))
+}
+
 pub fn valid_id(id: &str) -> bool {
     id.len() == 32
         && id
@@ -288,6 +305,8 @@ pub fn limits_json() -> Value {
         "queued_input_bytes": crate::terminal::pty::input::MAX_QUEUED_BYTES,
         "queued_input_actions": crate::terminal::pty::input::MAX_QUEUED_ACTIONS,
         "logical_keys_per_request": 1,
+        "viewport_cols": MAX_VIEWPORT_COLS,
+        "viewport_rows": MAX_VIEWPORT_ROWS,
         "title_bytes": MAX_TITLE_BYTES,
         "notification_title_bytes": MAX_NOTIFICATION_TITLE_BYTES,
         "notification_body_bytes": MAX_NOTIFICATION_BODY_BYTES,

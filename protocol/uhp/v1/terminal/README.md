@@ -39,6 +39,8 @@ Protocol v1 capabilities are:
 - `inventory`, `validate`, `capture`, `observe`, and `control_stream`
 - `type_literal`, `paste_text`, `paste_image`, `submit_text`, `send_key`, and
   bounded `upload_*` control-stream actions
+- `set_viewport`, a control-stream action that sizes a terminal while no native
+  client is rendering
 - `set_title` and `notify_terminal`
 - `create_workspace`, `create_sibling`, and `close`, with an optional
   per-terminal restart policy advertised by `create_restore_policy`
@@ -51,7 +53,8 @@ Every control-stream action is advertised by its exact action name in
 must not infer image or file-upload support from `control_stream`, the protocol
 version, or the Luvus release version. In particular, an older server without
 `paste_image`, `upload_start`, `upload_chunk`, `upload_finish`, or
-`upload_cancel` does not support that action.
+`upload_cancel` does not support that action. The same rule applies to
+`set_viewport`.
 
 When `terminal.features` includes `create_restore_policy`,
 `terminal.backend.create` accepts optional `restore:false`. The terminal stays
@@ -64,7 +67,20 @@ field retain the original strict create-response shape.
 
 The bounded `send_key` vocabulary includes `ctrl-w` and `alt-d` for backward
 and forward word deletion plus `ctrl-u` and `ctrl-k` for deletion toward the
-start and end of the current line.
+start and end of the current line. It also carries the common shell and agent
+controls `ctrl-a`, `ctrl-b`, `ctrl-e`, `ctrl-f`, `ctrl-g`, `ctrl-l`, `ctrl-n`,
+`ctrl-o`, `ctrl-p`, `ctrl-r`, `ctrl-t`, and `ctrl-y`. Without the
+`modified_keys` feature, job-control and flow-control keys such as `ctrl-z`,
+`ctrl-s`, and `ctrl-q` remain excluded.
+
+With `terminal.features: ["modified_keys", ...]`, it also accepts `ctrl-a`
+through `ctrl-z`, their `ctrl-shift-` variants, `ctrl-space` and
+`ctrl-shift-space`. Navigation, Enter and Tab accept `ctrl-`, `shift-` and
+`ctrl-shift-` prefixes. Encoding uses the pane's negotiated keyboard protocol
+and Luvus's configured Shift+Enter sequence, just like TUI input. No raw escape
+sequences or arbitrary key names are accepted.
+Each `send_key` action is one complete tap; when the child negotiates Kitty
+event reporting, supported keys include both press and release events.
 
 Protocol 1.0 capture includes a monotonic `content_revision` and provides a
 sequence-fenced snapshot, bounded terminal-only event streams, and event-driven
@@ -94,7 +110,13 @@ up to 160 KiB. General files use `upload_start`, ordered `upload_chunk` frames,
 and `upload_finish` or `upload_cancel`; one control stream owns at most one
 incomplete upload, each chunk is at most 160 KiB, and a file is at most 32 MiB.
 Luvus stages bytes in private selected-session storage and pastes only the
-completed server-owned path. Only one API control stream may lease a terminal
+completed server-owned path. `set_viewport` takes `{cols, rows}` within the
+advertised `viewport_cols` and `viewport_rows` limits and resizes the terminal
+only while no native client is rendering; otherwise it is rejected with
+`unavailable` and nothing changes. A native client that attaches later lays the
+pane out again, so native geometry authority is unchanged. A successful resize
+publishes a new content revision, so the stream sends a frame at the new size
+even when the child stays quiet. Only one API control stream may lease a terminal
 at a time. There are at most eight combined observe/control streams per server.
 Overflow requires a fresh capture and reconnect.
 
