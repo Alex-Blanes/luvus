@@ -98,10 +98,11 @@ fn install() -> Result<()> {
 /// entries never ran, so Codex asks to trust the new ones once.
 #[cfg(windows)]
 fn install() -> Result<()> {
-    integration::install_powershell_hook(
+    integration::install_windows_hook(
         &spec(),
         &powershell_script_for(&std::env::current_exe()?)?,
         &[("UserPromptSubmit", Some(PROMPT_HOOK_TIMEOUT_SECS))],
+        &integration::windows_hook_command(&spec().dir, "codex")?,
     )
 }
 
@@ -125,7 +126,9 @@ fn present() -> bool {
 
 #[cfg(windows)]
 fn is_installed() -> bool {
-    integration::powershell_hook_installed(&spec(), &["UserPromptSubmit"])
+    integration::windows_hook_command(&spec().dir, "codex").is_ok_and(|command| {
+        integration::windows_hook_installed(&spec(), &["UserPromptSubmit"], &command)
+    })
 }
 
 /// What one Codex hook payload says about its session.

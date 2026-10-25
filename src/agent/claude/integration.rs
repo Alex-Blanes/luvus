@@ -68,7 +68,8 @@ fn install() -> Result<()> {
 #[cfg(windows)]
 fn install() -> Result<()> {
     let events = EVENTS.map(|event| (event, None));
-    integration::install_powershell_hook(&spec(), POWERSHELL_SCRIPT, &events)
+    let command = integration::windows_hook_command(&spec().dir, "claude")?;
+    integration::install_windows_hook(&spec(), POWERSHELL_SCRIPT, &events, &command)
 }
 
 fn uninstall() -> Result<()> {
@@ -86,7 +87,8 @@ fn present() -> bool {
 
 #[cfg(windows)]
 fn is_installed() -> bool {
-    integration::powershell_hook_installed(&spec(), &EVENTS)
+    integration::windows_hook_command(&spec().dir, "claude")
+        .is_ok_and(|command| integration::windows_hook_installed(&spec(), &EVENTS, &command))
 }
 
 /// The hook runs only inside a Luvus pane, and never for Devin, which imports
