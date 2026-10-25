@@ -10,6 +10,7 @@ pub(super) const OPERATIONS: IntegrationOperations = IntegrationOperations {
     uninstall,
     is_installed,
     hook: None,
+    present: None,
 };
 
 const PLUGIN_NAME: &str = "luvus-agent-state";

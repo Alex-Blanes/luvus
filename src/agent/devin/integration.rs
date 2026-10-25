@@ -16,6 +16,7 @@ pub(super) const OPERATIONS: IntegrationOperations = IntegrationOperations {
     uninstall,
     is_installed,
     hook: Some(run_hook),
+    present: None,
 };
 
 /// Devin reads Claude Code-format command hooks, whose timeout is in seconds.

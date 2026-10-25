@@ -388,6 +388,16 @@ pub fn run() -> Result<()> {
         env!("LUVUS_VERSION_LABEL"),
         crate::session::display_name()
     ));
+    // This fork: bring integrations an older Luvus installed up to this
+    // version's form, off the event loop. A debug build would rewrite the real
+    // agent configs of whoever runs it, so only installed builds repair.
+    if !cfg!(debug_assertions) {
+        std::thread::spawn(|| {
+            for agent in crate::integration::repair_stale() {
+                persist::log_event(&format!("integration repaired agent={agent}"));
+            }
+        });
+    }
     let mut app = match App::restore_or_new(DEFAULT_SIZE.0, DEFAULT_SIZE.1, tx.clone()) {
         Ok(app) => app,
         Err(err) => {

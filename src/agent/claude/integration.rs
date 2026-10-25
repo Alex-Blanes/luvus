@@ -17,6 +17,7 @@ pub(super) const OPERATIONS: IntegrationOperations = IntegrationOperations {
     uninstall,
     is_installed,
     hook: Some(run_hook),
+    present: Some(present),
 };
 
 /// Hook events registered besides `SessionStart`.
@@ -76,7 +77,11 @@ fn uninstall() -> Result<()> {
 
 #[cfg(not(windows))]
 fn is_installed() -> bool {
-    integration::shell_hook_installed(spec(), &EVENTS)
+    integration::shell_hook_current(spec(), &EVENTS, &integration::agent_hook_script("claude"))
+}
+
+fn present() -> bool {
+    integration::shell_hook_present(&spec(), &EVENTS)
 }
 
 #[cfg(windows)]

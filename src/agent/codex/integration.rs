@@ -15,6 +15,7 @@ pub(super) const OPERATIONS: IntegrationOperations = IntegrationOperations {
     uninstall,
     is_installed,
     hook: Some(run_hook),
+    present: Some(present),
 };
 
 #[cfg(any(not(windows), test))]
@@ -110,7 +111,16 @@ fn uninstall() -> Result<()> {
 
 #[cfg(not(windows))]
 fn is_installed() -> bool {
-    integration::shell_hook_installed(spec(), &["UserPromptSubmit"])
+    std::env::current_exe()
+        .ok()
+        .and_then(|binary| script_for(&binary).ok())
+        .is_some_and(|script| {
+            integration::shell_hook_current(spec(), &["UserPromptSubmit"], &script)
+        })
+}
+
+fn present() -> bool {
+    integration::shell_hook_present(&spec(), &["UserPromptSubmit"])
 }
 
 #[cfg(windows)]

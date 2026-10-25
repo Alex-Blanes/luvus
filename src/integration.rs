@@ -449,6 +449,78 @@ pub(crate) fn shell_hook_installed(spec: ShellHookSpec, required_events: &[&str]
         })
 }
 
+/// This fork: [`shell_hook_installed`] in exactly the form this Luvus writes.
+/// `expected_script` is on disk and every required event runs it through
+/// [`hook_command`], so a raw Windows path (bash eats its backslashes) or a
+/// script from an older version reads as stale instead of installed.
+pub(crate) fn shell_hook_current(
+    spec: ShellHookSpec,
+    required_events: &[&str],
+    expected_script: &str,
+) -> bool {
+    let script = spec.dir.join("luvus-agent-hook.sh");
+    let config = spec.dir.join(spec.file);
+    let event = spec.event;
+    if fs::read_to_string(&script).ok().as_deref() != Some(expected_script)
+        || !shell_hook_installed(spec, required_events)
+    {
+        return false;
+    }
+    let command = hook_command(&script);
+    let Some(value) = read_json(&config) else {
+        return false;
+    };
+    std::iter::once(event)
+        .chain(required_events.iter().copied())
+        .all(|event| luvus_commands(&value, event).all(|found| found == command))
+}
+
+/// This fork: whether any luvus entry, current or left by an older version, is
+/// in the hook config for `events` or the spec's own event.
+pub(crate) fn shell_hook_present(spec: &ShellHookSpec, events: &[&str]) -> bool {
+    let Some(value) = read_json(&spec.dir.join(spec.file)) else {
+        return false;
+    };
+    std::iter::once(spec.event)
+        .chain(events.iter().copied())
+        .any(|event| luvus_commands(&value, event).next().is_some())
+}
+
+fn read_json(path: &Path) -> Option<Value> {
+    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+}
+
+/// Every hook command under `hooks.<event>` that runs a luvus hook.
+fn luvus_commands<'a>(value: &'a Value, event: &str) -> impl Iterator<Item = &'a str> {
+    value["hooks"][event]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group["hooks"].as_array())
+        .flatten()
+        .filter_map(|hook| hook["command"].as_str())
+        .filter(|command| command_mentions_luvus(command))
+}
+
+/// This fork: reinstall, in this version's form, every integration an older
+/// Luvus left behind that no longer reads as installed (a raw Windows path,
+/// an event it hooks now, an older script). One the user never installed, or
+/// removed, is left alone. Server startup runs it once, off the event loop.
+pub fn repair_stale() -> Vec<&'static str> {
+    crate::agent::registry::integrations()
+        .iter()
+        .filter(|descriptor| descriptor.integration.is_some_and(repair))
+        .map(|descriptor| descriptor.id)
+        .collect()
+}
+
+/// Reinstall one integration if it is present but stale; whether it did.
+fn repair(operations: crate::agent::types::IntegrationOperations) -> bool {
+    operations.present.is_some_and(|present| present())
+        && !(operations.is_installed)()
+        && (operations.install)().is_ok()
+}
+
 /// Insert a command hook under `hooks.<event>` pointing at `script` (with an
 /// optional group `matcher`), removing any prior luvus entry first.
 pub(crate) fn register_hook(
@@ -811,6 +883,65 @@ mod tests {
         let groups = settings["hooks"]["sessionStart"].as_array().unwrap();
         assert_eq!(groups.iter().filter(|g| group_mentions_luvus(g)).count(), 1);
         assert!(is_installed("copilot"));
+
+        std::env::remove_var("LUVUS_COPILOT_DIR");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// This fork: an install an older Luvus left (its own script, and on
+    /// Windows the native path bash reads as `C:Users…`) is present but not
+    /// installed, and one repair rewrites it in this version's form.
+    #[test]
+    fn a_stale_hook_from_an_older_luvus_is_repaired_in_this_versions_form() {
+        let _env = crate::persist::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("luvus-stale-hook-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("stale")).unwrap();
+        fs::create_dir_all(tmp.join("never")).unwrap();
+        let copilot = operation("copilot").unwrap();
+
+        std::env::set_var("LUVUS_COPILOT_DIR", tmp.join("stale"));
+        let script = tmp.join("stale").join("luvus-agent-hook.sh");
+        fs::write(&script, "#!/usr/bin/env bash\n# an older luvus hook\n").unwrap();
+        let settings = serde_json::json!({
+            "keep": "yes",
+            "hooks": { "sessionStart": [
+                { "hooks": [ { "type": "command", "command": script.to_string_lossy() } ] },
+                { "hooks": [ { "type": "command", "command": "echo user" } ] },
+            ] }
+        });
+        fs::write(
+            tmp.join("stale").join("settings.json"),
+            settings.to_string(),
+        )
+        .unwrap();
+        assert!((copilot.present.unwrap())(), "an older install is present");
+        assert!(!is_installed("copilot"), "but it is not current");
+        assert!(repair(copilot));
+        assert!(is_installed("copilot"));
+        assert!(!repair(copilot), "a current install is left alone");
+        let settings = read_json(&tmp.join("stale").join("settings.json")).unwrap();
+        let commands: Vec<&str> = luvus_commands(&settings, "sessionStart").collect();
+        assert_eq!(commands, [hook_command(&script)]);
+        if cfg!(windows) {
+            assert!(
+                commands[0].starts_with('"')
+                    && commands[0].contains(":/")
+                    && !commands[0].contains('\\'),
+                "the Windows path becomes a quoted C:/… path: {}",
+                commands[0]
+            );
+        }
+        assert_eq!(settings["keep"], "yes");
+        assert!(settings["hooks"]["sessionStart"]
+            .to_string()
+            .contains("echo user"));
+
+        std::env::set_var("LUVUS_COPILOT_DIR", tmp.join("never"));
+        assert!(!repair(copilot), "never installed: nothing to repair");
+        assert!(!tmp.join("never").join("settings.json").exists());
 
         std::env::remove_var("LUVUS_COPILOT_DIR");
         let _ = fs::remove_dir_all(&tmp);
