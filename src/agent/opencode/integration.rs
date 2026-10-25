@@ -18,6 +18,7 @@ pub(super) const OPERATIONS: IntegrationOperations = IntegrationOperations {
     uninstall: uninstall_current,
     is_installed: current_installed,
     hook: None,
+    present: None,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

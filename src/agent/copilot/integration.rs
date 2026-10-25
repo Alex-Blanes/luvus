@@ -10,6 +10,7 @@ pub(super) const OPERATIONS: IntegrationOperations = IntegrationOperations {
     uninstall,
     is_installed,
     hook: None,
+    present: Some(present),
 };
 
 fn config_dir() -> PathBuf {
@@ -36,5 +37,9 @@ fn uninstall() -> Result<()> {
 }
 
 fn is_installed() -> bool {
-    integration::shell_hook_installed(spec(), &[])
+    integration::shell_hook_current(spec(), &[], &integration::agent_hook_script("copilot"))
+}
+
+fn present() -> bool {
+    integration::shell_hook_present(&spec(), &[])
 }

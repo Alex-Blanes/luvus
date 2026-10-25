@@ -221,7 +221,11 @@ or bar placement.
 - Use UHP 1.0 for harnesses, orchestrators, typed discovery, event streams,
   atomic prompts, terminal access, and revision-safe mutations.
 - Use modules for reusable, explicitly installed extensions with UI surfaces
-  or event hooks.
+  or event hooks. With explicit approval, update a managed module via
+  `luvus module update <id|owner/repo[/sub]> [--ref REF] [--yes]` against its
+  running session. Saved refs, settings, and enabled state survive; local links
+  are updated in their own checkout. Existing module panes stay on old code
+  and may need reopening to publish UI with the new credentials.
 
 CLI commands and UHP methods control the same server state. UHP is the public
 automation protocol. The binary client-frame transport is an internal rendering
@@ -293,10 +297,16 @@ luvus agent read <target> --lines 100
 conversation title or `null`. It is for display only: target agents by pane ID
 or alias, never by title. Older servers omit the field.
 
+`pane transpose <pane-id>` toggles only the split immediately containing that
+pane and preserves focus, zoom, ratios, and live terminals. A single pane
+returns `changed:false`. Resolve the target ID first. After a lost response,
+inspect its layout before retrying: transposing twice restores the original.
+
 Examples of explicit mutations, only when requested:
 
 ```sh
 luvus pane split --down
+luvus pane transpose <pane-id>
 luvus pane run <pane-id> <command> [args...]
 luvus agent start reviewer --kind codex --anchor <pane-id> --timeout 60
 luvus agent prompt reviewer "Review the current diff" --wait --timeout 600
@@ -363,6 +373,9 @@ discovery rather than inferring support from an agent name.
   and terminal state.
 - Supported agents can reopen their own conversation through native session
   discovery and resume commands.
+- A scheduled automation worker pane restores as a plain shell. Its headless
+  agent run is never resumed interactively; resume that conversation explicitly
+  by its exact session ID when you need it.
 - Antigravity CLI is detected natively. Its optional
   `luvus integration install antigravity` hook reports only the exact
   conversation id needed for `agy --conversation <id>` restore; screen
@@ -389,7 +402,9 @@ discovery rather than inferring support from an agent name.
 - `luvus integration install devin` adds one `SessionStart` hook that reports
   only the exact Devin session ID selected in that pane, including after
   `/clear` or an in-TUI `/resume`. Detection remains native, and Luvus does not
-  open Devin's private session database.
+  open Devin's private session database. A scheduled Devin worker accepts
+  `read_only` or `full_access` and rejects `workspace`, because Devin's
+  `accept-edits` mode cannot commit worktree changes.
 
 Do not claim every shell command resumes after restart. Do not guess native
 session IDs. List sessions and use the exact returned identifier.

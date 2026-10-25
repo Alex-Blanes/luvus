@@ -202,6 +202,10 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
         if shared.cancelled.load(Ordering::Acquire) {
             break;
         }
+        #[allow(
+            deprecated,
+            reason = "AtomicUsize::try_update requires Rust 1.95; keep the Rust 1.88 MSRV"
+        )]
         if !peer.ip().is_loopback()
             || shared
                 .active
@@ -824,47 +828,25 @@ fn valid_terminal_control_frame(frame: &str) -> bool {
                         .and_then(Value::as_str)
                         .is_some_and(crate::terminal::backend::valid_id)
             }
+            Some("set_viewport") => {
+                params.len() == 2
+                    && crate::terminal::backend::viewport_dimension(
+                        params.get("cols"),
+                        crate::terminal::backend::MAX_VIEWPORT_COLS,
+                    )
+                    .is_some()
+                    && crate::terminal::backend::viewport_dimension(
+                        params.get("rows"),
+                        crate::terminal::backend::MAX_VIEWPORT_ROWS,
+                    )
+                    .is_some()
+            }
             Some("send_key") => {
                 params.len() == 1
                     && params
                         .get("key")
                         .and_then(Value::as_str)
-                        .is_some_and(|key| {
-                            matches!(
-                                key,
-                                "enter"
-                                    | "escape"
-                                    | "tab"
-                                    | "backtab"
-                                    | "up"
-                                    | "down"
-                                    | "left"
-                                    | "right"
-                                    | "home"
-                                    | "end"
-                                    | "backspace"
-                                    | "delete"
-                                    | "pageup"
-                                    | "pagedown"
-                                    | "ctrl-c"
-                                    | "ctrl-d"
-                                    | "ctrl-k"
-                                    | "ctrl-u"
-                                    | "ctrl-w"
-                                    | "alt-d"
-                                    | "space"
-                                    | "digit-0"
-                                    | "digit-1"
-                                    | "digit-2"
-                                    | "digit-3"
-                                    | "digit-4"
-                                    | "digit-5"
-                                    | "digit-6"
-                                    | "digit-7"
-                                    | "digit-8"
-                                    | "digit-9"
-                            )
-                        })
+                        .is_some_and(|key| crate::terminal::backend::control_key(key).is_some())
             }
             _ => false,
         }
@@ -1241,11 +1223,38 @@ mod tests {
         assert!(valid_terminal_control_frame(
             r#"{"id":"key-3","action":"send_key","params":{"key":"alt-d"}}"#
         ));
+        for key in [
+            "ctrl-a",
+            "ctrl-z",
+            "shift-enter",
+            "ctrl-shift-left",
+            "ctrl-space",
+        ] {
+            assert!(valid_terminal_control_frame(
+                &serde_json::json!({"id":"key","action":"send_key","params":{"key":key}})
+                    .to_string()
+            ));
+        }
+        assert!(valid_terminal_control_frame(
+            r#"{"id":"key-4","action":"send_key","params":{"key":"ctrl-r"}}"#
+        ));
+        assert!(valid_terminal_control_frame(
+            r#"{"id":"size-1","action":"set_viewport","params":{"cols":40,"rows":18}}"#
+        ));
+        assert!(!valid_terminal_control_frame(
+            r#"{"id":"size-2","action":"set_viewport","params":{"cols":1,"rows":18}}"#
+        ));
+        assert!(!valid_terminal_control_frame(
+            r#"{"id":"size-3","action":"set_viewport","params":{"cols":40,"rows":18,"pane_id":"7"}}"#
+        ));
+        assert!(!valid_terminal_control_frame(
+            r#"{"id":"size-4","action":"set_viewport","params":{"cols":"40","rows":18}}"#
+        ));
         assert!(!valid_terminal_control_frame(
             r#"{"id":"run-1","action":"pane.run","params":{"text":"id"}}"#
         ));
         assert!(!valid_terminal_control_frame(
-            r#"{"id":"key-1","action":"send_key","params":{"key":"ctrl-z"}}"#
+            r#"{"id":"key-1","action":"send_key","params":{"key":"raw-bytes"}}"#
         ));
         assert!(!valid_terminal_control_frame(
             r#"{"id":"input-1","action":"submit_text","params":{"text":"ok","extra":true}}"#

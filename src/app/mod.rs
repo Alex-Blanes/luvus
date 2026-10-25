@@ -1046,6 +1046,8 @@ pub struct PaneMenu {
     /// Whether this pane runs a fork-capable agent, snapshotted at open. Gates
     /// whether the "Fork to new pane" row is shown (docs/23).
     pub can_fork: bool,
+    /// Whether the pane has a sibling split that can be transposed.
+    pub can_transpose: bool,
     /// Exact tracked file + derived-preview kind snapshotted at menu open.
     /// Already-rendered previews and untracked shell/editor panes leave this empty.
     pub document_preview: Option<(PathBuf, crate::files::preview::PreviewKind)>,
@@ -1140,6 +1142,7 @@ pub struct AgentForkResult {
 pub enum PaneMenuItem {
     SplitVertical,
     SplitHorizontal,
+    Transpose,
     /// "Open Link" — open the URL that was under the right-click (docs/58). Only
     /// offered when there actually was one, so the row is never a dead end.
     OpenLink,
@@ -1170,6 +1173,7 @@ impl PaneMenuItem {
     pub const ALL: &'static [PaneMenuItem] = &[
         PaneMenuItem::SplitVertical,
         PaneMenuItem::SplitHorizontal,
+        PaneMenuItem::Transpose,
         PaneMenuItem::ForkPane,
         PaneMenuItem::OpenLink,
         PaneMenuItem::OpenFile,
@@ -2614,6 +2618,9 @@ pub struct App {
     /// UHP-created terminals whose lifecycle belongs to an external manager.
     /// They remain ordinary live panes, but are omitted from restart snapshots.
     pub(crate) backend_non_restorable: HashSet<PaneId>,
+    /// Panes started as scheduled automation workers. They restore as plain
+    /// shells: the headless run's native session is never saved for resume.
+    pub(crate) automation_worker_panes: HashSet<PaneId>,
     /// Last terminal content revision announced to backend observers. PTY
     /// readers coalesce wakeups, so the re-arm boundary may need to publish a
     /// newer trailing revision without duplicating the first wake's event.
@@ -3525,6 +3532,7 @@ impl App {
             backend_terminal_index,
             backend_labels: HashMap::new(),
             backend_non_restorable: HashSet::new(),
+            automation_worker_panes: HashSet::new(),
             backend_published_revisions: HashMap::new(),
             backend_revision_waits: HashMap::new(),
             last_backend_wait_scan: Instant::now(),
@@ -3930,6 +3938,7 @@ impl App {
         let mut views: HashMap<PaneId, ViewKind> = HashMap::new();
         let mut restored_names: Vec<(String, PaneId)> = Vec::new();
         let mut restored_backend_labels: Vec<(PaneId, String)> = Vec::new();
+        let mut automation_worker_panes = HashSet::new();
         let mut workspaces = Vec::new();
         for ws in snap.workspaces {
             let mut tabs = Vec::new();
@@ -4091,7 +4100,10 @@ impl App {
                     // it through the PTY after interactive profile setup.
                     // Re-apply the launch flags captured at save time (docs/62),
                     // unless Settings → General turns that off.
-                    let resume = ps.agent_session.as_ref().and_then(|(agent, sid)| {
+                    // A scheduled worker never resumes, even from a snapshot
+                    // that still names a session for it.
+                    let agent_session = ps.agent_session.as_ref().filter(|_| !ps.automation_worker);
+                    let resume = agent_session.and_then(|(agent, sid)| {
                         crate::agent::resume_for(
                             agent,
                             sid,
@@ -4191,7 +4203,7 @@ impl App {
                     }
                     let cmd = pane.command.clone();
                     let mut st = PaneStatus::new(cmd);
-                    if let Some((agent, sid)) = &ps.agent_session {
+                    if let Some((agent, sid)) = agent_session {
                         st.agent = agent.clone();
                         st.agent_session = Some(AgentSession {
                             agent: agent.clone(),
@@ -4205,6 +4217,9 @@ impl App {
                     }
                     panes.insert(id, pane);
                     status.insert(id, st);
+                    if ps.automation_worker {
+                        automation_worker_panes.insert(id);
+                    }
                     if let Some(label) = &ps.backend_label {
                         if !label.is_empty()
                             && label.len() <= crate::terminal::backend::MAX_TITLE_BYTES
@@ -4293,6 +4308,7 @@ impl App {
             backend_terminal_index,
             backend_labels,
             backend_non_restorable: HashSet::new(),
+            automation_worker_panes,
             backend_published_revisions: HashMap::new(),
             backend_revision_waits: HashMap::new(),
             last_backend_wait_scan: Instant::now(),
@@ -5504,16 +5520,18 @@ impl App {
     /// the synchronous spawn path's own fallback. Shared by `new_tab` and `split`
     /// so the two stay aligned.
     fn spawn_cwds(&self) -> Vec<PathBuf> {
-        self.spawn_cwds_for(self.active_ws, self.layout().focus)
+        self.spawn_cwds_for(self.active_ws, self.layout().focus, None)
     }
 
     /// Resolve the spawn directory chain for a specific pane and its workspace.
     /// Socket callers may target an inactive pane, so this cannot rely on the
     /// active workspace or tab.
-    fn spawn_cwds_for(&self, workspace: usize, pane: PaneId) -> Vec<PathBuf> {
+    fn spawn_cwds_for(&self, workspace: usize, pane: PaneId, cwd: Option<PathBuf>) -> Vec<PathBuf> {
         let home = crate::platform::home_dir().unwrap_or_default();
         let root = self.workspaces[workspace].cwd.clone();
-        let ordered = if self.config.layout.new_pane_to_workspace_root {
+        let ordered = if let Some(cwd) = cwd {
+            vec![cwd, root, home.clone()]
+        } else if self.config.layout.new_pane_to_workspace_root {
             vec![root, home.clone()]
         } else {
             let pane_cwd = self
@@ -5812,16 +5830,46 @@ impl App {
     /// With focus disabled, the current view and the target tab's prior focus are
     /// preserved even when the target belongs to another workspace.
     pub(crate) fn split_pane(&mut self, pane: PaneId, axis: Axis, focus: bool) -> Option<PaneId> {
+        self.split_pane_in(pane, axis, focus, None)
+    }
+
+    /// Split with an optional starting directory that overrides layout defaults.
+    pub(crate) fn split_pane_in(
+        &mut self,
+        pane: PaneId,
+        axis: Axis,
+        focus: bool,
+        cwd: Option<PathBuf>,
+    ) -> Option<PaneId> {
         let (wsi, ti) = self.pane_location(pane)?;
-        // Resolve the candidate chain up front (target pane → target workspace
+        // Resolve the candidate chain up front (explicit cwd or target pane → target workspace
         // root → $HOME, existing only) and hand the primary plus its fallbacks to
         // the deferred worker. If the primary vanishes before the fork, the
         // worker retries the fallbacks instead of spawning in a dead directory.
-        let cwds = self.spawn_cwds_for(wsi, pane);
+        let cwds = self.spawn_cwds_for(wsi, pane, cwd);
         let (cwd, fallback_cwds) = cwds.split_first()?;
         self.spawn_and_attach_new_pane(wsi, ti, pane, axis, focus, |app| {
             app.spawn_into_deferred(cwd.clone(), fallback_cwds)
         })
+    }
+
+    /// Transpose only the target pane's parent split without changing focus,
+    /// zoom, terminal lifetime, or any other tab.
+    pub(crate) fn transpose_pane(&mut self, pane: PaneId) -> Option<bool> {
+        let (workspace, tab) = self.pane_location(pane)?;
+        let target = &mut self.workspaces[workspace].tabs[tab];
+        if !target.is_renameable() {
+            return None;
+        }
+        let changed = target.layout.transpose_pane(pane);
+        if changed {
+            self.session_dirty = true;
+            self.emit_event(
+                "pane.transposed",
+                serde_json::json!({"pane":pane.0.to_string()}),
+            );
+        }
+        Some(changed)
     }
 
     /// Fork `pane`'s agent session into a new sibling on its right, preserving
@@ -7011,6 +7059,7 @@ impl App {
             .as_ref()
             .is_some_and(|m| !m.move_targets.is_empty());
         let can_fork = self.pane_menu.as_ref().is_some_and(|m| m.can_fork);
+        let can_transpose = self.pane_menu.as_ref().is_some_and(|m| m.can_transpose);
         let document_preview = self
             .pane_menu
             .as_ref()
@@ -7025,6 +7074,7 @@ impl App {
             .copied()
             .filter(|it| has_move || *it != PaneMenuItem::MoveToTab)
             .filter(|it| can_fork || *it != PaneMenuItem::ForkPane)
+            .filter(|it| can_transpose || *it != PaneMenuItem::Transpose)
             .filter(|it| has_url || *it != PaneMenuItem::OpenLink)
             .filter(|it| has_file || *it != PaneMenuItem::OpenFile)
             .filter(|it| {
@@ -7772,6 +7822,10 @@ impl App {
         }
         let move_targets = self.pane_move_targets();
         let can_fork = self.can_fork_pane(pane);
+        let can_transpose = self
+            .pane_location(pane)
+            .and_then(|(workspace, tab)| self.workspaces.get(workspace)?.tabs.get(tab))
+            .is_some_and(|tab| tab.layout.len() > 1);
         let link = self.link_at_screen(col, row).map(|h| h.target);
         let document_preview = match self.views.get(&pane) {
             Some(ViewKind::File(view)) => crate::files::preview::PreviewKind::for_path(&view.path)
@@ -7791,6 +7845,7 @@ impl App {
             move_open: false,
             tab_rects: Vec::new(),
             can_fork,
+            can_transpose,
             link,
             document_preview,
         });
@@ -8183,6 +8238,12 @@ impl App {
             return;
         };
         self.pane_menu = None;
+        // Transpose resolves the stable menu target globally and preserves focus,
+        // including after a background request has moved or closed that pane.
+        if item == PaneMenuItem::Transpose {
+            self.transpose_pane(pane);
+            return;
+        }
         // Act on the right-clicked pane, not whatever was focused before.
         self.layout_mut().focus = pane;
         match item {
@@ -8196,6 +8257,7 @@ impl App {
             }
             PaneMenuItem::SplitVertical => self.split(Axis::Col), // side by side
             PaneMenuItem::SplitHorizontal => self.split(Axis::Row), // stacked
+            PaneMenuItem::Transpose => {} // handled above without changing focus
             PaneMenuItem::ForkPane => {
                 self.fork_pane(pane);
             }
@@ -9836,6 +9898,7 @@ impl App {
         self.backend_terminal_index.retain(|_, pane| *pane != id);
         self.backend_labels.remove(&id);
         self.backend_non_restorable.remove(&id);
+        self.automation_worker_panes.remove(&id);
         self.backend_published_revisions.remove(&id);
         self.agent_title_panes.remove(&id);
         self.cancel_backend_revision_waits(id);
@@ -17045,6 +17108,43 @@ fi
     }
 
     #[test]
+    fn transpose_menu_preserves_focus_and_ignores_closed_target() {
+        let _env = crate::persist::test_env("transpose-menu");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let pane = app.layout().focus;
+        app.open_pane_menu(pane, 1, 1);
+        assert!(!app.pane_menu_items().contains(&PaneMenuItem::Transpose));
+        app.split(Axis::Col);
+        let focus = app.layout().focus;
+        app.open_pane_menu(pane, 1, 1);
+        assert!(app.pane_menu_items().contains(&PaneMenuItem::Transpose));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        term.draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let rect = app
+            .pane_menu
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .find(|(item, _)| *item == PaneMenuItem::Transpose)
+            .unwrap()
+            .1;
+        app.pane_menu_click(rect.x, rect.y);
+        assert!(app.pane_menu.is_none());
+        assert_eq!(app.layout().focus, focus);
+        let crate::layout::LayoutTree::Split { axis, .. } = app.layout().to_tree() else {
+            panic!("split");
+        };
+        assert_eq!(axis, 1);
+        app.open_pane_menu(pane, 1, 1);
+        app.close_pane(pane);
+        app.pane_menu_action(PaneMenuItem::Transpose);
+        assert_eq!(app.layout().focus, focus);
+    }
+
+    #[test]
     fn pane_menu_splits_closes_and_skips_dashboards() {
         let _env = crate::persist::test_env("pane-menu");
         use ratatui::backend::TestBackend;
@@ -19216,13 +19316,20 @@ fi
         );
         app.close_folder_picker();
 
-        // The `?` cheat-sheet body (command labels) is translated.
+        // The cheat sheet grows with the command registry. Verify the translated
+        // close label on whichever scroll page contains it, not just page one.
         app.help_open = true;
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert!(
-            text(&term).contains("Cerrar panel"),
-            "cheat-sheet command labels translated"
-        );
+        let mut translated = text(&term).contains("Cerrar panel");
+        for scroll in 1..=app.help_scroll_max {
+            if translated {
+                break;
+            }
+            app.help_scroll = scroll;
+            term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+            translated = text(&term).contains("Cerrar panel");
+        }
+        assert!(translated, "cheat-sheet command labels translated");
     }
 
     #[test]

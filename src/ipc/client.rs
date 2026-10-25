@@ -1000,7 +1000,7 @@ fn host_terminal_shares_local_filesystem_with(
     // Windows Terminal is local, but it claims a `Ctrl`+click on any hyperlink
     // under the pointer instead of forwarding it (microsoft/terminal#9396), and
     // it does not open these `file://` targets either: a projected path turns
-    // the gesture into a silent no-op (this fork). Leave the click to luvus.
+    // the gesture into a silent no-op. Leave the click to luvus.
     if [
         "SSH_CONNECTION",
         "SSH_CLIENT",
@@ -1355,6 +1355,52 @@ mod tests {
             error.to_string(),
             "connection failed before the Luvus handshake: remote command exited"
         );
+    }
+
+    #[test]
+    fn rgb_color_depth_is_consistent_for_full_and_diff_frames() {
+        use super::{diff_cells, frame_cells};
+        use crate::ipc::protocol::{self, pack, CellData, DiffRun, FrameData, FrameDiff};
+        use ratatui::style::Color;
+
+        let (fg, bg) = (Color::Rgb(17, 34, 51), Color::Rgb(68, 85, 102));
+        let frame = FrameData {
+            width: 1,
+            height: 1,
+            cells: vec![CellData {
+                symbol: "x".into(),
+                fg: pack(fg),
+                bg: pack(bg),
+                mods: 0,
+            }],
+            hyperlinks: Vec::new(),
+            cursor: None,
+            cursor_visible: false,
+        };
+        let diff = FrameDiff {
+            width: 1,
+            height: 1,
+            runs: vec![DiffRun {
+                start: 0,
+                fg: pack(fg),
+                bg: pack(bg),
+                mods: 0,
+                symbols: vec!["x".into()],
+            }],
+            cursor: None,
+            cursor_visible: false,
+        };
+        for truecolor in [true, false] {
+            let full = frame_cells(&frame, truecolor);
+            let changed = diff_cells(&diff, truecolor);
+            let expected = if truecolor {
+                (fg, bg)
+            } else {
+                (protocol::to_256(fg), protocol::to_256(bg))
+            };
+            assert_eq!((full[0].2.fg, full[0].2.bg), expected);
+            assert_eq!((changed[0].2.fg, changed[0].2.bg), expected);
+        }
     }
 
     /// The blit skips wide-char continuation cells (empty symbol) instead of

@@ -55,6 +55,7 @@ pub const METHODS: &[&str] = &[
     "pane.split",
     "pane.move",
     "pane.swap",
+    "pane.transpose",
     "pane.focus",
     "pane.focus_direction",
     "pane.resize",
@@ -151,6 +152,7 @@ pub const METHODS: &[&str] = &[
     "module.list",
     "module.info",
     "module.link",
+    "module.update",
     "module.unlink",
     "module.uninstall",
     "module.enable",
@@ -491,7 +493,7 @@ mod tests {
         assert_eq!(capabilities["limits"]["agent_row_title_agent_bytes"], 64);
         assert_eq!(
             capabilities["terminal"]["features"],
-            json!(["stream_cursor", "create_restore_policy"])
+            json!(["stream_cursor", "create_restore_policy", "modified_keys"])
         );
         let terminal_capabilities = capabilities["terminal"]["capabilities"]
             .as_array()
@@ -502,6 +504,7 @@ mod tests {
             "upload_chunk",
             "upload_finish",
             "upload_cancel",
+            "set_viewport",
         ] {
             assert!(
                 terminal_capabilities.iter().any(|value| value == action),

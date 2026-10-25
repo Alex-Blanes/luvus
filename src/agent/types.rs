@@ -47,6 +47,10 @@ pub(crate) struct IntegrationOperations {
     pub is_installed: fn() -> bool,
     /// Optional private hook entrypoint owned by the agent adapter.
     pub hook: Option<fn() -> i32>,
+    /// This fork: whether any form of the integration, current or left by an
+    /// older Luvus, is in the agent's config. With `is_installed` false it marks
+    /// a stale install that server startup repairs; `None` never repairs.
+    pub present: Option<fn() -> bool>,
 }
 
 /// Static argv inserted between the descriptor's executable and the quoted

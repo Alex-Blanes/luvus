@@ -371,7 +371,14 @@ impl App {
         let pane_id = self.resolve_backend_runtime(params, true)?;
         let key = required_bounded_string(params, "key", 32, true)?;
         let pane = &self.panes[&pane_id];
-        let bytes = backend_key_bytes(key, pane.application_cursor()).ok_or_else(|| {
+        let modes = pane.key_encoding_modes();
+        let bytes = backend_key_bytes(
+            key,
+            modes.application_cursor,
+            modes.protocol,
+            self.config.shift_enter_bytes(),
+        )
+        .ok_or_else(|| {
             BackendError::mutation(
                 "invalid_params",
                 "unsupported logical key",
@@ -1253,6 +1260,73 @@ impl App {
         })
     }
 
+    /// Size one terminal for an API control stream.
+    ///
+    /// Native render clients keep geometry authority: while one is drawing,
+    /// the interactive render sizes every visible pane, so the request is
+    /// refused and nothing changes. Without one there is no render to size the
+    /// PTY at all, and the stream's viewport stands until a native client
+    /// attaches and lays the pane out again.
+    pub(crate) fn backend_set_viewport(
+        &mut self,
+        params: &Value,
+        native_geometry: bool,
+    ) -> BackendResult {
+        reject_mutation_fields(
+            params,
+            &[
+                "server_generation",
+                "terminal_id",
+                "pane_id",
+                "cols",
+                "rows",
+            ],
+        )?;
+        let (Some(cols), Some(rows)) = (
+            backend::viewport_dimension(params.get("cols"), backend::MAX_VIEWPORT_COLS),
+            backend::viewport_dimension(params.get("rows"), backend::MAX_VIEWPORT_ROWS),
+        ) else {
+            return Err(BackendError::mutation(
+                "invalid_params",
+                "cols and rows must be integers within the advertised viewport limits",
+                DispatchEvidence::NotStarted,
+            ));
+        };
+        let pane_id = self.resolve_backend_runtime(params, true)?;
+        if native_geometry {
+            return Err(mutation_error(
+                "unavailable",
+                "a native client owns terminal geometry",
+            ));
+        }
+        let resized = self
+            .panes
+            .get_mut(&pane_id)
+            .is_some_and(|pane| pane.resize(cols, rows));
+        if resized {
+            // Same bookkeeping as a resize from the interactive render: the
+            // child repaints, so detection pauses and stale matches are dropped.
+            if let Some(search) = self
+                .pane_search
+                .as_mut()
+                .filter(|search| search.pane == pane_id)
+            {
+                search.invalidate_matches();
+            }
+            if let Some(status) = self.status.get_mut(&pane_id) {
+                status.last_resize = Some(Instant::now());
+                status.force_detect = true;
+            }
+            // A reflow changes the captured text even when the child stays
+            // quiet; publish it so the stream sends a frame at the new size.
+            if let Some(pane) = self.panes.get(&pane_id) {
+                pane.note_reflow();
+            }
+            self.backend_output_changed(pane_id);
+        }
+        Ok(executed_action_json())
+    }
+
     pub(super) fn start_backend_wait(&mut self, req: ApiRequest) {
         let parsed = (|| -> Result<_, BackendError> {
             let output_wait = req.method == "terminal.backend.wait_output";
@@ -1637,48 +1711,26 @@ pub(super) fn bounded_text(text: &str, max_bytes: usize) -> String {
         .collect()
 }
 
-fn backend_key_bytes(key: &str, application_cursor: bool) -> Option<Vec<u8>> {
-    let sequence: &[u8] = match key {
-        "enter" => b"\r",
-        "escape" => b"\x1b",
-        "tab" => b"\t",
-        "backtab" => b"\x1b[Z",
-        "up" if application_cursor => b"\x1bOA",
-        "up" => b"\x1b[A",
-        "down" if application_cursor => b"\x1bOB",
-        "down" => b"\x1b[B",
-        "right" if application_cursor => b"\x1bOC",
-        "right" => b"\x1b[C",
-        "left" if application_cursor => b"\x1bOD",
-        "left" => b"\x1b[D",
-        "home" if application_cursor => b"\x1bOH",
-        "home" => b"\x1b[H",
-        "end" if application_cursor => b"\x1bOF",
-        "end" => b"\x1b[F",
-        "backspace" => b"\x7f",
-        "delete" => b"\x1b[3~",
-        "pageup" => b"\x1b[5~",
-        "pagedown" => b"\x1b[6~",
-        "ctrl-c" => b"\x03",
-        "ctrl-d" => b"\x04",
-        "ctrl-k" => b"\x0b",
-        "ctrl-u" => b"\x15",
-        "ctrl-w" => b"\x17",
-        "alt-d" => b"\x1bd",
-        "space" => b" ",
-        "digit-0" => b"0",
-        "digit-1" => b"1",
-        "digit-2" => b"2",
-        "digit-3" => b"3",
-        "digit-4" => b"4",
-        "digit-5" => b"5",
-        "digit-6" => b"6",
-        "digit-7" => b"7",
-        "digit-8" => b"8",
-        "digit-9" => b"9",
-        _ => return None,
-    };
-    Some(sequence.to_vec())
+fn backend_key_bytes(
+    key: &str,
+    application_cursor: bool,
+    protocol: crate::terminal::keyboard::KeyboardProtocol,
+    newline: &[u8],
+) -> Option<Vec<u8>> {
+    let event = backend::control_key(key)?;
+    let mut bytes =
+        super::input::encode_key_with_modes(&event, newline, application_cursor, protocol)?;
+    // A logical stream key is a complete tap, not a held physical key. Apps
+    // requesting Kitty event types must not be left with a pressed key forever.
+    if protocol.reports_event_types() {
+        let release = KeyEvent::new_with_kind(event.code, event.modifiers, KeyEventKind::Release);
+        if let Some(released) =
+            super::input::encode_key_with_modes(&release, newline, application_cursor, protocol)
+        {
+            bytes.extend(released);
+        }
+    }
+    Some(bytes)
 }
 
 #[cfg(test)]
@@ -2313,6 +2365,73 @@ mod tests {
     }
 
     #[test]
+    fn set_viewport_resizes_only_without_native_geometry() {
+        let _env = crate::persist::test_env("backend-set-viewport");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let runtime = app.panes[&pane].terminal_runtime().unwrap();
+        let params = json!({
+            "server_generation":app.backend_server_generation,
+            "terminal_id":runtime.terminal_id,
+            "pane_id":pane.0.to_string(),
+            "cols":40,
+            "rows":18,
+        });
+        let native_size = app.panes[&pane].size();
+        assert_ne!(native_size, (40, 18));
+
+        let refused = app.backend_set_viewport(&params, true).err().unwrap();
+        assert_eq!(refused.code, "unavailable");
+        assert_eq!(refused.dispatch, Some(DispatchEvidence::Rejected));
+        assert_eq!(
+            app.panes[&pane].size(),
+            native_size,
+            "a native client keeps geometry authority"
+        );
+
+        let revision = app.panes[&pane].content_revision();
+        let applied = app.backend_set_viewport(&params, false).unwrap();
+        assert_eq!(applied["type"], "terminal_backend_action");
+        assert_eq!(applied["dispatch"], "executed");
+        assert_eq!(app.panes[&pane].size(), (40, 18));
+        assert!(
+            app.panes[&pane].content_revision() > revision,
+            "a reflow publishes a new revision so quiet panes still send a frame"
+        );
+        assert_eq!(app.layout().focus, pane, "sizing never moves focus");
+
+        for (cols, rows) in [
+            (json!(1), json!(18)),
+            (json!(40), json!(1)),
+            (json!(backend::MAX_VIEWPORT_COLS + 1), json!(18)),
+            (json!(40), json!(backend::MAX_VIEWPORT_ROWS + 1)),
+            (json!("40"), json!(18)),
+            (json!(40.5), json!(18)),
+        ] {
+            let mut invalid = params.clone();
+            invalid["cols"] = cols;
+            invalid["rows"] = rows;
+            let error = app.backend_set_viewport(&invalid, false).err().unwrap();
+            assert_eq!(error.code, "invalid_params");
+            assert_eq!(error.dispatch, Some(DispatchEvidence::NotStarted));
+        }
+        let mut extra = params.clone();
+        extra["text"] = json!("ls");
+        assert_eq!(
+            app.backend_set_viewport(&extra, false).err().unwrap().code,
+            "invalid_params"
+        );
+        let mut stale = params;
+        stale["terminal_id"] = json!(backend::random_id().unwrap());
+        assert_eq!(
+            app.backend_set_viewport(&stale, false).err().unwrap().code,
+            "stale_terminal"
+        );
+        assert_eq!(app.panes[&pane].size(), (40, 18));
+    }
+
+    #[test]
     fn observe_target_is_identity_safe_bounded_and_focus_preserving() {
         let _env = crate::persist::test_env("backend-observe-target");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -2368,11 +2487,70 @@ mod tests {
 
     #[test]
     fn logical_keys_are_strict_and_mode_aware() {
-        assert_eq!(backend_key_bytes("left", false).unwrap(), b"\x1b[D");
-        assert_eq!(backend_key_bytes("left", true).unwrap(), b"\x1bOD");
-        assert_eq!(backend_key_bytes("ctrl-k", false).unwrap(), b"\x0b");
-        assert_eq!(backend_key_bytes("alt-d", false).unwrap(), b"\x1bd");
-        assert!(backend_key_bytes("raw-escape", false).is_none());
+        use crate::terminal::keyboard::{KeyboardProtocol, KittyKeyboardFlags};
+        let legacy = |key: &str, app_cursor: bool| {
+            backend_key_bytes(key, app_cursor, KeyboardProtocol::Legacy, b"\n")
+        };
+        assert_eq!(legacy("left", false).unwrap(), b"\x1b[D");
+        assert_eq!(legacy("left", true).unwrap(), b"\x1bOD");
+        assert_eq!(legacy("ctrl-k", false).unwrap(), b"\x0b");
+        assert_eq!(legacy("alt-d", false).unwrap(), b"\x1bd");
+        assert_eq!(legacy("ctrl-a", false).unwrap(), b"\x01");
+        for letter in b'a'..=b'z' {
+            let key = format!("ctrl-{}", char::from(letter));
+            assert_eq!(legacy(&key, false).unwrap(), [letter - b'a' + 1]);
+        }
+        assert_eq!(legacy("ctrl-space", false).unwrap(), b"\x00");
+        assert_eq!(legacy("ctrl-shift-space", false).unwrap(), b"\x00");
+        assert_eq!(legacy("ctrl-left", true).unwrap(), b"\x1b[1;5D");
+        assert_eq!(legacy("ctrl-shift-right", false).unwrap(), b"\x1b[1;6C");
+        assert_eq!(legacy("shift-enter", false).unwrap(), b"\n");
+        assert_eq!(legacy("shift-tab", false).unwrap(), b"\x1b[Z");
+        assert!(legacy("raw-escape", false).is_none());
+        let kitty = KeyboardProtocol::Kitty {
+            flags: KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES,
+        };
+        for (key, bytes) in [
+            ("ctrl-a", &b"\x1b[97;5u"[..]),
+            ("ctrl-space", &b"\x1b[32;5u"[..]),
+            ("ctrl-shift-space", &b"\x1b[32;6u"[..]),
+            ("shift-enter", &b"\x1b[13;2u"[..]),
+            ("ctrl-enter", &b"\x1b[13;5u"[..]),
+            ("ctrl-shift-enter", &b"\x1b[13;6u"[..]),
+        ] {
+            assert_eq!(backend_key_bytes(key, false, kitty, b"\n").unwrap(), bytes);
+        }
+        let report_all = KeyboardProtocol::Kitty {
+            flags: KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+        };
+        assert_eq!(
+            backend_key_bytes("ctrl-shift-space", false, report_all, b"\n").unwrap(),
+            b"\x1b[32;6u"
+        );
+        let events = KeyboardProtocol::Kitty {
+            flags: KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KittyKeyboardFlags::REPORT_EVENT_TYPES,
+        };
+        assert_eq!(
+            backend_key_bytes("ctrl-enter", false, events, b"\n").unwrap(),
+            b"\x1b[13;5u\x1b[13;5:3u"
+        );
+        assert_eq!(
+            backend_key_bytes("ctrl-shift-a", false, events, b"\n").unwrap(),
+            b"\x1b[97;6u\x1b[97;6:3u"
+        );
+        assert_eq!(
+            backend_key_bytes("ctrl-shift-space", false, events, b"\n").unwrap(),
+            b"\x1b[32;6u\x1b[32;6:3u"
+        );
+        assert_eq!(
+            backend_key_bytes("ctrl-left", false, events, b"\n").unwrap(),
+            b"\x1b[1;5D\x1b[1;5:3D"
+        );
+        assert_eq!(
+            backend_key_bytes("backspace", false, events, b"\n").unwrap(),
+            b"\x7f"
+        );
     }
 
     #[test]

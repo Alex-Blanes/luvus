@@ -154,6 +154,27 @@ impl App {
     pub(super) fn api_pane_split(&mut self, method: &str, p: &Value) -> DispatchResult {
         let _ = (method, p);
         {
+            let cwd = match p.get("cwd") {
+                None | Some(Value::Null) => None,
+                Some(value) => {
+                    let invalid =
+                        |message: &str| ("invalid_request".to_string(), message.to_string());
+                    let cwd = value
+                        .as_str()
+                        .filter(|cwd| !cwd.is_empty() && cwd.len() <= 4096)
+                        .ok_or_else(|| {
+                            invalid("cwd must be a non-empty path of at most 4096 bytes")
+                        })?;
+                    let path = Path::new(cwd);
+                    if !path.is_absolute() {
+                        return Err(invalid("cwd must be absolute"));
+                    }
+                    if !path.is_dir() {
+                        return Err(invalid("cwd must be an existing directory"));
+                    }
+                    Some(path.to_path_buf())
+                }
+            };
             if self.workspaces.is_empty() && !self.ensure_workspace_for_terminal() {
                 return Err((
                     "spawn_failed".to_string(),
@@ -185,7 +206,9 @@ impl App {
                 }
             };
             let focus = p.get("focus").and_then(|v| v.as_bool()) != Some(false);
-            let new = self.split_pane(base, axis, focus).ok_or_else(not_found)?;
+            let new = self
+                .split_pane_in(base, axis, focus, cwd)
+                .ok_or_else(not_found)?;
             let (workspace, tab) = self.pane_location(new).ok_or_else(not_found)?;
             Ok(json!({
                 "type":"pane",
@@ -1452,6 +1475,21 @@ impl App {
         }
     }
 
+    pub(super) fn api_pane_transpose(&mut self, _method: &str, p: &Value) -> DispatchResult {
+        reject_api_fields(p, &["pane"])?;
+        let pane = match p.get("pane") {
+            None | Some(Value::Null) => self
+                .workspaces
+                .get(self.active_ws)
+                .and_then(|workspace| workspace.tabs.get(workspace.active_tab))
+                .map(|tab| tab.layout.focus)
+                .ok_or_else(not_found)?,
+            Some(value) => PaneId(parse_u32_value(value, "pane")?),
+        };
+        let changed = self.transpose_pane(pane).ok_or_else(not_found)?;
+        Ok(json!({"type":"pane_transpose","pane":pane.0.to_string(),"changed":changed}))
+    }
+
     pub(super) fn api_pane_swap(&mut self, method: &str, p: &Value) -> DispatchResult {
         let _ = (method, p);
         {
@@ -1852,6 +1890,81 @@ mod tests {
             LayoutTree::Split { axis, .. } => axis,
             LayoutTree::Leaf(_) => panic!("expected a split tree"),
         }
+    }
+
+    #[test]
+    fn transpose_targets_inactive_tab_preserving_focus_and_pty() {
+        let _env = crate::persist::test_env("transpose-inactive");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let engine = app.panes[&pane].engine.clone();
+        app.split(crate::layout::Axis::Col);
+        let target_focus = app.layout().focus;
+        app.new_tab();
+        let active_tab = app.ws().active_tab;
+        let active_focus = app.layout().focus;
+        app.zoomed = true;
+        app.session_dirty = false;
+        let result = app
+            .dispatch("pane.transpose", &json!({"pane":pane.0}))
+            .unwrap();
+        assert_eq!(result["changed"], true);
+        assert!(app.session_dirty);
+        assert_eq!(app.ws().active_tab, active_tab);
+        assert_eq!(app.layout().focus, active_focus);
+        assert!(app.zoomed);
+        assert_eq!(app.workspaces[0].tabs[0].layout.focus, target_focus);
+        assert!(std::sync::Arc::ptr_eq(&engine, &app.panes[&pane].engine));
+        let LayoutTree::Split { axis, .. } = app.workspaces[0].tabs[0].layout.to_tree() else {
+            panic!("split");
+        };
+        assert_eq!(axis, 1);
+    }
+
+    #[test]
+    fn transpose_validates_before_mutation_and_handles_single_pane() {
+        let _env = crate::persist::test_env("transpose-validation");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.session_dirty = false;
+        assert_eq!(
+            app.dispatch("pane.transpose", &json!({})).unwrap()["changed"],
+            false
+        );
+        assert!(!app.session_dirty);
+        let before = serde_json::to_value(app.layout().to_tree()).unwrap();
+        for params in [
+            json!({"pane":true}),
+            json!({"pane":-1}),
+            json!({"pane":"bad"}),
+            json!({"extra":true}),
+        ] {
+            assert_eq!(
+                app.dispatch("pane.transpose", &params).unwrap_err().0,
+                "invalid_request"
+            );
+        }
+        assert_eq!(
+            app.dispatch("pane.transpose", &json!({"pane":u32::MAX}))
+                .unwrap_err()
+                .0,
+            "not_found"
+        );
+        assert_eq!(
+            serde_json::to_value(app.layout().to_tree()).unwrap(),
+            before
+        );
+        app.run_cmd(crate::app::keys::Cmd::OpenBoard);
+        assert_eq!(
+            app.dispatch("pane.transpose", &json!({})).unwrap_err().0,
+            "not_found"
+        );
+        app.workspaces.clear();
+        assert_eq!(
+            app.dispatch("pane.transpose", &json!({})).unwrap_err().0,
+            "not_found"
+        );
     }
 
     #[test]

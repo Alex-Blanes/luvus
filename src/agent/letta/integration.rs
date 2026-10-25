@@ -13,6 +13,7 @@ pub(super) const OPERATIONS: IntegrationOperations = IntegrationOperations {
     uninstall,
     is_installed,
     hook: Some(run_hook),
+    present: None,
 };
 
 const HOOK_TIMEOUT_MS: u64 = 5_000;

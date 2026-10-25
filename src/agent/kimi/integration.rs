@@ -12,6 +12,7 @@ pub(super) const OPERATIONS: IntegrationOperations = IntegrationOperations {
     uninstall,
     is_installed,
     hook: None,
+    present: None,
 };
 
 const HOOK_EVENTS: &[(&str, Option<&str>)] = &[

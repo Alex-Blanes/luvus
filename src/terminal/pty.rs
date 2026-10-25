@@ -875,6 +875,12 @@ impl Pane {
         self.content_revision.load(Ordering::Acquire)
     }
 
+    /// Record that the captured text changed without new child output, as
+    /// after a reflow, so revision-driven readers take a fresh capture.
+    pub fn note_reflow(&self) {
+        self.content_revision.fetch_add(1, Ordering::Release);
+    }
+
     pub fn content_revision_handle(&self) -> Arc<AtomicU64> {
         self.content_revision.clone()
     }
@@ -1051,16 +1057,6 @@ impl Pane {
     /// input to the app there instead of scrolling scrollback.
     pub fn alt_screen(&self) -> bool {
         self.engine.lock().map(|e| e.alt_screen()).unwrap_or(false)
-    }
-
-    /// Whether the child enabled application cursor mode (DECCKM). When it has,
-    /// the key encoder sends SS3 (`ESC O` + letter) cursor-key codes so apps
-    /// like `less` that are strict about the mode recognize the keys.
-    pub fn application_cursor(&self) -> bool {
-        self.engine
-            .lock()
-            .map(|e| e.application_cursor())
-            .unwrap_or(false)
     }
 
     /// Input modes read together under one engine lock.

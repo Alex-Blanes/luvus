@@ -145,7 +145,8 @@ tabs:
 panes / agents:
   pane list [--all-tabs]     list panes across every workspace and tab
   pane list --current-tab    list panes and read-only history metrics in the current tab
-  pane split [<id>] [--auto|--right|--down] [--no-focus]   split a pane (default: auto by size, creates a workspace if empty)
+  pane split [<id>] [--auto|--right|--down] [--no-focus] [--cwd <path>]   split a pane (default: auto by size, creates a workspace if empty)
+  pane transpose [<id>]     transpose the nearest split without changing focus
   pane focus <id>            focus a pane (jumps to its workspace/tab)
   pane move [<id>] (--tab <n> | --new-tab)  move a pane within its workspace
   pane run [<id>] <cmd...>   run a command in a pane
@@ -230,6 +231,7 @@ modules (extensions):
   module info <id>           show a module's actions / panes / events / source
   module link <path>         register a local module dir (--disabled to skip enabling)
   module install <owner>/<repo>[/sub] [--ref REF] [--yes]   install from GitHub
+  module update <id> [--ref REF] [--yes]   update an installed module
   module unlink <id>         remove a module from the registry
   module uninstall <id>      unlink + delete a git-installed module's checkout
   module enable <id> | disable <id>
@@ -334,7 +336,7 @@ universal harness protocol:
   uhp proxy                 forward one JSON request from stdin to the selected server
 
 web access:
-  web [--control|--read-only] [--port <port>] [--max-devices <1-8>] [--public-url <origin>] [--origin <origin>] [--no-open]
+  web [--control|--read-only] [--port <port>] [--max-devices <1-8>] [--ticket-ttl <seconds>] [--public-url <origin>] [--origin <origin>] [--no-open]
                              serve the optional loopback browser client (read-only by default)
 
 sessions:
@@ -508,6 +510,11 @@ fn run_inner(args: &[String]) -> Result<i32> {
         && args.get(2).map(String::as_str) == Some("install")
     {
         return module_install(args, crate::i18n::cli::Context::configured());
+    }
+    if args.get(1).map(String::as_str) == Some("module")
+        && args.get(2).map(String::as_str) == Some("update")
+    {
+        return module_update(args, crate::i18n::cli::Context::configured());
     }
     // `module search` is a read-only GitHub lookup — no server involved.
     if args.get(1).map(String::as_str) == Some("module")
@@ -1427,6 +1434,7 @@ fn module_install(args: &[String], context: crate::i18n::cli::Context) -> Result
     let params = json!({
         "path": installed.root.display().to_string(),
         "source": installed.source,
+        "git_ref": installed.git_ref,
     });
     match send_request("module.link", params) {
         Ok(v) if v.get("error").is_some() => {
@@ -1456,6 +1464,80 @@ fn module_install(args: &[String], context: crate::i18n::cli::Context) -> Result
             Ok(0)
         }
     }
+}
+
+/// Update is a local approval/build followed by a fenced server-side adoption.
+/// Never fall back to editing the registry on an ambiguous transport failure.
+fn module_update(args: &[String], context: crate::i18n::cli::Context) -> Result<i32> {
+    let (id, git_ref, yes) = parse_module_update(&args[3.min(args.len())..])?;
+    let response = send_request("module.info", json!({"id":id}))?;
+    ensure_api_success(&response)?;
+    if response["result"]["source"].is_null() {
+        return Err(anyhow!(context.text(
+            "linked modules must be updated in their own working directory"
+        )));
+    }
+    let target: crate::module::install::UpdateTarget = serde_json::from_value(
+        response
+            .get("result")
+            .cloned()
+            .ok_or_else(|| anyhow!("missing module.info result"))?,
+    )?;
+    // Check support before any download/build (older servers cannot adopt).
+    let capabilities = send_request("uhp.capabilities", json!({}))?;
+    ensure_api_success(&capabilities)?;
+    if !capabilities["result"]["methods"]
+        .as_array()
+        .is_some_and(|methods| methods.iter().any(|method| method == "module.update"))
+    {
+        return Err(anyhow!(
+            context.text("selected server does not support module.update")
+        ));
+    }
+    let installed = crate::module::install::update(&target, git_ref.as_deref(), yes)?;
+    let response = send_request(
+        "module.update",
+        json!({
+            "id": target.id,
+            "path": installed.root,
+            "source": installed.source,
+            "git_ref": installed.git_ref,
+            "expected_root": target.root,
+            "expected_source": target.source,
+            "expected_ref": target.git_ref,
+        }),
+    )?;
+    ensure_api_success(&response)?;
+    println!(
+        "{} {} ({})",
+        context.text("updated"),
+        installed.id,
+        installed.source
+    );
+    Ok(0)
+}
+
+fn parse_module_update(args: &[String]) -> Result<(String, Option<String>, bool)> {
+    let usage = "usage: luvus module update <id|owner/repo[/sub]> [--ref REF] [--yes]";
+    let mut id = None;
+    let mut git_ref = None;
+    let mut yes = false;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--ref" if git_ref.is_none() => {
+                let value = args
+                    .next()
+                    .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                    .ok_or_else(|| anyhow!(usage))?;
+                git_ref = Some(value.clone());
+            }
+            "--yes" | "-y" if !yes => yes = true,
+            value if !value.starts_with('-') && id.is_none() => id = Some(arg.clone()),
+            _ => return Err(anyhow!(usage)),
+        }
+    }
+    Ok((id.ok_or_else(|| anyhow!(usage))?, git_ref, yes))
 }
 
 /// `luvus doctor` — report which optional external tools are present. The core
@@ -2670,6 +2752,7 @@ fn register_directly(installed: &crate::module::install::Installed) -> Result<()
         root: installed.root.clone(),
         enabled: true,
         source: Some(installed.source.clone()),
+        git_ref: installed.git_ref.clone(),
         manifest,
         warning: None,
     });
@@ -3454,7 +3537,34 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             if args.iter().any(|a| a == "--no-focus") {
                 obj.insert("focus".to_string(), json!(false));
             }
+            for (i, arg) in rest.iter().enumerate() {
+                if arg == "--cwd" {
+                    let raw = rest
+                        .get(i + 1)
+                        .filter(|v| !v.is_empty() && !v.starts_with("--"))
+                        .ok_or_else(|| anyhow!("usage: luvus pane split [<id>] [--cwd <path>]"))?;
+                    if obj.contains_key("cwd") {
+                        return Err(anyhow!("--cwd may be passed only once"));
+                    }
+                    let path = std::path::PathBuf::from(raw);
+                    let path = if path.is_absolute() {
+                        path
+                    } else {
+                        std::env::current_dir()?.join(path)
+                    };
+                    let path = path
+                        .to_str()
+                        .ok_or_else(|| anyhow!("--cwd must be valid UTF-8"))?;
+                    obj.insert("cwd".to_string(), json!(path));
+                }
+            }
             ("pane.split".into(), with_pane(obj))
+        }
+        ("pane", "transpose") => {
+            if rest.len() > 1 || rest.first().is_some_and(|id| id.parse::<u32>().is_err()) {
+                return Err(anyhow!("usage: luvus pane transpose [<id>]"));
+            }
+            ("pane.transpose".into(), with_pane(serde_json::Map::new()))
         }
         ("pane", "focus") => ("pane.focus".into(), with_pane(serde_json::Map::new())),
         ("pane", "move") => {
@@ -4549,6 +4659,34 @@ mod tests {
         assert_eq!(unchanged.to_string(), server_message);
     }
 
+    #[test]
+    fn parses_module_update_and_rejects_extras() {
+        let parse = |s: &str| parse_module_update(&argv(s));
+        assert_eq!(parse("you.test").unwrap(), ("you.test".into(), None, false));
+        assert_eq!(
+            parse("--yes owner/repo/sub --ref v2").unwrap(),
+            ("owner/repo/sub".into(), Some("v2".into()), true)
+        );
+        assert!(parse("you.test -y").unwrap().2);
+        for invalid in [
+            "",
+            "--yes",
+            "you.test extra",
+            "you.test --all",
+            "you.test --ref",
+            "you.test --ref --yes",
+            "you.test --ref v1 --ref v2",
+            "you.test --yes -y",
+        ] {
+            assert!(parse(invalid).is_err(), "{invalid}");
+        }
+        assert!(parse_module_update(&["you.test".into(), "--ref".into(), "".into()]).is_err());
+        assert!(DETAILED_USAGE.contains("module update <id>"));
+        let help = rendered_topic_help("module", Some("update"));
+        assert!(help.contains("module update <id>"));
+        assert!(!help.contains("module install"));
+    }
+
     fn argv(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
     }
@@ -5060,6 +5198,83 @@ mod tests {
     }
 
     #[test]
+    fn pane_split_cwd_resolves_paths_and_keeps_existing_options() {
+        let absolute = std::env::current_dir().unwrap();
+        let args = vec![
+            "luvus".into(),
+            "pane".into(),
+            "split".into(),
+            "3".into(),
+            "--cwd".into(),
+            absolute.to_string_lossy().into_owned(),
+            "--right".into(),
+            "--no-focus".into(),
+        ];
+        let (method, params) = parse(&args).unwrap();
+        assert_eq!(method, "pane.split");
+        assert_eq!(
+            params,
+            json!({
+                "pane": "3", "cwd": absolute, "direction": "right", "focus": false,
+            })
+        );
+
+        let (_, params) = parse(&argv("luvus pane split --cwd nested --auto")).unwrap();
+        assert_eq!(params["cwd"], json!(absolute.join("nested")));
+        assert_eq!(params["direction"], "auto");
+        for command in ["luvus pane split --cwd", "luvus pane split --cwd --down"] {
+            assert!(parse(&argv(command))
+                .unwrap_err()
+                .to_string()
+                .contains("usage:"));
+        }
+        assert!(parse(&argv("luvus pane split --cwd one --cwd two")).is_err());
+        let empty = vec![
+            "luvus".into(),
+            "pane".into(),
+            "split".into(),
+            "--cwd".into(),
+            String::new(),
+        ];
+        assert!(parse(&empty).unwrap_err().to_string().contains("usage:"));
+    }
+
+    // This filesystem fixture needs non-UTF-8 filenames, which APFS rejects.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pane_split_cwd_reports_non_utf8_working_directory() {
+        use std::os::unix::ffi::OsStringExt;
+
+        const CHILD: &str = "LUVUS_TEST_SPLIT_NON_UTF8_CWD";
+        if std::env::var_os(CHILD).is_some() {
+            let error = parse(&argv("luvus pane split --cwd nested")).unwrap_err();
+            assert_eq!(error.to_string(), "--cwd must be valid UTF-8");
+            return;
+        }
+
+        // A subprocess exercises current_dir without changing the test suite's cwd.
+        let _env = crate::persist::test_env("split-non-utf8-cwd");
+        let cwd =
+            crate::persist::config_dir().join(std::ffi::OsString::from_vec(b"cwd-\xff".to_vec()));
+        fs::create_dir_all(&cwd).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli::tests::pane_split_cwd_reports_non_utf8_working_directory",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn search_keeps_exact_contract_and_fuzzy_is_explicit() {
         let (method, params) = parse(&argv("luvus search build failed --case")).unwrap();
         assert_eq!(method, "search");
@@ -5164,6 +5379,28 @@ mod tests {
             parse(&argv(&long)).is_err(),
             "41-character name is rejected"
         );
+    }
+
+    #[test]
+    fn transpose_parser_and_focused_help() {
+        let (method, params) = parse(&argv("luvus pane transpose 7")).unwrap();
+        assert_eq!(method, "pane.transpose");
+        assert_eq!(params, json!({"pane":"7"}));
+        assert_eq!(
+            parse(&argv("luvus pane transpose")).unwrap().0,
+            "pane.transpose"
+        );
+        for command in [
+            "luvus pane transpose 7 8",
+            "luvus pane transpose --right",
+            "luvus pane transpose bad",
+            "luvus pane transpose -1",
+        ] {
+            assert!(parse(&argv(command)).is_err(), "{command}");
+        }
+        let help = rendered_topic_help("pane", Some("transpose"));
+        assert!(help.contains("pane transpose [<id>]"));
+        assert!(!help.contains("pane split"));
     }
 
     #[test]
