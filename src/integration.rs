@@ -1099,7 +1099,9 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(is_installed("codex"), !cfg!(windows));
+        // This fork: an older script is stale on every platform, so startup
+        // repairs it (upstream counts it as installed on Unix).
+        assert!(!is_installed("codex"));
 
         install("codex").unwrap();
         assert!(is_installed("codex"));
@@ -1108,10 +1110,9 @@ mod tests {
             assert!(!raw.exists(), "the raw-path script is replaced");
         }
         fs::remove_file(&script).unwrap();
-        assert_eq!(
-            is_installed("codex"),
-            !cfg!(windows),
-            "on Windows the PowerShell script must exist"
+        assert!(
+            !is_installed("codex"),
+            "the script the hook runs must exist on every platform"
         );
 
         std::env::remove_var("CODEX_HOME");
