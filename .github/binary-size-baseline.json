@@ -6,12 +6,12 @@
   },
   "targets": {
     "aarch64-apple-darwin": {
-      "executable_bytes": 12729232,
-      "archive_bytes": 5456766
+      "executable_bytes": 13972096,
+      "archive_bytes": 6010478
     },
     "x86_64-apple-darwin": {
-      "executable_bytes": 13847368,
-      "archive_bytes": 5807987
+      "executable_bytes": 15166048,
+      "archive_bytes": 6387201
     },
     "aarch64-unknown-linux-musl": {
       "executable_bytes": 10345896,
@@ -22,8 +22,8 @@
       "archive_bytes": 5157914
     },
     "x86_64-pc-windows-msvc": {
-      "executable_bytes": 17481216,
-      "archive_bytes": 6018154
+      "executable_bytes": 19226624,
+      "archive_bytes": 6654010
     }
   }
 }
