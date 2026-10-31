@@ -677,33 +677,19 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
 
     let aheader = area.y;
     line_at(f, aheader, header(cat.agents, t));
-    // All/Active filter toggle, right-aligned in the header row. "All" shows the
-    // session history too; "Active" shows only live agents.
+    // All/Active filter, right-aligned in the header row. "All" shows the session
+    // history too; "Active" shows only live agents. This fork draws one button
+    // that names the current filter, and a click switches to the other: the two
+    // segments took 17 columns and left a narrow sidebar's title as "AGE".
     app.agents_filter_rects.clear();
     let active_only = app.agents_active_only;
-    if area.width >= 22 {
-        let segs = [
-            (format!(" {} ", cat.all), false),
-            (format!(" {} ", cat.active), true),
-        ];
-        let total: u16 = segs
-            .iter()
-            .map(|(l, _)| crate::ui::display_width(l) as u16)
-            .sum();
-        let mut x = area.right().saturating_sub(1 + total);
-        for (label, val) in &segs {
-            let (label, val) = (label.as_str(), *val);
-            let w = crate::ui::display_width(label) as u16;
-            let rect = Rect::new(x, aheader, w, 1);
-            let style = if active_only == val {
-                Style::new().fg(t.crust).bg(t.accent).bold()
-            } else {
-                Style::new().fg(t.overlay1).bg(t.surface1)
-            };
-            f.render_widget(Paragraph::new(Span::styled(label, style)), rect);
-            app.agents_filter_rects.push((val, rect));
-            x = x.saturating_add(w);
-        }
+    if area.width >= 16 {
+        let label = format!(" {} ", if active_only { cat.active } else { cat.all });
+        let w = crate::ui::display_width(&label) as u16;
+        let rect = Rect::new(area.right().saturating_sub(1 + w), aheader, w, 1);
+        let style = Style::new().fg(t.crust).bg(t.accent).bold();
+        f.render_widget(Paragraph::new(Span::styled(label, style)), rect);
+        app.agents_filter_rects.push((!active_only, rect));
     }
     // Workspace scope is controlled by prefix `A`, Settings → Keys, or an
     // agent/session row's context menu. It consumes no extra dock row.
@@ -1739,60 +1725,46 @@ mod tests {
         // snapshot restore, so history never appears to have been lost.
         assert!(!app.agents_active_only);
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert_eq!(app.agents_filter_rects.len(), 2, "All/Active toggle drawn");
-        assert!(buffer_contains(&term, "Active"), "toggle label present");
+        // This fork: one button that names the current filter and switches to
+        // the other one.
+        assert_eq!(app.agents_filter_rects.len(), 1, "one All/Active button");
+        assert!(
+            buffer_contains(&term, " All "),
+            "it names the current filter"
+        );
         assert!(
             buffer_contains(&term, "resume"),
             "All default shows session history"
         );
+        let click = |app: &mut App, rect: Rect| {
+            app.handle_event(AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            }))
+        };
 
-        // Clicking Active resets the filtered list and persists the choice.
+        // A click switches to Active, resets the filtered list and persists it.
         app.agents_scroll = 7;
-        let active = app
-            .agents_filter_rects
-            .iter()
-            .find(|(active, _)| *active)
-            .map(|(_, rect)| *rect)
-            .expect("Active filter target");
-        app.handle_event(AppEvent::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: active.x,
-            row: active.y,
-            modifiers: KeyModifiers::NONE,
-        }));
+        let (target, button) = app.agents_filter_rects[0];
+        assert!(target, "the click selects the other filter");
+        click(&mut app, button);
         assert!(app.agents_active_only);
         assert_eq!(app.agents_scroll, 0);
         app.flush_config_for_test(&_rx);
         assert!(crate::config::load().agents_active_only);
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(buffer_contains(&term, " Active "), "the button follows");
         assert!(
             !buffer_contains(&term, "resume"),
             "Active hides session history"
         );
 
-        // Clicking the selected choice is a true no-op, including its scroll.
-        app.agents_scroll = 5;
-        app.handle_event(AppEvent::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: active.x,
-            row: active.y,
-            modifiers: KeyModifiers::NONE,
-        }));
-        assert_eq!(app.agents_scroll, 5);
-
-        // All follows the same path and restores resumable history.
-        let all = app
-            .agents_filter_rects
-            .iter()
-            .find(|(active, _)| !*active)
-            .map(|(_, rect)| *rect)
-            .expect("All filter target");
-        app.handle_event(AppEvent::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: all.x,
-            row: all.y,
-            modifiers: KeyModifiers::NONE,
-        }));
+        // The same button switches back to All and restores resumable history.
+        let (target, button) = app.agents_filter_rects[0];
+        assert!(!target);
+        click(&mut app, button);
         assert!(!app.agents_active_only);
         assert_eq!(app.agents_scroll, 0);
         app.flush_config_for_test(&_rx);
@@ -1871,10 +1843,10 @@ mod tests {
             },
         ];
 
-        // All workspaces is the default. Workspace scope is not a third member
-        // of the All/Active segmented control and consumes no extra row.
+        // All workspaces is the default. Workspace scope is not part of the
+        // All/Active button (one in this fork) and consumes no extra row.
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert_eq!(app.agents_filter_rects.len(), 2);
+        assert_eq!(app.agents_filter_rects.len(), 1);
         assert!(!buffer_contains(&term, "Here"));
         for visible in ["claude", "codex", "kimi", "hermes"] {
             assert!(
