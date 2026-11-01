@@ -872,8 +872,11 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 let id = *id;
                 let focused = id == focus;
                 let st = pane_state(app, id);
+                // A renamed pane is listed under its name; otherwise the
+                // detected agent kind or program reporter identifies the row.
                 let mut agent = app
-                    .status_reporter_label(id)
+                    .agent_name_for(id)
+                    .or_else(|| app.status_reporter_label(id))
                     .unwrap_or_default()
                     .to_string();
                 if let Some(progress) = app
@@ -1602,6 +1605,42 @@ mod tests {
         assert!(
             buffer_contains(&term, "· =worker"),
             "a named agent row shows =name"
+        );
+    }
+
+    // A renamed agent is listed under its new name; an unnamed one keeps the
+    // detected agent kind as its label.
+    #[test]
+    fn renamed_agent_row_shows_its_name() {
+        let _env = crate::persist::test_env("agent-rename-label");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let id = app.layout().focus;
+        app.status.get_mut(&id).unwrap().agent = "claude".into();
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        // The pane header also shows the name, so match the sidebar row's
+        // status prefix to be sure the label is the AGENTS row's.
+        let st = crate::ui::pane_state(&app, id);
+        let prefix = format!("{} {}", st.dot(), st.label());
+
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(
+            buffer_contains(&term, &format!("{prefix}  claude")),
+            "an unnamed agent row shows the agent kind"
+        );
+
+        app.set_agent_name(id, Some("reviewer"));
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(
+            buffer_contains(&term, &format!("{prefix}  reviewer")),
+            "a renamed agent row shows its new name"
+        );
+
+        app.set_agent_name(id, None);
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(
+            buffer_contains(&term, &format!("{prefix}  claude")),
+            "clearing the name restores the agent kind"
         );
     }
 
