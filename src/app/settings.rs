@@ -63,10 +63,10 @@ pub struct SettingsUi {
     /// Candidate prefix captured once and waiting for the same chord again.
     /// Nothing is persisted until confirmation succeeds.
     pub prefix_candidate: Option<String>,
-    /// First visual row shown in the Layout tab. Persisting this while the modal
-    /// is open prevents a visible dock/bar button click from re-anchoring the
-    /// list around its newly selected row.
-    pub layout_scroll: usize,
+    /// First visual row shown in the scrolling tabs (General and Layout).
+    /// Persisting this while the modal is open prevents a visible button click
+    /// from re-anchoring the list around its newly selected row.
+    pub list_scroll: usize,
     /// In the Keys tab: capturing the next key press to rebind `cursor`'s command.
     pub capturing: bool,
 }
@@ -90,6 +90,7 @@ pub enum LayoutRow {
     DiffLineNumbers,
     DiffMarkers,
     DiffColors,
+    DiffProvider,
     DiffLiveRefresh,
     #[cfg(windows)]
     Shell,
@@ -122,6 +123,7 @@ pub enum GeneralRow {
     /// Open a new tab/split at the workspace root instead of inheriting the
     /// focused pane's cwd.
     NewPaneToWorkspaceRoot,
+    FocusFollowsMouse,
     /// Show each agent's live session title in the AGENTS sidebar.
     AgentTitle,
     SoundStyle,
@@ -157,6 +159,7 @@ impl App {
             GeneralRow::AutoUpdate,
             GeneralRow::ResumeFlags,
             GeneralRow::NewPaneToWorkspaceRoot,
+            GeneralRow::FocusFollowsMouse,
             GeneralRow::AgentTitle,
             GeneralRow::SoundStyle,
             GeneralRow::SoundDone,
@@ -197,6 +200,7 @@ impl App {
         v.push(LayoutRow::DiffLineNumbers);
         v.push(LayoutRow::DiffMarkers);
         v.push(LayoutRow::DiffColors);
+        v.push(LayoutRow::DiffProvider);
         v.push(LayoutRow::DiffLiveRefresh);
         v.push(LayoutRow::LeftVisible);
         v.push(LayoutRow::RightVisible);
@@ -249,7 +253,7 @@ impl App {
             tab: SettingsTab::General,
             cursor: 0,
             prefix_candidate: None,
-            layout_scroll: 0,
+            list_scroll: 0,
             capturing: false,
         });
     }
@@ -515,7 +519,7 @@ impl App {
             ui.tab = tab;
             ui.cursor = cursor;
             ui.prefix_candidate = None;
-            ui.layout_scroll = 0;
+            ui.list_scroll = 0;
             ui.capturing = false;
         }
     }
@@ -1111,6 +1115,22 @@ impl App {
                 self.config.layout.diff_color_mode = self.config.layout.diff_color_mode.cycle();
                 self.persist_config();
             }
+            LayoutRow::DiffProvider => {
+                use crate::diff::model::DiffProvider;
+                self.config.layout.diff_provider = match self.config.layout.diff_provider {
+                    DiffProvider::Git => DiffProvider::Difftastic,
+                    DiffProvider::Difftastic => DiffProvider::Git,
+                };
+                self.persist_config();
+                let ids: Vec<_> = self
+                    .views
+                    .iter()
+                    .filter_map(|(id, view)| matches!(view, ViewKind::Diff(_)).then_some(*id))
+                    .collect();
+                for id in ids {
+                    self.schedule_diff_read(id);
+                }
+            }
             LayoutRow::DiffLiveRefresh => {
                 self.config.layout.diff_live_refresh = !self.config.layout.diff_live_refresh;
                 self.persist_config();
@@ -1369,6 +1389,10 @@ impl App {
             Some(GeneralRow::FileLinkDefaultApp) => {
                 self.config.layout.file_links_in_default_app =
                     !self.config.layout.file_links_in_default_app;
+                self.persist_config();
+            }
+            Some(GeneralRow::FocusFollowsMouse) => {
+                self.config.layout.focus_follows_mouse = !self.config.layout.focus_follows_mouse;
                 self.persist_config();
             }
             Some(GeneralRow::AgentTitle) => {
@@ -1703,7 +1727,7 @@ mod tests {
         terminal
             .draw(|frame| crate::ui::render(frame, &mut app))
             .unwrap();
-        let before = app.settings.as_ref().unwrap().layout_scroll;
+        let before = app.settings.as_ref().unwrap().list_scroll;
         assert!(before > 0, "the regression requires a scrolled Layout list");
 
         let rows = app.layout_rows();
@@ -1726,7 +1750,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            app.settings.as_ref().unwrap().layout_scroll,
+            app.settings.as_ref().unwrap().list_scroll,
             before,
             "clicking a visible placement button must not re-anchor the modal"
         );
@@ -1773,6 +1797,32 @@ mod tests {
             crate::diff::DiffMarkerStyle::Bars,
             "reverse navigation follows the same ordering"
         );
+    }
+
+    #[test]
+    fn diff_provider_setting_cycles_and_persists() {
+        use crate::diff::model::DiffProvider;
+        let _env = crate::persist::test_env("diff-provider");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(120, 32, tx).unwrap();
+        app.open_settings();
+        app.settings.as_mut().unwrap().tab = SettingsTab::Layout;
+        let row = app
+            .layout_rows()
+            .iter()
+            .position(|r| matches!(r, LayoutRow::DiffProvider))
+            .unwrap();
+        assert_eq!(app.config.layout.diff_provider, DiffProvider::Git);
+        app.settings_adjust(row, 1);
+        app.flush_config_for_test(&rx);
+        assert_eq!(
+            crate::config::load().layout.diff_provider,
+            DiffProvider::Difftastic
+        );
+        app.settings_adjust(row, -1);
+        assert_eq!(app.config.layout.diff_provider, DiffProvider::Git);
+        let unknown: DiffProvider = serde_json::from_str("\"future-provider\"").unwrap();
+        assert_eq!(unknown, DiffProvider::Git);
     }
 
     #[test]
@@ -1901,6 +1951,29 @@ mod tests {
         assert!(!old.layout.new_pane_to_workspace_root);
     }
 
+    #[test]
+    fn focus_follows_mouse_toggle_persists() {
+        let _env = crate::persist::test_env("focus-follows-mouse");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        assert!(!app.config.layout.focus_follows_mouse);
+        let old: crate::config::Config = serde_json::from_str(r#"{"layout":{}}"#).unwrap();
+        assert!(!old.layout.focus_follows_mouse);
+
+        let row = app
+            .general_rows()
+            .iter()
+            .position(|r| *r == GeneralRow::FocusFollowsMouse)
+            .unwrap();
+        assert!(row < app.general_section_start());
+        app.adjust_general(row, 1);
+        assert!(app.config.layout.focus_follows_mouse);
+        app.flush_config_for_test(&rx);
+        assert!(crate::config::load().layout.focus_follows_mouse);
+        app.adjust_general(row, 1);
+        assert!(!app.config.layout.focus_follows_mouse);
+    }
+
     // The General tab is the two file choosers plus the Notifications section:
     // the selected sound style, two persisted event toggles, and separate test
     // rows for the completion and attention cues.
@@ -1913,9 +1986,9 @@ mod tests {
         if let Some(ui) = app.settings.as_mut() {
             ui.tab = SettingsTab::General;
         }
-        // 14 upstream rows plus this fork's "install updates automatically" and
+        // 15 upstream rows plus this fork's "install updates automatically" and
         // "Ctrl+click a file path: open in the default app".
-        assert_eq!(app.settings_rows(SettingsTab::General), 16);
+        assert_eq!(app.settings_rows(SettingsTab::General), 17);
         let rows = app.general_rows();
         assert_eq!(rows[0], GeneralRow::FileOpen, "file-open leads the tab");
         assert_eq!(

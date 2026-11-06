@@ -97,6 +97,25 @@ impl DiffColorMode {
     }
 }
 
+/// Only reviewed structured adapters are accepted, never arbitrary difftool shell commands.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffProvider {
+    Difftastic,
+    #[default]
+    #[serde(other)]
+    Git,
+}
+
+impl DiffProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Git => "git",
+            Self::Difftastic => "difftastic",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffFilter {
@@ -350,6 +369,13 @@ pub enum DiffListRow {
 }
 
 #[derive(Debug)]
+pub struct ProgressSaveWorker {
+    pub key: DiffKey,
+    pub fingerprint: Option<String>,
+    pub handle: std::thread::JoinHandle<Result<(), String>>,
+}
+
+#[derive(Debug)]
 pub struct DiffState {
     pub snapshot: Option<DiffSnapshot>,
     pub error: Option<String>,
@@ -363,8 +389,16 @@ pub struct DiffState {
     /// Workspace folder owned by the newest scheduled status scan.
     pub status_root: Option<PathBuf>,
     pub loaded_review: Option<String>,
+    pub review_load_generation: u64,
     pub notes: Vec<crate::diff::notes::ReviewNote>,
     pub progress: crate::diff::notes::ReviewProgress,
+    /// One save in flight; later toggles coalesce per key and drain in order.
+    pub progress_save_inflight: bool,
+    pub pending_progress: VecDeque<(DiffKey, Option<String>)>,
+    /// Retained for the shutdown barrier, even if its completion is undispatched.
+    pub progress_save_worker: Option<ProgressSaveWorker>,
+    /// Local intent since the current review load began, including removals.
+    pub progress_load_edits: Option<HashMap<DiffKey, Option<String>>>,
     pub selected_notes: std::collections::HashSet<String>,
     pub viewport: usize,
     pub scroll_detached: bool,
@@ -385,8 +419,13 @@ impl Default for DiffState {
             status_inflight: false,
             status_root: None,
             loaded_review: None,
+            review_load_generation: 0,
             notes: Vec::new(),
             progress: crate::diff::notes::ReviewProgress::default(),
+            progress_save_inflight: false,
+            pending_progress: VecDeque::new(),
+            progress_save_worker: None,
+            progress_load_edits: None,
             selected_notes: std::collections::HashSet::new(),
             viewport: 0,
             scroll_detached: false,
@@ -661,6 +700,18 @@ pub struct FileDiff {
     pub truncated: bool,
     pub omitted_lines: usize,
     pub hunks: Vec<DiffHunk>,
+    /// Presentation is separate from the canonical Git patch and its counts.
+    #[serde(skip)]
+    pub presentation: Option<super::provider::Presentation>,
+}
+
+impl FileDiff {
+    pub fn source_lines(&self) -> impl Iterator<Item = &DiffLine> {
+        self.hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .chain(self.presentation.iter().flat_map(|p| p.source_lines()))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -675,8 +726,16 @@ pub struct LoadedDiff {
 
 impl LoadedDiff {
     pub fn prepare(diff: Arc<FileDiff>, reconciled_notes: Vec<crate::diff::ReviewNote>) -> Self {
-        let stack_rows = crate::diff::rows::stack_rows(&diff);
-        let split_rows = crate::diff::rows::split_rows(&diff);
+        let (stack_rows, split_rows) = if let Some(presentation) =
+            diff.presentation.as_ref().filter(|p| p.fallback.is_none())
+        {
+            (presentation.stack_rows(), presentation.split_rows())
+        } else {
+            (
+                crate::diff::rows::stack_rows(&diff),
+                crate::diff::rows::split_rows(&diff),
+            )
+        };
         let (stack_indices, split_indices) = build_row_indices(&stack_rows, &split_rows);
         Self {
             diff,
@@ -697,7 +756,9 @@ pub enum DiffLoad {
     Error(String),
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffSide {
     Old,
@@ -981,6 +1042,13 @@ fn build_row_indices(
     }
 
     let mut header = 0;
+    // No-newline markers have no source number. Their occurrence order is
+    // stable across both projections, so preserve that order independently
+    // of source-numbered rows.
+    let mut no_newline = stack_rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (line.kind == DiffLineKind::NoNewline).then_some(index));
     let split_indices = split_rows
         .iter()
         .map(|row| {
@@ -992,6 +1060,15 @@ fn build_row_indices(
             {
                 let index = headers.get(header).copied();
                 header += 1;
+                return (index, index);
+            }
+            if row
+                .old
+                .as_ref()
+                .or(row.new.as_ref())
+                .is_some_and(|line| line.kind == DiffLineKind::NoNewline)
+            {
+                let index = no_newline.next();
                 return (index, index);
             }
             let old = row
@@ -1039,6 +1116,7 @@ mod tests {
     fn parsed_cache_never_reuses_a_stale_file_fingerprint() {
         let key = test_key();
         let diff = FileDiff {
+            presentation: None,
             key: key.clone(),
             status: DiffFileStatus::Modified,
             additions: 0,
@@ -1066,6 +1144,7 @@ mod tests {
             text: "shared source text".into(),
         };
         let diff = Arc::new(FileDiff {
+            presentation: None,
             key: test_key(),
             status: DiffFileStatus::Modified,
             additions: 1,
@@ -1185,6 +1264,93 @@ mod tests {
         assert_eq!(view.stack_row_for_split(1), Some(1));
         assert_eq!(view.stack_row_for_split(2), Some(2));
         assert_eq!(view.split_row_for_stack(3), 1);
+    }
+
+    #[test]
+    fn no_newline_markers_keep_their_split_and_stack_positions() {
+        let mut view = DiffView::new(
+            PathBuf::from("/repo"),
+            test_key(),
+            DiffLayoutPreference::Split,
+            3,
+            false,
+            false,
+        );
+        view.stack_rows = vec![
+            DiffLine {
+                kind: DiffLineKind::Header,
+                old_line: None,
+                new_line: None,
+                text: "@@ -1 +1 @@".into(),
+            },
+            DiffLine {
+                kind: DiffLineKind::Deletion,
+                old_line: Some(1),
+                new_line: None,
+                text: "old".into(),
+            },
+            DiffLine {
+                kind: DiffLineKind::NoNewline,
+                old_line: None,
+                new_line: None,
+                text: "\\ No newline at end of file".into(),
+            },
+            DiffLine {
+                kind: DiffLineKind::Header,
+                old_line: None,
+                new_line: None,
+                text: "@@ -8 +8 @@".into(),
+            },
+            DiffLine {
+                kind: DiffLineKind::Addition,
+                old_line: None,
+                new_line: Some(8),
+                text: "new".into(),
+            },
+            DiffLine {
+                kind: DiffLineKind::NoNewline,
+                old_line: None,
+                new_line: None,
+                text: "\\ No newline at end of file".into(),
+            },
+        ];
+        view.split_rows = vec![
+            crate::diff::rows::SplitRow {
+                old: Some(view.stack_rows[0].clone()),
+                new: Some(view.stack_rows[0].clone()),
+            },
+            crate::diff::rows::SplitRow {
+                old: Some(view.stack_rows[1].clone()),
+                new: None,
+            },
+            crate::diff::rows::SplitRow {
+                old: Some(view.stack_rows[2].clone()),
+                new: None,
+            },
+            crate::diff::rows::SplitRow {
+                old: Some(view.stack_rows[3].clone()),
+                new: Some(view.stack_rows[3].clone()),
+            },
+            crate::diff::rows::SplitRow {
+                old: None,
+                new: Some(view.stack_rows[4].clone()),
+            },
+            crate::diff::rows::SplitRow {
+                old: None,
+                new: Some(view.stack_rows[5].clone()),
+            },
+        ];
+        view.rebuild_row_indices();
+
+        assert_eq!(view.split_indices[2], (Some(2), Some(2)));
+        assert_eq!(view.split_indices[5], (Some(5), Some(5)));
+        assert_eq!(view.split_row_for_stack(2), 2);
+        assert_eq!(view.split_row_for_stack(5), 5);
+        for side in [DiffSide::Old, DiffSide::New] {
+            view.selected_side = side;
+            assert_eq!(view.stack_row_for_split(2), Some(2));
+            assert_eq!(view.stack_row_for_split(5), Some(5));
+        }
     }
 
     #[test]

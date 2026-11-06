@@ -222,13 +222,13 @@ pub fn load_progress(repo_id: &str, review_id: &str) -> Result<ReviewProgress, S
     }
 }
 
-/// Merge one viewed fingerprint under the same review lock used by notes.
+/// Set or remove one viewed fingerprint under the same review lock used by notes.
 /// This prevents two named Luvus sessions from replacing each other's state.
-pub fn mark_viewed(
+pub fn set_viewed(
     repo_id: &str,
     review_id: &str,
     key: &DiffKey,
-    fingerprint: &str,
+    fingerprint: Option<&str>,
 ) -> Result<(), String> {
     let dir = stored_review_dir(repo_id, review_id)?;
     let _lock = lock_review(&dir)?;
@@ -239,15 +239,19 @@ pub fn mark_viewed(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => ReviewProgress::default(),
         Err(error) => return Err(format!("read review progress: {error}")),
     };
-    let viewed = ViewedChange {
-        key: key.clone(),
-        fingerprint: fingerprint.to_string(),
-        viewed_at_ms: now_ms(),
-    };
-    if let Some(existing) = progress.viewed.iter_mut().find(|entry| entry.key == *key) {
-        *existing = viewed;
+    if let Some(fingerprint) = fingerprint {
+        let viewed = ViewedChange {
+            key: key.clone(),
+            fingerprint: fingerprint.to_string(),
+            viewed_at_ms: now_ms(),
+        };
+        if let Some(existing) = progress.viewed.iter_mut().find(|entry| entry.key == *key) {
+            *existing = viewed;
+        } else {
+            progress.viewed.push(viewed);
+        }
     } else {
-        progress.viewed.push(viewed);
+        progress.viewed.retain(|entry| entry.key != *key);
     }
     atomic_write_json(&path, &progress)
 }
@@ -422,18 +426,18 @@ pub fn reconcile(notes: &mut [ReviewNote], diff: &FileDiff) {
             continue;
         }
         let mut candidates = Vec::new();
-        for hunk in &diff.hunks {
-            for line in &hunk.lines {
-                let number = match note.anchor.side {
-                    DiffSide::Old => line.old_line,
-                    DiffSide::New => line.new_line,
-                };
-                let Some(number) = number else { continue };
-                if context_hash(&line.text) == note.anchor.context_sha256 {
-                    candidates.push(number);
-                }
+        for line in diff.source_lines() {
+            let number = match note.anchor.side {
+                DiffSide::Old => line.old_line,
+                DiffSide::New => line.new_line,
+            };
+            let Some(number) = number else { continue };
+            if context_hash(&line.text) == note.anchor.context_sha256 {
+                candidates.push(number);
             }
         }
+        candidates.sort_unstable();
+        candidates.dedup();
         if candidates.contains(&note.anchor.start_line) {
             if matches!(note.state, NoteState::Outdated | NoteState::Orphaned) {
                 note.state = NoteState::Open;
@@ -482,7 +486,7 @@ pub fn anchor_context(
     }
 
     let mut source = BTreeMap::new();
-    for line in diff.hunks.iter().flat_map(|hunk| &hunk.lines) {
+    for line in diff.source_lines() {
         let number = match side {
             DiffSide::Old => line.old_line,
             DiffSide::New => line.new_line,
@@ -504,15 +508,13 @@ pub fn anchor_context(
 fn anchor_exists(note: &ReviewNote, diff: &FileDiff) -> bool {
     let mut start = false;
     let mut end = false;
-    for hunk in &diff.hunks {
-        for line in &hunk.lines {
-            let number = match note.anchor.side {
-                DiffSide::Old => line.old_line,
-                DiffSide::New => line.new_line,
-            };
-            start |= number == Some(note.anchor.start_line);
-            end |= number == Some(note.anchor.end_line);
-        }
+    for line in diff.source_lines() {
+        let number = match note.anchor.side {
+            DiffSide::Old => line.old_line,
+            DiffSide::New => line.new_line,
+        };
+        start |= number == Some(note.anchor.start_line);
+        end |= number == Some(note.anchor.end_line);
     }
     start && end
 }
@@ -541,6 +543,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn viewed_progress_can_be_removed_without_erasing_other_files_or_layers() {
+        let _env = crate::persist::test_env("diff-viewed-storage");
+        let key = key();
+        let review = review_id(&key);
+        let mut staged = key.clone();
+        staged.layer = DiffLayer::Staged;
+        set_viewed(&key.repo_id, &review, &key, Some("worktree-v1")).unwrap();
+        set_viewed(&key.repo_id, &review, &staged, Some("staged-v1")).unwrap();
+        set_viewed(&key.repo_id, &review, &key, None).unwrap();
+        set_viewed(&key.repo_id, &review, &key, None).unwrap();
+        let progress = load_progress(&key.repo_id, &review).unwrap();
+        assert_eq!(progress.viewed.len(), 1);
+        assert_eq!(progress.viewed[0].key, staged);
+        set_viewed(&key.repo_id, &review, &key, Some("worktree-v2")).unwrap();
+        let progress = load_progress(&key.repo_id, &review).unwrap();
+        assert_eq!(progress.viewed.len(), 2);
+        assert_eq!(
+            progress
+                .viewed
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap()
+                .fingerprint,
+            "worktree-v2"
+        );
+    }
+
     fn note(line: u32, context: &str) -> ReviewNote {
         ReviewNote {
             id: "n".into(),
@@ -564,8 +594,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn semantic_presentation_keeps_notes_on_hidden_source_rows_open() {
+        let mut diff = file_diff(1, "changed");
+        let presentation =
+            crate::diff::provider::parse(br#"{"status":"unchanged"}"#, "context", "context", 3)
+                .unwrap();
+        diff.presentation = Some(presentation);
+        let mut notes = vec![note(1, "changed")];
+        reconcile(&mut notes, &diff);
+        assert_eq!(notes[0].state, NoteState::Open);
+        assert_eq!(notes[0].revision, 1);
+    }
+
     fn file_diff(line: u32, text: &str) -> FileDiff {
         FileDiff {
+            presentation: None,
             key: key(),
             status: DiffFileStatus::Modified,
             additions: 1,

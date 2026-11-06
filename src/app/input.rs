@@ -760,6 +760,16 @@ impl App {
                 );
                 return true;
             }
+            AppEvent::DiffProgressSaved { result } => {
+                self.diff.progress_save_worker.take();
+                self.diff.progress_save_inflight = false;
+                self.schedule_diff_progress_save();
+                if let Err(error) = result {
+                    log_worker_failed(crate::logging::Worker::Diff, "progress_save");
+                    self.show_toast(format!("review progress not saved: {error}"));
+                }
+                return true;
+            }
             other => other,
         };
         // Control-API requests and parked `wait.output` replies must be answered
@@ -1308,11 +1318,15 @@ impl App {
                 }
                 self.apply_diff_loaded(id, token, result)
             }
-            AppEvent::DiffNotesLoaded { review_id, result } => {
+            AppEvent::DiffNotesLoaded {
+                review_id,
+                generation,
+                result,
+            } => {
                 if result.is_err() {
                     log_worker_failed(crate::logging::Worker::Diff, "notes");
                 }
-                self.apply_diff_notes_loaded(review_id, result)
+                self.apply_diff_notes_loaded(review_id, generation, result)
             }
             AppEvent::DiffNoteSaved { note, result } => {
                 if result.is_err() {
@@ -1325,13 +1339,6 @@ impl App {
                     log_worker_failed(crate::logging::Worker::Diff, "note_remove");
                 }
                 self.apply_diff_note_removed(id, result)
-            }
-            AppEvent::DiffProgressSaved { result } => {
-                if let Err(error) = result {
-                    log_worker_failed(crate::logging::Worker::Diff, "progress_save");
-                    self.show_toast(format!("review progress not saved: {error}"));
-                }
-                true
             }
             AppEvent::FileChanges {
                 id,
@@ -1395,8 +1402,8 @@ impl App {
                 self.git_data(view, payload);
                 true
             }
-            AppEvent::TaskGateFinished { .. } => {
-                unreachable!("task gate completions are handled before workspace routing")
+            AppEvent::TaskGateFinished { .. } | AppEvent::DiffProgressSaved { .. } => {
+                unreachable!("ledger completions are handled before workspace routing")
             }
             AppEvent::TaskMergeFinished {
                 task,
@@ -1818,6 +1825,7 @@ impl App {
             .map(|d| (d.path.clone(), d.axis, d.line, d.span));
         let sidebar_before = self.hover_sidebar;
         let link_before = self.hover_link.clone();
+        let focus_before = self.layout().focus;
 
         self.apply_mouse(m);
 
@@ -1833,6 +1841,7 @@ impl App {
             || divider_before != divider_after
             || sidebar_before != self.hover_sidebar
             || link_before != self.hover_link
+            || focus_before != self.layout().focus
     }
 
     /// The hover-highlighted rectangle containing `at`, if any. Moving within
@@ -2960,6 +2969,37 @@ impl App {
                         }
                     }
                 }
+                if self.config.layout.focus_follows_mouse
+                    && self.mode == Mode::Normal
+                    && !self
+                        .commander
+                        .as_ref()
+                        .is_some_and(|commander| commander.focused)
+                    && !self.views.get(&self.layout().focus).is_some_and(|view| {
+                        let search = match view {
+                            ViewKind::File(view) => &view.search,
+                            ViewKind::Preview(view) => &view.search,
+                            ViewKind::Diff(view) => &view.search,
+                        };
+                        search.as_ref().is_some_and(|search| search.editing)
+                    })
+                    && self.pane_search.is_none()
+                    && self.copy_mode.is_none()
+                    && self.selection.is_none()
+                    && self.mouse_grab.is_none()
+                    && self.suppressed_mouse_buttons == 0
+                    && self.resize_drag.is_none()
+                    && self.sidebar_resize.is_none()
+                    && self.dock_resize.is_none()
+                    && self.diff_note_drag.is_none()
+                    && self.link_press.is_none()
+                {
+                    if let Some((id, _)) = self.pane_content_at(m.column, m.row) {
+                        if id != self.layout().focus {
+                            self.focus_pane_global(id);
+                        }
+                    }
+                }
                 return;
             }
             _ => {}
@@ -3061,7 +3101,11 @@ impl App {
                                 let split = if scroll < 0 {
                                     current.saturating_sub(3)
                                 } else {
-                                    current.saturating_add(3).min(rows.saturating_sub(viewport))
+                                    current.saturating_add(3).min(
+                                        rows.saturating_sub(viewport)
+                                            .max(current.saturating_add(1))
+                                            .min(rows.saturating_sub(1)),
+                                    )
                                 };
                                 if let Some(stack) = v.stack_row_for_split(split) {
                                     v.scroll = stack;
@@ -3071,10 +3115,7 @@ impl App {
                                 v.scroll = v.scroll.saturating_sub(3);
                                 v.selected = v.scroll;
                             } else {
-                                v.scroll = v
-                                    .scroll
-                                    .saturating_add(3)
-                                    .min(rows.saturating_sub(viewport));
+                                v.scroll = v.scroll.saturating_add(3).min(rows.saturating_sub(1));
                                 v.selected = v.scroll;
                             }
                         }
@@ -7828,6 +7869,20 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
         let pane = app.layout().focus;
+        let (response_tx, _response_rx) = std::sync::mpsc::channel();
+        let shell_engine = std::mem::replace(
+            &mut app.panes.get_mut(&pane).unwrap().engine,
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::terminal::vt::alacritty::AlacrittyEngine::new(
+                    80,
+                    24,
+                    response_tx,
+                    crate::config::SCROLLBACK_BYTES_DEFAULT,
+                ),
+            )),
+        );
+        // Shell output must not reach the fixture's terminal grid.
+        shell_engine.lock().unwrap().advance(b"shell prompt needle");
         add_scrollback(&app, pane, &["hello Needle world"]);
         app.pane_content_rects = vec![(pane, ratatui::layout::Rect::new(0, 0, 80, 24))];
         app.scroll_pane = Some(pane);
@@ -7912,6 +7967,7 @@ mod tests {
         let _env = crate::persist::test_env("prefix-shifted-workspace-jump");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.workspaces[0].worktree = None;
         let focus = app.layout().focus;
         for position in 2..=9 {
             app.workspaces[0]
@@ -9212,6 +9268,202 @@ mod link_click_tests {
             row: at.1,
             modifiers: mods,
         })
+    }
+
+    fn split_hover_fixture() -> (App, crate::ids::PaneId, crate::ids::PaneId, (u16, u16)) {
+        let Fixture {
+            mut app,
+            mut term,
+            pane,
+            ..
+        } = fixture();
+        let other = app
+            .split_pane(pane, crate::layout::Axis::Col, false)
+            .expect("second pane");
+        term.draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let rect = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == other)
+            .unwrap()
+            .1;
+        (app, pane, other, (rect.x, rect.y))
+    }
+
+    #[test]
+    fn hover_focus_is_opt_in_and_requests_a_frame_only_on_transition() {
+        let _env = crate::persist::test_env("hover-focus-opt-in");
+        let (mut app, first, second, at) = split_hover_fixture();
+        assert!(!app.config.layout.focus_follows_mouse);
+        app.handle_event(mouse(MouseEventKind::Moved, at, KeyModifiers::NONE));
+        assert_eq!(app.layout().focus, first);
+
+        app.config.layout.focus_follows_mouse = true;
+        assert!(app.handle_event(mouse(MouseEventKind::Moved, at, KeyModifiers::NONE)));
+        assert_eq!(app.layout().focus, second);
+        assert!(!app.handle_event(mouse(MouseEventKind::Moved, at, KeyModifiers::NONE)));
+        assert_eq!(app.focus_history_back.last(), Some(&first));
+    }
+
+    #[test]
+    fn hover_focus_preserves_commander_input() {
+        let _env = crate::persist::test_env("hover-focus-commander");
+        let (mut app, first, second, at) = split_hover_fixture();
+        app.config.layout.focus_follows_mouse = true;
+        app.open_commander();
+        app.handle_event(mouse(MouseEventKind::Moved, at, KeyModifiers::NONE));
+        assert_eq!(app.layout().focus, first);
+        app.commander.as_mut().unwrap().focused = false;
+        app.handle_event(mouse(MouseEventKind::Moved, at, KeyModifiers::NONE));
+        assert_eq!(app.layout().focus, second);
+    }
+
+    #[test]
+    fn hover_focus_preserves_native_search_input() {
+        let _env = crate::persist::test_env("hover-focus-native-search");
+        let (mut app, first, second, at) = split_hover_fixture();
+        app.config.layout.focus_follows_mouse = true;
+        let path = std::path::PathBuf::from("sample.txt");
+        let diff_path = crate::diff::RepoPath::from_path(&path).unwrap();
+        let mut views = vec![
+            ViewKind::File(crate::files::FileView::new(path.clone())),
+            ViewKind::Preview(crate::files::preview::DocumentView::new(
+                path,
+                crate::files::preview::PreviewKind::Markdown,
+            )),
+            ViewKind::Diff(Box::new(crate::diff::DiffView::new(
+                std::path::PathBuf::from("/repo"),
+                crate::diff::DiffKey {
+                    repo_id: "repo".into(),
+                    worktree_id: "tree".into(),
+                    layer: crate::diff::DiffLayer::Worktree,
+                    old_path: Some(diff_path.clone()),
+                    new_path: Some(diff_path),
+                },
+                crate::diff::DiffLayoutPreference::Stack,
+                3,
+                false,
+                false,
+            ))),
+        ];
+        app.panes.remove(&first);
+        for mut view in views.drain(..) {
+            let search = match &mut view {
+                ViewKind::File(view) => &mut view.search,
+                ViewKind::Preview(view) => &mut view.search,
+                ViewKind::Diff(view) => &mut view.search,
+            };
+            *search = Some(crate::search::local::LocalSearch::editing());
+            app.views.insert(first, view);
+            app.handle_event(mouse(MouseEventKind::Moved, at, KeyModifiers::NONE));
+            assert_eq!(app.layout().focus, first);
+            app.handle_event(crate::event::AppEvent::Paste("needle".into()));
+            let search = match app.views.get(&first).unwrap() {
+                ViewKind::File(view) => &view.search,
+                ViewKind::Preview(view) => &view.search,
+                ViewKind::Diff(view) => &view.search,
+            };
+            assert_eq!(search.as_ref().unwrap().query, "needle");
+        }
+        app.views.remove(&first);
+        app.handle_event(mouse(MouseEventKind::Moved, at, KeyModifiers::NONE));
+        assert_eq!(app.layout().focus, second);
+    }
+
+    #[test]
+    fn hover_focus_respects_modal_selection_and_drag_ownership() {
+        let _env = crate::persist::test_env("hover-focus-ownership");
+        let (mut app, first, second, at) = split_hover_fixture();
+        app.config.layout.focus_follows_mouse = true;
+        app.help_open = true;
+        app.handle_event(mouse(MouseEventKind::Moved, at, KeyModifiers::NONE));
+        assert_eq!(app.layout().focus, first);
+        app.help_open = false;
+        app.mode = Mode::PaneNavigate;
+        app.handle_event(mouse(MouseEventKind::Moved, at, KeyModifiers::NONE));
+        assert_eq!(app.layout().focus, first);
+        app.mode = Mode::Normal;
+
+        let first_rect = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == first)
+            .unwrap()
+            .1;
+        let start = (first_rect.x, first_rect.y);
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            start,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(MouseEventKind::Moved, at, KeyModifiers::NONE));
+        assert_eq!(app.layout().focus, first);
+        app.clear_selection();
+        app.sidebar_resize = Some(crate::app::Side::Left);
+        app.handle_event(mouse(MouseEventKind::Moved, at, KeyModifiers::NONE));
+        assert_eq!(app.layout().focus, first);
+        app.sidebar_resize = None;
+        app.handle_event(mouse(MouseEventKind::Moved, at, KeyModifiers::NONE));
+        assert_eq!(app.layout().focus, second);
+    }
+
+    #[test]
+    fn hover_focus_waits_for_a_forwarded_mouse_grab() {
+        let _env = crate::persist::test_env("hover-focus-grab");
+        let (mut app, first, second, at) = split_hover_fixture();
+        app.config.layout.focus_follows_mouse = true;
+        enable_mouse_tracking(&app, first);
+        let rect = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == first)
+            .unwrap()
+            .1;
+        let start = (rect.x, rect.y);
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Middle),
+            start,
+            KeyModifiers::NONE,
+        ));
+        assert!(app.mouse_grab.is_some());
+        app.handle_event(mouse(MouseEventKind::Moved, at, KeyModifiers::NONE));
+        assert_eq!(app.layout().focus, first);
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Middle),
+            at,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(MouseEventKind::Moved, at, KeyModifiers::NONE));
+        assert_eq!(app.layout().focus, second);
+    }
+
+    #[test]
+    fn hover_reports_1003_before_focusing_without_marking_input() {
+        let _env = crate::persist::test_env("hover-focus-1003");
+        let (mut app, first, second, at) = split_hover_fixture();
+        app.config.layout.focus_follows_mouse = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pane = app.panes.get_mut(&second).unwrap();
+        pane.replace_input_sender_for_test(tx);
+        pane.engine
+            .lock()
+            .unwrap()
+            .advance(b"\x1b[?1003h\x1b[?1006h");
+        let before = app.status.get(&second).unwrap().last_input;
+        assert!(app.handle_event(mouse(MouseEventKind::Moved, at, KeyModifiers::NONE)));
+        assert_eq!(app.layout().focus, second);
+        assert_eq!(app.focus_history_back.last(), Some(&first));
+        assert_eq!(app.status.get(&second).unwrap().last_input, before);
+        match rx.try_recv().expect("1003 hover report") {
+            crate::terminal::pty::InputAction::Bytes(bytes) => assert_eq!(bytes, b"\x1b[<35;1;1M"),
+            _ => panic!("expected mouse bytes"),
+        }
     }
 
     /// The feature: `Ctrl`+click a URL in a pane and it goes to the client to be

@@ -4122,12 +4122,15 @@ impl App {
                             fingerprint: String::new(),
                         };
                         let context = context_lines;
+                        let provider = config.layout.diff_provider;
                         std::thread::spawn(move || {
-                            let result =
-                                crate::diff::git::load_diff(&root, &file, context).map(|diff| {
-                                    let diff = std::sync::Arc::new(diff);
-                                    crate::diff::LoadedDiff::prepare(diff, Vec::new())
-                                });
+                            let result = crate::diff::provider::load(
+                                &root, &file, context, provider,
+                            )
+                            .map(|diff| {
+                                let diff = std::sync::Arc::new(diff);
+                                crate::diff::LoadedDiff::prepare(diff, Vec::new())
+                            });
                             let _ = tx.send(crate::event::AppEvent::DiffLoaded {
                                 id,
                                 token: 1,
@@ -17295,6 +17298,16 @@ fi
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(120, 40, tx).unwrap();
         let pane = app.layout().focus;
+        // The live shell reader keeps its original engine, away from this fixture.
+        let (response_tx, _response_rx) = std::sync::mpsc::channel();
+        app.panes.get_mut(&pane).unwrap().engine = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::terminal::vt::alacritty::AlacrittyEngine::new(
+                120,
+                40,
+                response_tx,
+                crate::config::SCROLLBACK_BYTES_DEFAULT,
+            ),
+        ));
         app.panes
             .get(&pane)
             .expect("focused pane exists")
@@ -21363,7 +21376,7 @@ fi
             tab: SettingsTab::Layout,
             cursor: idx,
             prefix_candidate: None,
-            layout_scroll: 0,
+            list_scroll: 0,
             capturing: false,
         });
         app.handle_settings_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -22515,6 +22528,16 @@ fi
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
         let id = app.layout().focus;
+        // The live shell reader keeps its original engine, away from this fixture.
+        let (response_tx, _response_rx) = std::sync::mpsc::channel();
+        app.panes.get_mut(&id).unwrap().engine = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::terminal::vt::alacritty::AlacrittyEngine::new(
+                80,
+                24,
+                response_tx,
+                crate::config::SCROLLBACK_BYTES_DEFAULT,
+            ),
+        ));
         if let Some(pane) = app.panes.get(&id) {
             if let Ok(mut engine) = pane.engine.lock() {
                 for i in 0..80 {

@@ -314,6 +314,9 @@ pub struct LayoutConfig {
     /// user is working; turn this on to always reset to the workspace root.
     #[serde(default)]
     pub new_pane_to_workspace_root: bool,
+    /// Focus a pane when the mouse moves over it.
+    #[serde(default)]
+    pub focus_follows_mouse: bool,
     /// Default action when a file is opened from the FILES tree (docs/38):
     /// `"readonly"` (the native viewer) or an editor run-command such as `"vim"`
     /// / `"emacs -nw"`. Consulted whenever a file opens in a *tab* — see
@@ -369,6 +372,9 @@ pub struct LayoutConfig {
     /// familiar fixed red/green review palette.
     #[serde(default)]
     pub diff_color_mode: crate::diff::DiffColorMode,
+    /// Optional structured presentation; canonical patches and notes stay Git-backed.
+    #[serde(default)]
+    pub diff_provider: crate::diff::model::DiffProvider,
     #[serde(default = "yes")]
     pub diff_live_refresh: bool,
     /// Terminal width (columns) at or below which the automatic mobile layout
@@ -593,6 +599,7 @@ impl Default for LayoutConfig {
             agent_paths: true,
             resume_in_new_workspace: true,
             new_pane_to_workspace_root: false,
+            focus_follows_mouse: false,
             file_open: default_file_open(),
             file_click: default_file_click(),
             file_links_in_default_app: false,
@@ -606,6 +613,7 @@ impl Default for LayoutConfig {
             diff_marker_style: crate::diff::DiffMarkerStyle::Symbols,
             diff_color_mode: crate::diff::DiffColorMode::Theme,
             diff_live_refresh: true,
+            diff_provider: crate::diff::model::DiffProvider::Git,
             mobile_width: default_mobile_width(),
             shift_enter: default_shift_enter(),
         }
