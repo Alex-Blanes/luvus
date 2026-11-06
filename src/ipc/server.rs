@@ -868,22 +868,6 @@ fn apply(
             );
             let activity = *next_activity;
             *next_activity = next_activity.saturating_add(1);
-            // One display client at a time: the newcomer takes over and every
-            // client already attached is told to detach.
-            //
-            // Two of them is not a harmless duplicate view. A second `luvus` in
-            // a terminal that still has one running leaves two processes reading
-            // the *same* console, and the console hands each key record to
-            // whichever reader asks first: both forward their share to this
-            // server, which writes them to the same pane. Nothing is lost and
-            // everything is out of order — a pasted path arrives as its own
-            // characters shuffled, which is unreadable and, in a shell, runs
-            // something other than what you pasted.
-            //
-            // `spawn_successor` already avoids this for a client it replaces
-            // itself ("never left reading alongside the new client"); this is
-            // the same rule for the ones it does not spawn.
-            detach_others(clients);
             clients.insert(
                 id,
                 ClientState::new(
@@ -1295,15 +1279,6 @@ fn apply(
         // Redraw only if the event actually changed the UI — a plain keystroke
         // forwarded to a pane does not (its echo arrives as a separate `PtyData`).
         other => app.handle_event(other),
-    }
-}
-
-/// Tell every attached display client to detach, and forget them. Called when a
-/// new one attaches: see the note at `ClientConnected` for why two of them on
-/// one terminal shuffle the keyboard between themselves.
-fn detach_others(clients: &mut Clients) {
-    for (_, previous) in clients.drain() {
-        let _ = previous.send_control(ServerMessage::Detach);
     }
 }
 
@@ -2692,11 +2667,11 @@ mod shutdown {
 mod tests {
     use super::ServerMessage;
     use super::{
-        apply, broadcast, broadcast_effect, broadcast_machine_catalog_changed, detach_others,
-        dispatch_clipboard, ends_client_writer, frame_cadence_ready, frame_wait, handle_client,
-        pty_rearm_interval, record_event_render_request, relaunch_plan, render_clients,
-        shell_workspace_projection, ClientSender, ClientState, EventRenderSource, FrameSendError,
-        RenderCause, RenderRequest, RenderScratch, FRAME_INTERVAL,
+        apply, broadcast, broadcast_effect, broadcast_machine_catalog_changed, dispatch_clipboard,
+        ends_client_writer, frame_cadence_ready, frame_wait, handle_client, pty_rearm_interval,
+        record_event_render_request, relaunch_plan, render_clients, shell_workspace_projection,
+        ClientSender, ClientState, EventRenderSource, FrameSendError, RenderCause, RenderRequest,
+        RenderScratch, FRAME_INTERVAL,
     };
     use crate::app::App;
     use crate::event::{AppEvent, ClientInput};
@@ -2814,23 +2789,47 @@ mod tests {
         assert!(relaunch_plan(&clients, Some(404)).is_none());
     }
 
-    /// A second `luvus` in a terminal that already has one leaves two processes
-    /// reading the same console, and the keyboard is split between them: the
-    /// text that reaches a pane is its own characters shuffled. The newcomer
-    /// takes over instead.
+    /// Clients on different machines attach to the same session side by side,
+    /// as upstream allows: the newcomer becomes the foreground client but nobody
+    /// is told to detach. Detaching them made two machines with persistent links
+    /// to one server evict each other in a reconnect loop.
     #[test]
-    fn attaching_detaches_whoever_was_already_there() {
-        let mut clients = HashMap::new();
-        let (first, first_rx) = display_client(80, 24, 1);
-        clients.insert(1, first);
+    fn a_new_client_attaches_beside_the_ones_already_there() {
+        let _env = crate::persist::test_env("concurrent-clients");
+        let (tx, _) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let (first, first_rx) = display_client(133, 71, 1);
+        let mut clients = HashMap::from([(1, first)]);
+        let mut foreground = Some(1);
+        let mut size = (133, 71);
+        let mut activity = 2;
 
-        detach_others(&mut clients);
+        let (messages, _second_rx) = mpsc::channel::<ServerMessage>();
+        let event = AppEvent::ClientConnected {
+            id: 2,
+            messages,
+            frame_pending: Arc::new(AtomicBool::new(false)),
+            cols: 270,
+            rows: 72,
+            terminal_colors: None,
+        };
+        apply(
+            event,
+            &mut app,
+            &mut clients,
+            &mut foreground,
+            &mut size,
+            &mut activity,
+        );
 
-        assert!(clients.is_empty(), "the previous client is forgotten");
-        assert!(matches!(
-            first_rx.recv_timeout(Duration::from_secs(1)),
-            Ok(ServerMessage::Detach)
-        ));
+        assert_eq!(foreground, Some(2), "the newcomer takes the foreground");
+        assert!(clients.contains_key(&1), "the first client stays attached");
+        while let Ok(message) = first_rx.try_recv() {
+            assert!(
+                !matches!(message, ServerMessage::Detach),
+                "the first client is not told to detach"
+            );
+        }
     }
 
     #[test]
