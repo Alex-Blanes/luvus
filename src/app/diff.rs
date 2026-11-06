@@ -3414,6 +3414,7 @@ mod tests {
             })
             .collect();
         let diff = Arc::new(FileDiff {
+            presentation: None,
             key,
             status: DiffFileStatus::Modified,
             additions: 30,
@@ -3556,6 +3557,7 @@ mod tests {
             text: text.into(),
         };
         let diff = Arc::new(FileDiff {
+            presentation: None,
             key,
             status: DiffFileStatus::Modified,
             additions: 2,
