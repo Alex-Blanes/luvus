@@ -123,6 +123,7 @@ pub enum GeneralRow {
     /// Open a new tab/split at the workspace root instead of inheriting the
     /// focused pane's cwd.
     NewPaneToWorkspaceRoot,
+    FocusFollowsMouse,
     /// Show each agent's live session title in the AGENTS sidebar.
     AgentTitle,
     SoundStyle,
@@ -158,6 +159,7 @@ impl App {
             GeneralRow::AutoUpdate,
             GeneralRow::ResumeFlags,
             GeneralRow::NewPaneToWorkspaceRoot,
+            GeneralRow::FocusFollowsMouse,
             GeneralRow::AgentTitle,
             GeneralRow::SoundStyle,
             GeneralRow::SoundDone,
@@ -1389,6 +1391,10 @@ impl App {
                     !self.config.layout.file_links_in_default_app;
                 self.persist_config();
             }
+            Some(GeneralRow::FocusFollowsMouse) => {
+                self.config.layout.focus_follows_mouse = !self.config.layout.focus_follows_mouse;
+                self.persist_config();
+            }
             Some(GeneralRow::AgentTitle) => {
                 self.config.layout.agent_title = !self.config.layout.agent_title;
                 self.persist_config();
@@ -1945,6 +1951,29 @@ mod tests {
         assert!(!old.layout.new_pane_to_workspace_root);
     }
 
+    #[test]
+    fn focus_follows_mouse_toggle_persists() {
+        let _env = crate::persist::test_env("focus-follows-mouse");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        assert!(!app.config.layout.focus_follows_mouse);
+        let old: crate::config::Config = serde_json::from_str(r#"{"layout":{}}"#).unwrap();
+        assert!(!old.layout.focus_follows_mouse);
+
+        let row = app
+            .general_rows()
+            .iter()
+            .position(|r| *r == GeneralRow::FocusFollowsMouse)
+            .unwrap();
+        assert!(row < app.general_section_start());
+        app.adjust_general(row, 1);
+        assert!(app.config.layout.focus_follows_mouse);
+        app.flush_config_for_test(&rx);
+        assert!(crate::config::load().layout.focus_follows_mouse);
+        app.adjust_general(row, 1);
+        assert!(!app.config.layout.focus_follows_mouse);
+    }
+
     // The General tab is the two file choosers plus the Notifications section:
     // the selected sound style, two persisted event toggles, and separate test
     // rows for the completion and attention cues.
@@ -1957,9 +1986,9 @@ mod tests {
         if let Some(ui) = app.settings.as_mut() {
             ui.tab = SettingsTab::General;
         }
-        // 14 upstream rows plus this fork's "install updates automatically" and
+        // 15 upstream rows plus this fork's "install updates automatically" and
         // "Ctrl+click a file path: open in the default app".
-        assert_eq!(app.settings_rows(SettingsTab::General), 16);
+        assert_eq!(app.settings_rows(SettingsTab::General), 17);
         let rows = app.general_rows();
         assert_eq!(rows[0], GeneralRow::FileOpen, "file-open leads the tab");
         assert_eq!(
