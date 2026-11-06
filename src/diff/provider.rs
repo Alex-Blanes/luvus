@@ -210,6 +210,8 @@ fn prepare(
     std::fs::write(&lhs, &old_display).map_err(|e| e.to_string())?;
     std::fs::write(&rhs, &new_display).map_err(|e| e.to_string())?;
     let mut command = Command::new("difft");
+    // A detached Windows server would otherwise flash a console per diff.
+    crate::platform::no_window(&mut command);
     command
         .args([
             "--display=json",
