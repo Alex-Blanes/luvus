@@ -177,11 +177,28 @@ fn dock_slots(body: Rect, weights: &[u16]) -> (Vec<Rect>, Vec<u16>) {
 /// The open docks are split by `dock_slots` over a body shortened by what the
 /// folded ones take — their header row plus the divider each one adds — so
 /// the open heights, the folded rows and every divider still add up to `body`.
-fn folded_dock_slots(body: Rect, weights: &[u16], folded: &[bool]) -> (Vec<Rect>, Vec<u16>) {
+///
+/// When a single dock stays open and `fit` knows its content height, it shrinks
+/// to that, so the folded headers sit right under its last row instead of at
+/// the bottom of the sidebar; the spare rows go below them.
+fn folded_dock_slots(
+    body: Rect,
+    weights: &[u16],
+    folded: &[bool],
+    fit: &[Option<u16>],
+) -> (Vec<Rect>, Vec<u16>) {
     let k = folded.iter().filter(|f| **f).count() as u16;
     if k == 0 {
         return dock_slots(body, weights);
     }
+    let single_open_fit = if folded.len() as u16 == k + 1 {
+        folded
+            .iter()
+            .position(|f| !*f)
+            .and_then(|i| fit.get(i).copied().flatten())
+    } else {
+        None
+    };
     let open: Vec<u16> = weights
         .iter()
         .zip(folded)
@@ -204,7 +221,8 @@ fn folded_dock_slots(body: Rect, weights: &[u16], folded: &[bool]) -> (Vec<Rect>
         let h = if *is_folded {
             1
         } else {
-            open_heights.next().unwrap_or(0)
+            let h = open_heights.next().unwrap_or(0);
+            single_open_fit.map_or(h, |c| h.min(c.max(crate::app::MIN_DOCK_HEIGHT)))
         };
         let h = h.min(body.bottom().saturating_sub(y));
         slots.push(Rect::new(body.x, y, body.width, h));
@@ -215,6 +233,26 @@ fn folded_dock_slots(body: Rect, weights: &[u16], folded: &[bool]) -> (Vec<Rect>
         }
     }
     (slots, dividers)
+}
+
+/// Rows a dock needs to show everything it lists, when that is cheap to know.
+/// Only WORKSPACES says: its rows are fixed-stride, saved machines included.
+fn dock_content_rows(app: &App, kind: &DockKind) -> Option<u16> {
+    match kind {
+        // A machine-aware client paints its own list here; its length is its own.
+        DockKind::Workspaces if app.client_machine_capable && app.client_shell_owns_workspaces => {
+            None
+        }
+        DockKind::Workspaces => {
+            let items = app.workspaces.len() + usize::from(app.client_shell_dock_rows);
+            let stride = dock_row_stride(app.config.layout.workspace_paths);
+            let rows = u16::try_from(items)
+                .unwrap_or(u16::MAX)
+                .saturating_mul(stride);
+            Some(DOCK_HEADER_ROWS.saturating_add(rows))
+        }
+        _ => None,
+    }
 }
 
 /// A one-row horizontal rule between two stacked docks.
@@ -289,8 +327,9 @@ pub(super) fn draw_sidebar(
     );
     let docks = app.sidebars.get(side).docks.clone();
     let folded: Vec<bool> = docks.iter().map(|d| app.dock_is_folded(d)).collect();
+    let fit: Vec<Option<u16>> = docks.iter().map(|d| dock_content_rows(app, d)).collect();
     let (slots, dividers) =
-        folded_dock_slots(body, &app.sidebars.get(side).dock_weights(), &folded);
+        folded_dock_slots(body, &app.sidebars.get(side).dock_weights(), &folded, &fit);
     // Publish the rules so a press can grab one. Recomputed every frame, so a
     // sidebar that stops being drawn leaves no stale drag target behind.
     app.dock_dividers.retain(|(s, _, _)| *s != side);
@@ -2066,11 +2105,12 @@ mod tests {
     fn folded_docks_keep_their_header_and_the_rest_is_shared() {
         let body = Rect::new(0, 2, 26, 30);
         assert_eq!(
-            super::folded_dock_slots(body, &[1, 1, 1], &[false, false, false]),
+            super::folded_dock_slots(body, &[1, 1, 1], &[false, false, false], &[]),
             super::dock_slots(body, &[1, 1, 1]),
         );
 
-        let (slots, dividers) = super::folded_dock_slots(body, &[22, 8, 16], &[false, true, false]);
+        let (slots, dividers) =
+            super::folded_dock_slots(body, &[22, 8, 16], &[false, true, false], &[Some(5); 3]);
         assert_eq!(slots[1].height, 1, "folded to its header");
         assert_eq!(slots[1].y, dividers[0] + 1);
         assert_eq!(slots[2].y, dividers[1] + 1);
@@ -2079,6 +2119,33 @@ mod tests {
         assert!(
             slots[0].height > slots[2].height,
             "the open docks keep their proportion: {slots:?}"
+        );
+    }
+
+    /// With the only other dock folded, a short WORKSPACES list ends where its
+    /// rows do and the folded header follows it, instead of sitting at the
+    /// bottom with a gap above. Unknown content keeps the full share.
+    #[test]
+    fn a_lone_open_dock_fits_its_content_and_the_folded_one_follows() {
+        let body = Rect::new(0, 2, 26, 46);
+        let (slots, dividers) =
+            super::folded_dock_slots(body, &[1, 1], &[false, true], &[Some(23), None]);
+        assert_eq!(slots[0].height, 23);
+        assert_eq!(dividers, vec![body.y + 23]);
+        assert_eq!((slots[1].y, slots[1].height), (body.y + 24, 1));
+
+        let (full, _) = super::folded_dock_slots(body, &[1, 1], &[false, true], &[None, None]);
+        assert_eq!(
+            full[0].height,
+            body.height - 2,
+            "nothing to fit: full share"
+        );
+
+        let (tall, _) = super::folded_dock_slots(body, &[1, 1], &[false, true], &[Some(200), None]);
+        assert_eq!(
+            tall[0].height,
+            body.height - 2,
+            "never taller than the body"
         );
     }
 
