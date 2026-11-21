@@ -1812,22 +1812,7 @@ impl App {
         for (offset, index) in block.iter().copied().enumerate() {
             order.insert(insertion + offset, index);
         }
-        if !order.iter().copied().eq(0..len) {
-            let old_active = self.active_ws;
-            let mut old: Vec<Option<Workspace>> = std::mem::take(&mut self.workspaces)
-                .into_iter()
-                .map(Some)
-                .collect();
-            self.workspaces = order
-                .iter()
-                .map(|index| old[*index].take().unwrap())
-                .collect();
-            self.active_ws = order
-                .iter()
-                .position(|index| *index == old_active)
-                .unwrap_or(0);
-            self.session_dirty = true;
-        }
+        self.apply_workspace_order(&order);
         Ok(block
             .iter()
             .map(|index| {

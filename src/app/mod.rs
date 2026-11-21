@@ -764,6 +764,10 @@ pub struct WsMenu {
 pub enum WsMenuItem {
     Pin,
     Unpin,
+    /// Swap the node (with its worktrees) with the one above or below it, inside
+    /// its pinned or unpinned block (this fork). Only offered when it can move.
+    MoveUp,
+    MoveDown,
     /// Toggle the persisted cwd line for every WORKSPACES row.
     TogglePath,
     /// Parent row of the Quick Actions submenu, which holds the copy rows so the
@@ -6339,6 +6343,58 @@ impl App {
             .collect()
     }
 
+    /// The raw workspace order that shows node `index` one display slot up or
+    /// down, carrying its nested worktrees and staying inside its pinned or
+    /// unpinned block. `None` for a nested worktree or a node already at the edge.
+    fn workspace_move_order(&self, index: usize, up: bool) -> Option<Vec<usize>> {
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for (idx, is_child) in self.workspace_display_order() {
+            match groups.last_mut() {
+                Some(group) if is_child => group.push(idx),
+                _ => groups.push(vec![idx]),
+            }
+        }
+        let pinned = |g: &[usize]| g.iter().any(|i| self.workspaces[*i].pinned);
+        let from = groups.iter().position(|g| g[0] == index)?;
+        let to = if up { from.checked_sub(1)? } else { from + 1 };
+        if pinned(groups.get(to)?) != pinned(&groups[from]) {
+            return None;
+        }
+        groups.swap(from, to);
+        Some(groups.concat())
+    }
+
+    /// Move node `index` one display slot up or down (see `workspace_move_order`).
+    pub fn move_workspace_display(&mut self, index: usize, up: bool) -> bool {
+        let Some(order) = self.workspace_move_order(index, up) else {
+            return false;
+        };
+        self.apply_workspace_order(&order);
+        true
+    }
+
+    /// Reorder `workspaces` so slot `i` holds the old `order[i]`, keeping the
+    /// active node active. `order` must be a permutation of `0..len`.
+    pub(crate) fn apply_workspace_order(&mut self, order: &[usize]) {
+        if order.iter().copied().eq(0..self.workspaces.len()) {
+            return;
+        }
+        let old_active = self.active_ws;
+        let mut old: Vec<Option<Workspace>> = std::mem::take(&mut self.workspaces)
+            .into_iter()
+            .map(Some)
+            .collect();
+        self.workspaces = order
+            .iter()
+            .map(|index| old[*index].take().unwrap())
+            .collect();
+        self.active_ws = order
+            .iter()
+            .position(|index| *index == old_active)
+            .unwrap_or(0);
+        self.session_dirty = true;
+    }
+
     /// A workspace's 0-based position in the sidebar after pin/group ordering.
     pub fn workspace_display_position(&self, index: usize) -> Option<usize> {
         self.workspace_display_order()
@@ -7065,13 +7121,14 @@ impl App {
         } else {
             WsMenuItem::Pin
         };
-        let mut items = vec![
-            WsMenuItem::Close,
-            WsMenuItem::Rename,
-            pin,
-            WsMenuItem::TogglePath,
-            WsMenuItem::QuickActions,
-        ];
+        let mut items = vec![WsMenuItem::Close, WsMenuItem::Rename, pin];
+        if self.workspace_move_order(index, true).is_some() {
+            items.push(WsMenuItem::MoveUp);
+        }
+        if self.workspace_move_order(index, false).is_some() {
+            items.push(WsMenuItem::MoveDown);
+        }
+        items.extend([WsMenuItem::TogglePath, WsMenuItem::QuickActions]);
         if is_worktree {
             items.push(WsMenuItem::DeleteWorktree);
         }
@@ -7252,6 +7309,9 @@ impl App {
             // (docs), persisted across restarts.
             WsMenuItem::Pin | WsMenuItem::Unpin => {
                 let _ = self.set_workspace_pinned(index, item == WsMenuItem::Pin);
+            }
+            WsMenuItem::MoveUp | WsMenuItem::MoveDown => {
+                self.move_workspace_display(index, item == WsMenuItem::MoveUp);
             }
             WsMenuItem::TogglePath => {
                 self.config.layout.workspace_paths = !self.config.layout.workspace_paths;
@@ -15920,6 +15980,79 @@ fi
         assert_eq!(
             app.workspace_display_order(),
             vec![(1, false), (2, true), (0, false)]
+        );
+    }
+
+    /// Move Up/Down swap a node with its display neighbour, carry its nested
+    /// worktree, keep the active node active, and never cross the pinned block
+    /// or move a nested worktree on its own.
+    #[test]
+    fn ws_menu_moves_a_node_with_its_worktrees() {
+        let _env = crate::persist::test_env("ws-menu-move");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let common_dir = PathBuf::from("/tmp/luvus-move/.git");
+        for (name, linked) in [
+            ("a", None),
+            ("b", None),
+            ("parent", Some(false)),
+            ("child", Some(true)),
+        ] {
+            app.workspaces.push(Workspace {
+                id: crate::ids::public_id("workspace"),
+                name: name.into(),
+                cwd: PathBuf::from(format!("/tmp/luvus-move-{name}")),
+                branch: None,
+                git_ahead_behind: None,
+                worktree: linked.map(|linked| crate::git::WorktreeMembership {
+                    common_dir: common_dir.clone(),
+                    directory_identity: None,
+                    linked,
+                }),
+                tabs: vec![Tab::panes(TileLayout::new(pane))],
+                active_tab: 0,
+                pinned: false,
+            });
+        }
+        app.workspaces[0].name = "first".into();
+        let shown = |app: &App| -> Vec<String> {
+            app.workspace_display_order()
+                .iter()
+                .map(|&(i, _)| app.workspaces[i].name.clone())
+                .collect()
+        };
+        assert_eq!(shown(&app), ["first", "a", "b", "parent", "child"]);
+        assert!(
+            !app.ws_menu_items(0).contains(&WsMenuItem::MoveUp),
+            "already first"
+        );
+        assert!(app.ws_menu_items(0).contains(&WsMenuItem::MoveDown));
+        let items = app.ws_menu_items(4);
+        assert!(!items.contains(&WsMenuItem::MoveUp) && !items.contains(&WsMenuItem::MoveDown));
+
+        app.active_ws = 2; // "b"
+        app.open_ws_menu(3, 0, 0);
+        app.ws_menu_action(WsMenuItem::MoveUp);
+        assert_eq!(shown(&app), ["first", "a", "parent", "child", "b"]);
+        assert_eq!(
+            app.workspaces[app.active_ws].name, "b",
+            "active follows the move"
+        );
+
+        let a = app.workspaces.iter().position(|w| w.name == "a").unwrap();
+        app.set_workspace_pinned(a, true).unwrap();
+        assert_eq!(shown(&app)[0], "a");
+        let items = app.ws_menu_items(a);
+        assert!(!items.contains(&WsMenuItem::MoveUp) && !items.contains(&WsMenuItem::MoveDown));
+        let first = app
+            .workspaces
+            .iter()
+            .position(|w| w.name == "first")
+            .unwrap();
+        assert!(
+            !app.ws_menu_items(first).contains(&WsMenuItem::MoveUp),
+            "not into the pins"
         );
     }
 
