@@ -647,6 +647,8 @@ fn ws_label(
     match it {
         WsMenuItem::Pin => cat.menu_pin.to_string(),
         WsMenuItem::Unpin => cat.menu_unpin.to_string(),
+        WsMenuItem::MoveUp => cat.menu_move_up.to_string(),
+        WsMenuItem::MoveDown => cat.menu_move_down.to_string(),
         WsMenuItem::TogglePath => if paths_visible {
             cat.menu_hide_path
         } else {
@@ -984,6 +986,8 @@ mod label_case_tests {
         for it in [
             WsMenuItem::Close,
             WsMenuItem::Rename,
+            WsMenuItem::MoveUp,
+            WsMenuItem::MoveDown,
             WsMenuItem::TogglePath,
             WsMenuItem::QuickActions,
             WsMenuItem::CopyPath,
