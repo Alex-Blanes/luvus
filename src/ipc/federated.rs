@@ -901,6 +901,7 @@ fn run_inner(
             }
             ShellEvent::MachineCreated(result) => match result {
                 Ok(crate::machine::ProfileSetupOutcome::Ready(profile)) => {
+                    revive_enabled_machine(&mut machines, &profile.id);
                     if let Some(form) = dock.machine_form.as_mut() {
                         form.submitting = true;
                         form.error = None;
@@ -3012,6 +3013,31 @@ fn machine_can_disconnect(state: &MachineState) -> bool {
     )
 }
 
+fn retry_link_now(runtime: &mut SessionRuntime) {
+    stop_link(runtime);
+    runtime.state = MachineState::Reconnecting { at: Instant::now() };
+    runtime.backoff = Duration::from_secs(1);
+    runtime.handshake_failures = 0;
+}
+
+/// An explicit Connect of a profile that was already enabled saves it
+/// unchanged, so the catalog refresh keeps its runtime: one parked in
+/// Attention (it gave up while the remote server restarted) or Disabled (by
+/// Disconnect) has to be retried here or the click does nothing. A profile
+/// that was saved disabled changes, so the refresh replaces it instead.
+fn revive_enabled_machine(machines: &mut HashMap<String, MachineRuntime>, id: &str) {
+    if let Some(machine) = machines.get_mut(id) {
+        if machine.profile.enabled
+            && matches!(
+                machine.runtime.state,
+                MachineState::Attention(_) | MachineState::Disabled
+            )
+        {
+            retry_link_now(&mut machine.runtime);
+        }
+    }
+}
+
 fn disconnect_machine_runtime(runtime: &mut SessionRuntime) {
     runtime.generation = next_connection_generation();
     runtime.state = MachineState::Disabled;
@@ -3962,12 +3988,7 @@ fn request_user_switch(
                 MachineState::Reconnecting { .. } => {
                     runtime.state = MachineState::Reconnecting { at: Instant::now() };
                 }
-                MachineState::Attention(_) => {
-                    stop_link(runtime);
-                    runtime.state = MachineState::Reconnecting { at: Instant::now() };
-                    runtime.backoff = Duration::from_secs(1);
-                    runtime.handshake_failures = 0;
-                }
+                MachineState::Attention(_) => retry_link_now(runtime),
                 MachineState::Online => unreachable!(),
             }
             *pending_endpoint = Some(endpoint.clone());
@@ -6072,6 +6093,48 @@ mod tests {
             &KeyCode::Enter
         ));
         assert_eq!(selected, 0);
+    }
+
+    /// Connect on a machine that gave up (or was disconnected) retries it now;
+    /// a live link is left alone.
+    #[test]
+    fn connect_revives_a_parked_machine_but_not_a_live_one() {
+        let parked = [
+            MachineState::Attention("connection failed repeatedly".into()),
+            MachineState::Disabled,
+        ];
+        for state in parked {
+            let mut machine = machine_with_sessions("box", &["default"], state);
+            machine.runtime.handshake_failures = 3;
+            machine.runtime.backoff = Duration::from_secs(30);
+            let mut machines = HashMap::from([("box".to_string(), machine)]);
+            revive_enabled_machine(&mut machines, "box");
+            let runtime = &machines["box"].runtime;
+            assert!(
+                matches!(runtime.state, MachineState::Reconnecting { at } if at <= Instant::now())
+            );
+            assert_eq!(runtime.handshake_failures, 0);
+            assert_eq!(runtime.backoff, Duration::from_secs(1));
+        }
+        let mut machines = HashMap::from([(
+            "box".to_string(),
+            machine_with_sessions("box", &["default"], MachineState::Online),
+        )]);
+        revive_enabled_machine(&mut machines, "box");
+        assert!(matches!(
+            machines["box"].runtime.state,
+            MachineState::Online
+        ));
+        revive_enabled_machine(&mut machines, "unknown");
+
+        let mut saved_disabled = machine_with_sessions("box", &["default"], MachineState::Disabled);
+        saved_disabled.profile.enabled = false;
+        let mut machines = HashMap::from([("box".to_string(), saved_disabled)]);
+        revive_enabled_machine(&mut machines, "box");
+        assert!(
+            matches!(machines["box"].runtime.state, MachineState::Disabled),
+            "the catalog refresh replaces it"
+        );
     }
 
     #[test]
