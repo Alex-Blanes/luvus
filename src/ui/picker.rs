@@ -9,12 +9,14 @@ use ratatui::widgets::{Borders, Clear};
 
 /// Draw the picker over a dimmed backdrop; returns the clickable row rects
 /// (row index → rect) the input layer uses for mouse selection.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_picker(
     f: &mut RenderTarget,
     area: Rect,
     p: &FolderPicker,
     machine_capable: bool,
     mobile: bool,
+    hover: Option<(u16, u16)>,
     cat: &Catalog,
     t: &Theme,
 ) -> Vec<(PickerHit, Rect)> {
@@ -53,8 +55,13 @@ pub(super) fn draw_picker(
             (display_width(&remote_label) as u16).min(inner.right().saturating_sub(x)),
             1,
         );
+        let fg = if over(hover, remote_tab) {
+            t.accent
+        } else {
+            t.subtext0
+        };
         f.render_widget(
-            Paragraph::new(Span::styled(remote_label, Style::new().fg(t.subtext0))),
+            Paragraph::new(Span::styled(remote_label, Style::new().fg(fg))),
             remote_tab,
         );
         tab_hits.push((PickerHit::RemoteMachineTab, remote_tab));
@@ -123,7 +130,9 @@ pub(super) fn draw_picker(
                     continue;
                 }
                 let w = (display_width(key) + 1 + display_width(label)).min(available as usize);
-                footer_hints.push((PickerHit::Hint(*code), Rect::new(x, footer_y, w as u16, 1)));
+                let rect = Rect::new(x, footer_y, w as u16, 1);
+                hot_hint(f, rect, key, label, hover, t);
+                footer_hints.push((PickerHit::Hint(*code), rect));
             }
         }
     } else if let Some(buf) = &p.creating {
@@ -172,7 +181,9 @@ pub(super) fn draw_picker(
                 continue;
             }
             let w = (display_width(key) + 1 + display_width(label)).min(available as usize);
-            footer_hints.push((PickerHit::Hint(*code), Rect::new(x, footer_y, w as u16, 1)));
+            let rect = Rect::new(x, footer_y, w as u16, 1);
+            hot_hint(f, rect, key, label, hover, t);
+            footer_hints.push((PickerHit::Hint(*code), rect));
         }
     }
 
@@ -190,9 +201,15 @@ pub(super) fn draw_picker(
         let y = list.y + vi as u16;
         let row_rect = Rect::new(list.x, y, list.width, 1);
         let sel = i == p.cursor;
-        if sel {
+        // As in the open-worktree list: the pointer fills its row with the
+        // accent, the keyboard cursor keeps the subtler `sel_bg`.
+        let hot = over(hover, row_rect);
+        if hot {
+            fill_bg(f, row_rect, t.accent);
+        } else if sel {
             fill_bg(f, row_rect, t.sel_bg);
         }
+        let ink = |fg: Color| Style::new().fg(if hot { t.crust } else { fg });
         // (icon, label, color). Folders navigate; files are dimmed + inert.
         let (icon, label, fg) = match p.row(i) {
             Row::OpenFolder => ("✓", cat.open_this_folder.to_string(), t.accent),
@@ -215,11 +232,11 @@ pub(super) fn draw_picker(
         };
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(if sel { "▸ " } else { "  " }, Style::new().fg(t.accent)),
-                Span::styled(format!("{icon} "), Style::new().fg(fg)),
+                Span::styled(if sel { "▸ " } else { "  " }, ink(t.accent)),
+                Span::styled(format!("{icon} "), ink(fg)),
                 Span::styled(
                     trunc_tail(&label, list.width.saturating_sub(5) as usize),
-                    Style::new().fg(fg),
+                    ink(fg),
                 ),
             ])),
             Rect::new(list.x, y, list.width, 1),
@@ -231,6 +248,35 @@ pub(super) fn draw_picker(
     }
     rects.push((PickerHit::Modal, modal));
     rects
+}
+
+/// Whether the pointer sits on `rect` (all of these are one row tall).
+fn over(hover: Option<(u16, u16)>, rect: Rect) -> bool {
+    hover.is_some_and(|(c, r)| r == rect.y && c >= rect.x && c < rect.right())
+}
+
+/// Repaint a footer hint under the pointer as the accent pill with dark ink
+/// the other modals' buttons use; `hint_line_with_offsets` laid it out as
+/// `key label` starting at `rect.x`.
+fn hot_hint(
+    f: &mut RenderTarget,
+    rect: Rect,
+    key: &str,
+    label: &str,
+    hover: Option<(u16, u16)>,
+    t: &Theme,
+) {
+    if !over(hover, rect) {
+        return;
+    }
+    fill_bg(f, rect, t.accent);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(key.to_string(), Style::new().fg(t.crust).bold()),
+            Span::styled(format!(" {label}"), Style::new().fg(t.crust)),
+        ])),
+        rect,
+    );
 }
 
 /// One geometry contract for both tabs of the workspace creation surface.
