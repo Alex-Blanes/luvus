@@ -1746,6 +1746,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// This fork: the pointer lights the picker row and footer button under
+    /// it, and moving onto one is a changed frame, else it would never repaint.
+    #[test]
+    fn picker_hover_lights_its_rows_and_footer_buttons() {
+        use ratatui::crossterm::event::{MouseEvent, MouseEventKind};
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let _env = crate::persist::test_env("picker-hover");
+        let tmp = complete_fixture("hover");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.open_folder_picker_at(tmp.clone());
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let rect_of = |app: &App, want: PickerHit| {
+            app.picker_rects
+                .iter()
+                .find_map(|(hit, rect)| (*hit == want).then_some(*rect))
+                .expect("rendered")
+        };
+        let (row0, row1) = (
+            rect_of(&app, PickerHit::Row(0)),
+            rect_of(&app, PickerHit::Row(1)),
+        );
+        let enter = rect_of(&app, PickerHit::Hint(KeyCode::Enter));
+        let moved = |column, row| {
+            AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        assert!(
+            app.handle_event(moved(row1.x + 2, row1.y)),
+            "onto a row redraws"
+        );
+        assert!(
+            !app.handle_event(moved(row1.x + 5, row1.y)),
+            "within it does not"
+        );
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let hot = buf[(row1.x + 2, row1.y)].bg;
+        assert_ne!(
+            hot,
+            buf[(row0.x + 2, row0.y)].bg,
+            "hover differs from the cursor row"
+        );
+
+        assert!(
+            app.handle_event(moved(enter.x, enter.y)),
+            "onto a button redraws"
+        );
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        assert_eq!(
+            buf[(enter.x, enter.y)].bg,
+            hot,
+            "the button lights like a row"
+        );
+        assert_ne!(
+            buf[(row1.x + 2, row1.y)].bg,
+            hot,
+            "the row it left goes dark"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     fn complete_fixture(label: &str) -> PathBuf {
         let tmp =
             std::env::temp_dir().join(format!("luvus-pickcomp-{label}-{}", std::process::id()));

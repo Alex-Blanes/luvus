@@ -1984,6 +1984,16 @@ impl App {
                 .flatten()
                 .find(|rect| hit(*rect));
         }
+        // This fork: the folder picker hovers its rows, hints and remote tab;
+        // the modal body is inert, so leaving a row onto it repaints too.
+        if self.picker.is_some() {
+            return self
+                .picker_rects
+                .iter()
+                .filter(|(target, _)| !matches!(*target, PickerHit::Modal))
+                .map(|(_, rect)| *rect)
+                .find(|rect| hit(*rect));
+        }
 
         if self.switcher {
             return self

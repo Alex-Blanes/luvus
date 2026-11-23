@@ -2163,6 +2163,18 @@ fn handle_dock_input(
                         rect.contains((mouse.column, mouse.row).into()) && mouse.row == rect.y + 1
                     });
                 }
+                // This fork: the pointer moves the highlight, so the row under
+                // it lights up the way the server's context menus do.
+                ClientMessage::Mouse(mouse) if mouse.kind == MouseEventKind::Moved => {
+                    if let Some(row) =
+                        rect.and_then(|rect| machine_menu_row(rect, mouse.column, mouse.row))
+                    {
+                        if *selected != row {
+                            *selected = row;
+                            dock.dirty = true;
+                        }
+                    }
+                }
                 _ => {}
             }
             if activate_connection {
@@ -3016,6 +3028,19 @@ fn disconnect_machine_runtime(runtime: &mut SessionRuntime) {
     runtime.generation = next_connection_generation();
     runtime.state = MachineState::Disabled;
     stop_link(runtime);
+}
+
+/// The machine menu row under the pointer: 0 is Connect/Disconnect, 1 is
+/// Delete; the border rows are neither.
+fn machine_menu_row(rect: Rect, column: u16, row: u16) -> Option<usize> {
+    if !rect.contains((column, row).into()) {
+        return None;
+    }
+    match row - rect.y {
+        1 => Some(0),
+        2 => Some(1),
+        _ => None,
+    }
 }
 
 fn move_machine_popup_selection(selected: &mut usize, code: &KeyCode) -> bool {
@@ -4664,6 +4689,7 @@ fn paint_machine_popup(
     let text = protocol::unpack(theme.text);
     let subtext = protocol::unpack(theme.subtext1);
     let accent = protocol::unpack(theme.accent);
+    let accent_text = protocol::unpack(theme.accent_text);
     let error_color = protocol::unpack(theme.error);
 
     let (rect, menu) = match dock.machine_popup.as_ref() {
@@ -4727,30 +4753,28 @@ fn paint_machine_popup(
             ),
             _ => unreachable!(),
         };
-        write_endpoint_text(
-            &mut cells,
-            rect,
-            1,
-            2,
-            connection_label,
-            StyleSpec {
-                fg: if selected == 0 { accent } else { text },
-                bg: None,
-                bold: selected == 0,
-            },
-        );
-        write_endpoint_text(
-            &mut cells,
-            rect,
-            2,
-            2,
-            dock.delete_label,
-            StyleSpec {
-                fg: error_color,
-                bg: None,
-                bold: selected == 1,
-            },
-        );
+        // The highlighted row (keyboard or pointer) is filled border to
+        // border with dark ink on it, like a row of the server's menus.
+        let inner = usize::from(rect.width.saturating_sub(2));
+        for (row, label, fg, fill) in [
+            (0, connection_label, text, accent),
+            (1, dock.delete_label, error_color, error_color),
+        ] {
+            let hot = selected == row;
+            let pad = inner.saturating_sub(usize::from(display_columns(label)) + 1);
+            write_endpoint_text(
+                &mut cells,
+                rect,
+                row as u16 + 1,
+                1,
+                &format!(" {label}{}", " ".repeat(pad)),
+                StyleSpec {
+                    fg: if hot { accent_text } else { fg },
+                    bg: hot.then_some(fill),
+                    bold: hot,
+                },
+            );
+        }
         if let Some(MachinePopup::Menu {
             rect: popup_rect,
             remove_rect,
@@ -5950,6 +5974,19 @@ mod tests {
         assert!(!dock.refresh_catalog);
         assert!(note_catalog_revision(&mut dock, 6));
         assert!(dock.refresh_catalog);
+    }
+
+    /// Hovering the machine menu picks the row under the pointer; its border
+    /// and the outside pick nothing, so the highlight stays where it was.
+    #[test]
+    fn machine_menu_hover_maps_the_pointer_to_its_row() {
+        let rect = Rect::new(10, 5, 14, 4);
+        assert_eq!(machine_menu_row(rect, 12, 6), Some(0), "Connect");
+        assert_eq!(machine_menu_row(rect, 22, 7), Some(1), "Delete");
+        assert_eq!(machine_menu_row(rect, 12, 5), None, "top border");
+        assert_eq!(machine_menu_row(rect, 12, 8), None, "bottom border");
+        assert_eq!(machine_menu_row(rect, 9, 6), None, "left of the menu");
+        assert_eq!(machine_menu_row(rect, 12, 9), None, "below the menu");
     }
 
     #[test]

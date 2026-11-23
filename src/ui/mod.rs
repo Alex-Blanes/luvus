@@ -1045,8 +1045,16 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool) {
     let picker_open = app.picker.is_some();
     let mut picker_rects = Vec::new();
     if let Some(p) = &app.picker {
-        picker_rects =
-            picker::draw_picker(f, area, p, app.client_machine_capable, app.compact, cat, &t);
+        picker_rects = picker::draw_picker(
+            f,
+            area,
+            p,
+            app.client_machine_capable,
+            app.compact,
+            app.hover,
+            cat,
+            &t,
+        );
     }
     app.picker_rects = picker_rects;
 
