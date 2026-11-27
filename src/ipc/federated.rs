@@ -1143,6 +1143,17 @@ fn start_due_links(
     }
 }
 
+/// Re-arm an endpoint that stopped retrying, with a fresh backoff budget.
+fn retry_attention(runtime: &mut SessionRuntime) {
+    if !matches!(runtime.state, MachineState::Attention(_)) {
+        return;
+    }
+    stop_link(runtime);
+    runtime.state = MachineState::Reconnecting { at: Instant::now() };
+    runtime.backoff = Duration::from_secs(1);
+    runtime.handshake_failures = 0;
+}
+
 fn next_connection_generation() -> u64 {
     static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -3754,7 +3765,13 @@ fn refresh_catalog(
     for (id, profile) in next {
         machines
             .entry(id)
-            .and_modify(|runtime| runtime.profile.label.clone_from(&profile.label))
+            .and_modify(|machine| {
+                machine.profile.label.clone_from(&profile.label);
+                // Re-enabling an already enabled machine (its Reconnect action)
+                // saves an identical profile, so the runtime is kept; without
+                // this an endpoint that gave up would never dial again.
+                retry_attention(&mut machine.runtime);
+            })
             .or_insert_with(|| new_machine_runtime(profile));
     }
     if active_removed {
@@ -3962,12 +3979,7 @@ fn request_user_switch(
                 MachineState::Reconnecting { .. } => {
                     runtime.state = MachineState::Reconnecting { at: Instant::now() };
                 }
-                MachineState::Attention(_) => {
-                    stop_link(runtime);
-                    runtime.state = MachineState::Reconnecting { at: Instant::now() };
-                    runtime.backoff = Duration::from_secs(1);
-                    runtime.handshake_failures = 0;
-                }
+                MachineState::Attention(_) => retry_attention(runtime),
                 MachineState::Online => unreachable!(),
             }
             *pending_endpoint = Some(endpoint.clone());
@@ -6439,6 +6451,28 @@ mod tests {
         let mut machine = new_machine_runtime(profile);
         machine.runtime.state = state;
         machine
+    }
+
+    #[test]
+    fn retry_attention_rearms_only_endpoints_that_gave_up() {
+        let mut machine = machine_with_sessions(
+            "nas",
+            &["default"],
+            MachineState::Attention("connection timed out repeatedly".into()),
+        );
+        machine.runtime.backoff = RECONNECT_MAX;
+        machine.runtime.handshake_failures = 3;
+        retry_attention(&mut machine.runtime);
+        assert!(matches!(
+            machine.runtime.state,
+            MachineState::Reconnecting { .. }
+        ));
+        assert_eq!(machine.runtime.backoff, Duration::from_secs(1));
+        assert_eq!(machine.runtime.handshake_failures, 0);
+
+        let mut online = machine_with_sessions("nas", &["default"], MachineState::Online);
+        retry_attention(&mut online.runtime);
+        assert!(matches!(online.runtime.state, MachineState::Online));
     }
 
     #[test]
